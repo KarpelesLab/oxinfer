@@ -86,6 +86,44 @@ export function fmtAgo(t) {
   return new Date(t * 1e3).toLocaleDateString();
 }
 
+/// opencode's configuration as `GET /api/web/opencode` reports it (null until asked, or when the
+/// server does not offer it), with the last change's message and the actions in progress.
+export const opencode = reactive({ status: null, message: '', error: '', busy: {} });
+let ocAsked = 0;
+
+/// Asks the server again (at most every 5 s unless `force`).
+export async function refreshOpencode(force = false) {
+  if (!store.api || (!force && Date.now() - ocAsked < 5000)) return;
+  ocAsked = Date.now();
+  try {
+    opencode.status = await store.api.opencode();
+  } catch {
+    opencode.status = null;
+  }
+}
+
+/// The opencode state of chat model `id`: null when opencode is not offered or the model is not
+/// a listed chat model, else its row (`present`, `up_to_date`).
+export function opencodeOf(id) {
+  const s = opencode.status;
+  if (!s?.available || !s.detected) return null;
+  return s.models?.find((m) => m.id === id) || null;
+}
+
+/// Adds (or updates) or removes model `id` in opencode's configuration.
+export async function opencodeChange(id, add) {
+  opencode.busy[id] = true;
+  opencode.error = '';
+  try {
+    const r = add ? await store.api.opencodeAdd(id) : await store.api.opencodeRemove(id);
+    opencode.message = r.message || '';
+  } catch (e) {
+    opencode.error = e.message;
+  }
+  delete opencode.busy[id];
+  await refreshOpencode(true);
+}
+
 /// What a model's load state reads as.
 export function loadLine(m) {
   const l = m.load || {};

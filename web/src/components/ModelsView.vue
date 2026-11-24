@@ -3,8 +3,9 @@
 // machine, what is downloaded), any other model by its spec, downloads with live progress, the
 // models in use and the cache on disk.
 import { computed, onMounted, onUnmounted, ref } from 'vue';
-import { store, refresh, fmtBytes, fmtSecs, fmtAgo, loadLine } from '../lib/native.js';
+import { store, refresh, fmtBytes, fmtSecs, fmtAgo, loadLine, opencode } from '../lib/native.js';
 import SetupDialog from './SetupDialog.vue';
+import OpencodeButtons from './OpencodeButtons.vue';
 
 const emit = defineEmits(['use']);
 
@@ -289,8 +290,11 @@ onUnmounted(() => clearInterval(timer));
               <button v-if="m.kind" type="button" class="link" @click="useKind(m.kind)">Use for {{ KIND_LABEL[m.kind] || m.kind }}</button>
               <button v-if="m.loaded || ['queued', 'waiting', 'downloading', 'loading'].includes(m.state)" type="button" class="link" :disabled="m.busy && m.loaded" @click="unload(m.id)">Unload</button>
             </span>
+            <OpencodeButtons v-if="(m.kind || 'chat') === 'chat'" :id="m.id" />
           </li>
         </ul>
+        <p v-if="opencode.error" class="error" role="alert">{{ opencode.error }}</p>
+        <p v-else-if="opencode.message" class="hint" role="status">{{ opencode.message }}</p>
       </section>
       <p v-if="readOnly" class="hint warn-text">This server listens beyond this computer without an API key, so downloads, deletions and loads are turned off.</p>
     </aside>

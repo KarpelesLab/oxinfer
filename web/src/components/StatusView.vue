@@ -4,7 +4,8 @@
 // process's and the machine's resources, and the prompt caches (clear). One GET of
 // /api/web/activity a second while the page is shown.
 import { computed, onMounted, onUnmounted, ref } from 'vue';
-import { store, refresh, fmtBytes, fmtSecs, fmtAgo } from '../lib/native.js';
+import { store, refresh, fmtBytes, fmtSecs, fmtAgo, opencode } from '../lib/native.js';
+import OpencodeButtons from './OpencodeButtons.vue';
 
 const KIND_LABEL = { chat: 'chat', completion: 'completion', embedding: 'embeddings', image: 'image', transcription: 'speech to text', speech: 'text to speech', video: 'video' };
 
@@ -384,6 +385,7 @@ onUnmounted(() => {
                     <span class="mono">{{ m.id }}</span>
                     <span v-if="m.kind" class="badge">{{ KIND_LABEL[m.kind] || m.kind }}</span>
                     <div v-if="m.model_type" class="hint">{{ m.model_type }}{{ m.quant ? `, ${m.quant}` : '' }}{{ m.format ? `, ${m.format}` : '' }}</div>
+                    <div v-if="(m.kind || 'chat') === 'chat'" class="oc-line"><OpencodeButtons :id="m.id" /></div>
                   </td>
                   <td>
                     <span :class="['badge', 'flat', STATE[m.state]?.[1]]">{{ STATE[m.state]?.[0] || m.state }}</span>
@@ -417,9 +419,14 @@ onUnmounted(() => {
           <template v-if="otherModels.length">
             <button v-if="!showAllModels" type="button" class="link" @click="showAllModels = true">Show the {{ otherModels.length }} models not loaded</button>
             <ul v-else class="plain others">
-              <li v-for="m in otherModels" :key="m.id"><span class="mono">{{ m.id }}</span> <span v-if="m.kind" class="badge">{{ KIND_LABEL[m.kind] || m.kind }}</span></li>
+              <li v-for="m in otherModels" :key="m.id">
+                <span class="mono">{{ m.id }}</span> <span v-if="m.kind" class="badge">{{ KIND_LABEL[m.kind] || m.kind }}</span>
+                <OpencodeButtons v-if="(m.kind || 'chat') === 'chat'" :id="m.id" class="oc-inline" />
+              </li>
             </ul>
           </template>
+          <p v-if="opencode.error" class="error" role="alert">{{ opencode.error }}</p>
+          <p v-else-if="opencode.message" class="hint" role="status">{{ opencode.message }}</p>
         </section>
 
         <section class="block-section" aria-labelledby="pc-h">
@@ -595,6 +602,14 @@ onUnmounted(() => {
   display: flex;
   gap: 0.9rem;
   white-space: nowrap;
+}
+.oc-line {
+  margin-top: 0.2rem;
+  font-size: 0.86rem;
+}
+.oc-inline {
+  margin-left: 0.6rem;
+  font-size: 0.86rem;
 }
 .bar.thin {
   height: 4px;

@@ -307,6 +307,69 @@ them as `Api::status` (the same JSON), `Api::requests`, `Api::cancel`, `Api::unl
 engine; the C API as `oxi_server_status`, `oxi_server_cancel`, `oxi_server_unload_model`,
 `oxi_server_clear_prompt_cache`, `oxi_server_free_caches` and `oxi_engine_clear_prompt_cache`.
 
+### opencode
+
+When the server finds opencode's global configuration directory (`$XDG_CONFIG_HOME/opencode`, else
+`~/.config/opencode`, of the user running the server), the GUI's **Models** and **Status** views
+offer **Add to opencode** on each chat model; an added model shows **In opencode** with **Remove
+from opencode**, or **Update** when its entry no longer matches what oxinfer knows of the model.
+The buttons are hidden when opencode is not set up.
+
+```sh
+curl -s localhost:8080/api/web/opencode | jq '.models[] | {id, state}'
+curl -s -X POST -H 'Content-Type: application/json' -d '{"model": "qwen"}' localhost:8080/api/web/opencode/add
+curl -s -X POST -H 'Content-Type: application/json' -d '{"model": "qwen"}' localhost:8080/api/web/opencode/remove
+```
+
+Adding writes the model under an `oxinfer` provider, created when missing:
+
+```json
+"provider": { "oxinfer": { "npm": "@ai-sdk/openai-compatible", "name": "oxinfer (local)",
+  "options": { "baseURL": "http://127.0.0.1:8080/v1" },
+  "models": { "qwen": { "name": "qwen (oxinfer)", "reasoning": true, "tool_call": true,
+    "attachment": false, "temperature": true, "modalities": { "input": ["text"], "output": ["text"] },
+    "limit": { "context": 40960, "output": 10240 } } } } }
+```
+
+- `attachment` and `image` in `modalities.input`: the model takes images. Once the model has been
+  loaded this is what the engine says (`Engine::accepts_images`: its vision tower, or for a GGUF
+  model the mmproj file beside it, is there); before that, its files say it (an mmproj beside it,
+  a `vision_config`), or the catalog does for a vision model whose GGUF projector its load fetches.
+- `reasoning`: its chat format has a thinking block; `tool_call`: it has tool calls (before the
+  first load: the catalog, or the chat template).
+- `limit.context`: the model's `max_context` option, else its trained context (32768 when
+  neither is known); `limit.output` a quarter of it, from 1024 to 32768 tokens.
+- `options.baseURL` is this server as a program on this machine reaches it (`https` with TLS),
+  and `options.apiKey` its API key when it has one. An existing provider keeps its name and
+  other options; an existing entry keeps its `name` (rename it freely) and any other key.
+
+The file is `opencode.jsonc` when there is one (opencode reads it last), else `opencode.json`
+(created when missing, readable by its owner only). It is read as JSONC (comments, trailing
+commas) and changed with minimal text edits: every other key and provider, the comments and the
+indentation stay as they were (comments inside a replaced or removed entry go with it, and the
+answer says so). Each write first copies the file to `opencode.json.oxinfer-<unix time>.bak`
+(the last five are kept) and replaces it atomically (a temporary file renamed over it, with the
+same permissions; through a symbolic link, the file it points at). A file that cannot be parsed
+is not touched (409, `opencode_config`).
+
+Removing deletes the model's entry, and the `oxinfer` provider when it has no model left. When
+opencode's `model` (or `small_model`) names the removed model, the answer's `default_model` and
+`message` say so; the setting is left for you to change.
+
+| Endpoint | |
+|---|---|
+| `GET /api/web/opencode` | `{available, detected, writable, dir, path, exists, error, provider, base_url, default_model, models, other}`: `models` the server's chat models with `state` (`absent`, `current`, `outdated`), `present`, `up_to_date`, `capabilities` (`vision`, `thinking`, `tools`, `context`), `source` (`loaded`: the engine's; `files`: not loaded yet) and the `entry` it would write; `other` the provider's models the server does not list. `available` is false (and nothing else is said) for a request from another machine |
+| `POST /api/web/opencode/add` | `{"model"}`: writes or updates its entry; answers `{model, changed, created, path, backup, comments_removed, message, entry, source}` (nothing is written when the file already says it) |
+| `POST /api/web/opencode/remove` | `{"model"}`: answers `{model, changed, path, backup, provider_removed, default_model, comments_removed, message}` |
+
+They follow the management API's rules (the API key, JSON bodies from the page's own origin, a
+loopback `Host` on a loopback listener, read-only without a key on a non-loopback listener), and
+since they write to the home directory of the user running the server, they also need a request
+from this machine: a loopback listener, or a client connecting from a loopback address (403,
+`opencode_local_only`). The library has them as `oxinfer::opencode` (`detect`, `Config::add`,
+`Config::remove`, `Config::state`, `Model::new` from `Engine::capabilities`), the C API as
+`oxi_opencode_detect`, `oxi_opencode_add` and `oxi_opencode_remove`.
+
 ### Models on request
 
 A request may name a model that is not listed: a repo id (`org/name`, or `org/name:QUANT` for a

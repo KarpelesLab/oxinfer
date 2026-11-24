@@ -204,6 +204,16 @@ export class HttpApi {
   freeCaches(model) {
     return this.post('api/web/caches/free', model ? { model } : {});
   }
+  /// opencode's configuration: detected, its file, per chat model present / up to date.
+  opencode() {
+    return this.get('api/web/opencode');
+  }
+  opencodeAdd(model) {
+    return this.post('api/web/opencode/add', { model });
+  }
+  opencodeRemove(model) {
+    return this.post('api/web/opencode/remove', { model });
+  }
 
   /// Follows a download job until it ends: `onUpdate(job)` for each report.
   async watchDownload(id, onUpdate, signal) {

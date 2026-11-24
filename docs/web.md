@@ -112,7 +112,9 @@ list must be loaded once from the GUI, or given with `--model`).
   (`"apiKey"` in `options` with `--api-key`.) With opencode 1.19.6,
   `opencode run -m oxinfer/Qwen/Qwen3.5-0.8B "Reply with just the word: pong"` answered `pong`.
   opencode's newer schema also has a `providers` key (with `package` and `settings`); `provider`
-  is still read.
+  is still read. The **Models** and **Status** views write this for you when the server finds
+  opencode's configuration: **Add to opencode** on each chat model (see
+  [docs/server.md](server.md#opencode)).
 - **Claude Code**: `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` (no `/v1`),
   `ANTHROPIC_AUTH_TOKEN` (the key, or any value without one), `ANTHROPIC_MODEL` and
   `ANTHROPIC_SMALL_FAST_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL` set to a model id, then `claude`.
@@ -187,6 +189,7 @@ Under `/api/web/`, apart from `/v1`. Every endpoint but `info` needs the API key
 | `GET /api/web/prompt-cache` | the prompt caches (`--prompt-cache`, and the models' own `prompt_cache` options): `{dirs, entries, bytes, cap}`, per directory `path`, `exists`, `entries`, `bytes`, `models`: per fingerprint `fingerprint`, `model_type`, `ids` (the listed models loaded with it since the start), `entries`, `bytes`, `tokens`, `last_used` |
 | `POST /api/web/prompt-cache/clear` | removes snapshots: `{"model": ID}` (a model loaded since the start; 409 otherwise, as its snapshots cannot be told apart), `{"fingerprint": F}`, or `{}` for all of them; `"dir"` (one of the prompt-cache directories, else 400) limits it to that directory. Only `*.oxsnap` files directly in those directories are touched. Loaded idle models forget them too (a model busy meanwhile notices on its next restore). Answers `{removed, bytes}` |
 | `POST /api/web/caches/free` | `{"model": ID}` or `{}` (all): the models streamed from disk let go of the experts their part cache keeps between uses (dropped from the page cache in the background; read from storage again when next needed). Answers `{freed}` bytes |
+| `GET /api/web/opencode`, `POST /api/web/opencode/add`, `POST /api/web/opencode/remove` | opencode's configuration and the chat models' entries in it: see [docs/server.md](server.md#opencode); only for requests from this machine |
 | `GET /api/web/update` | `{enabled, state, current, latest, newer, url, checked, checking, error, can_update, why_not, command, job}`: `state` is `checking`, `available`, `up_to_date`, `error`, `unknown`, `disabled` (`--no-update-check`) or `unsupported` (a build without the `update` feature); `url` the release notes; `checked` the Unix time of the answer; `can_update` whether `POST` would install it, else `why_not` and `command` (`oxinfer --update`); `job` the update started from the GUI, if any |
 | `POST /api/web/update` | installs the latest release and restarts into it (see [Updates](#updates)); answers the job: `state` (`checking`, `downloading`, `restarting`, `updated`: installed, restart by hand; `up_to_date`, `error`), `version`, `file`, `size`, `message`, `error`, `started`. 403 when read-only (`read_only`) or turned off (`update_check_off`), 409 while busy (`busy`) or when this process cannot replace itself (`cannot_update`); a job already running (or done, waiting for a restart) is returned as it is |
 
