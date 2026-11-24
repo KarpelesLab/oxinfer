@@ -435,7 +435,6 @@ fn backup(target: &Path) -> Result<PathBuf> {
 /// Writes `text` to `path` atomically (a temporary file beside it, renamed over it) with the
 /// old file's permissions, after backing the old file up. Returns the backup.
 fn save(path: &Path, exists: bool, text: &str) -> Result<Option<PathBuf>> {
-    use std::io::Write;
     // A symbolic link (dotfiles): the file it points at is the one replaced.
     let target = if exists {
         std::fs::canonicalize(path).with_context(|| format!("resolve {}", path.display()))?
@@ -450,32 +449,37 @@ fn save(path: &Path, exists: bool, text: &str) -> Result<Option<PathBuf>> {
     let name = target.file_name().context("the file has no name")?.to_string_lossy().into_owned();
     let tmp = dir.join(format!(".{name}.oxinfer-{}.tmp", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
-    let r = (|| -> Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        if exists {
-            std::fs::set_permissions(&tmp, std::fs::metadata(&target)?.permissions())?;
-        } else {
-            // It may hold the server's API key: readable by its owner only.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-            }
-        }
-        std::fs::rename(&tmp, &target).with_context(|| format!("replace {}", target.display()))?;
-        Ok(())
-    })();
+    let r = replace_with(&tmp, &target, exists, text);
     if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     r.map(|_| backup)
+}
+
+/// Writes `text` to `tmp`, gives it the permissions of `target` (or the owner's only, for a new
+/// file) and renames it over `target`.
+fn replace_with(tmp: &Path, target: &Path, exists: bool, text: &str) -> Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)
+        .with_context(|| format!("create {}", tmp.display()))?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    if exists {
+        std::fs::set_permissions(tmp, std::fs::metadata(target)?.permissions())?;
+    } else {
+        // It may hold the server's API key: readable by its owner only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    std::fs::rename(tmp, target).with_context(|| format!("replace {}", target.display()))?;
+    Ok(())
 }
 
 /// JSONC (JSON with `//` and `/* */` comments and trailing commas) with the byte spans of its
