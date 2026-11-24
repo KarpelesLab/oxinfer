@@ -52,7 +52,7 @@ the compressors keep the rows of the windows still pooling, both trimmed as the 
 (64 positions of slack, so speculative rounds can roll back); the compressed keys and the engram
 ids only grow. A checkpoint (`DeepSeek4Session::checkpoint`, `reachable`, `cut_to`) holds, per
 layer, the window's raw keys and the compressors' pending rows as they were at its position (the
-compressed keys are cut back to their count then): about 30 MB for V4.1-Flash, so the default
+compressed keys are cut back to their count then): about 22 MB for V4.1-Flash, so the default
 two cost little. `Engine::chat` takes them as for Inkling-2 (`prompt_checkpoints`, default 2, 0
 off), and a next turn whose past reply lost its thinking goes back to the previous prompt but its
 last token. Snapshots (`--save-session`, `--prompt-cache`) hold the host's session, which stays
@@ -60,6 +60,26 @@ authoritative on Metal too (V4.1's GPU decode appends each pass's keys to it); t
 copies of the caches are rebuilt from it at the first pass after a restore or a cut back
 (`deepseek41_gpu.rs`). Not with a DSpark draft (V4's draft keeps its own state; snapshots and
 checkpoints are refused there).
+
+Measured on DeepSeek-V4.1-Flash-1017 (ISTA-DASLab GSQ-RCO IQ1_M, M5 Max, Metal decode, warm page
+cache, other jobs on the machine at load 4-10) with `examples/chat_turns.rs`: a 2131-token
+first turn in thinking mode (160 reply tokens, all thinking, so the reply sent back is empty and
+its tokens differ from the cache's), then a 2142-token second turn:
+
+| turn 2 | cached | prefill | wall (160 tokens) |
+|---|---|---|---|
+| before (`prompt_checkpoints=0`: the cache cannot go back that far, the conversation starts over) | 0 | 17.0 s | 22.1 s |
+| after (in memory, back to the previous prompt but its last token) | 2130 | 0.70 s | 5.9 s |
+| a new process, `--prompt-cache` (a 36 MB snapshot read in 0.01 s) | 2141 | 0.71 s | 4.6 s |
+
+The checkpoints there took 3.2 MB (the 34-token system prefix) and 21-22 MB (2130 and 2141
+tokens); the prompt cache held four snapshots of 35-40 MB. The reply restored in a new process is
+the in-memory second turn's token for token (the restored session is the original bit for bit);
+against the prompt computed in one pass, the greedy replies part at a near tie after a few
+tokens, as any prompt fed in other passes does: the restored prompt's last token runs as a
+decode step (on the GPU, at KL 3e-5 from the CPU's), and the tokens agree for 3 of 160 decoding on
+Metal (both paths pick the same token at each step: KL 1e-4 at the tie) and 60 of 160 on the CPU
+(`stream_gpu=off`).
 
 The directory is created private (0700; an existing one is set to 0700, which fails unless it is
 yours, so `/tmp` or `/dev/shm` themselves are refused; a directory of your own on a tmpfs gives

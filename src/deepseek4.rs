@@ -444,7 +444,7 @@ impl DeepSeek4Session {
     /// Takes a [`Checkpoint`] of the current position (none when there is one already or `max`
     /// is 0), keeping at most `max`: past that the lowest one (a shared prefix, say) and the
     /// newest stay, the second lowest goes. Each holds the window's raw keys and the
-    /// compressors' pending rows of every layer (DeepSeek-V4-Flash: about 30 MB).
+    /// compressors' pending rows of every layer (DeepSeek-V4.1-Flash: about 22 MB).
     pub fn checkpoint(&mut self, max: usize) {
         let pos = self.pos;
         if max == 0 || pos == 0 || self.has_checkpoint(pos) {

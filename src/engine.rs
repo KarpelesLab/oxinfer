@@ -353,7 +353,7 @@ pub struct EngineOptions {
     /// thinking, an edited message) instead of starting over: the models' convolutions, sliding
     /// windows and compressors' rows cannot be cut back further than 64 positions otherwise.
     /// Each holds the sliding layers' last window of keys and values (Inkling-2-Mini: about 650
-    /// MB with f32 caches, 180 MB with q8; DeepSeek-V4-Flash: about 30 MB, the window's raw keys
+    /// MB with f32 caches, 180 MB with q8; DeepSeek-V4.1-Flash: about 22 MB, the window's raw keys
     /// and the compressors' pending rows, the compressed keys being shared). Past
     /// the cap the lowest one and the newest stay. Default [`DEFAULT_PROMPT_CHECKPOINTS`], 0
     /// turns them off. Key `prompt_checkpoints`.

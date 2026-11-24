@@ -134,7 +134,7 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *                        token) so that the next conversation reuses the cache up to one after a
  *                        mismatch (a past reply without its thinking, an edited message); each
  *                        holds the sliding layers' last window (Inkling-2-Mini: ~650 MB with f32
- *                        caches, ~180 MB q8; DeepSeek-V4-Flash: ~30 MB). Default 2, 0 off
+ *                        caches, ~180 MB q8; DeepSeek-V4.1-Flash: ~22 MB). Default 2, 0 off
  *   cache_dir=PATH       where repo ids are downloaded
  *   gpu_exact=0|1        GPU matmuls bit-identical to the CPU (default 0: M5/A19 matrix
  *                        units, half-precision inputs; CUDA prompts of GGUF models in f16
