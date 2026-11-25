@@ -996,6 +996,185 @@ against 1.0-1.2 ms a token: the exponentials are not what it costs). The grouped
 ranges start where every token's outputs cross a cache line (a large `Vec` starts 16 bytes into
 one): 3-4% of the grouped GEMM over two rounds, kept.
 
+### DGX Spark (GB10, unified memory)
+
+One NVIDIA DGX Spark ([platforms.md](platforms.md#dgx-spark-aarch64-linux): 10 Cortex-X925 and
+10 Cortex-A725, a GB10 sharing the system's 121 GiB, driver 580.173.02 / CUDA 13.0, NVRTC 13.0,
+kernel 6.17, Rust 1.100), November 2026, shared with one other job (load averages 1 to 2 before
+the GPU runs, up to 16 after the CPU ones). "Before" is master `7e69165`, "after" this work on
+top of it, both `--release`, built on the machine; each row is two rounds, the builds in turn
+(round 1 / round 2). oxinfer: `examples/inkling2_bench MODEL -p 512,2048 -n 128 -r 3` (a
+warm-up, then the median of 3; f32 KV caches) for the speeds, and `oxinfer --model MODEL
+--device cuda --no-draft --no-lookup --temp 0 -n 64 --prompt "..."` for the load. Memory taken
+is `MemAvailable` before a run less its minimum during it, in GiB, the checkpoint in the page
+cache already. llama.cpp: master `94f3af3` built on the machine (CUDA 13.0), `llama-bench -p
+512,2048 -n 128 -r 3 -fa 1 -ngl 99`, measured three days before the oxinfer rows. tok/s:
+
+| GB10, checkpoint | engine | weights on the device | model loaded | pp512 | pp2048 | tg128 | memory taken |
+|---|---|---:|---:|---:|---:|---:|---:|
+| ggml-org Q8_0 (27.8 GB) | llama.cpp | | | 756 | 598 | 30.4 | 28.2 |
+| | oxinfer before | 97.6 / 87.9 s | 98.1 / 88.3 s | 813 / 822 | 894 / 893 | 30.6 / 31.8 | 28.0 |
+| | **oxinfer after** | **1.6 / 1.5 s** | **2.1 / 2.0 s** | 815 / 819 | **949 / 947** | **32.9 / 33.7** | 28.0 |
+| AtomicChat AD-Q4_K (16.5 GB) | llama.cpp | | | 817 | 638 | 36.4 | 17.7 |
+| | oxinfer before | 62.0 / 64.0 s | 62.5 / 64.4 s | 885 / 856 | 912 / 922 | 39.4 / 40.4 | 17.2 |
+| | **oxinfer after** | **1.0 / 0.9 s** | **1.4 / 1.3 s** | 871 / 878 | **969 / 958** | **41.5 / 42.9** | 17.3 |
+| release (NVFP4 / MXFP8 experts, 19.5 GB) | oxinfer before | 19.2 / 19.2 s | 25.8 / 25.7 s | 809 / 840 | 930 / 927 | 32.2 / 33.6 | 30.8 |
+| | **oxinfer after** | **1.0 / 1.0 s** | **7.5 / 7.5 s** | 854 / 872 | **984 / 984** | **33.7 / 34.7** | 30.9 |
+| unsloth UD-IQ3_XXS (11.7 GB) | oxinfer before | 48.2 / 37.2 s | 57.4 / 37.5 s | 814 / 832 | 861 / 863 | 43.0 / 45.1 | 13.0 |
+| | **oxinfer after** | **0.7 / 0.7 s** | **10.9 / 1.1 s** | 828 / 813 | **919 / 903** | **44.3 / 45.8** | 13.0 |
+
+(llama.cpp's mainline has no reader for the release's safetensors nor for unsloth's root files.
+Of the release's 7.5 s, 1.0 is the upload and the rest its load on the host, where the NVFP4
+experts are repacked. UD-IQ3_XXS's round 1 was the first load of the file after its download.)
+
+**What changed on the GPU.** Each applies to devices that report
+`CU_DEVICE_ATTRIBUTE_INTEGRATED` only; a discrete card runs what it ran.
+
+- **Weight pages read before the uploads.** On such a device the checkpoint is mapped
+  ([platforms.md](platforms.md#cuda-speed-and-memory-on-the-gb10)), and the driver copies host
+  pages that are not in the process's page table yet at 0.3 GB/s. The engine copies its weights
+  with driver bindings of its own and was not covered by the page pass of the language models'
+  uploads: Q8_0's 27.3 GB took 88 to 98 s to reach the device, and a first answer 93 to 115 s.
+  Every weight's pages are now read first, in one pass of the thread pool (0.1 s for 27.3 GB
+  in the page cache): 1.5 s for the upload, and a first answer (88 prompt tokens, 64 generated)
+  in 6 to 10 s of wall time.
+- **Output pages written before the downloads.** A pass's hidden states, a prompt's logits and
+  a session's caches come down into buffers just allocated. Buffers of 1 MB and more have their
+  pages written first: the copies of six 2048-token prompt passes took 310 ms and take 6 (the
+  pp2048 column: +5 to +7%), and a 2048-position session moves to the host in 0.15 s (491 MB).
+  A decode step's two copies (9 KB of hidden state, 800 KB of logits) were 9 and 21 us a token
+  and are left alone.
+- **A lane per block in the decode kernels** (`LANE_BLOCKS` in `inkling_cuda.cu`,
+  `OXINFER_INKLING_LANES=0/2/4`, 2 by default here). The matvecs, the routed experts' gate / up
+  and down rows and the LM head were bound by their loads and arithmetic, not by the memory: a
+  lane took 4 values of every block of 32 and decoded the block's scale again each time. A lane
+  now takes whole blocks, sums a block's stored values against the input unscaled and scales
+  each 16's sum once (the GEMMs' `dqi` / `dqs`), and a block of the input is loaded once for two
+  rows. Rows here are 72 or 36 blocks, not a multiple of a warp's 32 lanes, so a warp takes
+  several row groups, each starting its lanes `blocks mod 32` further round: every lane walks
+  the same number of blocks. The float formats keep a lane per 4 values (bf16 reads at 227 GB/s
+  that way, 112 with a lane per block). The same build with the lanes off and on, two rounds:
+
+  | tg128 tok/s (4-token pass, ms) | lanes off | 2 (default) | 4 |
+  |---|---:|---:|---:|
+  | ggml-org Q8_0 | 31.8 / 31.3 (83.8 / 86.0) | 33.7 / 32.8 (78.0 / 80.4) | 33.0 / 32.0 (72.1 / 75.5) |
+  | AtomicChat AD-Q4_K | 39.8 / 37.5 (57.9 / 60.4) | 43.1 / 41.4 (55.0 / 57.2) | 39.9 / 38.3 (53.0 / 55.9) |
+  | release | 23.6 / 30.9 (119.5 / 87.7) | 33.9 / 32.8 (84.5 / 85.5) | 33.9 / 33.2 (82.2 / 83.7) |
+  | unsloth UD-IQ3_XXS | 45.3 / 45.3 (47.2 / 47.6) | 46.3 / 46.0 (50.0 / 50.4) | 40.6 / 40.4 (47.1 / 47.1) |
+
+  The kernels alone on Mini's shapes with random weights (`cargo test --release --lib
+  inkling::cuda::tests::bench_decode_kernels -- --ignored --nocapture`, one token, us before /
+  after: 8 experts' gate / up and down; a layer's six projections; the LM head): Q8_0 375 / 338,
+  116 / 107, 2595 / 2351; Q4_K (Q5_0 down rows) 235 / 208, 77 / 68, 1600 / 1337; Q5_0 260 /
+  220, 86 / 70, 1734 / 1441; IQ3_XXS 182 / 160, 56 / 51, 1090 / 915; NVFP4 219 / 186, 73 / 64,
+  1464 / 1153; FP8 E4M3 343 / 332, 109 / 106, 2297 / 2267. One file loses on verification
+  passes: UD-IQ3_XXS's 4-token pass is 6% slower with the lanes (its one-token step 2% faster).
+  Plain decoding is the default on CUDA, so the lanes stay on for every file.
+
+**Where a decoded token goes on the GB10** (`OXINFER_INKLING_PROFILE=1`, CUDA events around
+each launch, Q8_0: 35.7 ms a token that way, 30 without). Per token: the experts' gate / up
+rows 10.8 ms and down rows 5.3 (48 launches each), the layers' projections 5.7, the output
+projections and the LM head 4.2, the message gates 2.1, the mixes 1.7, the convolutions 1.1,
+the norms 0.8, the router 0.5, and 1.8 for the routing, cache stores, residual adds, vector
+clips and attention together. The experts read 3.25 GB a token in 16.1 ms, 202 GB/s, where a
+kernel that only reads reaches 220 on this device: a Q8_0 token is 5.1 GB, 23 ms at that rate,
+and decodes in 30. On the release the bf16 dense matrices and head are 47% of the kernel time
+and the NVFP4 experts 27%. A 2048-token prompt (2.2 s) is 59% the split GEMMs (`gemmi_8`), 13%
+the tiled attention, 6% the gates' low-rank projection, 5% the convolutions, 3% the router's
+f32 matvec.
+
+**Context.** Q8_0 after 8192 and 32768 tokens of a pseudo-random prompt (`inkling2_cuda_check
+--prompt-len 2048 --chunk 1024 --steps 128 --depth D`, one run each): pp2048 785 and 533 tok/s,
+tg128 24.9 and 20.8. With the caches filled with placeholder rows (`inkling2_ctx_bench`, 64
+tokens, three runs): 29.2 to 29.9 tok/s at 8192 and 24.1 to 25.1 at 32768 (30.9 at 2048, one
+run); `--kv f16` 31.6 and 28.6 (one run each). With f16 caches at no depth: pp2048 929, tg128
+32.5.
+
+**Memory.** A GGUF file takes its size once (the device's copy; the mapped file is page cache
+the system takes back) plus about 2 GiB of activations and caches: 28.0 GiB for Q8_0's 25.9, as
+llama.cpp (28.2). The release takes 30.8 GiB for 18.2: its NVFP4 experts are repacked into
+ggml's blocks in the process's own memory at load, and the device holds a second
+copy of them (the 10.5 GiB the release takes beyond what a GGUF file does). Not changed here:
+the CPU path reads the host's copy whenever a pass leaves the device (a session it cannot hold,
+interventions, `OXINFER_GPU_DECODE_CHECK`).
+
+**The CPU** (20 threads; `inkling2_bench --cpu -p 512,2048 -n 64 -r 2`, "fast"
+`OXINFER_PREFILL_GEMM=fast`; llama.cpp `llama-bench -p 512 -n 64 -r 2 -t 10` on a build without
+CUDA, the same revision as above). tok/s, round 1 / round 2:
+
+| CPU, checkpoint | engine | pp512 | pp2048 | tg64 | memory taken |
+|---|---|---:|---:|---:|---:|
+| ggml-org Q8_0 | llama.cpp, 10 threads | 48.0 | | 9.4 | |
+| | llama.cpp, 20 threads | 51.1 | | 2.5 | |
+| | oxinfer before, f32 | 81.8 / 78.2 | 85.3 / 85.5 | 16.3 / 16.6 | 26.8 (prompts in chunks of 2048: 32.5) |
+| | oxinfer before, fast | 166 / 165 | 165 / 164 | | |
+| | **oxinfer after**, f32 | 78.5 / 75.0 | 87.2 / 86.3 | **19.0 / 19.1** | 26.5 (32.7 to 33.2) |
+| | oxinfer after, fast | 164 / 164 | 166 / 167 | | |
+| release | oxinfer before, f32 | 80.6 / 80.6 | 87.5 / 86.7 | 14.5 / 14.9 | 19.3 (25.5) |
+| | oxinfer before, fast | 82.4 / 79.8 | 86.8 / 87.0 | | |
+| | **oxinfer after**, f32 | 80.8 / 80.7 | 86.4 / 87.6 | **15.6 / 15.8** | 19.3 (25.5) |
+| | oxinfer after, fast | 82.5 / 80.4 | 88.1 / 87.4 | | |
+
+- **The message gates of a short pass as dot products.** A decoded token runs 96 gates, each
+  three float matmuls (64 x 4608, then two of 2304 x 64: 2.4 MB) and two tanh per output. For
+  one token they went through the prompt GEMM's tiles in three parallel regions with the tanh
+  on the calling thread: 55 us for the low-rank rows, 27 for forget / gain and 38 for the tanh
+  mix, 11.5 ms of a 69 ms token. Passes under 8 tokens now take two regions (`gate_rows`): the
+  low-rank rows as plain dot products, then each output's two dot products with its tanh mix;
+  the mixes, gates and norms go from 12.6 to 3.7 ms a token. Prompts keep the GEMMs, and
+  `OXINFER_INKLING_GATE_ROWS=0` keeps them for short passes too. Not specific to this machine:
+  on the Threadripper 9970X above (Q8_0, the `ci` profile, 48 tokens, off / on alternated twice,
+  load 9 to 30) 10.1 and 9.5 tok/s with the GEMMs, 10.8 and 10.4 with the rows, the mixes, gates
+  and norms 11.9 and 14.1 against 6.0 and 6.2 ms a token.
+- Decoding is not faster with fewer threads here (10 / 18 / 20 threads: 14.7 / 14.3 / 14.1
+  tok/s on the tree of three days before), where llama.cpp falls from 9.4 to 2.5 tok/s with the
+  efficiency cores in.
+- **Not done: the release's prompts on the int8 GEMM.** On aarch64 the int8 prompt GEMM has no
+  layout for NVFP4 (its scales per 16 are integers, NVFP4's are E4M3 values) and declines a
+  matrix with a factor as wide as its rows, so under `fast` the release's experts stay on the
+  f32 GEMM beside its bf16 dense matrices: 80 to 88 tok/s either way, where Q8_0 goes from 75-87
+  to 164-167. (x86-64 has both since `e4a8ec4`.)
+
+**Agreement.** `inkling2_cuda_check`, pseudo-random prompts of 300 tokens (`--seed`), every
+prompt position and 32 forced decode steps:
+
+| Against | checkpoint (prompts) | prompt, every position | decode steps | greedy tokens |
+|---|---|---|---|---|
+| master on the GPU | ggml-org Q8_0 (2, and 3 on the tree of three days before) | mean KL 6.8e-13 to 7.2e-13, largest logit difference 9.5e-6, same top 300 / 300 | 3.0e-13 to 6.1e-13, 32 / 32 | 33 / 33 |
+| | release (3) | bit-identical | 3.2e-13 to 6.4e-13, 32 / 32 | 33 / 33 |
+| | AtomicChat AD-Q4_K (1) | 7.0e-13, 300 / 300 | 5.0e-13, 32 / 32 | 33 / 33 |
+| | unsloth UD-IQ3_XXS (1) | 8.4e-13, 300 / 300 | 4.5e-13, 32 / 32 | 33 / 33 |
+| master on the GPU, `OXINFER_INKLING_LANES=0` | all four (2, 3, 1, 1) | bit-identical | bit-identical | |
+| the CPU's f32 prompt GEMM | ggml-org Q8_0 (2) | 4.2e-11, 300 / 300 | prompt tokens fed as steps: 4.3e-11 to 4.4e-11, 32 / 32 | 17 / 17 |
+| | release (3) | 4.1e-11 to 4.2e-11, 300 / 300 | 4.4e-11 to 4.5e-11, 32 / 32 | 17 / 17 |
+| | AD-Q4_K (1) / UD-IQ3_XXS (1) | 4.2e-11 / 4.3e-11, 300 / 300 | 4.4e-11 / 4.6e-11, 32 / 32 | 17 / 17 |
+| the CPU's decode steps (int8 activations) | Q8_0 (2) / release (3) / AD-Q4_K (1) / UD-IQ3_XXS (1) | | 6.6e-4 to 1.2e-3 / 4.9e-4 to 1.1e-3 / 6.4e-4 / 1.9e-3, 16 / 16 each | |
+
+(The prompt's logits move on the GGUF files because the LM head of the last positions is a
+matvec; the release's head is bf16, which keeps its kernel.) The CPU's gates sum in another
+order, and its decode kernels round activations to int8, so a decode step moves by that
+rounding's size: against master on the CPU, three Q8_0 prompts and 32 forced steps, mean KL
+2.1e-4 to 7.2e-4 with the same top token on 96 of 96 and the same greedy tokens, the prompt's
+logits bit-identical; against the f32 prompt GEMM on 64 prompt positions fed as steps, mean KL
+3.9e-3, 1.7e-3 and 1.8e-3 (3.4e-3, 1.4e-3 and 1.8e-3 before) with the same top token on 181 of
+192 (182 before). On the release, whose gates are bf16 and take the same dot kernel either way,
+the 64 decode steps of the bench have the same logits digest before and after. `gate_rows` is
+held to 2e-5 of its f64 definition, and the lane kernels of every weight format to the bounds
+of the others (`matvecs_and_gemms_match_definition`, `moe_matches_definition`: rows of 16, 72
+and 36 or 40 blocks, 8 and 40 for the experts).
+
+**Measured and not kept** (this machine): the first lane-per-block kernels, which kept `dq`'s scaled
+values (the experts' launches of a layer: NVFP4 232 -> 257 us, FP8 356 -> 399, the others 1 to 8%
+better); a lane per block for the float formats (bf16 experts 562 -> 1136 us); four rows a warp
+instead of two (the table above: better on 4-token passes, no better or worse on one-token steps);
+16 / 8 to 128 / 64 splits of a token's keys in the attention where the kernels take 32 / 16 (29.1 to
+29.5 tok/s at 8192 tokens against the default's 29.2 to 29.9, and 30.8 to 31.1 against 30.9 at
+2048); decode steps launched op by op instead of as a graph (29.1 against 32.8 to 33.7 tok/s); the
+experts' scalar activations of a short pass in one parallel region on the CPU (16.5 -> 18.2 tok/s on
+the tree of three days before, the same logits; master's `2b05da1` does it per expert, so it was
+dropped at the rebase). Not tried: the prompt GEMMs (`gemmi_*`, 59% of a prompt) and the tiled
+attention on this device, and one copy of the release's NVFP4 experts.
+
 ## Speculative decoding
 
 A session goes back up to 64 positions (`Inkling2Session::truncate`: the convolutions read

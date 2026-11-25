@@ -844,8 +844,18 @@ GGUF files (three prompts of Llama 1B, one of the 27B) the prompt's last-token l
 difference (KL 0) and the decode steps differ by the matvec's order of sums, mean KL 1.7e-10 to
 1.1e-8, with the same 48 and 32 tokens.
 
-**Not run on this machine:** the affine-Q4 MLX checkpoints, MoE models, GGUF files other than
-Llama-3.2-1B Q4_K_M and Qwen3.8-27B UD-Q3_K_XL / UD-Q4_K_M, Inkling-2 with real weights (its
-CUDA engine ran in the unit tests only; MiniMax-H3 ran one clip, above), Whisper, the image and
+**Inkling-2 Mini** has an engine of its own on CUDA, which copies its weights and results with
+driver bindings of its own. On this machine it now reads its weights' pages before the uploads
+(Q8_0's 27.3 GB on the device in 1.5 s instead of 88 to 98), writes its outputs' pages before
+the downloads (2048-token prompts 5 to 7% faster) and takes whole blocks of 32 per lane in its
+decode kernels (one-token steps 2 to 10% faster): Q8_0 at 815-819 / 947-949 / 32.9-33.7 tok/s
+(pp512 / pp2048 / tg128) against llama.cpp's 756 / 598 / 30.4, in 28.0 GiB; on the CPU 164 at
+512 prompt tokens (`prefill_gemm=fast`) and 19.0 decoding against llama.cpp's 48-51 and 9.4. The four checkpoints measured, the profile, the agreement with
+master and with the CPU, and what was not kept are in
+[inkling.md](inkling.md#dgx-spark-gb10-unified-memory).
+
+**Not run on this machine:** the affine-Q4 MLX checkpoints, MoE models other than Inkling-2
+Mini, GGUF files other than Llama-3.2-1B Q4_K_M, Qwen3.8-27B UD-Q3_K_XL / UD-Q4_K_M and
+Inkling-2 Mini's, Inkling-2 Small (MiniMax-H3 ran one clip, above), Whisper, the image and
 video pipelines other than SD-Turbo and that clip, speculative decoding, streamed weights and
 the server with a model.
