@@ -4426,19 +4426,21 @@ whole file, best of two alternated runs (details and word error rates in
 
 | Model | Metal: oxinfer / whisper.cpp | CPU: oxinfer / whisper.cpp |
 |---|---|---|
-| tiny | 0.80 / 1.59 s (1.99x) | 1.36 / 2.43 s (1.79x) |
-| base | 1.26 / 2.25 s (1.79x) | 2.69 / 4.32 s (1.61x) |
-| small | 2.72 / 4.21 s (1.55x) | 8.25 / 12.02 s (1.46x) |
-| large-v3-turbo | 3.27 / 4.85 s (1.48x) | 29.5 / 42.4 s (1.44x) |
-| medium | 6.59 / 9.62 s (1.46x) | 25.6 / 32.0 s (1.25x) |
-| large-v3 | 10.87 / 14.05 s (1.29x) | 49.7 / 68.8 s (1.38x) |
+| tiny | 0.71 / 1.62 s (2.29x) | 1.36 / 2.43 s (1.79x) |
+| base | 1.07 / 2.28 s (2.13x) | 2.69 / 4.32 s (1.61x) |
+| small | 2.26 / 4.22 s (1.87x) | 8.25 / 12.02 s (1.46x) |
+| large-v3-turbo | 2.84 / 4.89 s (1.72x) | 29.5 / 42.4 s (1.44x) |
+| medium | 5.45 / 9.71 s (1.78x) | 25.6 / 32.0 s (1.25x) |
+| large-v3 | 8.98 / 14.13 s (1.57x) | 49.7 / 68.8 s (1.38x) |
 
 On Metal the encoder and the decoder run as whole device passes (`crate::gpu::whisper`): the
 encoder's GEMMs, attention and row work in one pass per batch of windows with the
 cross-attention keys and values left on the device, each decoder step one command buffer, and
 greedy decoding chained 8 steps per submission with the token choice (suppression, timestamp
-rules, argmax) on the GPU. The large-v3 / medium decoders are where whisper.cpp is closest: each
-step streams 1.6 / 0.8 GB of bf16 weights and runs about 13 serialized kernels per layer.
+rules, argmax) on the GPU, the steps past a window's end skipped on the device. A large-v3 /
+medium decoder step streams 1.9 / 1.0 GB (bf16 weights, half cross-attention keys and values)
+through 11 dependent stages a layer: 4.8 / 2.8 ms a token (about 390 / 350 GB/s, against 7.6 /
+5.0 ms for whisper.cpp; before the fused stages, 5.9 / 3.4 ms).
 
 ## Quantization quality
 

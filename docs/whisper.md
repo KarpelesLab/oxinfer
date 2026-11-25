@@ -222,15 +222,17 @@ On Metal:
 
 | Model | oxinfer encoder / decoder | oxinfer total | whisper.cpp encoder / decoder | whisper.cpp total | Speedup | WER oxinfer / whisper.cpp |
 |---|---|---|---|---|---|---|
-| tiny | 0.07 / 0.67 s | **0.80 s** (621x real time) | 0.10 / 1.35 s | 1.59 s | 1.99x | 6.40% / 7.30% |
-| base | 0.15 / 1.05 s | **1.26 s** (393x) | 0.16 / 1.92 s | 2.25 s | 1.79x | 3.70% / 4.33% |
-| small | 0.34 / 2.32 s | **2.72 s** (182x) | 0.42 / 3.55 s | 4.21 s | 1.55x | 1.89% / 1.89% |
-| large-v3-turbo | 1.57 / 1.60 s | **3.27 s** (152x) | 2.13 / 2.24 s | 4.85 s | 1.48x | 0.90% / 0.90% |
-| medium | 0.94 / 5.60 s | **6.59 s** (75x) | 1.19 / 7.97 s | 9.62 s | 1.46x | 1.71% / 1.62% |
-| large-v3 | 1.88 / 8.89 s | **10.87 s** (46x) | 2.61 / 10.64 s | 14.05 s | 1.29x | 1.17% / 1.08% |
+| tiny | 0.06 / 0.58 s | **0.71 s** (703x real time) | 0.09 / 1.39 s | 1.62 s | 2.29x | 6.40% / 7.30% |
+| base | 0.12 / 0.89 s | **1.07 s** (466x) | 0.16 / 1.96 s | 2.28 s | 2.13x | 3.70% / 4.33% |
+| small | 0.27 / 1.94 s | **2.26 s** (219x) | 0.42 / 3.57 s | 4.22 s | 1.87x | 1.89% / 1.89% |
+| large-v3-turbo | 1.38 / 1.36 s | **2.84 s** (175x) | 2.14 / 2.29 s | 4.89 s | 1.72x | 0.90% / 0.90% |
+| medium | 0.82 / 4.58 s | **5.45 s** (91x) | 1.19 / 8.07 s | 9.71 s | 1.78x | 1.71% / 1.62% |
+| large-v3 | 1.65 / 7.23 s | **8.98 s** (55x) | 2.62 / 10.72 s | 14.13 s | 1.57x | 1.17% / 1.08% |
 
 (whisper.cpp's decoder column is its `decode`, `batchd` and `sample` times together: its token
-choice runs on the CPU between steps.) Before the device sessions, oxinfer took 1.66 / 2.54 / 6.25
+choice runs on the CPU between steps.) Before the decoder's fused stages and skipped steps (see
+below), the decoder took 0.67 / 1.05 / 2.32 / 1.60 / 5.60 / 8.89 s from tiny to large-v3, with
+the same transcripts. Before the device sessions, oxinfer took 1.66 / 2.54 / 6.25
 / 10.30 s for tiny / base / small / large-v3-turbo on Metal (encoder 0.59 / 1.02 / 2.63 / 7.43 s,
 CPU decoder 1.01 / 1.47 / 3.56 / 2.77 s, in a busier moment of the shared machine).
 
