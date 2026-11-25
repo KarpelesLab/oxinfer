@@ -3254,11 +3254,12 @@ mod tests {
             let mut got = vec![f32::NAN; t * nh * hd];
             attention_prefill_gemm(&q, &cache, nh, t, lo_of, hi_of, &mut want);
             crate::attn_prefill::attention(&q, &cache, nh, t, &lo_of, &hi_of, &mut got);
+            // Bit-identical against the SME GEMM. Without SME (M1-M3) the NEON GEMM's edge tiles
+            // (head size 20) round differently, to ~1.6e-5 relative.
+            let exact = crate::kernels::sme_available();
             for (i, (a, b)) in got.iter().zip(&want).enumerate() {
-                assert!(
-                    a.to_bits() == b.to_bits() || (*a == 0.0 && *b == 0.0),
-                    "hd {hd} start {start} t {t} [{i}]: {a} vs {b}"
-                );
+                let ok = a.to_bits() == b.to_bits() || (*a == 0.0 && *b == 0.0) || (!exact && (a - b).abs() <= 1e-4 * b.abs().max(1e-2));
+                assert!(ok, "hd {hd} start {start} t {t} [{i}]: {a} vs {b}");
             }
         }
     }
