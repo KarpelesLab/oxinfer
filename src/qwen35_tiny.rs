@@ -230,6 +230,10 @@ mod tests {
         (m, files)
     }
 
+    /// Every pass of these tests is up to 7 tokens or more than 15: a pass of 8 to 15 runs the
+    /// decode kernels or the prefill GEMM (other rounding) after the process-wide
+    /// `kernels::set_decode_max_tokens`, which other tests of this process raise and restore
+    /// while these run, so the passes compared could part.
     fn toks(n: usize, seed: u32) -> Vec<u32> {
         (0..n as u32).map(|i| (i * 37 + seed * 11 + 5) % super::SPECIAL_BASE).collect()
     }
@@ -257,7 +261,7 @@ mod tests {
     fn checkpoint_cut_back_matches_fresh() {
         for moe in [false, true] {
             let (m, _) = load(&format!("cp{moe}"), moe, false);
-            let (a, b, c) = (toks(40, 1), toks(9, 2), toks(7, 3));
+            let (a, b, c) = (toks(40, 1), toks(17, 2), toks(7, 3));
             let mut s = m.new_session();
             assert!(s.checkpointable());
             m.forward(&mut s, &a[..20]);
@@ -295,7 +299,7 @@ mod tests {
             s.checkpoint(2);
             m.forward(&mut s, &b);
             s.checkpoint(2);
-            assert_eq!(s.checkpoint_positions(), [20, 36]);
+            assert_eq!(s.checkpoint_positions(), [20, 44]);
             // Off.
             let mut s = m.new_session();
             m.forward(&mut s, &a);
@@ -316,7 +320,7 @@ mod tests {
                 stop: Vec::new(),
                 ..MtpOptions::default()
             };
-            let (a, b) = (toks(40, 4), toks(9, 5));
+            let (a, b) = (toks(40, 4), toks(17, 5));
             let reply = |d: &mut MtpDecoder, l: &[f32], n: usize| {
                 let mut g = Sampler::new(0.0, 0, 1.0, 1);
                 let mut out = vec![argmax(l)];
