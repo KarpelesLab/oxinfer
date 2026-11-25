@@ -29,18 +29,21 @@ kernel void un_gn_stats(device const float* x [[buffer(0)]], device float2* part
     threadgroup float2 cs[2560];
     uint b = tg.y, n = p.g.h * p.g.w;
     uint p0 = tg.x * p.chunk, p1 = min(p0 + p.chunk, n);
+    uint cpg = p.c / p.groups;
+    device const float* x0 = x + (ulong)un_prow(p.g, b, 0, 0) * p.c;
     for (uint ch = tid; ch < p.c; ch += 256) {
-        float s = 0.f, s2 = 0.f;
+        // Sums of the values minus the group's first value (no cancellation when the mean is
+        // large against the spread).
+        float s = 0.f, s2 = 0.f, k = x0[(ch / cpg) * cpg];
         uint y = p0 / p.g.w, xx = p0 - y * p.g.w;
         for (uint q = p0; q < p1; q++) {
-            float v = x[(ulong)un_prow(p.g, b, y, xx) * p.c + ch];
+            float v = x[(ulong)un_prow(p.g, b, y, xx) * p.c + ch] - k;
             s += v; s2 += v * v;
             if (++xx == p.g.w) { xx = 0; y++; }
         }
         cs[ch] = float2(s, s2);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint cpg = p.c / p.groups;
     for (uint gi = tid; gi < p.groups; gi += 256) {
         float2 a = float2(0.f);
         for (uint j = 0; j < cpg; j++) a += cs[gi * cpg + j];
@@ -49,7 +52,8 @@ kernel void un_gn_stats(device const float* x [[buffer(0)]], device float2* part
 }
 // Second stage: (mean, 1 / std) per image and group. One thread per (group, image).
 kernel void un_gn_fin(device const float2* part [[buffer(0)]], device float2* st [[buffer(1)]], constant UGS& p [[buffer(2)]],
-                      constant float& eps [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+                      constant float& eps [[buffer(3)]], device const float* x [[buffer(4)]],
+                      uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
     uint gi = tg.x * 64 + tid, b = tg.y;
     if (gi >= p.groups) return;
     float s = 0.f, s2 = 0.f;
@@ -57,7 +61,8 @@ kernel void un_gn_fin(device const float2* part [[buffer(0)]], device float2* st
     float cnt = float(p.g.h * p.g.w * (p.c / p.groups));
     float m = s / cnt;
     float var = max(s2 / cnt - m * m, 0.f);
-    st[b * p.groups + gi] = float2(m, 1.0f / sqrt(var + eps));
+    float k = x[(ulong)un_prow(p.g, b, 0, 0) * p.c + gi * (p.c / p.groups)];
+    st[b * p.groups + gi] = float2(k + m, 1.0f / sqrt(var + eps));
 }
 
 // The half input of a GEMM from f32 padded rows: optionally group-normalized (stats from
@@ -286,6 +291,11 @@ kernel void un_concat(device const float* a [[buffer(0)]], device const float* b
 // of one image; keys stream in blocks of 64 with an online softmax (flash_attn128_body's).
 // Heads wider than 160 (a VAE's single head of 512) split their values and outputs into DV-wide
 // chunks, a threadgroup each (the scores computed once per chunk): grid y is heads x D / DV.
+#define UN_SLD 68
+#define UN_PLD 72
+// Probabilities go to half scaled by 2^15: with thousands of keys most are far below half's
+// smallest normal (6e-5), where they would lose their precision; the sums divide it out.
+#define UN_PSCALE 32768.0f
 struct UFA { uint tq; uint tk; uint qs; uint ks; uint heads; uint dh; uint o_ld; float scale; };
 template <int D, int DV>
 inline void un_flash_body(device const half* q, device const half* k, device const half* v, device half* o, constant UFA& p,
@@ -296,8 +306,10 @@ inline void un_flash_body(device const half* q, device const half* k, device con
     tensor<device half, dextents<int32_t, 2>, tensor_inline> Qt((device half*)q, dextents<int32_t, 2>(ld, qrows));
     tensor<device half, dextents<int32_t, 2>, tensor_inline> Kt((device half*)k, dextents<int32_t, 2>(ld, krows));
     tensor<device half, dextents<int32_t, 2>, tensor_inline> Vt((device half*)v, dextents<int32_t, 2>(ld, krows));
-    tensor<threadgroup float, extents<int32_t, 64, 64>, tensor_inline> St(S, extents<int32_t, 64, 64>());
-    tensor<threadgroup half, extents<int32_t, 64, 64>, tensor_inline> Pt(P, extents<int32_t, 64, 64>());
+    // Score and probability rows padded (UN_SLD floats, UN_PLD halves) against bank conflicts:
+    // each thread reads half a row.
+    tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline> St(S, dextents<int32_t, 2>(64, 64), array<int32_t, 2>{1, UN_SLD});
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> Pt(P, dextents<int32_t, 2>(64, 64), array<int32_t, 2>{1, UN_PLD});
     constexpr auto ds = matmul2d_descriptor(64, 64, D, false, true, false);
     constexpr auto dov = matmul2d_descriptor(64, DV, 64, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<ds, execution_simdgroups<4>> ops;
@@ -320,14 +332,14 @@ inline void un_flash_body(device const half* q, device const half* k, device con
         float bm = -INFINITY;
         for (uint j = 0; j < 32; j++) {
             uint col = part * 32 + j;
-            x[j] = kb + col < p.tk ? S[r * 64 + col] * p.scale : -INFINITY;
+            x[j] = kb + col < p.tk ? S[r * UN_SLD + col] * p.scale : -INFINITY;
             bm = max(bm, x[j]);
         }
         bm = max(bm, simd_shuffle_xor(bm, 1));
         float mn = max(m, bm);
         float alpha = exp(m - mn);
         float ps = 0.0f;
-        for (uint j = 0; j < 32; j++) { float e = exp(x[j] - mn); P[r * 64 + part * 32 + j] = half(e); ps += e; }
+        for (uint j = 0; j < 32; j++) { float e = exp(x[j] - mn); P[r * UN_PLD + part * 32 + j] = half(e * UN_PSCALE); ps += e; }
         ps += simd_shuffle_xor(ps, 1);
         l = l * alpha + ps;
         m = mn;
@@ -340,7 +352,7 @@ inline void un_flash_body(device const half* q, device const half* k, device con
         opo.run(Pt, vt, co);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (part == 0) L[r] = 1.0f / l;
+    if (part == 0) L[r] = 1.0f / (l * UN_PSCALE);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
     for (uint16_t i = 0; i < co.get_capacity(); ++i)
@@ -354,9 +366,9 @@ inline void un_flash_body(device const half* q, device const half* k, device con
 kernel void NAME(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]], device const half* v [[buffer(2)]], \
                         device half* o [[buffer(3)]], constant UFA& p [[buffer(4)]], \
                         uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
-    threadgroup float S[64 * 64]; threadgroup half P[64 * 64]; threadgroup float A[64]; threadgroup float L[64]; \
+    threadgroup float S[64 * UN_SLD]; threadgroup half P[64 * UN_PLD]; threadgroup float A[64]; threadgroup float L[64]; \
     un_flash_body<D, DV>(q, k, v, o, p, S, P, A, L, tg, tid); }
-UN_FLASH(un_flash64, 64, 64) UN_FLASH(un_flash96, 96, 96) UN_FLASH(un_flash128, 128, 128) UN_FLASH(un_flash160, 160, 160)
+UN_FLASH(un_flash48, 48, 48) UN_FLASH(un_flash64, 64, 64) UN_FLASH(un_flash80, 80, 80) UN_FLASH(un_flash96, 96, 96) UN_FLASH(un_flash128, 128, 128) UN_FLASH(un_flash160, 160, 160)
 UN_FLASH(un_flash512, 512, 128)
 
 // f32 rows to half rows (n4 float4s each).

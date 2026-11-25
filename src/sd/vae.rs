@@ -164,14 +164,14 @@ impl VaeDecoder {
     /// [`VaeDecoder::decode`] of the (scaled) latents `z` as one device plan.
     fn decode_device(&self, z: &[f32], h: usize, w: usize) -> Option<(Vec<f32>, usize, usize)> {
         use super::unet::{conv_op, new_tensor};
-        use crate::gpu::unet::{Graph, Item, Op};
+        use crate::gpu::unet::{Graph, Item};
         let be = crate::gpu::active()?;
         if super::ops::gpu_check::on() || crate::gpu::exact() {
             return None;
         }
         let _t = super::ops::timing::start(super::ops::timing::PASS);
         let mut g = Graph {
-            tensors: vec![[h, w, self.latent_channels]],
+            tensors: vec![[h, w, self.conv_in.plan_cin()]],
             ops: Vec::new(),
             input: 0,
             output: 0,
@@ -181,22 +181,8 @@ impl VaeDecoder {
         let mut x = new_tensor(&mut g, [h, w, self.conv_in.cout]);
         g.ops.push(conv_op(&self.conv_in, 0, x, None, None, false)?);
         x = self.mid1.plan(&mut g, x, &[], 1)?;
-        let a = &self.attn;
-        let s = g.tensors[x];
-        let y = new_tensor(&mut g, s);
-        g.ops.push(Op::Attention {
-            x,
-            out: y,
-            norm: a.norm.plan_norm(),
-            a: crate::gpu::unet::Attn {
-                q: a.q.plan_lin()?,
-                k: a.k.plan_lin()?,
-                v: a.v.plan_lin()?,
-                o: a.o.plan_lin()?,
-                heads: 1,
-            },
-        });
-        x = self.mid2.plan(&mut g, y, &[], 1)?;
+        x = plan_mid_attn(self.attn.parts(), &mut g, x)?;
+        x = self.mid2.plan(&mut g, x, &[], 1)?;
         for b in &self.ups {
             for r in &b.resnets {
                 x = r.plan(&mut g, x, &[], 1)?;
@@ -217,8 +203,9 @@ impl VaeDecoder {
         if sess.is_none() {
             *sess = Some(be.unet_session()?);
         }
+        let z = super::unet::pad_channels(z, self.latent_channels, self.conv_in.plan_cin());
         let item = Item {
-            latent: z,
+            latent: &z,
             ctx: &[],
             ctx_len: 0,
         };
@@ -226,6 +213,142 @@ impl VaeDecoder {
         sess.as_mut()?
             .forward(&g, std::slice::from_ref(&item), &mut out)
             .then(|| (out.pop().unwrap(), h, w))
+    }
+}
+
+/// A VAE mid block's single-head self-attention: its group norm and q, k, v, out projections.
+pub(crate) type AttnParts<'a> = (&'a GroupNorm, [&'a Linear; 4]);
+
+/// `x + o(attention(...))` of a VAE's mid block as a plan op from tensor `x` into a new tensor.
+fn plan_mid_attn<'a>(a: AttnParts<'a>, g: &mut crate::gpu::unet::Graph<'a>, x: usize) -> Option<usize> {
+    let s = g.tensors[x];
+    let y = super::unet::new_tensor(g, s);
+    let [q, k, v, o] = a.1;
+    g.ops.push(crate::gpu::unet::Op::Attention {
+        x,
+        out: y,
+        norm: a.0.plan_norm(),
+        a: crate::gpu::unet::Attn {
+            q: q.plan_lin()?,
+            k: k.plan_lin()?,
+            v: v.plan_lin()?,
+            o: o.plan_lin()?,
+            heads: 1,
+        },
+    });
+    Some(y)
+}
+
+impl MidAttn {
+    fn parts(&self) -> AttnParts<'_> {
+        (&self.norm, [&self.q, &self.k, &self.v, &self.o])
+    }
+}
+
+/// A down block of a VAE encoder: its ResNets and its stride-2 downsampler with the zero padding
+/// before it.
+pub(crate) type DownParts<'a> = (&'a [Resnet], Option<(&'a Conv, usize)>);
+
+/// A VAE encoder as a whole-pass plan sees it (SD's and FLUX's).
+pub(crate) struct EncParts<'a> {
+    pub conv_in: &'a Conv,
+    /// Each down block's ResNets and its stride-2 downsampler with the zero padding before it.
+    pub downs: Vec<DownParts<'a>>,
+    pub mid1: &'a Resnet,
+    pub attn: Option<AttnParts<'a>>,
+    pub mid2: &'a Resnet,
+    pub norm_out: &'a GroupNorm,
+    pub conv_out: &'a Conv,
+}
+
+/// A plan session slot, made on first use.
+pub(crate) type PlanSlot = std::sync::OnceLock<std::sync::Mutex<Option<Box<dyn crate::gpu::unet::Session>>>>;
+
+/// The encoder's output before any `quant_conv` (`[h w, conv_out channels]`) as one device plan,
+/// with its size; None when the device declines (the caller runs the ops one by one).
+pub(crate) fn encode_on_device(e: &EncParts, slot: &PlanSlot, rgb: &[f32], h: usize, w: usize) -> Option<(Vec<f32>, usize, usize)> {
+    use super::unet::{conv_op, new_tensor};
+    use crate::gpu::unet::{Graph, Item, Op};
+    if !gpu_pass_default() || super::ops::gpu_check::on() || crate::gpu::exact() {
+        return None;
+    }
+    let be = crate::gpu::active()?;
+    let _t = super::ops::timing::start(super::ops::timing::PASS);
+    let mut g = Graph {
+        tensors: vec![[h, w, e.conv_in.plan_cin()]],
+        ops: Vec::new(),
+        input: 0,
+        output: 0,
+        ctx_dim: 0,
+    };
+    let (mut h, mut w) = (h, w);
+    let mut x = new_tensor(&mut g, [h, w, e.conv_in.cout]);
+    g.ops.push(conv_op(e.conv_in, 0, x, None, None, false)?);
+    for (resnets, down) in &e.downs {
+        for r in resnets.iter() {
+            x = r.plan(&mut g, x, &[], 1)?;
+        }
+        if let Some((d, pb)) = down {
+            let c = g.tensors[x][2];
+            // Padding `pb` before and k - 1 - pb after (diffusers' (0, 1) or (1, 1)).
+            (h, w) = ((h - 1) / 2 + 1, (w - 1) / 2 + 1);
+            let y = new_tensor(&mut g, [h, w, c]);
+            g.ops.push(Op::Conv {
+                x,
+                out: y,
+                w: d.plan_lin()?,
+                k: d.k,
+                stride: 2,
+                pad: *pb,
+                up: false,
+                pre: None,
+                bias: None,
+                bias_per_image: false,
+                add: None,
+            });
+            x = y;
+        }
+    }
+    x = e.mid1.plan(&mut g, x, &[], 1)?;
+    if let Some(a) = e.attn {
+        x = plan_mid_attn(a, &mut g, x)?;
+    }
+    x = e.mid2.plan(&mut g, x, &[], 1)?;
+    let y = new_tensor(&mut g, [h, w, e.conv_out.cout]);
+    g.ops
+        .push(conv_op(e.conv_out, x, y, Some((e.norm_out.plan_norm(), true)), None, false)?);
+    g.output = y;
+    let sess = slot.get_or_init(|| std::sync::Mutex::new(be.unet_session()));
+    let mut sess = sess.lock().unwrap_or_else(|e| e.into_inner());
+    let rgb = super::unet::pad_channels(rgb, e.conv_in.cin, e.conv_in.plan_cin());
+    let item = Item {
+        latent: &rgb,
+        ctx: &[],
+        ctx_len: 0,
+    };
+    let mut out = vec![Vec::new()];
+    sess.as_mut()?
+        .forward(&g, std::slice::from_ref(&item), &mut out)
+        .then(|| (out.pop().unwrap(), h, w))
+}
+
+impl VaeEncoder {
+    /// The encoder's moments (`[h w, 2 latent]` before `quant_conv`) as one device plan.
+    fn encode_device(&self, rgb: &[f32], h: usize, w: usize) -> Option<(Vec<f32>, usize, usize)> {
+        let e = EncParts {
+            conv_in: &self.conv_in,
+            downs: self
+                .downs
+                .iter()
+                .map(|d| (&d.resnets[..], d.down.as_ref().map(|c| (c, c.pad_before()))))
+                .collect(),
+            mid1: &self.mid1,
+            attn: Some(self.attn.parts()),
+            mid2: &self.mid2,
+            norm_out: &self.norm_out,
+            conv_out: &self.conv_out,
+        };
+        encode_on_device(&e, &self.gpu, rgb, h, w)
     }
 }
 
@@ -246,6 +369,8 @@ pub struct VaeEncoder {
     conv_out: Conv,
     quant: Option<Linear>,
     pub latent_channels: usize,
+    /// The whole-pass device session ([`crate::gpu::unet`]), once made.
+    gpu: PlanSlot,
 }
 
 /// The encoder's output: the latent distribution's mean and standard deviation, channels-last
@@ -309,24 +434,16 @@ impl VaeEncoder {
             } else {
                 None
             },
+            gpu: std::sync::OnceLock::new(),
         }))
     }
 
     /// `rgb` (`[h*w, 3]` in [-1, 1]; `h`, `w` multiples of 8) to the latent distribution.
     pub fn encode(&self, rgb: &[f32], h: usize, w: usize) -> LatentDist {
-        let (mut x, mut h, mut w) = self.conv_in.forward(rgb, h, w, 1);
-        for b in &self.downs {
-            for r in &b.resnets {
-                x = r.forward(&x, h, w, None);
-            }
-            if let Some(d) = &b.down {
-                (x, h, w) = d.forward(&x, h, w, 2);
-            }
-        }
-        x = self.mid1.forward(&x, h, w, None);
-        self.attn.forward(&mut x, h * w);
-        x = self.mid2.forward(&x, h, w, None);
-        let (mut m, _, _) = self.conv_out.forward_pre(&x, h, w, 1, Pre::Group(&self.norm_out, true));
+        let (mut m, h, w) = match self.encode_device(rgb, h, w) {
+            Some(r) => r,
+            None => self.encode_cpu(rgb, h, w),
+        };
         if let Some(q) = &self.quant {
             m = q.forward(&m, h * w);
         }
@@ -339,4 +456,28 @@ impl VaeEncoder {
         }
         LatentDist { mean, std, h, w }
     }
+
+    /// The moments op by op.
+    fn encode_cpu(&self, rgb: &[f32], h: usize, w: usize) -> (Vec<f32>, usize, usize) {
+        let (mut x, mut h, mut w) = self.conv_in.forward(rgb, h, w, 1);
+        for b in &self.downs {
+            for r in &b.resnets {
+                x = r.forward(&x, h, w, None);
+            }
+            if let Some(d) = &b.down {
+                (x, h, w) = d.forward(&x, h, w, 2);
+            }
+        }
+        x = self.mid1.forward(&x, h, w, None);
+        self.attn.forward(&mut x, h * w);
+        x = self.mid2.forward(&x, h, w, None);
+        let (m, _, _) = self.conv_out.forward_pre(&x, h, w, 1, Pre::Group(&self.norm_out, true));
+        (m, h, w)
+    }
+}
+
+/// `OXINFER_SD_GPU_PASS` is not `0`.
+pub(crate) fn gpu_pass_default() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OXINFER_SD_GPU_PASS").map_or(true, |v| v != "0"))
 }

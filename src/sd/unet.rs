@@ -460,10 +460,14 @@ impl Unet {
             *sess = Some(be.unet_session()?);
         }
         let s = sess.as_mut()?;
+        // Latents with zero channels up to what the plan's first convolution reads.
+        let cp = self.conv_in.plan_cin();
+        let padded: Vec<Vec<f32>> = items.iter().map(|it| pad_channels(it.latent, self.in_channels, cp)).collect();
         let gi: Vec<crate::gpu::unet::Item> = items
             .iter()
-            .map(|it| crate::gpu::unet::Item {
-                latent: it.latent,
+            .zip(&padded)
+            .map(|(it, lat)| crate::gpu::unet::Item {
+                latent: lat,
                 ctx: it.ctx,
                 ctx_len: m,
             })
@@ -476,7 +480,7 @@ impl Unet {
     fn plan_graph(&self, h: usize, w: usize, temb: &[f32], nb: usize) -> Option<crate::gpu::unet::Graph<'_>> {
         use crate::gpu::unet::{Graph, Op};
         let mut g = Graph {
-            tensors: vec![[h, w, self.in_channels]],
+            tensors: vec![[h, w, self.conv_in.plan_cin()]],
             ops: Vec::new(),
             input: 0,
             output: 0,
@@ -544,6 +548,18 @@ impl Unet {
         g.output = y;
         Some(g)
     }
+}
+
+/// `[n, c]` rows as `[n, cp]` with zeros after each row's `c` values (`cp >= c`).
+pub(super) fn pad_channels(x: &[f32], c: usize, cp: usize) -> Vec<f32> {
+    if cp == c {
+        return x.to_vec();
+    }
+    let mut y = vec![0f32; x.len() / c * cp];
+    for (d, s) in y.chunks_mut(cp).zip(x.chunks(c)) {
+        d[..c].copy_from_slice(s);
+    }
+    y
 }
 
 pub(super) fn new_tensor(g: &mut crate::gpu::unet::Graph, s: [usize; 3]) -> usize {

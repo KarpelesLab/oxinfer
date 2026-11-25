@@ -715,9 +715,9 @@ impl Linear {
         })
     }
 
-    /// This layer with zero columns up to `n_in` inputs (appended to each row) and zero rows up
-    /// to `n_out` outputs.
-    fn zero_padded(&self, n_out: usize, n_in: usize) -> Option<Linear> {
+    /// This layer with zero rows up to `n_out` outputs and `n_in` inputs per row: each row's
+    /// `taps` groups of `cin` inputs spread `cin_p` apart, zeros after them.
+    fn zero_padded(&self, n_out: usize, n_in: usize, taps: usize, cin: usize, cin_p: usize) -> Option<Linear> {
         let mut w = vec![0f32; self.n_out * self.n_in];
         let idx: Vec<u32> = (0..self.n_out as u32).collect();
         if self.lo.is_some() || !self.w.rows(&idx, self.n_in, &mut w) {
@@ -725,7 +725,9 @@ impl Linear {
         }
         let mut wp = vec![0f32; n_out * n_in];
         for (o, r) in w.chunks(self.n_in).enumerate() {
-            wp[o * n_in..o * n_in + self.n_in].copy_from_slice(r);
+            for (t, g) in r.chunks(cin).take(taps).enumerate() {
+                wp[o * n_in + t * cin_p..o * n_in + t * cin_p + cin].copy_from_slice(g);
+            }
         }
         let b = self.b.as_ref().map(|b| {
             let mut v = b.clone();
@@ -745,16 +747,28 @@ impl Conv {
         if self.cin.is_multiple_of(32) && l.n_out.is_multiple_of(64) {
             return l.plan_lin();
         }
+        let taps = self.k * self.k;
+        let cin_p = self.plan_cin();
         let n_in = if self.cin.is_multiple_of(32) {
             l.n_in
         } else {
-            l.n_in.next_multiple_of(64)
+            (taps * cin_p).next_multiple_of(64)
         };
         let p = self
             .plan_lin
-            .get_or_init(|| l.zero_padded(l.n_out.next_multiple_of(64), n_in).map(Box::new))
+            .get_or_init(|| {
+                l.zero_padded(l.n_out.next_multiple_of(64), n_in, taps, self.cin, cin_p)
+                    .map(Box::new)
+            })
             .as_ref()?;
         p.plan_lin()
+    }
+
+    /// The input channels a whole-pass plan feeds this convolution: `cin` rounded up to a
+    /// multiple of 4 (zero channels after the real ones; [`Conv::plan_lin`] spreads its taps to
+    /// match).
+    pub fn plan_cin(&self) -> usize {
+        self.cin.next_multiple_of(4)
     }
 
     /// Zero padding before the input (top / left).

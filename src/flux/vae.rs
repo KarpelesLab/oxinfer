@@ -71,6 +71,8 @@ pub struct VaeEncoder {
     conv_out: Conv,
     quant: Option<Linear>,
     pub latent_channels: usize,
+    /// The whole-pass device session ([`crate::gpu::unet`]), once made.
+    gpu: crate::sd::vae::PlanSlot,
 }
 
 impl VaeEncoder {
@@ -115,12 +117,33 @@ impl VaeEncoder {
             latent_channels: conv_out.cout / 2,
             conv_out,
             quant,
+            gpu: std::sync::OnceLock::new(),
         })
     }
 
     /// `x` is `[h*w, 3]` RGB in [-1, 1]; returns the posterior moments `([h/f * w/f, 2c], h/f,
     /// w/f)` (mean channels first), `f` = 2^(number of downsamplers).
     pub fn moments(&self, x: &[f32], h: usize, w: usize) -> (Vec<f32>, usize, usize) {
+        // One device plan where the accelerator runs them (downsamplers padded (0, 1)).
+        let parts = crate::sd::vae::EncParts {
+            conv_in: &self.conv_in,
+            downs: self
+                .downs
+                .iter()
+                .map(|d| (&d.resnets[..], d.down.as_ref().map(|c| (c, 0))))
+                .collect(),
+            mid1: &self.mid1,
+            attn: self.attn.as_ref().map(|a| (&a.norm, [&a.q, &a.k, &a.v, &a.o])),
+            mid2: &self.mid2,
+            norm_out: &self.norm_out,
+            conv_out: &self.conv_out,
+        };
+        if let Some((mut y, h, w)) = crate::sd::vae::encode_on_device(&parts, &self.gpu, x, h, w) {
+            if let Some(q) = &self.quant {
+                y = q.forward(&y, h * w);
+            }
+            return (y, h, w);
+        }
         let (mut x, mut h, mut w) = self.conv_in.forward(x, h, w, 1);
         for b in &self.downs {
             for r in &b.resnets {

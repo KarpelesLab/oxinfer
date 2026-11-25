@@ -56,7 +56,7 @@ struct Pipes {
     half: Id,
     amax: Id,
     amax_clear: Id,
-    flash: [(usize, Id); 5],
+    flash: [(usize, Id); 7],
 }
 
 /// Scratch buffers of a session.
@@ -213,7 +213,9 @@ impl MetalBackend {
             amax: pipe("un_amax")?,
             amax_clear: pipe("un_amax_clear")?,
             flash: [
+                (48, pipe("un_flash48")?),
                 (64, pipe("un_flash64")?),
+                (80, pipe("un_flash80")?),
                 (96, pipe("un_flash96")?),
                 (128, pipe("un_flash128")?),
                 (160, pipe("un_flash160")?),
@@ -305,7 +307,8 @@ fn head_pad(dh: usize) -> Option<usize> {
     if dh == 512 {
         return Some(512);
     }
-    [64, 96, 128, 160].into_iter().find(|&d| d >= dh && d - dh <= dh)
+    // The matrix units take products over multiples of 16.
+    [48, 64, 80, 96, 128, 160].into_iter().find(|&d| d >= dh && d - dh <= dh)
 }
 
 /// The value / output chunk of the flash kernel for heads padded to `d`.
@@ -419,7 +422,7 @@ impl Session for MetalUnet {
                     if !c.is_multiple_of(4) || c > 2560 || oc > w.n_out || w.n_out - oc >= 64 || !lin_ok(w, &mut consts) {
                         return false;
                     }
-                    if (oh, ow) != ((sh + 2 * pad - k) / stride + 1, (sw + 2 * pad - k) / stride + 1) {
+                    if *pad >= *k || (oh, ow) != ((sh - 1) / stride + 1, (sw - 1) / stride + 1) {
                         return false;
                     }
                     if add.is_some_and(|a| g.tensors[a] != [oh, ow, oc]) {
@@ -676,6 +679,7 @@ impl Session for MetalUnet {
             m,
             mp,
             consts: &consts,
+            nobar: std::cell::Cell::new(false),
         };
         let nops = g.ops.len();
         let parts: Vec<std::ops::Range<usize>> = (0..nops.div_ceil(OPS_PER_CB).max(1))
@@ -714,6 +718,8 @@ struct Cx<'c, 'g> {
     m: usize,
     mp: usize,
     consts: &'c Consts,
+    /// The next GEMM needs no barrier after it (independent GEMMs reading the same input).
+    nobar: std::cell::Cell<bool>,
 }
 
 /// The store of a GEMM.
@@ -810,7 +816,9 @@ impl Cx<'_, '_> {
         e.buf(add.unwrap_or(y), 0, 5);
         e.buf(self.sc(S::Amax), 0, 6);
         e.dispatch((w.n_out.div_ceil(tn), (rows.1 - rows.0).div_ceil(TM)), 128);
-        e.barrier();
+        if !self.nobar.replace(false) {
+            e.barrier();
+        }
     }
 
     /// Group-norm statistics of tensor buffer `x` (layout `l`, `c` channels) into `S::Stats`.
@@ -837,6 +845,7 @@ impl Cx<'_, '_> {
         e.buf(self.sc(S::Stats), 0, 1);
         e.bytes(&p, 2);
         e.bytes(&n.eps, 3);
+        e.buf(x, 0, 4);
         e.dispatch((n.groups.div_ceil(64), self.nb), 64);
         e.barrier();
     }
@@ -1157,8 +1166,9 @@ impl Cx<'_, '_> {
             let dhp = head_pad(dh).unwrap();
             let ld = b.a1.heads * dhp;
             self.ln(e, rows, c, &b.n1);
-            for (l, dst) in [(&b.a1.q, qb), (&b.a1.k, kb), (&b.a1.v, vb)] {
+            for (j, (l, dst)) in [(&b.a1.q, qb), (&b.a1.k, kb), (&b.a1.v, vb)].into_iter().enumerate() {
                 let o = Out::Heads { y: dst, dh, dhp, ld };
+                self.nobar.set(j < 2);
                 self.gemm(e, l, hn, crow, c, &[0], (0, rows), o, None, None, l.n_out, false);
             }
             self.flash(e, &b.a1, c, qb, kb, vb, n, n, n);
@@ -1169,10 +1179,12 @@ impl Cx<'_, '_> {
             let ld = b.a2.heads * dhp;
             self.ln(e, rows, c, &b.n2);
             let o = Out::Heads { y: qb, dh, dhp, ld };
+            self.nobar.set(true);
             self.gemm(e, &b.a2.q, hn, crow, c, &[0], (0, rows), o, None, None, b.a2.q.n_out, false);
             let ctx = self.sc(S::Ctx);
-            for (l, dst) in [(&b.a2.k, self.sc(S::Ck)), (&b.a2.v, self.sc(S::Cv))] {
+            for (j, (l, dst)) in [(&b.a2.k, self.sc(S::Ck)), (&b.a2.v, self.sc(S::Cv))].into_iter().enumerate() {
                 let o = Out::Heads { y: dst, dh, dhp, ld };
+                self.nobar.set(j == 0);
                 self.gemm(e, l, ctx, crows + 64, cd, &[0], (0, crows), o, None, None, l.n_out, false);
             }
             self.flash(e, &b.a2, c, qb, self.sc(S::Ck), self.sc(S::Cv), n, self.m, self.mp);

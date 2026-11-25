@@ -46,15 +46,20 @@ channels-last layout (each image with a border of zero pixels), so a 3x3 convolu
 shifted GEMMs accumulated into the same tile on the matrix units (`matmul2d`, half inputs, bf16
 weights, f32 sums), with the group norm and SiLU applied while the half inputs are written;
 strided convolutions and narrow inputs (the 4 latent channels) go through an unfolded copy.
-Attention is a fused flash kernel over heads padded to 64 / 96 / 128 / 160 (a VAE's single head
-of 512 in value chunks of 128); layer norms, GEGLU, residual adds, skip concatenation and 2x
+Attention is a fused flash kernel over heads padded to a multiple of 16 (48 for SD 1.5's 40, 64,
+80, 128, 160; a VAE's single head of 512 in value chunks of 128; the probabilities scaled by 2^15
+on their way to half, so that the thousands of tiny ones of a long row keep their precision); layer norms, GEGLU, residual adds, skip concatenation and 2x
 upsampling are fused into row kernels or the GEMMs' stores. Inputs without a norm are scaled by
 a power of two when their largest magnitude passes half's range (the SDXL VAE's activations
 do), and the products scaled back. `gpu_pass=0` (`Pipeline::set_gpu_pass(false)`, the
 C API's and the server's load option, or `OXINFER_SD_GPU_PASS=0`) keeps the op-by-op path below;
 `OXINFER_GPU_CHECK=1` and exact mode (`OXINFER_METAL_MMA=0`) use it too. FLUX.1's VAE decoder is
 the same code, so it takes the same plan: 1024x1024 FLUX.1-schnell decodes in 0.57 s instead of 2.9 s
-(66.9 dB against the op-by-op decode of the same latents; mflux, on MLX, takes 0.5-0.7 s).
+(66.9 dB against the op-by-op decode of the same latents; mflux, on MLX, takes 0.5-0.7 s). The
+VAE encoders (SD's for image-to-image and inpainting, FLUX's for its edits) run the same way:
+SD 1.5 at 512x512 0.44 -> 0.10 s (posterior mean 6.6e-4 from the op-by-op one, the image after
+10 img2img steps 58.3 dB), FLUX.1 at 1024x1024 1.75 -> 0.28-0.34 s (latents 1.3e-2 apart, the
+image after a 2-step edit 52.8 dB; SD's encoder on the same 1024x1024 picture 3.5e-3).
 
 Against the op-by-op path (512x512, same seed): the first guided SD 1.5 UNet output differs by
 5.2e-4 (relative L2), the image after 20 Euler steps at guidance 7.5 by 53.4 dB (8-bit PSNR; the
@@ -78,7 +83,14 @@ Metal, flash attention, cond and uncond in one batch) on the same fp16 weights, 
 | UNet | 0.09 s (the first pass, with the session's setup) | 0.15-0.23 s |
 | VAE decode | 0.10 s | 1.17-1.19 s |
 
-Before this (op by op, CFG branches one after the other): SD 1.5 0.60 s/step, VAE 0.56 s.
+Before this (op by op, CFG branches one after the other): SD 1.5 0.60 s/step, VAE 0.56 s. A second
+round took the guided SD 1.5 step's GPU time from 98.1 to 94.7 ms (q / k / v projections, and the
+cross-attention's query, key and value, encoded without barriers between them) and measured
+these at under 1 ms each: heads of 40 padded to 48 instead of 64, padded score / probability
+rows in threadgroup memory (kept), group-norm sums shifted by the group's first value (kept, for
+the precision). The step's GPU time splits roughly as convolutions 33 ms, attention 29 ms, the
+transformer projections and feed-forward 22 ms, group norms 4 ms (`OXINFER_UNET_SKIP=conv3,flash,
+lin,qkv,gn,...` leaves kinds of dispatches out to measure them).
 
 Op by op (other GPUs, or `gpu_pass=0`), convolutions, attention and the group and layer norms run on the GPU: each norm is fused
 into the convolution or projection that consumes it (a statistics kernel, then normalization and
