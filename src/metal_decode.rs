@@ -168,6 +168,7 @@ impl MvFmt {
                 GgmlType::Q4_K => format!("MV_RAW({n}, MQ4_K, XKQ, 32, {nr}, {ks})"),
                 GgmlType::Q5_K => format!("MV_RAW({n}, MQ5_K, XKQ, 32, {nr}, {ks})"),
                 GgmlType::Q6_K => format!("MV_RAW({n}, MQ6_K, X6, 32, {nr}, {ks})"),
+                GgmlType::IQ4_XS => format!("MV_IQ4({n}, {nr}, {ks})"),
                 GgmlType::F32 => format!("MV_GEN({n}, F32W2, {nr}, {ks})"),
                 k => format!("MV_GEN({n}, {}W, {nr}, {ks})", k.name()),
             },
@@ -246,7 +247,7 @@ impl MvFmt {
         }
     }
     fn specialized(self) -> bool {
-        !matches!(self, MvFmt::Gguf(k) if !matches!(k, GgmlType::F16 | GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K))
+        !matches!(self, MvFmt::Gguf(k) if !matches!(k, GgmlType::F16 | GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::IQ4_XS))
     }
 }
 
@@ -1817,6 +1818,39 @@ struct GdnRuleParams {
 /// Threads of the one-row norm kernels (`dec_rms_norm`, `dec_add_norm`) for rows of `n`: 8
 /// values each, which the kernels load at once with their weights (fewer threads finish sooner
 /// than 1024 with fewer values: an RMSNorm of 4096 took 3.6 us instead of 5.1 in a pass).
+/// The kind of an op for `OXINFER_DEC_ONLY` (timing experiments).
+fn dec_only_kind(op: &MOp) -> &'static str {
+    match op {
+        MOp::Barrier => "barrier",
+        MOp::Norm { .. } => "norm",
+        MOp::Mv { .. } => "mv",
+        MOp::Topk { .. } | MOp::Experts { .. } => "moe",
+        MOp::QkRope { .. } => "qk",
+        MOp::GdnConv { .. } | MOp::GdnRule { .. } => "gdn",
+        MOp::Glu { .. } | MOp::Ew { .. } | MOp::PleGate { .. } => "glu",
+        MOp::LoraDown { .. } | MOp::LoraUp { .. } => "lora",
+        MOp::Steer { .. } | MOp::NeuronEdit { .. } => "iv",
+        MOp::AddNorm { .. } => "norm",
+        MOp::Attn { .. } => "attn",
+        MOp::QsaKey { .. } | MOp::QsaScore { .. } | MOp::QsaTopk { .. } => "qsa",
+        MOp::XHalf { .. } | MOp::Gemm { .. } | MOp::GemmF32 { .. } | MOp::AddRows { .. } => "mv",
+        MOp::PfTopk { .. } | MOp::PfExperts(..) => "moe",
+        MOp::PfGdn { .. } => "gdn",
+        MOp::PfAttn { .. } | MOp::PfFlash { .. } | MOp::PfKvHalf { .. } => "attn",
+        MOp::NormHalf { .. } | MOp::AddNormHalf { .. } | MOp::PfMoeTail { .. } => "norm",
+        MOp::GluHalf { .. } => "glu",
+    }
+}
+
+/// `OXINFER_DEC_ONLY=barrier,norm,mv,qk,attn` (timing experiments only: wrong results): whether
+/// to encode this op.
+fn dec_only(op: &MOp) -> bool {
+    static ONLY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ONLY.get_or_init(|| std::env::var("OXINFER_DEC_ONLY").ok())
+        .as_ref()
+        .is_none_or(|o| o.split(',').any(|x| x == dec_only_kind(op)))
+}
+
 fn norm_threads(n: usize) -> usize {
     n.div_ceil(8).next_multiple_of(32).clamp(32, 1024)
 }
@@ -1877,6 +1911,27 @@ struct QkParams {
     v_norm: u32,
     v_from_k: u32,
     _p: [u32; 2],
+}
+
+/// A `MOp::QkRope` folded into the `MOp::Attn` reading its queries (one-token plans; see
+/// `dec_attnr_*` in metal_decode.metal): the fused kernels (as `MOp::Attn`'s `pipe` and
+/// `narrow`) and the QkRope's operands.
+#[derive(Clone)]
+struct AttnRope {
+    pipe: Id,
+    narrow: [Option<Id>; 2],
+    qkv: usize,
+    qo: usize,
+    qn: Option<usize>,
+    kn: Option<usize>,
+    p: QkParams,
+    cs: usize,
+}
+
+/// Whether one-token plans fold each QkRope into the attention after it (`OXINFER_DEC_ATTN_ROPE=0`:
+/// not; read as each plan is built).
+fn dec_attn_rope() -> bool {
+    std::env::var("OXINFER_DEC_ATTN_ROPE").map_or(true, |v| v != "0")
 }
 
 #[repr(C)]
@@ -2155,6 +2210,8 @@ enum MOp {
         /// QSA (`Op::AttendSel`): the sparse kernel, the arena offset of the positions, the block
         /// size, the blocks kept and the positions' token stride in bytes.
         sel: Option<(Id, usize, usize, usize, usize)>,
+        /// One-token plans: the `MOp::QkRope` before it folded in (`dec_attnr_*`).
+        rope: Option<Box<AttnRope>>,
     },
     /// See `Op::QsaKey`: `cs` is where the block-start RoPE table starts in a step's cos / sin
     /// floats; multi-token plans: the arena offset of that table's per-token rows.
@@ -3055,6 +3112,8 @@ impl MetalBackend {
         let mut indirect: Vec<Id> = Vec::new();
         let mut head_from = usize::MAX;
         let (mut rd, mut wr): (Vec<Range>, Vec<Range>) = (Vec::new(), Vec::new());
+        // The reads and writes of the last QkRope emitted (folded into the Attn after it).
+        let mut last_qk: Option<(Vec<Range>, Vec<Range>)> = None;
         // Prefill plans: every op covers all the token rows of the views it touches, so a view
         // within one row stands for its columns (views on disjoint columns of the same rows do
         // not overlap, e.g. the query, key and value GEMMs' outputs); a wider one for the buffer.
@@ -4569,6 +4628,7 @@ impl MetalBackend {
                             top,
                             ts(sel) * 4,
                         )),
+                        rope: None,
                     });
                     let mut r = vec![rng(q, nh * hd), (KV_RES + kv, 0, usize::MAX), rng(sel, (top + 1) * ratio)];
                     if let Some((v, s)) = gate {
@@ -4728,6 +4788,7 @@ impl MetalBackend {
                         t: mt.then(|| (ts(q) * 4, ts(out) * 4, gate.map_or(0, |(v, _)| ts(v) * 4))),
                         block,
                         sel: None,
+                        rope: None,
                     });
                     let mut r = vec![rng(q, nh * hd), (KV_RES + kv, 0, usize::MAX)];
                     if let Some((v, s)) = gate {
@@ -4736,6 +4797,83 @@ impl MetalBackend {
                     (r, vec![rng(out, nh * hd)])
                 }
             };
+            let (mut r, mut w) = (r, w);
+            // One-token plans: a QkRope alone in the stage before an Attn reading its queries
+            // goes into it (its reads and writes become the Attn's; the stage had only them).
+            if !mt
+                && dec_attn_rope()
+                && let [
+                    MOp::Attn {
+                        q,
+                        kv,
+                        p: ap,
+                        hd,
+                        t: None,
+                        block: None,
+                        sel: None,
+                        rope: rope @ None,
+                        grp,
+                        narrow,
+                        ..
+                    },
+                ] = &mut emit[..]
+                && let [
+                    ..,
+                    MOp::Barrier,
+                    MOp::QkRope {
+                        qkv: rq,
+                        qo: rqo,
+                        kv: rkv,
+                        qn: rqn,
+                        kn: rkn,
+                        p: rp,
+                        half: None,
+                        cs: rcs,
+                        t: None,
+                        ..
+                    },
+                ] = &ops[..]
+                && *rqo == *q
+                && *rkv == *kv
+                && rp.nh == ap.nh
+                && rp.hd == *hd
+                && (rp.nkv == 0 || rp.nkv == ap.nkv)
+                && let Some((qk_r, qk_w)) = last_qk.take()
+            {
+                let d = *hd / 32;
+                let kt = if kv_half[*kv] { "h_" } else { "" };
+                let fused = (|| -> Option<AttnRope> {
+                    let nw = [1, 2].map(|n| {
+                        if n < *grp {
+                            self.named_pipeline(&format!("dec_attnr_{kt}{d}_{n}"))
+                        } else {
+                            None
+                        }
+                    });
+                    if nw.iter().zip(narrow.iter()).any(|(a, b)| a.is_some() != b.is_some()) {
+                        return None;
+                    }
+                    Some(AttnRope {
+                        pipe: self.named_pipeline(&format!("dec_attnr_{kt}{d}_{grp}"))?,
+                        narrow: nw,
+                        qkv: *rq,
+                        qo: *rqo,
+                        qn: *rqn,
+                        kn: *rkn,
+                        p: *rp,
+                        cs: *rcs,
+                    })
+                })();
+                if let Some(f) = fused {
+                    *rope = Some(Box::new(f));
+                    ops.pop();
+                    rd.clear();
+                    wr.clear();
+                    r.extend(qk_r);
+                    w.extend(qk_w);
+                }
+            }
+            last_qk = matches!(emit.last(), Some(MOp::QkRope { .. })).then(|| (r.clone(), w.clone()));
             // A barrier when this op touches what earlier ones of the stage wrote, or writes what
             // they read.
             if overlaps(&r, &wr) || overlaps(&w, &wr) || overlaps(&w, &rd) {
@@ -5799,6 +5937,7 @@ impl MetalPlan<'_> {
                 t: tk,
                 block,
                 sel,
+                ..
             } => {
                 let (sq, so, sg) = tk.expect("multi-token attention");
                 for j in 0..t {
@@ -7668,6 +7807,7 @@ impl MetalPlan<'_> {
                 threads,
                 hd,
                 sel,
+                rope,
                 ..
             } => {
                 let mut p = *p;
@@ -7685,11 +7825,20 @@ impl MetalPlan<'_> {
                 p.nsplit = n.div_ceil(chunk) as u32;
                 p.chunk = chunk as u32;
                 let mut grp = *grp;
-                if sel.is_none() {
+                if let Some(r) = rope {
+                    (pipe, grp) = attn_narrow(r.pipe, grp, &r.narrow, n);
+                    let mut rp = r.p;
+                    rp.pos = pos as u32;
+                    e.bytes_slice(&cs[r.cs..r.cs + 2 * rp.half_rot as usize], 7);
+                    e.bytes(&rp, 8);
+                    e.buf(consts, r.qn.unwrap_or(0), 9);
+                    e.buf(consts, r.kn.unwrap_or(0), 10);
+                    e.buf(arena, r.qo, 11);
+                } else if sel.is_none() {
                     (pipe, grp) = attn_narrow(pipe, grp, narrow, n);
                 }
                 e.pipe(pipe);
-                e.buf(arena, *q, 0);
+                e.buf(arena, rope.as_ref().map_or(*q, |r| r.qkv), 0);
                 e.buf(kvb[*kv].0, 0, 1);
                 e.buf(kvb[*kv].1, 0, 2);
                 e.buf(arena, *out, 3);
@@ -7857,35 +8006,10 @@ impl DecodePlan for MetalPlan<'_> {
         // this step's wraps).
         let encode = |e: &FastEnc, range: std::ops::Range<usize>, bound: &[(usize, MOp)]| {
             e.use_resources(indirect);
-            // OXINFER_DEC_ONLY=barrier,norm,mv,qk,attn (debugging): encode only these ops.
-            static ONLY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-            let only = ONLY.get_or_init(|| std::env::var("OXINFER_DEC_ONLY").ok());
             for i in range {
                 let op = bound.iter().find(|b| b.0 == i).map_or(&self.ops[i], |b| &b.1);
-                if let Some(o) = only {
-                    let k = match op {
-                        MOp::Barrier => "barrier",
-                        MOp::Norm { .. } => "norm",
-                        MOp::Mv { .. } => "mv",
-                        MOp::Topk { .. } | MOp::Experts { .. } => "moe",
-                        MOp::QkRope { .. } => "qk",
-                        MOp::GdnConv { .. } | MOp::GdnRule { .. } => "gdn",
-                        MOp::Glu { .. } | MOp::Ew { .. } | MOp::PleGate { .. } => "glu",
-                        MOp::LoraDown { .. } | MOp::LoraUp { .. } => "lora",
-                        MOp::Steer { .. } | MOp::NeuronEdit { .. } => "iv",
-                        MOp::AddNorm { .. } => "norm",
-                        MOp::Attn { .. } => "attn",
-                        MOp::QsaKey { .. } | MOp::QsaScore { .. } | MOp::QsaTopk { .. } => "qsa",
-                        MOp::XHalf { .. } | MOp::Gemm { .. } | MOp::GemmF32 { .. } | MOp::AddRows { .. } => "mv",
-                        MOp::PfTopk { .. } | MOp::PfExperts(..) => "moe",
-                        MOp::PfGdn { .. } => "gdn",
-                        MOp::PfAttn { .. } | MOp::PfFlash { .. } | MOp::PfKvHalf { .. } => "attn",
-                        MOp::NormHalf { .. } | MOp::AddNormHalf { .. } | MOp::PfMoeTail { .. } => "norm",
-                        MOp::GluHalf { .. } => "glu",
-                    };
-                    if !o.split(',').any(|x| x == k) {
-                        continue;
-                    }
+                if !dec_only(op) {
+                    continue;
                 }
                 if self.pf.is_some() {
                     // OXINFER_PF_SKIP=xhalf,norm,... (timing experiments only: wrong results):
@@ -8233,6 +8357,9 @@ impl MetalPlan<'_> {
                         e.barrier();
                     }
                     for i in r.clone() {
+                        if !dec_only(&self.ops[i]) {
+                            continue;
+                        }
                         self.encode_one(&e, &self.ops[i], kvb, so, si, pos, &cs);
                     }
                     if pi + 1 == parts.len() {
@@ -8302,8 +8429,16 @@ impl MetalPlan<'_> {
             push(&mut q, sub, ms, &mut kvb, &mut ok);
             sub += 1;
         }
+        let mut gpu_us: Vec<f64> = Vec::new();
         while let Some((k, cbs)) = q.pop_front() {
             ok &= wait(&cbs);
+            if trace() {
+                let time: unsafe extern "C" fn(Id, Sel) -> f64 = be.o.msg_send();
+                let (s0, s1) = (be.o.sel(c"GPUStartTime"), be.o.sel(c"GPUEndTime"));
+                // SAFETY: completed command buffers.
+                let (a, b) = unsafe { (time(cbs[0], s0), time(*cbs.last().unwrap(), s1)) };
+                gpu_us.push((b - a) * 1e6);
+            }
             release(cbs);
             if !ok || stopped {
                 continue;
@@ -8343,6 +8478,16 @@ impl MetalPlan<'_> {
         }
         if !ok {
             panic!("Metal: a chained decode pass failed (OXINFER_GPU_PLAN_DEBUG=1 says why)");
+        }
+        if !gpu_us.is_empty() {
+            gpu_us.sort_by(f64::total_cmp);
+            eprintln!(
+                "[metal chain: {} passes, gpu us per pass: min {:.0}, median {:.0}, p90 {:.0}]",
+                gpu_us.len(),
+                gpu_us[0],
+                gpu_us[gpu_us.len() / 2],
+                gpu_us[gpu_us.len() * 9 / 10]
+            );
         }
         Some(kept)
     }
