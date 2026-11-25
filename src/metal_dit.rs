@@ -7,7 +7,7 @@
 
 use super::decode::{FastEnc, Fns, run_concurrent};
 use super::*;
-use crate::gpu::dit::{Lin, Model, Seq, Session};
+use crate::gpu::dit::{FluxInput, FluxModel, FluxSession, Lin, Model, Seq, Session};
 
 pub(crate) const SRC: &str = include_str!("metal_dit.metal");
 
@@ -123,12 +123,7 @@ impl MetalBackend {
 
 impl Drop for MetalDit {
     fn drop(&mut self) {
-        let void: MsgVoid = self.be.o.msg_send();
-        for b in &self.bufs {
-            if !b.id.is_null() {
-                unsafe { void(b.id, self.be.sels.release) };
-            }
-        }
+        release_all(self.be, &self.bufs);
     }
 }
 
@@ -143,23 +138,7 @@ impl MetalDit {
     /// Makes buffer `b` hold at least `bytes` (new buffers are zero-filled; contents are lost when
     /// one grows).
     fn ensure(&mut self, b: B, bytes: usize) -> bool {
-        let s = &mut self.bufs[b as usize];
-        if s.cap >= bytes && !s.id.is_null() {
-            return true;
-        }
-        let new_len: MsgNewBufLen = self.be.o.msg_send();
-        let void: MsgVoid = self.be.o.msg_send();
-        let cap = bytes.max(256).div_ceil(PAGE) * PAGE;
-        let id = unsafe { new_len(self.be.device, self.be.sels.new_buffer_len, cap, 0) };
-        if id.is_null() {
-            return false;
-        }
-        if !s.id.is_null() {
-            unsafe { void(s.id, self.be.sels.release) };
-        }
-        s.id = id;
-        s.cap = cap;
-        true
+        grow(self.be, &mut self.bufs[b as usize], bytes)
     }
 
     fn id(&self, b: B) -> Id {
@@ -168,6 +147,36 @@ impl MetalDit {
 
     fn host(&self, b: B) -> *mut f32 {
         self.f.contents(self.id(b)) as *mut f32
+    }
+}
+
+/// Makes `s` hold at least `bytes` (new buffers are zero-filled; contents are lost when one
+/// grows).
+fn grow(be: &MetalBackend, s: &mut DBuf, bytes: usize) -> bool {
+    if s.cap >= bytes && !s.id.is_null() {
+        return true;
+    }
+    let new_len: MsgNewBufLen = be.o.msg_send();
+    let void: MsgVoid = be.o.msg_send();
+    let cap = bytes.max(256).div_ceil(PAGE) * PAGE;
+    let id = unsafe { new_len(be.device, be.sels.new_buffer_len, cap, 0) };
+    if id.is_null() {
+        return false;
+    }
+    if !s.id.is_null() {
+        unsafe { void(s.id, be.sels.release) };
+    }
+    s.id = id;
+    s.cap = cap;
+    true
+}
+
+fn release_all(be: &MetalBackend, bufs: &[DBuf]) {
+    let void: MsgVoid = be.o.msg_send();
+    for b in bufs {
+        if !b.id.is_null() {
+            unsafe { void(b.id, be.sels.release) };
+        }
     }
 }
 
@@ -197,6 +206,12 @@ impl Enc<'_, '_> {
     /// `y = W x` (or `y +=` with `add`) over `rows` rows (a multiple of 128) into rows `ldy`
     /// floats apart.
     fn gemm(&self, l: &Lin, x: Xh, rows: usize, y: (Id, usize), ldy: usize, add: bool) {
+        self.gemm_nb(l, x, rows, y, ldy, add);
+        self.e.barrier();
+    }
+
+    /// [`Self::gemm`] without the barrier after it (GEMMs that may run together).
+    fn gemm_nb(&self, l: &Lin, x: Xh, rows: usize, y: (Id, usize), ldy: usize, add: bool) {
         let mw = l.dev.downcast_ref::<MetalWeight>().unwrap();
         let (pipe, tn) = self.be.mma_pipe(&l.w, mw.offsets.is_some(), l.n_out, l.n_in, Tile::Dense).unwrap();
         let (_, elem_bytes, scale_bytes) = format_index(&l.w);
@@ -236,7 +251,6 @@ impl Enc<'_, '_> {
             );
         }
         e.dispatch((l.n_out / tn, rows / MMA_TM), 128);
-        e.barrier();
     }
 
     /// f32 rows (`ld` apart) to scaled half rows.
@@ -608,6 +622,480 @@ impl Session for MetalDit {
                     for (v, &bb) in row.iter_mut().zip(bias) {
                         *v += bb;
                     }
+                }
+            }
+        }
+        true
+    }
+}
+
+// ---- FLUX.1 ----
+
+struct FluxPipes {
+    ln: Id,
+    heads: Id,
+    gelu: Id,
+    cat: Id,
+    gated: Id,
+    bias: Id,
+}
+
+/// FLUX.1 passes ([`FluxSession`]): the joint sequence `[text; image]` in one set of device
+/// buffers, the text rows first (their count a multiple of 128, so both streams start on a
+/// GEMM tile and the attention sees the tokens without gaps).
+pub(crate) struct MetalFlux {
+    be: &'static MetalBackend,
+    f: Fns,
+    p: FluxPipes,
+    bufs: Vec<DBuf>,
+}
+
+// SAFETY: as MetalDit.
+unsafe impl Send for MetalFlux {}
+
+#[derive(Clone, Copy)]
+enum F {
+    H = 0,
+    Xh,
+    Rs,
+    Qkv,
+    Q,
+    K,
+    V,
+    Att,
+    Tmp,
+    Hg,
+    Consts,
+    Cos,
+    Sin,
+    Img,
+    Txt,
+}
+const NFBUF: usize = 15;
+
+#[repr(C)]
+struct Fln {
+    n: u32,
+    eps: f32,
+    _p: [u32; 2],
+}
+#[repr(C)]
+struct Fhd {
+    ld_src: u32,
+    norm: u32,
+    rope: u32,
+    out_half: u32,
+    eps: f32,
+    heads: u32,
+    split: u32,
+    has_bias: u32,
+}
+
+impl MetalBackend {
+    /// [`crate::gpu::Backend::flux_session`].
+    pub(crate) fn flux_session_impl(&'static self) -> Option<Box<dyn FluxSession>> {
+        self.mma().filter(|m| m.units)?;
+        let pipe = |n: &str| self.named_pipeline(n);
+        let p = FluxPipes {
+            ln: pipe("flux_ln_mod")?,
+            heads: pipe("flux_heads")?,
+            gelu: pipe("flux_gelu_half")?,
+            cat: pipe("flux_cat_half")?,
+            gated: pipe("flux_gated_add")?,
+            bias: pipe("dit_bias_rows")?,
+        };
+        Some(Box::new(MetalFlux {
+            be: self,
+            f: Fns::new(self),
+            p,
+            bufs: (0..NFBUF)
+                .map(|_| DBuf {
+                    id: std::ptr::null_mut(),
+                    cap: 0,
+                })
+                .collect(),
+        }))
+    }
+}
+
+impl Drop for MetalFlux {
+    fn drop(&mut self) {
+        release_all(self.be, &self.bufs);
+    }
+}
+
+impl MetalFlux {
+    fn ensure(&mut self, b: F, bytes: usize) -> bool {
+        grow(self.be, &mut self.bufs[b as usize], bytes)
+    }
+
+    fn host(&self, b: F) -> *mut f32 {
+        self.f.contents(self.bufs[b as usize].id) as *mut f32
+    }
+}
+
+/// Bias offsets (into the constants) of a double block's layers.
+struct DoubleBias {
+    iq: [Option<usize>; 3],
+    tq: [Option<usize>; 3],
+    io: Option<usize>,
+    to: Option<usize>,
+    im: [Option<usize>; 2],
+    tm: [Option<usize>; 2],
+}
+
+impl FluxSession for MetalFlux {
+    fn forward(&mut self, m: &FluxModel, inp: &FluxInput, out: &mut Vec<f32>) -> bool {
+        let be = self.be;
+        let (d, heads, hd) = (m.dim, m.heads, m.head_dim);
+        let (ni, nx) = (inp.n_img, inp.n_txt);
+        let (nd, ns) = (m.doubles.len(), m.singles.len());
+        if hd != 128 || heads * hd != d || !d.is_multiple_of(256) || !nx.is_multiple_of(MMA_TM) || ni == 0 || nd + ns == 0 {
+            return false;
+        }
+        let n = nx + ni;
+        let (cin, cj, cout) = (m.x_emb.n_in, m.ctx_emb.n_in, m.proj_out.n_out);
+        if inp.img.len() != ni * cin
+            || inp.txt.len() != nx * cj
+            || inp.cos.len() != n * hd / 2
+            || inp.sin.len() != n * hd / 2
+            || inp.mods.len() != (12 * nd + 3 * ns + 2) * d
+        {
+            return false;
+        }
+        let mut lins: Vec<&Lin> = vec![&m.x_emb, &m.ctx_emb, &m.proj_out];
+        let mut fm = 0;
+        for b in &m.doubles {
+            lins.extend(b.img_qkv.iter().chain(&b.txt_qkv).chain(&b.img_mlp).chain(&b.txt_mlp));
+            lins.extend([&b.img_out, &b.txt_out]);
+            let f = b.img_mlp[0].n_out;
+            if b.txt_mlp[0].n_out != f || b.img_mlp[1].n_in != f || b.txt_mlp[1].n_in != f {
+                return false;
+            }
+            fm = fm.max(f);
+        }
+        let mut wide = cj.max(cin).max(fm).max(d);
+        for b in &m.singles {
+            lins.extend(b.qkv.iter().chain([&b.mlp, &b.out]));
+            if b.out.n_in != d + b.mlp.n_out || !b.mlp.n_out.is_multiple_of(4) {
+                return false;
+            }
+            fm = fm.max(b.mlp.n_out);
+            wide = wide.max(b.out.n_in);
+        }
+        if lins.iter().any(|l| l.side.is_some() || l.rot.is_some() || !runnable(be, l))
+            || lins.iter().any(|l| l.bias.is_some_and(|b| b.len() != l.n_out))
+            || m.doubles.iter().any(|b| {
+                b.img_qkv
+                    .iter()
+                    .chain(&b.txt_qkv)
+                    .chain([&b.img_out, &b.txt_out])
+                    .any(|l| l.n_out != d)
+                    || b.img_mlp[1].n_out != d
+                    || b.txt_mlp[1].n_out != d
+            })
+            || m.singles.iter().any(|b| b.qkv.iter().any(|l| l.n_out != d) || b.out.n_out != d)
+            || m.x_emb.n_out != d
+            || m.ctx_emb.n_out != d
+        {
+            return false;
+        }
+        let ri = ni.next_multiple_of(MMA_TM);
+        let rg = nx + ri;
+        let half_att = m.half_attention;
+        let eb = if half_att { 2 } else { 4 };
+        let ok = self.ensure(F::H, rg * d * 4)
+            && self.ensure(F::Xh, rg * wide * 2)
+            && self.ensure(F::Rs, rg * 4)
+            && self.ensure(F::Qkv, 3 * rg * d * 4)
+            && self.ensure(F::Q, rg * d * eb)
+            && self.ensure(F::K, rg * d * eb)
+            && self.ensure(F::V, rg * d * eb)
+            && self.ensure(F::Att, rg * d * 4)
+            && self.ensure(F::Tmp, rg * d.max(cout) * 4)
+            && self.ensure(F::Hg, rg * fm * 4)
+            && self.ensure(F::Cos, rg * hd / 2 * 4)
+            && self.ensure(F::Sin, rg * hd / 2 * 4)
+            && self.ensure(F::Img, ri * cin * 4)
+            && self.ensure(F::Txt, nx * cj * 4);
+        if !ok {
+            return false;
+        }
+        // Constants: the modulations, the biases, the norm weights.
+        let mut consts: Vec<f32> = Vec::with_capacity(inp.mods.len() + (nd + ns) * 24 * d);
+        let mut put = |v: &[f32]| -> usize {
+            let o = consts.len();
+            consts.extend_from_slice(v);
+            consts.resize(consts.len().next_multiple_of(64), 0.0);
+            o * 4
+        };
+        let mods = put(inp.mods);
+        let x_b = m.x_emb.bias.map(&mut put);
+        let c_b = m.ctx_emb.bias.map(&mut put);
+        let dbs: Vec<DoubleBias> = m
+            .doubles
+            .iter()
+            .map(|b| {
+                let mut bias = |l: &Lin| l.bias.map(&mut put);
+                DoubleBias {
+                    iq: [bias(&b.img_qkv[0]), bias(&b.img_qkv[1]), bias(&b.img_qkv[2])],
+                    tq: [bias(&b.txt_qkv[0]), bias(&b.txt_qkv[1]), bias(&b.txt_qkv[2])],
+                    io: bias(&b.img_out),
+                    to: bias(&b.txt_out),
+                    im: [bias(&b.img_mlp[0]), bias(&b.img_mlp[1])],
+                    tm: [bias(&b.txt_mlp[0]), bias(&b.txt_mlp[1])],
+                }
+            })
+            .collect();
+        type SingleBias = ([Option<usize>; 3], Option<usize>, Option<usize>);
+        let sbs: Vec<SingleBias> = m
+            .singles
+            .iter()
+            .map(|b| {
+                let mut bias = |l: &Lin| l.bias.map(&mut put);
+                ([bias(&b.qkv[0]), bias(&b.qkv[1]), bias(&b.qkv[2])], bias(&b.mlp), bias(&b.out))
+            })
+            .collect();
+        let dnorms: Vec<[usize; 4]> = m
+            .doubles
+            .iter()
+            .map(|b| [put(b.norms[0]), put(b.norms[1]), put(b.norms[2]), put(b.norms[3])])
+            .collect();
+        let snorms: Vec<[usize; 2]> = m.singles.iter().map(|b| [put(b.norms[0]), put(b.norms[1])]).collect();
+        if !self.ensure(F::Consts, consts.len() * 4) {
+            return false;
+        }
+        // SAFETY: every buffer was sized above; the device is idle (the last pass was waited for).
+        unsafe {
+            par_copy(self.host(F::Consts), consts.as_ptr(), consts.len());
+            let img = self.host(F::Img);
+            par_copy(img, inp.img.as_ptr(), ni * cin);
+            std::ptr::write_bytes(img.add(ni * cin), 0, (ri - ni) * cin);
+            par_copy(self.host(F::Txt), inp.txt.as_ptr(), nx * cj);
+            par_copy(self.host(F::Cos), inp.cos.as_ptr(), n * hd / 2);
+            par_copy(self.host(F::Sin), inp.sin.as_ptr(), n * hd / 2);
+            std::ptr::write_bytes(self.host(F::H).add(n * d), 0, (rg - n) * d);
+        }
+        let ids: [Id; NFBUF] = std::array::from_fn(|i| self.bufs[i].id);
+        let id = |b: F| ids[b as usize];
+        let at = |b: F, bytes: usize| (id(b), bytes);
+        let mo = |k: usize| mods + k * d * 4;
+        let cst = id(F::Consts);
+        let p = &self.p;
+        let mma = be.mma.as_ref().unwrap();
+        const EPS: f32 = 1e-6;
+        // Scaled half rows of width w from row r0 on.
+        let xh = |r0: usize, w: usize| Xh {
+            xh: at(F::Xh, r0 * w * 2),
+            rs: at(F::Rs, r0 * 4),
+        };
+        // Layer norm + modulation of `rows` rows of H from r0 into xh(r0, d).
+        let ln = |e: &FastEnc, r0: usize, rows: usize, scale: usize, shift: usize| {
+            e.pipe(p.ln);
+            e.buf(id(F::H), r0 * d * 4, 0);
+            e.buf(cst, scale, 1);
+            e.buf(cst, shift, 2);
+            e.buf(id(F::Xh), r0 * d * 2, 3);
+            e.buf(id(F::Rs), r0 * 4, 4);
+            e.bytes(
+                &Fln {
+                    n: d as u32,
+                    eps: EPS,
+                    _p: [0; 2],
+                },
+                5,
+            );
+            e.dispatch((rows, 1), 256);
+        };
+        // H rows from r0 += gate * (y + bias), y rows of d in Tmp at the same rows.
+        let gated = |e: &FastEnc, r0: usize, rows: usize, gate: usize, b: Option<usize>| {
+            e.pipe(p.gated);
+            e.buf(id(F::H), r0 * d * 4, 0);
+            e.buf(id(F::Tmp), r0 * d * 4, 1);
+            e.buf(cst, gate, 2);
+            e.buf(cst, b.unwrap_or(0), 3);
+            e.bytes(&U4([d as u32, b.is_some() as u32, 0, 0]), 4);
+            e.dispatch(((d / 4).div_ceil(256), rows), 256);
+        };
+        // Plane j of Qkv (+ biases), normed and rotated with `norm`, into dst; rows below
+        // `split` take the A weights and bias.
+        let heads_op = |e: &FastEnc, j: usize, dst: F, norm: Option<(usize, usize)>, b: (Option<usize>, Option<usize>), split: usize| {
+            e.pipe(p.heads);
+            e.buf(id(F::Qkv), j * rg * d * 4, 0);
+            e.buf(id(dst), 0, 1);
+            let (wa, wb) = norm.unwrap_or((0, 0));
+            e.buf(cst, wa, 2);
+            e.buf(cst, wb, 3);
+            e.buf(cst, b.0.unwrap_or(0), 4);
+            e.buf(cst, b.1.unwrap_or(0), 5);
+            e.buf(id(F::Cos), 0, 6);
+            e.buf(id(F::Sin), 0, 7);
+            e.bytes(
+                &Fhd {
+                    ld_src: d as u32,
+                    norm: norm.is_some() as u32,
+                    rope: norm.is_some() as u32,
+                    out_half: half_att as u32,
+                    eps: EPS,
+                    heads: heads as u32,
+                    split: split as u32,
+                    has_bias: (b.0.is_some() || b.1.is_some()) as u32,
+                },
+                8,
+            );
+            e.dispatch((n, heads), 32);
+        };
+        let attention = |e: &FastEnc| {
+            if skip_op("att") {
+                return;
+            }
+            e.pipe(if half_att { mma.flash128 } else { mma.flash128_f32 });
+            e.buf(id(F::Q), 0, 0);
+            e.buf(id(F::K), 0, 1);
+            e.buf(id(F::V), 0, 2);
+            e.buf(id(F::Att), 0, 3);
+            e.bytes(&U4([n as u32, n as u32, d as u32, (1.0 / (hd as f32).sqrt()).to_bits()]), 4);
+            e.dispatch((n.div_ceil(64), heads), 128);
+            e.barrier();
+        };
+        let total = nd + ns;
+        let parts: Vec<std::ops::Range<usize>> = (0..total.div_ceil(BLOCKS_PER_CB))
+            .map(|c| c * BLOCKS_PER_CB..((c + 1) * BLOCKS_PER_CB).min(total))
+            .collect();
+        let (ok, _) = run_concurrent(be, &self.f, &parts, |e, range| {
+            let en = Enc { e, be };
+            if range.start == 0 {
+                // The embeddings: image tokens into rows nx.., text tokens into rows ..nx.
+                let emb = |l: &Lin, src: F, rows: usize, valid: usize, r0: usize, b: Option<usize>| {
+                    en.to_half(at(src, 0), l.n_in, l.n_in, rows, xh(0, l.n_in));
+                    en.gemm(l, xh(0, l.n_in), rows, at(F::Tmp, 0), d, false);
+                    e.pipe(p.bias);
+                    e.buf(id(F::Tmp), 0, 0);
+                    e.buf(id(F::H), r0 * d * 4, 1);
+                    e.buf(cst, b.unwrap_or(0), 2);
+                    e.bytes(&U4([d as u32, d as u32, d as u32, b.is_some() as u32]), 3);
+                    e.dispatch((d.div_ceil(256), valid), 256);
+                    e.barrier();
+                };
+                emb(&m.x_emb, F::Img, ri, ni, nx, x_b);
+                emb(&m.ctx_emb, F::Txt, nx, nx, 0, c_b);
+            }
+            for i in range.clone() {
+                if i < nd {
+                    let b = &m.doubles[i];
+                    let (bi, nr) = (&dbs[i], &dnorms[i]);
+                    // Modulations: image k at mo(12 i + k), text at mo(12 i + 6 + k).
+                    let im = |k: usize| mo(12 * i + k);
+                    let tm = |k: usize| mo(12 * i + 6 + k);
+                    ln(e, nx, ni, im(1), im(0));
+                    ln(e, 0, nx, tm(1), tm(0));
+                    e.barrier();
+                    if !skip_op("qkv") {
+                        for j in 0..3 {
+                            en.gemm_nb(&b.img_qkv[j], xh(nx, d), ri, at(F::Qkv, (j * rg + nx) * d * 4), d, false);
+                            en.gemm_nb(&b.txt_qkv[j], xh(0, d), nx, at(F::Qkv, j * rg * d * 4), d, false);
+                        }
+                    }
+                    e.barrier();
+                    heads_op(e, 0, F::Q, Some((nr[2], nr[0])), (bi.tq[0], bi.iq[0]), nx);
+                    heads_op(e, 1, F::K, Some((nr[3], nr[1])), (bi.tq[1], bi.iq[1]), nx);
+                    heads_op(e, 2, F::V, None, (bi.tq[2], bi.iq[2]), nx);
+                    e.barrier();
+                    attention(e);
+                    en.to_half(at(F::Att, 0), d, d, rg, xh(0, d));
+                    if !skip_op("o") {
+                        en.gemm_nb(&b.img_out, xh(nx, d), ri, at(F::Tmp, nx * d * 4), d, false);
+                        en.gemm_nb(&b.txt_out, xh(0, d), nx, at(F::Tmp, 0), d, false);
+                    }
+                    e.barrier();
+                    gated(e, nx, ni, im(2), bi.io);
+                    gated(e, 0, nx, tm(2), bi.to);
+                    e.barrier();
+                    // The MLPs.
+                    ln(e, nx, ni, im(4), im(3));
+                    ln(e, 0, nx, tm(4), tm(3));
+                    e.barrier();
+                    let f = b.img_mlp[0].n_out;
+                    if !skip_op("up") {
+                        en.gemm_nb(&b.img_mlp[0], xh(nx, d), ri, at(F::Hg, nx * f * 4), f, false);
+                        en.gemm_nb(&b.txt_mlp[0], xh(0, d), nx, at(F::Hg, 0), f, false);
+                    }
+                    e.barrier();
+                    for (r0, rows, bb) in [(nx, ni, bi.im[0]), (0, nx, bi.tm[0])] {
+                        e.pipe(p.gelu);
+                        e.buf(id(F::Hg), r0 * f * 4, 0);
+                        e.buf(cst, bb.unwrap_or(0), 1);
+                        e.buf(id(F::Xh), r0 * f * 2, 2);
+                        e.buf(id(F::Rs), r0 * 4, 3);
+                        e.bytes(&U4([f as u32, bb.is_some() as u32, 0, 0]), 4);
+                        e.dispatch((rows, 1), 256);
+                    }
+                    e.barrier();
+                    if !skip_op("down") {
+                        en.gemm_nb(&b.img_mlp[1], xh(nx, f), ri, at(F::Tmp, nx * d * 4), d, false);
+                        en.gemm_nb(&b.txt_mlp[1], xh(0, f), nx, at(F::Tmp, 0), d, false);
+                    }
+                    e.barrier();
+                    gated(e, nx, ni, im(5), bi.im[1]);
+                    gated(e, 0, nx, tm(5), bi.tm[1]);
+                    e.barrier();
+                } else {
+                    let k = i - nd;
+                    let b = &m.singles[k];
+                    let (qb, mb, ob) = sbs[k];
+                    let nr = snorms[k];
+                    let sm = |j: usize| mo(12 * nd + 3 * k + j);
+                    ln(e, 0, n, sm(1), sm(0));
+                    e.barrier();
+                    let f = b.mlp.n_out;
+                    if !skip_op("qkv") {
+                        for j in 0..3 {
+                            en.gemm_nb(&b.qkv[j], xh(0, d), rg, at(F::Qkv, j * rg * d * 4), d, false);
+                        }
+                    }
+                    if !skip_op("up") {
+                        en.gemm_nb(&b.mlp, xh(0, d), rg, at(F::Hg, 0), f, false);
+                    }
+                    e.barrier();
+                    heads_op(e, 0, F::Q, Some((nr[0], nr[0])), (qb[0], qb[0]), n);
+                    heads_op(e, 1, F::K, Some((nr[1], nr[1])), (qb[1], qb[1]), n);
+                    heads_op(e, 2, F::V, None, (qb[2], qb[2]), n);
+                    e.barrier();
+                    attention(e);
+                    e.pipe(p.cat);
+                    e.buf(id(F::Att), 0, 0);
+                    e.buf(id(F::Hg), 0, 1);
+                    e.buf(cst, mb.unwrap_or(0), 2);
+                    e.buf(id(F::Xh), 0, 3);
+                    e.buf(id(F::Rs), 0, 4);
+                    e.bytes(&U4([d as u32, f as u32, mb.is_some() as u32, 0]), 5);
+                    e.dispatch((n, 1), 256);
+                    e.barrier();
+                    if !skip_op("down") {
+                        en.gemm(&b.out, xh(0, d + f), rg, at(F::Tmp, 0), d, false);
+                    }
+                    gated(e, 0, n, sm(2), ob);
+                    e.barrier();
+                }
+            }
+            if range.end == total {
+                // The head: the final norm under its modulation, the output projection.
+                let hb = 12 * nd + 3 * ns;
+                ln(e, nx, ni, mo(hb), mo(hb + 1));
+                e.barrier();
+                en.gemm(&m.proj_out, xh(nx, d), ri, at(F::Tmp, 0), cout, false);
+            }
+        });
+        if !ok {
+            return false;
+        }
+        out.resize(ni * cout, 0.0);
+        // SAFETY: Tmp holds ri >= ni rows of cout floats.
+        unsafe { par_copy(out.as_mut_ptr(), self.host(F::Tmp), ni * cout) };
+        if let Some(b) = m.proj_out.bias {
+            for row in out.chunks_mut(cout) {
+                for (v, &bb) in row.iter_mut().zip(b) {
+                    *v += bb;
                 }
             }
         }

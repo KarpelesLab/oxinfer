@@ -226,6 +226,11 @@ pub trait Backend: Send + Sync {
     fn dit_session(&'static self) -> Option<Box<dyn dit::Session>> {
         None
     }
+    /// A session running whole FLUX.1 transformer passes on the device; None when the backend
+    /// has none.
+    fn flux_session(&'static self) -> Option<Box<dyn dit::FluxSession>> {
+        None
+    }
     /// See [`AttnJob`]. False when the backend does not run it (the caller then does).
     fn attention_cached(&self, _j: &mut AttnJob) -> bool {
         false

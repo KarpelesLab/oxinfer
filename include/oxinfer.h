@@ -954,6 +954,7 @@ typedef struct OxiFlux OxiFlux;
  *   lora=FILE[:SCALE]     a LoRA applied to the transformer (diffusers / kohya / BFL / XLabs
  *                         keys); give it again for more
  *   vae=SPEC              the autoencoder: BFL's ae.safetensors or a diffusers vae folder
+ *   device_passes=0|1     whole transformer passes on the GPU (default 1); 0: op by op
  * `model` may also be a BFL single-file checkpoint (flux1-dev.safetensors). */
 OxiFlux *oxi_flux_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
 

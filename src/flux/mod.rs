@@ -101,6 +101,10 @@ pub struct LoadOptions {
     /// A FLUX.1 Redux folder or repo (`image_encoder/` SigLIP tower + `image_embedder/`), for
     /// image prompts.
     pub redux: Option<String>,
+    /// Whole transformer passes on the GPU (every block in a few command buffers, activations
+    /// kept on the device; default on, also `OXINFER_FLUX_DEVICE_PASS=0`); off, the per-operation
+    /// path (see [`transformer::FluxTransformer::set_device_passes`]).
+    pub device_passes: bool,
 }
 
 impl Default for LoadOptions {
@@ -117,13 +121,15 @@ impl Default for LoadOptions {
             loras: Vec::new(),
             vae: None,
             redux: None,
+            device_passes: transformer::device_passes_default(),
         }
     }
 }
 
 impl LoadOptions {
     /// Sets one `key=value` option (C API): quant, text_quant, transformer, text_encoder, base,
-    /// device, cache_dir, vae_encoder, lora (`FILE[:SCALE]`, repeatable), vae, redux.
+    /// device, cache_dir, vae_encoder, lora (`FILE[:SCALE]`, repeatable), vae, redux,
+    /// device_passes (`0` / `1`).
     pub fn set(&mut self, k: &str, v: &str) -> Result<()> {
         let q = |v: &str| Quant::parse(v).with_context(|| format!("{k}={v}: expected bf16, q8 or q4"));
         match k {
@@ -138,6 +144,7 @@ impl LoadOptions {
             "lora" => self.loras.push(lora::LoraSpec::parse(v)?),
             "vae" => self.vae = Some(v.to_string()),
             "redux" => self.redux = Some(v.to_string()),
+            "device_passes" => self.device_passes = !matches!(v, "0" | "false" | "no" | "off"),
             _ => bail!("unknown FLUX option {k}"),
         }
         Ok(())
@@ -489,6 +496,7 @@ impl Pipeline {
         };
         let mut transformer =
             transformer::FluxTransformer::load(&tr_path, opts.quant).with_context(|| format!("transformer {}", tr_path.display()))?;
+        transformer.set_device_passes(opts.device_passes);
         // LoRA files: local paths, or `org/name/file.safetensors` (with the `hf` feature).
         let loras = opts
             .loras

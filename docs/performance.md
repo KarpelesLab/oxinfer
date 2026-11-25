@@ -4223,6 +4223,31 @@ tools/bench/bench.py --model M.gguf --sidecar FastMTP.gguf --llama-bin ~/llama.c
 tools/bench/summarize.py results.jsonl          # medians, acceptance, greedy agreement
 ```
 
+## Image generation against stable-diffusion.cpp and mflux
+
+November 2026, M5 Max, same files where the engines read them (GGUF transformers, the same
+diffusers / BFL VAE), same size, steps, sampler and guidance; seconds per denoising step at steady
+state, text encoders and VAE decode apart. stable-diffusion.cpp master 82c19c8 (Metal, flash
+attention auto), mflux 0.24 on MLX 0.32.5.
+
+| model | engine | per step | text | VAE decode |
+|---|---|---|---|---|
+| FLUX.1 [schnell] Q4_0, 1024^2, 4 steps | oxinfer before | 3.5-4.2 s | 0.6 s | 2.4-2.9 s |
+| | oxinfer, whole-pass GPU plan | 1.9 s | 0.6 s | 2.4-2.9 s |
+| | stable-diffusion.cpp | 5.2 s | 4.9 s | 4.2 s |
+| | mflux `-q 4` | 2.6-2.7 s | 0.1-0.2 s | 0.5-0.7 s |
+| FLUX.1 [schnell] Q8_0, 1024^2 | oxinfer before / after | 5.0 s / ~2.5 s | | |
+| | mflux `-q 8` | 3.8 s | 0.1-0.4 s | 0.6-1.0 s |
+| Qwen-Image-2512 Q4_0, 1024^2, true CFG 4 (2 passes) | oxinfer (per-operation) | 10.1 s | 3.3 s | 2.0 s |
+| | stable-diffusion.cpp | 12.4 s | 12.8 s | 46 s (untiled) |
+| SD 1.5 fp16, 512^2, CFG 7.5, Euler | oxinfer (two UNet passes) | 0.60 s | 0.06 s | 0.56 s |
+| | stable-diffusion.cpp (batched CFG) | 0.30 s | 0.43 s | 1.23 s |
+
+FLUX.1: the transformer now runs as one GPU plan per pass (see [FLUX.1](flux.md), "Whole passes
+on the GPU"); per pass at 1024^2 the GEMMs take about 1.25 s (~83 TFLOP/s of the 104 TFLOP),
+attention 0.55 s (13 TFLOP), the row kernels 0.1 s, the modulation vectors 5 ms (they took
+155 ms on the CPU). The VAE decoder (a CPU / GPU op mix) is what still trails MLX.
+
 ## Quantization quality
 
 Q8 and Q4 are both measured against the bf16 output distribution (itself within 1e-4 of the

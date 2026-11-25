@@ -349,6 +349,10 @@ pub struct FluxTransformer {
     pub singles: Vec<SingleBlock<'static>>,
     /// Bytes of weights held (borrowed from the mapped checkpoint or quantized copies).
     pub weight_bytes: usize,
+    /// Whole passes on the device (see [`FluxTransformer::set_device_passes`]).
+    device_passes: std::sync::atomic::AtomicBool,
+    /// The device session of whole passes (its activation buffers), made on first use.
+    gpu: std::sync::Mutex<Option<Box<dyn crate::gpu::dit::FluxSession>>>,
     // Declared last: dropped after every layer borrowing it.
     _files: Box<ModelFiles>,
 }
@@ -471,6 +475,8 @@ impl FluxTransformer {
             doubles,
             singles,
             weight_bytes,
+            device_passes: std::sync::atomic::AtomicBool::new(device_passes_default()),
+            gpu: std::sync::Mutex::new(None),
             _files: files,
         })
     }
@@ -608,6 +614,157 @@ impl FluxTransformer {
         e
     }
 
+    /// Runs whole transformer passes on the accelerator when it has them (the default; also
+    /// `OXINFER_FLUX_DEVICE_PASS=0`): every block in a few command buffers with the
+    /// activations kept on the device. Off, each matmul and attention goes to the device on its
+    /// own and the rest runs on the CPU. Same arithmetic either way (matrix-unit GEMMs on half
+    /// operands, the same attention kernel); the row work runs in f32 on the device instead of
+    /// the CPU.
+    pub fn set_device_passes(&self, on: bool) {
+        self.device_passes.store(on, std::sync::atomic::Ordering::Relaxed);
+        if !on {
+            self.release_device();
+        }
+    }
+
+    /// Drops the device session's buffers (made again on the next device pass).
+    pub fn release_device(&self) {
+        *self.gpu.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// [`Self::forward`] as one device pass; None when the device has no FLUX plan or declines
+    /// this call (LoRA updates, a widened input, an unsupported shape).
+    fn forward_device(&self, img: &[f32], n_img: usize, txt: &[f32], n_txt: usize, st: &[f32], rope: &Rope) -> Option<Vec<f32>> {
+        use crate::gpu::dit::{FluxDouble, FluxInput, FluxModel, FluxSingle};
+        if !self.device_passes.load(std::sync::atomic::Ordering::Relaxed) || self.x_ext.is_some() {
+            return None;
+        }
+        let be = crate::gpu::active()?;
+        let c = &self.cfg;
+        let d = c.hidden();
+        if c.head_dim != 128 || !n_txt.is_multiple_of(128) || rope.dim != 128 {
+            return None;
+        }
+        let _t = crate::prof::start(crate::prof::Cat::Matmul);
+        fn qkv<'a>(l: &'a [Dense<'static>]) -> Option<[crate::gpu::dit::Lin<'a>; 3]> {
+            Some([dit_lin(&l[0])?, dit_lin(&l[1])?, dit_lin(&l[2])?])
+        }
+        let mut doubles = Vec::with_capacity(self.doubles.len());
+        for b in &self.doubles {
+            doubles.push(FluxDouble {
+                img_qkv: qkv(&b.img_qkv)?,
+                txt_qkv: qkv(&b.txt_qkv)?,
+                norms: [&b.norms[0], &b.norms[1], &b.norms[2], &b.norms[3]],
+                img_out: dit_lin(&b.img_out)?,
+                txt_out: dit_lin(&b.txt_out)?,
+                img_mlp: [dit_lin(&b.img_mlp[0])?, dit_lin(&b.img_mlp[1])?],
+                txt_mlp: [dit_lin(&b.txt_mlp[0])?, dit_lin(&b.txt_mlp[1])?],
+            });
+        }
+        let mut singles = Vec::with_capacity(self.singles.len());
+        for b in &self.singles {
+            singles.push(FluxSingle {
+                qkv: qkv(&b.proj[..3])?,
+                mlp: dit_lin(&b.proj[3])?,
+                norms: [&b.norms[0], &b.norms[1]],
+                out: dit_lin(&b.out)?,
+            });
+        }
+        let model = FluxModel {
+            dim: d,
+            heads: c.heads,
+            head_dim: c.head_dim,
+            x_emb: dit_lin(&self.x_emb)?,
+            ctx_emb: dit_lin(&self.ctx_emb)?,
+            doubles,
+            singles,
+            proj_out: dit_lin(&self.proj_out)?,
+            half_attention: !crate::gpu::exact_attention(),
+        };
+        // The modulations of this timestep.
+        let t0 = std::time::Instant::now();
+        let mods = self.modulations(be, st);
+        // One angle per rotary pair.
+        let half = |t: &[f32]| t.iter().step_by(2).copied().collect::<Vec<f32>>();
+        let (cos, sin) = (half(&rope.cos), half(&rope.sin));
+        let inp = FluxInput {
+            img,
+            n_img,
+            txt,
+            n_txt,
+            cos: &cos,
+            sin: &sin,
+            mods: &mods,
+        };
+        let mut sess = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if sess.is_none() {
+            *sess = Some(be.flux_session()?);
+        }
+        let mut out = Vec::new();
+        let t1 = std::time::Instant::now();
+        let ok = sess.as_mut()?.forward(&model, &inp, &mut out);
+        if std::env::var_os("OXINFER_FLUX_TRACE").is_some() {
+            eprintln!(
+                "[flux pass: mods {:.0} ms, device {:.0} ms]",
+                (t1 - t0).as_secs_f64() * 1e3,
+                t1.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        ok.then_some(out)
+    }
+
+    /// Every block's modulation vectors and the head's (the layout of
+    /// [`crate::gpu::dit::FluxInput::mods`]) from `st` (SiLU of the conditioning vector): one
+    /// device submission of matrix-vector products with float32 activations when the device
+    /// takes them, else on the CPU.
+    fn modulations(&self, be: &dyn crate::gpu::Backend, st: &[f32]) -> Vec<f32> {
+        let mut layers: Vec<&Dense> = Vec::with_capacity(2 * self.doubles.len() + self.singles.len() + 2);
+        for b in &self.doubles {
+            layers.extend([&b.img_mod, &b.txt_mod]);
+        }
+        layers.extend(self.singles.iter().map(|b| &b.modl));
+        layers.extend(&self.norm_out);
+        let total: usize = layers.iter().map(|l| l.n_out).sum();
+        let mut mods = vec![0f32; total];
+        let devs: Option<Vec<_>> = layers
+            .iter()
+            .map(|l| {
+                (!l.w.has_lora() && l.w.fold.is_none())
+                    .then(|| l.w.device_weight(l.n_out, l.n_in))
+                    .flatten()
+            })
+            .collect();
+        let on_device = devs.is_some_and(|devs| {
+            let mut rest = &mut mods[..];
+            let mut jobs = Vec::with_capacity(layers.len());
+            for (l, dev) in layers.iter().zip(devs) {
+                let (y, r) = rest.split_at_mut(l.n_out);
+                rest = r;
+                jobs.push(crate::gpu::RowsJob {
+                    w: l.w.as_ref(),
+                    dev,
+                    up: None,
+                    n_out: l.n_out,
+                    y,
+                });
+            }
+            be.matvec_rows(st, 1, st.len(), &mut jobs)
+        });
+        let mut o = 0;
+        for l in &layers {
+            let y = &mut mods[o..o + l.n_out];
+            if on_device {
+                if let Some(b) = &l.b {
+                    add(y, b);
+                }
+            } else {
+                y.copy_from_slice(&l.forward_vec(st));
+            }
+            o += l.n_out;
+        }
+        mods
+    }
+
     /// One denoising call. `img` is `[n_img, in_channels]` (packed latent tokens: the noisy
     /// latent first, then any reference tokens), `txt` `[n_txt, joint_dim]` (T5 states),
     /// `rope` covers the `n_txt + n_img` tokens in that order. Returns `[n_img, out_channels]`.
@@ -629,6 +786,9 @@ impl FluxTransformer {
         assert_eq!(rope.rows, nt, "rope table rows");
         let temb = self.temb(t, guidance, pooled);
         let st: Vec<f32> = temb.iter().map(|&v| silu(v)).collect();
+        if let Some(v) = self.forward_device(img, n_img, txt, n_txt, &st, rope) {
+            return v;
+        }
         let mut hi = match &self.x_ext {
             None => self.x_emb.forward(img, n_img),
             Some(ext) => {
@@ -655,6 +815,29 @@ impl FluxTransformer {
         let x = ln_mod(hi, n_img, &m[0], &m[1]);
         self.proj_out.forward(&x, n_img)
     }
+}
+
+/// Whether FLUX transformers run whole device passes unless told otherwise
+/// (`OXINFER_FLUX_DEVICE_PASS=0` turns them off).
+pub(crate) fn device_passes_default() -> bool {
+    std::env::var("OXINFER_FLUX_DEVICE_PASS").map_or(true, |v| v != "0")
+}
+
+/// A layer as the device's whole-pass plans see it; None with a LoRA update attached or a
+/// weight the device has no state for.
+fn dit_lin<'a>(d: &'a Dense) -> Option<crate::gpu::dit::Lin<'a>> {
+    if d.w.has_lora() || d.w.fold.is_some() {
+        return None;
+    }
+    Some(crate::gpu::dit::Lin {
+        w: d.w.as_ref(),
+        dev: d.w.device_weight(d.n_out, d.n_in)?,
+        n_out: d.n_out,
+        n_in: d.n_in,
+        bias: d.b.as_deref(),
+        side: None,
+        rot: None,
+    })
 }
 
 pub(crate) fn forward_many_into(ls: &[Dense], x: &[f32], rows: usize, outs: &mut [&mut [f32]]) {

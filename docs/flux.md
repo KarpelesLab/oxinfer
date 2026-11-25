@@ -149,8 +149,36 @@ stays). For small machines the GGUF files are the way: a Q4_0 transformer with a
 (`--text-encoder city96/t5-v1_1-xxl-encoder-gguf:Q4_K_M`) is 9.7 GB on disk, all of it mapped.
 On Metal, every matmul runs on the GPU (M5's matrix units: half-precision operands) and
 attention uses a fused kernel on the matrix units (`flash_attn128_mma`: 7.2 -> 3.6 s per 1024^2
-step against the f32 kernel); norms, RoPE and the gates stay on the CPU. `OXINFER_METAL_MMA=0`
-gives the f32 kernels (the exact rows of the agreement table, 2-2.5x slower).
+step against the f32 kernel). `OXINFER_METAL_MMA=0` gives the f32 kernels (the exact rows of the
+agreement table, 2-2.5x slower).
+
+**Whole passes on the GPU** (the default with matrix units; `--no-device-passes`, the
+`device_passes=0` load option or `OXINFER_FLUX_DEVICE_PASS=0` turn them off). The transformer
+runs as one plan (`gpu::dit::FluxSession`, `src/metal_dit.rs`): the joint `[text; image]`
+sequence stays in device buffers for all 57 blocks, encoded into ten command buffers per pass.
+The layer norms and modulations, biases, QK RMS norms with the interleaved RoPE, GELU-tanh, the
+single blocks' `[attention | MLP]` concatenation and the gated residuals are row kernels that
+write the next GEMM's half-precision input directly; the per-block modulation vectors (78
+matrix-vector products of `silu(temb)`) are one f32 submission. The arithmetic is that of the
+per-operation path (same GEMMs and attention kernel), the row work now in f32 on the GPU instead
+of f64 / f32 on the CPU: against a CPU-only run (`--device cpu`), FLUX.1 [schnell] Q4_0 at 512^2
+is 38.0 dB per-operation and 37.9 dB with whole passes after one step, 34.2 and 34.0 dB after
+four (the half-precision operands set that floor either way). The text tokens' count must be a
+multiple of 128 (T5's 256 / 512: always); LoRA side paths and widened inputs (control LoRAs)
+take the per-operation path.
+
+FLUX.1 [schnell] Q4_0 (city96 GGUF), 1024x1024, 4 steps, M5 Max, against
+stable-diffusion.cpp (master 82c19c8, Metal, the same GGUF, T5 fp16, `ae.safetensors`) and mflux
+0.24 (MLX 0.32.5, the bf16 checkpoint quantized to 4 bits at load):
+
+| | per step (steady) | text encoders | VAE decode |
+|---|---|---|---|
+| oxinfer, per-operation (before) | 3.5-4.2 s | 0.6 s (2.6 s cold) | 2.4-2.9 s |
+| oxinfer, whole passes | 1.9 s | 0.6 s | 2.4-2.9 s |
+| stable-diffusion.cpp | 5.2 s | 4.9 s | 4.2 s |
+| mflux, `-q 4` | 2.6-2.7 s | 0.1-0.2 s (T5 at 4 bits) | 0.5-0.7 s |
+
+At 512x512 a step is 1.48 -> 0.61 s. Q8_0 / `-q 8`: oxinfer 4.97 -> ~2.5 s per step, mflux 3.8 s.
 
 **Sample edits** (FLUX.1 Kontext [dev] Q8_0, guidance 2.5, 28 steps, 1168x880 from 1024x768 inputs
 that FLUX.1 [schnell] generated): "Put a red knitted hat on the dog" keeps the dog, porch and

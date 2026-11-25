@@ -197,3 +197,126 @@ kernel void dit_rot_half(device float* x [[buffer(0)]], device half* xh [[buffer
     for (uint i = tid; i < p.n / 4; i += 256) o[i] = half4(row4[i] * s);
     if (tid == 0) rs[r] = sinv;
 }
+
+// ---- FLUX.1 passes (metal_dit.rs, crate::gpu::dit::FluxSession) ----
+// Layer norm without weights of rows of n (eps), then `* (1 + scale) + shift`, into scaled half
+// rows. 256 threads per row.
+struct FLN { uint n; float eps; uint _p0; uint _p1; };
+kernel void flux_ln_mod(device const float* x [[buffer(0)]], device const float* scale [[buffer(1)]],
+                        device const float* shift [[buffer(2)]], device half* out [[buffer(3)]], device float* rs [[buffer(4)]],
+                        constant FLN& p [[buffer(5)]],
+                        uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    threadgroup float red2[8];
+    threadgroup float red3[8];
+    device const float4* row = (device const float4*)(x + (ulong)r * p.n);
+    device const float4* sc4 = (device const float4*)scale;
+    device const float4* sh4 = (device const float4*)shift;
+    uint n4 = p.n / 4;
+    float s = 0.f;
+    for (uint i = tid; i < n4; i += 256) { float4 v = row[i]; s += v.x + v.y + v.z + v.w; }
+    float mean = dit_tg_sum(s, sg, lane, red) / float(p.n);
+    float ss = 0.f;
+    for (uint i = tid; i < n4; i += 256) { float4 v = row[i] - mean; ss += dot(v, v); }
+    float inv = 1.0f / sqrt(dit_tg_sum(ss, sg, lane, red2) / float(p.n) + p.eps);
+#define FLUX_LN(i) ((row[i] - mean) * inv * (1.0f + sc4[i]) + sh4[i])
+    float m = 0.f;
+    for (uint i = tid; i < n4; i += 256) { float4 v = abs(FLUX_LN(i)); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
+    m = dit_tg_max(m, sg, lane, red3);
+    float sinv, sc = dit_row_scale(m, sinv);
+    device half4* o = (device half4*)(out + (ulong)r * p.n);
+    for (uint i = tid; i < n4; i += 256) o[i] = half4(FLUX_LN(i) * sc);
+    if (tid == 0) rs[r] = sinv;
+#undef FLUX_LN
+}
+
+// Attention operands of 128-wide heads: head h of row r from src (rows ld_src floats apart) plus
+// a bias, RMS-normed with weight w (with `norm`), rotated by interleaved pairs (dims 2i, 2i + 1 by
+// the row's angle i, tables of 64 per row; with `rope`), into dst rows of heads * 128 (half or
+// f32). Rows below `split` take weights / biases A, the others B. One SIMD-group per
+// (row, head), lane l holding dims 4 l .. 4 l + 3.
+struct FHD { uint ld_src; uint norm; uint rope; uint out_half; float eps; uint heads; uint split; uint has_bias; };
+kernel void flux_heads(device const float* src [[buffer(0)]], device void* dst [[buffer(1)]],
+                       device const float* wa [[buffer(2)]], device const float* wb [[buffer(3)]],
+                       device const float* ba [[buffer(4)]], device const float* bb [[buffer(5)]],
+                       device const float* cs [[buffer(6)]], device const float* sn [[buffer(7)]], constant FHD& p [[buffer(8)]],
+                       uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint r = tg.x, h = tg.y;
+    bool a = r < p.split;
+    float4 x = *(device const float4*)(src + (ulong)r * p.ld_src + h * 128 + lane * 4);
+    if (p.has_bias != 0) x += *(device const float4*)((a ? ba : bb) + h * 128 + lane * 4);
+    if (p.norm != 0) {
+        float ss = simd_sum(dot(x, x));
+        float inv = 1.0f / sqrt(ss / 128.0f + p.eps);
+        x = x * inv * *(device const float4*)((a ? wa : wb) + lane * 4);
+    }
+    if (p.rope != 0) {
+        float2 c = *(device const float2*)(cs + (ulong)r * 64 + lane * 2);
+        float2 s = *(device const float2*)(sn + (ulong)r * 64 + lane * 2);
+        x = float4(x.x * c.x - x.y * s.x, x.y * c.x + x.x * s.x, x.z * c.y - x.w * s.y, x.w * c.y + x.z * s.y);
+    }
+    ulong o = (ulong)r * p.heads * 128 + h * 128 + lane * 4;
+    if (p.out_half != 0) *(device half4*)((device half*)dst + o) = half4(x);
+    else *(device float4*)((device float*)dst + o) = x;
+}
+
+// GELU-tanh of rows of n (+ bias) into scaled half rows. 256 threads per row.
+inline float4 flux_gelu4(float4 x) { return x / (1.0f + exp(-1.5957691f * (x + 0.044715f * x * x * x))); }
+struct FGE { uint n; uint has_bias; uint _p0; uint _p1; };
+kernel void flux_gelu_half(device const float* x [[buffer(0)]], device const float* b [[buffer(1)]], device half* out [[buffer(2)]],
+                           device float* rs [[buffer(3)]], constant FGE& p [[buffer(4)]],
+                           uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    device const float4* row = (device const float4*)(x + (ulong)r * p.n);
+    device const float4* b4 = (device const float4*)b;
+    uint n4 = p.n / 4;
+#define FLUX_GE(i) flux_gelu4(p.has_bias != 0 ? row[i] + b4[i] : row[i])
+    float m = 0.f;
+    for (uint i = tid; i < n4; i += 256) { float4 v = abs(FLUX_GE(i)); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
+    m = dit_tg_max(m, sg, lane, red);
+    float sinv, s = dit_row_scale(m, sinv);
+    device half4* o = (device half4*)(out + (ulong)r * p.n);
+    for (uint i = tid; i < n4; i += 256) o[i] = half4(FLUX_GE(i) * s);
+    if (tid == 0) rs[r] = sinv;
+#undef FLUX_GE
+}
+
+// Single-block projection input: row r of [a (rows of na) | gelu_tanh(g + bias) (rows of ng)]
+// into scaled half rows of na + ng. 256 threads per row.
+struct FCT { uint na; uint ng; uint has_bias; uint _p0; };
+kernel void flux_cat_half(device const float* a [[buffer(0)]], device const float* g [[buffer(1)]], device const float* b [[buffer(2)]],
+                          device half* out [[buffer(3)]], device float* rs [[buffer(4)]], constant FCT& p [[buffer(5)]],
+                          uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    device const float4* ar = (device const float4*)(a + (ulong)r * p.na);
+    device const float4* gr = (device const float4*)(g + (ulong)r * p.ng);
+    device const float4* b4 = (device const float4*)b;
+    uint na4 = p.na / 4, ng4 = p.ng / 4;
+#define FLUX_CG(i) flux_gelu4(p.has_bias != 0 ? gr[i] + b4[i] : gr[i])
+    float m = 0.f;
+    for (uint i = tid; i < na4; i += 256) { float4 v = abs(ar[i]); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
+    for (uint i = tid; i < ng4; i += 256) { float4 v = abs(FLUX_CG(i)); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
+    m = dit_tg_max(m, sg, lane, red);
+    float sinv, s = dit_row_scale(m, sinv);
+    device half4* o = (device half4*)(out + (ulong)r * (p.na + p.ng));
+    for (uint i = tid; i < na4; i += 256) o[i] = half4(ar[i] * s);
+    for (uint i = tid; i < ng4; i += 256) o[na4 + i] = half4(FLUX_CG(i) * s);
+    if (tid == 0) rs[r] = sinv;
+#undef FLUX_CG
+}
+
+// h[r][c] += gate[c] * (y[r][c] + bias[c]) over rows of n.
+struct FGA { uint n; uint has_bias; uint _p0; uint _p1; };
+kernel void flux_gated_add(device float* h [[buffer(0)]], device const float* y [[buffer(1)]], device const float* g [[buffer(2)]],
+                           device const float* b [[buffer(3)]], constant FGA& p [[buffer(4)]],
+                           uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    uint c = (tg.x * 256 + tid) * 4, r = tg.y;
+    if (c >= p.n) return;
+    device float4* hp = (device float4*)(h + (ulong)r * p.n + c);
+    float4 v = *(device const float4*)(y + (ulong)r * p.n + c);
+    if (p.has_bias != 0) v += *(device const float4*)(b + c);
+    *hp += *(device const float4*)(g + c) * v;
+}

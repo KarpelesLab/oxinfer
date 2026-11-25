@@ -3622,6 +3622,10 @@ impl Backend for MetalBackend {
         self.dit_session_impl()
     }
 
+    fn flux_session(&'static self) -> Option<Box<dyn crate::gpu::dit::FluxSession>> {
+        self.flux_session_impl()
+    }
+
     fn attention_cached(&self, j: &mut crate::gpu::AttnJob) -> bool {
         self.attention_cached_impl(j)
     }

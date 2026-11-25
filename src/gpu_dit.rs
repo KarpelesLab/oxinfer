@@ -79,3 +79,70 @@ pub trait Session: Send {
     #[allow(clippy::too_many_arguments)]
     fn forward(&mut self, m: &Model, x: &[f32], image: usize, seqs: &[Seq], modv: &[f32], head: &[f32], out: &mut [Vec<f32>]) -> bool;
 }
+
+/// A FLUX.1 double-stream block (`crate::flux::transformer::DoubleBlock`): separate image and
+/// text weights, one joint attention.
+pub struct FluxDouble<'a> {
+    /// q, k, v of the image tokens, then of the text tokens.
+    pub img_qkv: [Lin<'a>; 3],
+    pub txt_qkv: [Lin<'a>; 3],
+    /// QK RMS norm weights: image q, image k, text q, text k.
+    pub norms: [&'a [f32]; 4],
+    pub img_out: Lin<'a>,
+    pub txt_out: Lin<'a>,
+    /// The GELU-tanh MLPs (up, down).
+    pub img_mlp: [Lin<'a>; 2],
+    pub txt_mlp: [Lin<'a>; 2],
+}
+
+/// A FLUX.1 single-stream block: q, k, v and the MLP input from one normalized input, the
+/// attention output and the activated MLP projected together.
+pub struct FluxSingle<'a> {
+    pub qkv: [Lin<'a>; 3],
+    pub mlp: Lin<'a>,
+    pub norms: [&'a [f32]; 2],
+    /// Reads `[attention (dim) | gelu(mlp)]`.
+    pub out: Lin<'a>,
+}
+
+/// A FLUX.1 transformer (`crate::flux::transformer::FluxTransformer`) as the device runs it:
+/// layer norms without weights (eps 1e-6) under the modulations, QK RMS norms (eps 1e-6),
+/// interleaved rotary pairs, GELU-tanh MLPs, a bias on every linear layer.
+pub struct FluxModel<'a> {
+    pub dim: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub x_emb: Lin<'a>,
+    pub ctx_emb: Lin<'a>,
+    pub doubles: Vec<FluxDouble<'a>>,
+    pub singles: Vec<FluxSingle<'a>>,
+    pub proj_out: Lin<'a>,
+    /// Attention with half-precision operands (else float32 ones).
+    pub half_attention: bool,
+}
+
+/// One FLUX.1 call: the packed latent tokens, the T5 states, the rotary tables and the
+/// modulations of this timestep.
+pub struct FluxInput<'a> {
+    /// `[n_img, x_emb.n_in]`.
+    pub img: &'a [f32],
+    pub n_img: usize,
+    /// `[n_txt, ctx_emb.n_in]`.
+    pub txt: &'a [f32],
+    pub n_txt: usize,
+    /// Per token of `[text; image]`: `head_dim / 2` angles' cosines (pair `i` = dims `2i, 2i + 1`),
+    /// then as many sines (two planes of `tokens * head_dim / 2`).
+    pub cos: &'a [f32],
+    pub sin: &'a [f32],
+    /// Per double block `[image: shift, scale, gate, shift, scale, gate | text: the same]`
+    /// (`12 dim`), then per single block `[shift, scale, gate]` (`3 dim`), then the head's
+    /// `[scale, shift]`.
+    pub mods: &'a [f32],
+}
+
+/// FLUX.1 passes on the device, activations kept in device buffers between blocks.
+pub trait FluxSession: Send {
+    /// The prediction `[n_img, proj_out.n_out]` (bias included) into `out`; false when the
+    /// device declined or failed (the caller then runs the CPU path).
+    fn forward(&mut self, m: &FluxModel, inp: &FluxInput, out: &mut Vec<f32>) -> bool;
+}
