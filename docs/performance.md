@@ -1510,6 +1510,73 @@ at load averages 2.5-7. tok/s, llama.cpp / oxinfer (best of 2; oxinfer f32 cache
 Decoding at 32k positions is 1.3-1.7x the f32 caches' and level with or ahead of llama.cpp;
 prefill is within 0.95-1.14x of it at 8k and 32k.
 
+#### Metal decode round 2 (November 2026)
+
+Plain greedy decoding (tg128, the device chain on) re-measured against llama.cpp master `de30697`
+(2026-11-25, Metal, `llama-bench -n 128 -p 0 -r 3`) and `parity_bench MODEL pp= tg=128 reps=3
+lookup=0 draft=none mtp=0` (best of 3), the three run back to back twice per model under the bench
+lock ("before" is master `e9de36f`, with the device chain). M5 Max at load averages 1.4-22 from
+other sessions' CPU jobs. tok/s, both rounds:
+
+| model | llama.cpp | before | after | after / llama.cpp |
+|---|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | 441 / 419 | 525.6 / 526.4 | 529.6 / 529.3 | 1.20-1.26 |
+| Llama-3.2-1B Q8_0 | 319 / 319 | 373.6 / 373.4 | 374.8 / 374.8 | 1.17 |
+| Orpheus 3B Q4_K_M (22 tokens) | 198.6 / 198.5 | 211.1 / 210.0 | 210.0 / 209.5 | 1.06 |
+| Qwen3-8B Q8_0 | 64.2 / 64.2 | 68.4 / 68.6 | 68.6 / 68.6 | 1.07 |
+| Qwen3-8B Q4_K_M | 99.8 / 99.3 | 108.2 / 108.2 | 108.1 / 108.2 | 1.08-1.09 |
+| Gemma 4 12B Q8_0 | 40.2 / 35.2 | 39.5 / 42.8 | 43.4 / 38.5 | 1.08-1.09 |
+| Qwen3.8-27B Q4_K_P (HauhauCS) | 23.2 / 23.5 | 23.1 / 24.0 | 24.1 / 24.5 | 1.04 |
+
+(Gemma 4 12B's runs moved by 10-20% within a round, other jobs holding the page cache; the 27B in
+a quieter window earlier: llama.cpp 26.7, before 30.3.) The 0.92-0.98x rows of the
+[llama-bench matrix](#llama-bench-matrix-november-2026) were from before the
+[Metal decode round](#metal-decode-round-november-2026) and the
+[device chain](#greedy-decoding-chained-on-the-device-november-2026): every row is now ahead.
+
+Where a chained pass's GPU time goes (`OXINFER_METAL_TRACE=1` now prints each chain's per-pass
+GPU time, and `OXINFER_DEC_ONLY` applies to chains; Llama-3.2-1B Q4_K_M, median us per pass of
+three 128-token runs, two sets): matvecs alone 1466-1509, + their barriers 1657-1661, + norms
+1779-1787, + attention 1902-1906, whole pass 1897-1913. The streaming bound of its weights is
+~1360.
+
+What changed:
+
+- **RoPE folded into the attention** (`dec_attnr_*`): one-token plans fuse a `QkRope` alone in
+  its stage into the `Attn` reading its queries. Each attention threadgroup ropes (and RMS-norms)
+  its query heads and its key head's new key and value with `qk_rope_body`'s arithmetic (the
+  norms' SIMD-group sums over the same 32 dimensions, added in the same order), keeps the new
+  rows as the cache holds them (half rows clamped) in threadgroup memory and reads them there for
+  the token's own position; one threadgroup per key head stores them in the device caches, split
+  0 stores the roped queries. A dispatch and a barrier fewer per layer. `pf_check` (64 greedy
+  tokens and every step's top-20 log-probabilities after 200 prompt tokens) gives byte-identical
+  files with and without it on Llama-3.2-1B, Qwen3-8B (q / k norms), Orpheus, Gemma 4 12B and
+  26B-A4B (value norms, shared KV layers, sliding windows) and Qwen3.8-27B (gated attention).
+  `dec_ab`, 60 alternated 24-token runs on Llama-3.2-1B: per-pass medians 1928 -> 1917 us (0.6%).
+  `OXINFER_DEC_ATTN_ROPE=0` keeps the separate op.
+- **IQ4_XS matvecs of their own** (`MV_IQ4` / `MVK_IQ4`): the non-linear values are looked up in a
+  threadgroup copy (lanes reading distinct entries of the constant table serialized), the
+  sub-block scale applied once to the dot. It had gone through the GEMM dequantizer at two rows
+  and 4 SIMD-groups; it now takes the K-quants' splits. Alone with a barrier after each, 17408 x
+  5120 471 -> 560 GB/s, 10240 x 5120 299 -> 550. HauhauCS's Q4_K_P has its FFN gates in IQ4_XS:
+  Qwen3.8-27B passes 33.8 -> 32.6 ms (min) and -1.2 ms paired median over 20 alternated runs.
+  The multi-token kernels use the same dot, so verification stays exact
+  (`decode_mvk_matches_single_token`).
+- `examples/dec_ab`: one engine per configuration (environment variables read as its plans are
+  built), their decode runs alternated in one process.
+
+Measured and dropped:
+
+- **Matvec splits by shape.** `decode_mv_bench` with a barrier after each matvec puts the 4- to
+  6-bit formats well ahead on fewer SIMD-groups a row for LM heads (Q6_K 128256 x 2048 461 -> 380
+  us on one SIMD-group, Q4_K 151936 x 4096 749 -> 640, Q4_0 262144 x 2816 971 -> 719), for Q4_K /
+  Q5_K SiLU pairs (12288 x 4096 131.5 -> 115.1 us, 17408 x 5120 250 -> 220) and for rows of 5120
+  (Q5_K 17408 x 5120 157 -> 116 us). None of it showed in passes: the Llama-3.2-1B head on one
+  SIMD-group, 40 alternated runs, 2019 against 2017 us per pass (matvecs alone 1527 / 1528); every
+  rule at once on Qwen3.8-27B, 20 alternated runs, 32.95 -> 33.15 ms. The isolated timings do not
+  predict a pass; `dec_ab` does.
+- A serial (not concurrent) compute encoder without barriers for the chain: no faster.
+
 #### M3 Ultra (November 2026)
 
 A Mac Studio with an M3 Ultra (24 performance and 8 efficiency cores, an 80-core GPU, 96 GB,
