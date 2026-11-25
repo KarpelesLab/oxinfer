@@ -34,6 +34,8 @@ final class OxinferEngine: @unchecked Sendable {
 
     static var version: String { String(cString: oxi_version()) }
     static var devices: String { takeString(oxi_devices()) ?? "" }
+    /// Degraded-mode warnings (a JSON array of strings, "[]" when none).
+    static var warnings: String { takeString(oxi_warnings()) ?? "[]" }
 
     /// Downloads `spec` ("org/name" or "org/name:QUANT") into `cacheDir`; returns the local path.
     static func download(_ spec: String, cacheDir: String?, progress: @escaping ProgressHandler) throws -> String {

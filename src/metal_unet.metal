@@ -152,8 +152,10 @@ kernel void un_im2col(device const half* x [[buffer(0)]], device half* out [[buf
 }
 
 // y = sum over taps of A[r + off[tap]] W_tap^T: half rows of `cin` (A), bf16 weights [n_out][ldw]
-// whose tap t is columns t cin .. (t + 1) cin. 128 rows x TN outputs per threadgroup (4
-// SIMD-groups), rows r0 + ... < r_end. Stores (omode):
+// whose tap t is columns t cin .. (t + 1) cin. TMR rows x 64 outputs per threadgroup (4
+// SIMD-groups; 128 x 128 tiles ran at 60-75% of this speed on every UNet shape measured, 64-row
+// ones gain where 128-row tiles leave the GPU's cores short of threadgroups), rows r0 + ... <
+// r_end. Stores (omode):
 //   0 f32 rows ldy wide, row r (compact: image r / nimg);
 //   1 f32 padded rows of geometry g from compact rows (image b's pixel q);
 //   2 f32 padded rows from padded rows (borders stored as zeros);
@@ -161,14 +163,14 @@ kernel void un_im2col(device const half* x [[buffer(0)]], device half* out [[buf
 // With bias: + bias[b * bstride + o]; with add: + addb at the destination's index (addb may be y).
 struct UG { uint n_out; uint ldw; uint cin; uint taps; int off[9]; uint a_rows; uint r0; uint r_end; uint omode; uint ldy;
             uint has_bias; uint bstride; uint add; uint nimg; uint dh; uint dhp; UGEO g; uint scaled; uint _p0; uint _p1; uint _p2; };
-template <int TN>
+template <int TMR, int TN = 64>
 inline void un_gemm_body(device const bfloat* w, device const half* xh, device float* y, device const float* bias, device const float* addb,
                          device const uint* amax, constant UG& p, uint2 tg) {
     float inv = p.scaled != 0 ? 1.0f / un_scale(amax[0]) : 1.0f;
-    uint o0 = tg.x * TN, t0 = p.r0 + tg.y * 128;
+    uint o0 = tg.x * TN, t0 = p.r0 + tg.y * TMR;
     int nop = int(p.n_out + TN - 1) / TN * TN;
     XT X((device half*)xh, dextents<int32_t, 2>(p.cin, p.a_rows));
-    constexpr auto desc = matmul2d_descriptor(128, TN, static_cast<int>(dynamic_extent), false, true, false,
+    constexpr auto desc = matmul2d_descriptor(TMR, TN, static_cast<int>(dynamic_extent), false, true, false,
                                               matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroups<4>> op;
     array<int32_t, 2> ws = { 1, int32_t(p.ldw) };
@@ -215,12 +217,12 @@ inline void un_gemm_body(device const bfloat* w, device const half* xh, device f
         *d = v;
     }
 }
-#define UN_GEMM(NAME, TN) \
+#define UN_GEMM(NAME, TMR) \
 kernel void NAME(device const bfloat* w [[buffer(0)]], device const half* xh [[buffer(1)]], device float* y [[buffer(2)]], \
                  device const float* bias [[buffer(3)]], constant UG& p [[buffer(4)]], device const float* addb [[buffer(5)]], \
                  device const uint* amax [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]]) { \
-    un_gemm_body<TN>(w, xh, y, bias, addb, amax, p, tg); }
-UN_GEMM(un_gemm64, 64) UN_GEMM(un_gemm128, 128)
+    un_gemm_body<TMR>(w, xh, y, bias, addb, amax, p, tg); }
+UN_GEMM(un_gemm, 128) UN_GEMM(un_gemm_m64, 64)
 
 // Layer norm of f32 rows of c (c % 4 == 0, c <= 2048) into half rows. One SIMD-group per row.
 struct ULN { uint c; uint rows; float eps; uint _p; };
@@ -292,14 +294,20 @@ kernel void un_concat(device const float* a [[buffer(0)]], device const float* b
 // Heads wider than 160 (a VAE's single head of 512) split their values and outputs into DV-wide
 // chunks, a threadgroup each (the scores computed once per chunk): grid y is heads x D / DV.
 #define UN_SLD 68
-#define UN_PLD 72
-// Probabilities go to half scaled by 2^15: with thousands of keys most are far below half's
-// smallest normal (6e-5), where they would lose their precision; the sums divide it out.
-#define UN_PSCALE 32768.0f
+#define UN_PLD (2 * UN_SLD)
+// Scores are in base 2 (the scale times log2(e), exp2). The running row maximum moves only
+// when a block's scores pass it by more than UN_LAZY (probabilities then stay below 2^UN_LAZY),
+// and the output's rescaling is skipped for key blocks where no row of the threadgroup moved.
+// Probabilities go to half scaled by 2^10: with thousands of keys most are far below half's
+// smallest normal (6e-5), where they would lose their precision; the sums divide it out
+// (2^UN_LAZY * UN_PSCALE stays inside half's range).
+#define UN_LAZY 5.0f
+#define UN_PSCALE 1024.0f
 struct UFA { uint tq; uint tk; uint qs; uint ks; uint heads; uint dh; uint o_ld; float scale; };
 template <int D, int DV>
 inline void un_flash_body(device const half* q, device const half* k, device const half* v, device half* o, constant UFA& p,
-                          threadgroup float* S, threadgroup half* P, threadgroup float* A, threadgroup float* L, uint3 tg, uint tid) {
+                          threadgroup float* S, threadgroup half* P, threadgroup float* A, threadgroup float* L,
+                          threadgroup uint* RS, uint3 tg, uint tid) {
     uint q0 = tg.x * 64, h = tg.y / (D / DV), vc = (tg.y % (D / DV)) * DV, z = tg.z;
     int ld = int(p.heads) * D;
     int qrows = int(p.qs) * int(z) + int(q0) + 64, krows = int(p.ks) * int(z) + int(p.tk + 63) / 64 * 64;
@@ -321,6 +329,9 @@ inline void un_flash_body(device const half* q, device const half* k, device con
     zero(co);
     uint r = tid / 2, part = tid % 2;
     float m = -INFINITY, l = 0.0f;
+    float sl2 = p.scale * 1.44269504f;
+    threadgroup uint& rescale = RS[0];
+    if (tid == 0) rescale = 0;
     for (uint kb = 0; kb < p.tk; kb += 64) {
         auto kt = Kt.template slice<D, 64>(h * D, kr0 + kb);
         auto cs = ops.template get_destination_cooperative_tensor<decltype(qa), decltype(kt), float>();
@@ -332,25 +343,30 @@ inline void un_flash_body(device const half* q, device const half* k, device con
         float bm = -INFINITY;
         for (uint j = 0; j < 32; j++) {
             uint col = part * 32 + j;
-            x[j] = kb + col < p.tk ? S[r * UN_SLD + col] * p.scale : -INFINITY;
+            x[j] = kb + col < p.tk ? S[r * UN_SLD + col] * sl2 : -INFINITY;
             bm = max(bm, x[j]);
         }
         bm = max(bm, simd_shuffle_xor(bm, 1));
-        float mn = max(m, bm);
-        float alpha = exp(m - mn);
+        bool grow = bm > m + UN_LAZY;
+        float mn = grow ? bm : m;
+        float alpha = grow ? exp2(m - mn) : 1.0f;
+        if (grow) rescale = 1;
         float ps = 0.0f;
-        for (uint j = 0; j < 32; j++) { float e = exp(x[j] - mn); P[r * UN_PLD + part * 32 + j] = half(e * UN_PSCALE); ps += e; }
+        for (uint j = 0; j < 32; j++) { float e = exp2(x[j] - mn); P[r * UN_PLD + part * 32 + j] = half(e * UN_PSCALE); ps += e; }
         ps += simd_shuffle_xor(ps, 1);
         l = l * alpha + ps;
         m = mn;
         if (part == 0) A[r] = alpha;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (rescale != 0) {
 #pragma unroll
-        for (uint16_t i = 0; i < co.get_capacity(); ++i)
-            if (co.is_valid_element(i)) { auto idx = co.get_multidimensional_index(i); co[i] *= A[idx[1]]; }
+            for (uint16_t i = 0; i < co.get_capacity(); ++i)
+                if (co.is_valid_element(i)) { auto idx = co.get_multidimensional_index(i); co[i] *= A[idx[1]]; }
+        }
         auto vt = Vt.template slice<DV, 64>(h * D + vc, kr0 + kb);
         opo.run(Pt, vt, co);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) rescale = 0;
     }
     if (part == 0) L[r] = 1.0f / (l * UN_PSCALE);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -366,8 +382,9 @@ inline void un_flash_body(device const half* q, device const half* k, device con
 kernel void NAME(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]], device const half* v [[buffer(2)]], \
                         device half* o [[buffer(3)]], constant UFA& p [[buffer(4)]], \
                         uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
-    threadgroup float S[64 * UN_SLD]; threadgroup half P[64 * UN_PLD]; threadgroup float A[64]; threadgroup float L[64]; \
-    un_flash_body<D, DV>(q, k, v, o, p, S, P, A, L, tg, tid); }
+    threadgroup float S[64 * UN_SLD]; threadgroup half* P = (threadgroup half*)S; threadgroup float A[64]; threadgroup float L[64]; \
+    threadgroup uint RS[1]; \
+    un_flash_body<D, DV>(q, k, v, o, p, S, P, A, L, RS, tg, tid); }
 UN_FLASH(un_flash48, 48, 48) UN_FLASH(un_flash64, 64, 64) UN_FLASH(un_flash80, 80, 80) UN_FLASH(un_flash96, 96, 96) UN_FLASH(un_flash128, 128, 128) UN_FLASH(un_flash160, 160, 160)
 UN_FLASH(un_flash512, 512, 128)
 

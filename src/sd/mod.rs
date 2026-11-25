@@ -542,6 +542,15 @@ impl Pipeline {
             _ => noise.iter().map(|&v| v * init as f32).collect(),
         };
         let zeros = vec![0f32; n * lc];
+        // The UNet keeps the text's cross-attention keys and values for the steps (per-op path;
+        // the device plan keeps its own); dropped when the generation ends, however it ends.
+        struct ClearText<'a>(&'a unet::Unet);
+        impl Drop for ClearText<'_> {
+            fn drop(&mut self) {
+                self.0.clear_text_cache();
+            }
+        }
+        let _clear = ClearText(&self.unet);
         for i in start..steps {
             let (t, sigma, next) = (timesteps[i], sigmas[i], sigmas[i + 1]);
             let s = Schedule::scale_input(sigma);

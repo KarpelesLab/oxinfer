@@ -10,7 +10,8 @@ kernel void dit_flash128_hilo(device const half* q [[buffer(0)]], device const h
                               device const half* ql [[buffer(5)]], device const half* kl [[buffer(6)]],
                               uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float S[64 * 64];
-    threadgroup half P[64 * 64];
+    // Probabilities over the scores (as flash_attn128_body): rows of 128 halves.
+    threadgroup half* P = (threadgroup half*)S;
     threadgroup float A[64];
     threadgroup float L[64];
     threadgroup uint rescale;
@@ -22,7 +23,7 @@ kernel void dit_flash128_hilo(device const half* q [[buffer(0)]], device const h
     tensor<device half, dextents<int32_t, 2>, tensor_inline> Klt((device half*)kl, dextents<int32_t, 2>(p.d, tkp));
     tensor<device half, dextents<int32_t, 2>, tensor_inline> Vt((device half*)v, dextents<int32_t, 2>(p.d, tkp));
     tensor<threadgroup float, extents<int32_t, 64, 64>, tensor_inline> St(S, extents<int32_t, 64, 64>());
-    tensor<threadgroup half, extents<int32_t, 64, 64>, tensor_inline> Pt(P, extents<int32_t, 64, 64>());
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> Pt(P, dextents<int32_t, 2>(64, 64), array<int32_t, 2>{1, 128});
     constexpr auto ds = matmul2d_descriptor(64, 64, 128, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
     constexpr auto dov = matmul2d_descriptor(64, 128, 64, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<ds, execution_simdgroups<4>> ops;
@@ -59,7 +60,7 @@ kernel void dit_flash128_hilo(device const half* q [[buffer(0)]], device const h
         float alpha = grow ? exp(m - mn) : 1.0f;
         if (grow) rescale = 1;
         float ps = 0.0f;
-        for (uint j = 0; j < 32; j++) { float e = exp(x[j] - mn); P[r * 64 + part * 32 + j] = half(e); ps += e; }
+        for (uint j = 0; j < 32; j++) { float e = exp(x[j] - mn); P[r * 128 + part * 32 + j] = half(e); ps += e; }
         ps += simd_shuffle_xor(ps, 1);
         l = l * alpha + ps;
         m = mn;

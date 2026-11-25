@@ -283,10 +283,26 @@ fn pass_matches_reference() {
         })
         .collect();
     let mut out = vec![Vec::new(); nb];
-    // Twice: the second pass reuses the session's buffers.
-    for _ in 0..2 {
-        assert!(sess.forward(&g, &items, &mut out), "device pass failed");
-    }
+    // Twice: the second pass reuses the session's buffers and the text keys / values the first
+    // one computed, bit for bit the same output.
+    assert!(sess.forward(&g, &items, &mut out), "device pass failed");
+    let first = out.clone();
+    assert!(sess.forward(&g, &items, &mut out), "device pass failed");
+    assert!(first == out, "the cached cross-attention keys / values changed the output");
+    // Other contexts recompute them (a different output), and the first ones again give the
+    // first output.
+    let ctx2: Vec<Vec<f32>> = ctx.iter().map(|c| c.iter().map(|v| v * 0.5).collect()).collect();
+    let items2: Vec<Item> = (0..nb)
+        .map(|b| Item {
+            latent: &lat[b],
+            ctx: &ctx2[b],
+            ctx_len: m,
+        })
+        .collect();
+    assert!(sess.forward(&g, &items2, &mut out), "device pass failed");
+    assert!(first != out, "new contexts must not reuse the old keys / values");
+    assert!(sess.forward(&g, &items, &mut out), "device pass failed");
+    assert!(first == out, "back to the first contexts: not the first output");
     for b in 0..nb {
         let mut t1 = conv(&n1.apply(&lat[b], c0, 8, true), h, w, c0, &wc1, 3, 1, 1);
         for r in t1.chunks_mut(c) {
@@ -337,5 +353,122 @@ fn pass_matches_reference() {
         add(&mut t6, &t5);
         let e = rel(&out[b], &t6);
         assert!(e < 3e-3, "image {b}: rel L2 {e:.2e}");
+    }
+}
+
+/// GEMM kernel timings over UNet shapes (`cargo test --release --lib un_gemm_bench -- --ignored --nocapture`).
+#[test]
+#[ignore]
+fn un_gemm_bench() {
+    let Ok(b) = MetalBackend::new() else { return };
+    if b.mma().is_none_or(|m| !m.units) {
+        return;
+    }
+    let be: &'static MetalBackend = Box::leak(Box::new(b));
+    let f = Fns::new(be);
+    let pipe = |n: &str| be.named_pipeline(n).unwrap();
+    let names = std::env::var("UN_BENCH_KERNELS").unwrap_or("un_gemm,un_gemm_m64".into());
+    // UN_BENCH_SHAPES=rows:cin:n_out:taps,...
+    let shapes: Vec<(usize, usize, usize, usize)> = match std::env::var("UN_BENCH_SHAPES") {
+        Ok(v) => v
+            .split(',')
+            .map(|s| {
+                let n: Vec<usize> = s.split(':').map(|x| x.parse().unwrap()).collect();
+                (n[0], n[1], n[2], n[3])
+            })
+            .collect(),
+        Err(_) => vec![
+            (8192, 320, 320, 9),
+            (8192, 320, 2560, 1),
+            (8192, 1280, 320, 1),
+            (2048, 640, 640, 9),
+            (2048, 640, 5120, 1),
+            (512, 1280, 1280, 9),
+            (200, 1280, 1280, 9),
+            (648, 1280, 1280, 9),
+            (32768, 320, 320, 9),
+            (8192, 640, 640, 9),
+        ],
+    };
+    for &(rows, cin, nout, taps) in &shapes {
+        let mut bx = DBuf::empty();
+        let mut bw = DBuf::empty();
+        let mut by = DBuf::empty();
+        let mut bz = DBuf::empty();
+        let a_rows = rows + 256;
+        assert!(ensure(be, &mut bx, a_rows * cin * 2));
+        assert!(ensure(be, &mut bw, nout * cin * taps * 2 + 4096));
+        assert!(ensure(be, &mut by, rows * nout * 4));
+        assert!(ensure(be, &mut bz, 4096));
+        let mut off = [0i32; 9];
+        for (t, o) in off.iter_mut().enumerate().take(taps) {
+            *o = t as i32 * 3;
+        }
+        let p = Ug {
+            n_out: nout as u32,
+            ldw: (cin * taps) as u32,
+            cin: cin as u32,
+            taps: taps as u32,
+            off,
+            a_rows: a_rows as u32,
+            r0: 0,
+            r_end: rows as u32,
+            omode: 0,
+            ldy: nout as u32,
+            has_bias: 0,
+            bstride: 0,
+            add: 0,
+            nimg: rows as u32,
+            dh: 0,
+            dhp: 0,
+            g: Geo::default(),
+            scaled: 0,
+            _p: [0; 3],
+        };
+        let flop = 2.0 * rows as f64 * cin as f64 * taps as f64 * nout as f64;
+        for name in names.split(',') {
+            let pp = pipe(name);
+            let tn = if name.contains("_n128") {
+                128
+            } else if name.contains("_n32") {
+                32
+            } else {
+                64
+            };
+            let tmr = if name.contains("_m64") {
+                64
+            } else if name.contains("_m32") {
+                32
+            } else {
+                128
+            };
+            let reps = 20;
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let parts = [std::ops::Range { start: 0, end: reps }];
+                let (ok, _) = run_concurrent(be, &f, &parts, |e, r| {
+                    for _ in r {
+                        e.pipe(pp);
+                        e.buf(bw.id, 0, 0);
+                        e.buf(bx.id, 0, 1);
+                        e.buf(by.id, 0, 2);
+                        e.buf(bz.id, 0, 3);
+                        e.bytes(&p, 4);
+                        e.buf(by.id, 0, 5);
+                        e.buf(bz.id, 0, 6);
+                        e.dispatch((nout.div_ceil(tn), rows.div_ceil(tmr)), 128);
+                        e.barrier();
+                    }
+                });
+                assert!(ok);
+                best = best.min(t.elapsed().as_secs_f64() / reps as f64);
+            }
+            eprintln!(
+                "{rows:6} x {cin:5} x{taps} -> {nout:5}: {name:14} {:7.3} ms {:6.1} TFLOP/s",
+                best * 1e3,
+                flop / best / 1e12
+            );
+        }
     }
 }

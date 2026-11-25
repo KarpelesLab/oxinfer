@@ -48,8 +48,9 @@ struct Pipes {
     fin: Id,
     prep: Id,
     im2col: Id,
-    gemm64: Id,
-    gemm128: Id,
+    /// GEMMs over 128-row and 64-row tiles (64 outputs wide).
+    gemm: Id,
+    gemm_m64: Id,
     ln: Id,
     geglu: Id,
     concat: Id,
@@ -83,11 +84,8 @@ enum S {
     Ctx,
     /// The largest magnitude of a convolution's raw input (float bits).
     Amax,
-    /// Its keys and values.
-    Ck,
-    Cv,
 }
-const NS: usize = 17;
+const NS: usize = 15;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -188,6 +186,14 @@ pub(crate) struct MetalUnet {
     scratch: Vec<DBuf>,
     /// Physical buffers of the graph's tensors (assigned by liveness each pass).
     slots: Vec<DBuf>,
+    /// The cross-attention keys and values of every transformer block (keys then values, in
+    /// the graph's order), as half heads: they depend on the text contexts only, so they are
+    /// computed by the first pass that sees a batch of contexts and read by the passes after it
+    /// (the other steps of a generation) as long as the contexts stay the same.
+    kv: Vec<DBuf>,
+    /// The contexts (half bits, every image of the batch, `ctx_len` and the batch size
+    /// first) that `kv` holds; empty when it holds nothing valid.
+    kv_key: Vec<u16>,
 }
 
 // SAFETY: the session is used by one thread at a time (`&mut self`); the Objective-C objects
@@ -204,8 +210,8 @@ impl MetalBackend {
             fin: pipe("un_gn_fin")?,
             prep: pipe("un_prep")?,
             im2col: pipe("un_im2col")?,
-            gemm64: pipe("un_gemm64")?,
-            gemm128: pipe("un_gemm128")?,
+            gemm: pipe("un_gemm")?,
+            gemm_m64: pipe("un_gemm_m64")?,
             ln: pipe("un_ln")?,
             geglu: pipe("un_geglu")?,
             concat: pipe("un_concat")?,
@@ -228,6 +234,8 @@ impl MetalBackend {
             p,
             scratch: (0..NS).map(|_| DBuf::empty()).collect(),
             slots: Vec::new(),
+            kv: Vec::new(),
+            kv_key: Vec::new(),
         }))
     }
 }
@@ -235,7 +243,7 @@ impl MetalBackend {
 impl Drop for MetalUnet {
     fn drop(&mut self) {
         let void: MsgVoid = self.be.o.msg_send();
-        for b in self.scratch.iter().chain(&self.slots) {
+        for b in self.scratch.iter().chain(&self.slots).chain(&self.kv) {
             if !b.id.is_null() {
                 unsafe { void(b.id, self.be.sels.release) };
             }
@@ -387,6 +395,8 @@ impl Session for MetalUnet {
         }
         let mp = m.next_multiple_of(64);
         let mut need = Need::default();
+        // Bytes of each transformer block's cross-attention keys (and of its values).
+        let mut kv_bytes: Vec<usize> = Vec::new();
         let mut consts = Consts {
             v: Vec::new(),
             at: HashMap::new(),
@@ -537,8 +547,7 @@ impl Session for MetalUnet {
                         need.at_least(S::Q, rows * w1.max(w2) * 2);
                         need.at_least(S::K, rows * w1 * 2);
                         need.at_least(S::V, rows * w1 * 2);
-                        need.at_least(S::Ck, (nb * mp + 64) * w2 * 2);
-                        need.at_least(S::Cv, (nb * mp + 64) * w2 * 2);
+                        kv_bytes.push((nb * mp + 64) * w2 * 2);
                         let inner = b.ff2.n_in;
                         if b.ff1.n_in != c || b.ff1.n_out != 2 * inner || b.ff2.n_out != c || !inner.is_multiple_of(64) {
                             return false;
@@ -639,6 +648,34 @@ impl Session for MetalUnet {
                 return false;
             }
         }
+        // The contexts as half rows, and whether the keys and values of the last pass are theirs.
+        let cd = g.ctx_dim;
+        let mut key: Vec<u16> = Vec::new();
+        if cross {
+            key.reserve(2 + nb * m * cd);
+            key.extend([nb as u16, m as u16]);
+            for it in items {
+                key.extend(it.ctx.iter().map(|&s| half::f16::from_f32(s).to_bits()));
+            }
+        }
+        while self.kv.len() < 2 * kv_bytes.len() {
+            self.kv.push(DBuf::empty());
+        }
+        let mut kv_cached = cross && !kv_bytes.is_empty() && key == self.kv_key;
+        for (i, &bytes) in kv_bytes.iter().enumerate() {
+            for b in &mut self.kv[2 * i..2 * i + 2] {
+                let had = b.cap >= bytes && !b.id.is_null();
+                if !ensure(be, b, bytes) {
+                    self.kv_key.clear();
+                    return false;
+                }
+                kv_cached &= had;
+            }
+        }
+        // Until this pass completes, nothing valid (it rewrites them when not cached).
+        if !kv_cached {
+            self.kv_key.clear();
+        }
         // Inputs: the latents into the input tensor's padded rows, the contexts as half rows.
         let li = lay(ih, iw, nb);
         // SAFETY: the buffers were sized above; the device is idle (the last pass was waited for).
@@ -653,15 +690,11 @@ impl Session for MetalUnet {
                     std::ptr::copy_nonoverlapping(it.latent.as_ptr().add(y * iw * ic), xp.add(r * ic), iw * ic);
                 }
             }
-            if need.0[S::Ctx as usize] > 0 {
+            if need.0[S::Ctx as usize] > 0 && !kv_cached {
                 let ch = self.f.contents(self.scratch[S::Ctx as usize].id) as *mut u16;
-                let cd = g.ctx_dim;
                 std::ptr::write_bytes(ch, 0, (nb * mp + 64) * cd);
-                for (b, it) in items.iter().enumerate() {
-                    let dst = std::slice::from_raw_parts_mut(ch.add(b * mp * cd), m * cd);
-                    for (d, &s) in dst.iter_mut().zip(it.ctx) {
-                        *d = half::f16::from_f32(s).to_bits();
-                    }
+                for b in 0..nb {
+                    std::ptr::copy_nonoverlapping(key.as_ptr().add(2 + b * m * cd), ch.add(b * mp * cd), m * cd);
                 }
             }
         }
@@ -670,6 +703,15 @@ impl Session for MetalUnet {
             .iter()
             .map(|&s| if s == usize::MAX { std::ptr::null_mut() } else { self.slots[s].id })
             .collect();
+        // The first cross-attention block of each op (its keys and values at kv[2 i], kv[2 i + 1]).
+        let mut kv_base = Vec::with_capacity(g.ops.len());
+        let mut nblk = 0;
+        for op in &g.ops {
+            kv_base.push(nblk);
+            if let Op::Transformer { t, .. } = op {
+                nblk += t.blocks.len();
+            }
+        }
         let cx = Cx {
             p: &self.p,
             sc,
@@ -680,18 +722,28 @@ impl Session for MetalUnet {
             mp,
             consts: &consts,
             nobar: std::cell::Cell::new(false),
+            kv: self.kv.iter().map(|b| b.id).collect(),
+            kv_cached,
         };
         let nops = g.ops.len();
         let parts: Vec<std::ops::Range<usize>> = (0..nops.div_ceil(OPS_PER_CB).max(1))
             .map(|c| c * OPS_PER_CB..((c + 1) * OPS_PER_CB).min(nops))
             .collect();
-        let (ok, _) = run_concurrent(be, &self.f, &parts, |e, range| {
+        let (ok, gpu_s) = run_concurrent(be, &self.f, &parts, |e, range| {
             for i in range {
-                cx.op(e, &g.ops[i]);
+                cx.op(e, &g.ops[i], kv_base[i]);
             }
         });
         if !ok {
             return false;
+        }
+        if gpu_s > 0.0 && std::env::var_os("OXINFER_UNET_TIME").is_some() {
+            // Profiling (with OXINFER_PF_PROFILE, which times the command buffers): the pass's
+            // GPU span, from the first command buffer's start to the last one's end.
+            eprintln!("[unet pass: {nb} images, {} ops, GPU {:.2} ms]", g.ops.len(), gpu_s * 1e3);
+        }
+        if cross && !kv_cached && !skip("qkv") {
+            self.kv_key = key;
         }
         let [oh, ow, oc] = g.tensors[g.output];
         let lo = lay(oh, ow, nb);
@@ -720,6 +772,10 @@ struct Cx<'c, 'g> {
     consts: &'c Consts,
     /// The next GEMM needs no barrier after it (independent GEMMs reading the same input).
     nobar: std::cell::Cell<bool>,
+    /// Every cross-attention block's keys and values ([`MetalUnet::kv`]), and whether they
+    /// already hold this batch's (else the pass computes them).
+    kv: Vec<Id>,
+    kv_cached: bool,
 }
 
 /// The store of a GEMM.
@@ -772,10 +828,13 @@ impl Cx<'_, '_> {
             return;
         }
         let mw = metal_w(w).unwrap();
-        let (tn, pipe) = if w.n_out.is_multiple_of(128) {
-            (128, self.p.gemm128)
+        // 128-row tiles, or 64-row ones where those would leave the GPU's cores with too few
+        // threadgroups (fewer than 128: the lowest UNet levels, the text's keys and values).
+        let n_rows = rows.1 - rows.0;
+        let (tn, tm, pipe) = if n_rows.div_ceil(TM) * w.n_out.div_ceil(64) < 128 {
+            (64, 64, self.p.gemm_m64)
         } else {
-            (64, self.p.gemm64)
+            (64, TM, self.p.gemm)
         };
         let mut off = [0i32; 9];
         off[..offs.len()].copy_from_slice(offs);
@@ -815,7 +874,7 @@ impl Cx<'_, '_> {
         e.bytes(&p, 4);
         e.buf(add.unwrap_or(y), 0, 5);
         e.buf(self.sc(S::Amax), 0, 6);
-        e.dispatch((w.n_out.div_ceil(tn), (rows.1 - rows.0).div_ceil(TM)), 128);
+        e.dispatch((w.n_out.div_ceil(tn), n_rows.div_ceil(tm)), 128);
         if !self.nobar.replace(false) {
             e.barrier();
         }
@@ -988,7 +1047,7 @@ impl Cx<'_, '_> {
         e.barrier();
     }
 
-    fn op(&self, e: &FastEnc, op: &Op) {
+    fn op(&self, e: &FastEnc, op: &Op, kv_base: usize) {
         let nb = self.nb;
         match op {
             Op::Conv {
@@ -1092,7 +1151,7 @@ impl Cx<'_, '_> {
                 e.dispatch(((rows * (ca + cb) / 4).div_ceil(256), 1), 256);
                 e.barrier();
             }
-            Op::Transformer { x, out, t } => self.transformer(e, *x, *out, t),
+            Op::Transformer { x, out, t } => self.transformer(e, *x, *out, t, kv_base),
             Op::Attention { x, out, norm, a } => {
                 let [h, wd, c] = self.g.tensors[*x];
                 let l = lay(h, wd, nb);
@@ -1130,7 +1189,7 @@ impl Cx<'_, '_> {
         }
     }
 
-    fn transformer(&self, e: &FastEnc, x: usize, out: usize, t: &Transformer) {
+    fn transformer(&self, e: &FastEnc, x: usize, out: usize, t: &Transformer, kv_base: usize) {
         let nb = self.nb;
         let [h, wd, c] = self.g.tensors[x];
         let l = lay(h, wd, nb);
@@ -1160,7 +1219,8 @@ impl Cx<'_, '_> {
         let (hn, qb, kb, vb, ah) = (self.sc(S::Hn), self.sc(S::Q), self.sc(S::K), self.sc(S::V), self.sc(S::Ah));
         let cd = self.g.ctx_dim;
         let crows = nb * self.mp;
-        for b in &t.blocks {
+        for (bi, b) in t.blocks.iter().enumerate() {
+            let (ck, cv) = (self.kv[2 * (kv_base + bi)], self.kv[2 * (kv_base + bi) + 1]);
             // Self-attention.
             let dh = c / b.a1.heads;
             let dhp = head_pad(dh).unwrap();
@@ -1179,15 +1239,19 @@ impl Cx<'_, '_> {
             let ld = b.a2.heads * dhp;
             self.ln(e, rows, c, &b.n2);
             let o = Out::Heads { y: qb, dh, dhp, ld };
-            self.nobar.set(true);
+            // The keys and values of the text: computed by the first pass over these contexts
+            // (beside the query, without barriers between them), read as they are after it.
+            self.nobar.set(!self.kv_cached);
             self.gemm(e, &b.a2.q, hn, crow, c, &[0], (0, rows), o, None, None, b.a2.q.n_out, false);
-            let ctx = self.sc(S::Ctx);
-            for (j, (l, dst)) in [(&b.a2.k, self.sc(S::Ck)), (&b.a2.v, self.sc(S::Cv))].into_iter().enumerate() {
-                let o = Out::Heads { y: dst, dh, dhp, ld };
-                self.nobar.set(j == 0);
-                self.gemm(e, l, ctx, crows + 64, cd, &[0], (0, crows), o, None, None, l.n_out, false);
+            if !self.kv_cached {
+                let ctx = self.sc(S::Ctx);
+                for (j, (l, dst)) in [(&b.a2.k, ck), (&b.a2.v, cv)].into_iter().enumerate() {
+                    let o = Out::Heads { y: dst, dh, dhp, ld };
+                    self.nobar.set(j == 0);
+                    self.gemm(e, l, ctx, crows + 64, cd, &[0], (0, crows), o, None, None, l.n_out, false);
+                }
             }
-            self.flash(e, &b.a2, c, qb, self.sc(S::Ck), self.sc(S::Cv), n, self.m, self.mp);
+            self.flash(e, &b.a2, c, qb, ck, cv, n, self.m, self.mp);
             self.gemm(e, &b.a2.o, ah, crow, c, &[0], (0, rows), hrows, None, Some(hb), b.a2.o.n_out, false);
             // GEGLU feed-forward.
             self.ln(e, rows, c, &b.n3);

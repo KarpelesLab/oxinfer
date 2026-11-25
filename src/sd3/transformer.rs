@@ -497,14 +497,29 @@ impl Sd3Transformer {
     /// The conditioning vector: timestep embedding plus the pooled-text projection. `t` is the
     /// timestep in [0, 1000] (sigma * 1000).
     pub fn temb(&self, t: f32, pooled: &[f32]) -> Vec<f32> {
-        let mlp = |l: &[Dense; 2], x: &[f32]| {
-            let mut h = l[0].forward_vec(x);
-            h.iter_mut().for_each(|v| *v = silu(*v));
-            l[1].forward_vec(&h)
-        };
-        let mut e = mlp(&self.time, &timestep_proj(t, 256));
-        crate::flux::transformer::add(&mut e, &mlp(&self.text, pooled));
+        self.temb_text(t, &mlp2(&self.text, pooled))
+    }
+
+    /// [`Transformer::temb`] with the pooled text already projected ([`TextCond`]).
+    fn temb_text(&self, t: f32, text: &[f32]) -> Vec<f32> {
+        let mut e = mlp2(&self.time, &timestep_proj(t, 256));
+        crate::flux::transformer::add(&mut e, text);
         e
+    }
+
+    /// What the passes of a generation read of one prompt and do not change: its context tokens
+    /// through `context_embedder` and its pooled embedding through the text projection, computed
+    /// once instead of at every step ([`Transformer::forward_text`]).
+    pub fn text(&self, ctx: &[f32], n_ctx: usize, pooled: &[f32]) -> Result<TextCond> {
+        let c = &self.cfg;
+        if ctx.len() != n_ctx * c.joint_dim || pooled.len() != c.pooled_dim {
+            bail!("text conditioning has the wrong shape");
+        }
+        Ok(TextCond {
+            ht: self.ctx_emb.forward(ctx, n_ctx),
+            n_ctx,
+            pooled: mlp2(&self.text, pooled),
+        })
     }
 
     /// Patch tokens with their positions: `latent` is `[h * w, in_channels]` (channels last);
@@ -553,20 +568,24 @@ impl Sd3Transformer {
     /// `[pooled_dim]`, `t` the timestep (sigma * 1000). Returns `[h * w, out_channels]`.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(&self, latent: &[f32], h: usize, w: usize, ctx: &[f32], n_ctx: usize, pooled: &[f32], t: f32) -> Result<Vec<f32>> {
+        self.forward_text(latent, h, w, &self.text(ctx, n_ctx, pooled)?, t)
+    }
+
+    /// [`Transformer::forward`] on a prompt's [`Transformer::text`] (the same result: the
+    /// text's part computed once per generation).
+    pub fn forward_text(&self, latent: &[f32], h: usize, w: usize, text: &TextCond, t: f32) -> Result<Vec<f32>> {
         let c = &self.cfg;
         let (p, co) = (c.patch_size, c.out_channels);
         if !h.is_multiple_of(p) || !w.is_multiple_of(p) || latent.len() != h * w * c.in_channels {
             bail!("latent {w}x{h} does not split into {p}x{p} patches");
         }
-        if ctx.len() != n_ctx * c.joint_dim || pooled.len() != c.pooled_dim {
-            bail!("text conditioning has the wrong shape");
-        }
         let (gh, gw) = (h / p, w / p);
         let n_img = gh * gw;
-        let temb = self.temb(t, pooled);
+        let n_ctx = text.n_ctx;
+        let temb = self.temb_text(t, &text.pooled);
         let st: Vec<f32> = temb.iter().map(|&v| silu(v)).collect();
         let mut hi = self.embed(latent, h, w)?;
-        let mut ht = self.ctx_emb.forward(ctx, n_ctx);
+        let mut ht = text.ht.clone();
         for b in &self.blocks {
             b.forward(&mut hi, n_img, &mut ht, n_ctx, &st);
         }
@@ -586,4 +605,21 @@ impl Sd3Transformer {
         });
         Ok(out)
     }
+}
+
+/// `l[1](silu(l[0](x)))` on one vector (the time and pooled-text embedders).
+fn mlp2(l: &[Dense; 2], x: &[f32]) -> Vec<f32> {
+    let mut h = l[0].forward_vec(x);
+    h.iter_mut().for_each(|v| *v = silu(*v));
+    l[1].forward_vec(&h)
+}
+
+/// A prompt's part of the SD 3 transformer's input ([`Transformer::text`]): the same for every
+/// step of a generation.
+pub struct TextCond {
+    /// `[n_ctx, hidden]`: the context tokens after `context_embedder`.
+    ht: Vec<f32>,
+    n_ctx: usize,
+    /// The pooled embedding after the text projection (added to the timestep's).
+    pooled: Vec<f32>,
 }

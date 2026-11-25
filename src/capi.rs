@@ -549,6 +549,16 @@ pub extern "C" fn oxi_devices() -> *mut c_char {
     guard(std::ptr::null_mut(), || Ok(out_string(crate::platform::detect().report())))
 }
 
+/// The degraded-mode warnings recorded so far (`gpu::warnings`: matrix-unit kernels that failed
+/// to compile, a GPU backend that failed to start, ...), as a JSON array of strings; `[]` when the
+/// process runs as its hardware allows.
+#[unsafe(no_mangle)]
+pub extern "C" fn oxi_warnings() -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        Ok(out_string(serde_json::Value::from(crate::gpu::warnings()).to_string()))
+    })
+}
+
 /// A typed decision (Jev models, see `oxinfer.h`): a `/v1/decide` JSON request in, the JSON
 /// response out.
 #[unsafe(no_mangle)]

@@ -382,6 +382,33 @@ pub trait Backend: Send + Sync {
 
 static ACTIVE: OnceLock<Option<Box<dyn Backend>>> = OnceLock::new();
 
+/// What [`warn`] recorded: reasons this process runs slower than its hardware allows.
+static WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Records that the process runs in a degraded mode (the matrix-unit kernels failed to compile,
+/// a GPU kernel's pipeline could not be built, the GPU backend failed to start and the CPU took
+/// over...): printed to stderr at once as a `WARNING` line (the CLI's and the server's log), and
+/// kept for [`warnings`], which the server reports (`GET /health`, `"degraded"` / `"warnings"`)
+/// and the C API returns (`oxi_warnings`). The same message is recorded once.
+pub fn warn(msg: impl Into<String>) {
+    let msg = msg.into();
+    let mut w = WARNINGS.lock().unwrap_or_else(|e| e.into_inner());
+    if !w.contains(&msg) {
+        eprintln!("[WARNING: {msg}]");
+        w.push(msg);
+    }
+}
+
+/// The degraded-mode warnings recorded so far ([`warn`]), oldest first.
+pub fn warnings() -> Vec<String> {
+    WARNINGS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Whether any degraded-mode warning was recorded ([`warnings`] is not empty).
+pub fn degraded() -> bool {
+    !WARNINGS.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
 /// Process-wide switches: 0 = unset (environment default), 1 = on, 2 = off.
 static EXACT: AtomicU8 = AtomicU8::new(0);
 static MOE: AtomicU8 = AtomicU8::new(0);
@@ -632,7 +659,7 @@ pub fn init(plat: &crate::platform::Platform, pref: crate::platform::DevicePref)
             Ok(b) => Some(b),
             Err(e) => {
                 if !e.contains("not implemented") {
-                    eprintln!("[{}: {e}]", g.kind.as_str());
+                    warn(format!("the {} backend failed to start ({e}); falling back", g.kind.as_str()));
                 }
                 None
             }
@@ -716,5 +743,14 @@ mod tests {
         });
         let e = init(&plat, DevicePref::Gpu(kind)).err().expect("no compute for this kind here");
         assert!(e.to_string().contains("not implemented"), "{e}");
+    }
+
+    #[test]
+    fn warnings_are_recorded_once() {
+        let msg = "test: a degraded mode recorded by warnings_are_recorded_once";
+        warn(msg);
+        warn(msg);
+        assert_eq!(warnings().iter().filter(|w| *w == msg).count(), 1);
+        assert!(degraded());
     }
 }

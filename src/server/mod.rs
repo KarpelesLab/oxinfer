@@ -868,7 +868,13 @@ impl Api {
             format!("/v1{path}")
         };
         if path == "/health" || path == "/v1/health" {
-            return Ok(Output::Full(ApiResponse::json(200, &json!({ "status": "ok" }))));
+            // Still "ok" (the server answers), with the degraded-mode warnings beside it: kernels
+            // that failed to compile and the like (`gpu::warnings`).
+            let warnings = crate::gpu::warnings();
+            return Ok(Output::Full(ApiResponse::json(
+                200,
+                &json!({ "status": "ok", "degraded": !warnings.is_empty(), "warnings": warnings }),
+            )));
         }
         self.check_auth(req)?;
         if req.body.len() > self.opts.max_body {
@@ -1179,5 +1185,10 @@ mod tests {
         assert_eq!(v["error"]["code"], "model_not_found");
         let r = a.handle(&ApiRequest::new("GET", "/health", None, vec![])).collect();
         assert_eq!(r.status, 200);
+        // The degraded-mode flag and its reasons (`gpu::warnings`).
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["degraded"], Value::Bool(crate::gpu::degraded()));
+        assert!(v["warnings"].is_array());
     }
 }

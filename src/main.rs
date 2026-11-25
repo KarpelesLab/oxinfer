@@ -1845,6 +1845,17 @@ fn run(mut args: Args) -> Result<()> {
         Some(b) => eprintln!("[device: {} (prefill matmuls on the GPU, everything else on the CPU)]", b.name()),
         None => eprintln!("[device: cpu]"),
     }
+    // A degraded mode (kernels that failed to compile, a GPU that failed to start) was warned
+    // about as it happened; repeat it after the device line so it is not lost in the load log.
+    let warnings = oxinfer::gpu::warnings();
+    if !warnings.is_empty() {
+        eprintln!(
+            "[WARNING: running degraded, slower than this hardware allows ({} warning{}: {})]",
+            warnings.len(),
+            if warnings.len() == 1 { "" } else { "s" },
+            warnings.join("; ")
+        );
+    }
     // Bigger prefill chunks keep the GPU busier (577 vs 431 tok/s on E4B q4 at 1024 vs 256);
     // on the CPU `generate::CPU_PREFILL_CHUNK`.
     // (Inkling-2: big chunks for its 128 experts, see `oxinfer::inkling::default_prefill_chunk`.)

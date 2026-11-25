@@ -227,6 +227,16 @@ stable-diffusion.cpp (master 82c19c8, Metal, the same GGUF, T5 fp16, `ae.safeten
 | mflux, `-q 4` | 2.6-2.7 s | 0.1-0.2 s (T5 at 4 bits) | 0.5-0.7 s |
 
 At 512x512 a step is 1.48 -> 0.61 s. Q8_0 / `-q 8`: oxinfer 4.97 -> ~2.5 s per step, mflux 3.8 s.
+With the transformer in bf16 (the diffusers folder as stored), the GEMMs now take 128 x 64 output
+tiles on the matrix units instead of 128 x 128 ones, which ran 25-30% slower there: 1.95 -> 1.7 s
+per 1024^2 step of FLUX.1 [schnell], the same image bit for bit. The VAE encoder's half-precision
+error (latents 1.3e-2 from the op-by-op encoder, an edit 52.8 dB) is explained in
+[Stable Diffusion](stable-diffusion.md#image-generation) ("Why FLUX.1's encoder is further
+off"): its mid-block attention is so peaked (scores up to 480) that it amplifies the rounding of
+the layers before it. The only part of a pass that depends on the prompt alone is the text
+tokens' input projection (`context_embedder`: 512 x 4096 -> 3072, 13 GFLOP, about 0.15 ms of a
+1.7-1.9 s pass); the double blocks modulate the text stream with the timestep, so nothing else is
+static across steps, and the projection stays in the pass.
 
 **Sample edits** (FLUX.1 Kontext [dev] Q8_0, guidance 2.5, 28 steps, 1168x880 from 1024x768 inputs
 that FLUX.1 [schnell] generated): "Put a red knitted hat on the dog" keeps the dog, porch and

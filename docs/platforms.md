@@ -57,6 +57,16 @@ grouped GEMM walks per-expert tiles for the gate/up projection, then SiLU, the g
 projection and the weighted combination, all on the GPU (the expert weights are kept resident
 with an `MTLResidencySet`; making them resident per submission cost more than the GEMMs).
 
+If the matrix-unit library fails to compile on such a GPU (a driver or SDK that rejects one of
+its kernels), oxinfer falls back to the SIMD-group kernels below, which still work but are 2-3x
+slower and have no whole-pass image plans. That is no longer silent: a `[WARNING: ...]` line
+says so at once and again after the CLI's `[device: ...]` line, the server's `GET /health` and
+`/api/web/activity` report `"degraded": true` with the `warnings`, the library has
+`gpu::warnings()` / `gpu::degraded()` and the C API `oxi_warnings()` (a JSON array). A kernel
+whose pipeline fails, and a GPU backend that fails to start (`--device auto` then runs on the
+CPU), are reported the same way. `OXINFER_METAL_MMA_BREAK=1` injects a compile error into that
+library to see it.
+
 GPUs without matrix units (M1-M4) get the same GEMM kernels, under the same names and with the
 same operands and rounding (half input rows with a power-of-two scale, weights dequantized to
 half, f32 sums), on 8x8 SIMD-group matrices (`MMA_UNITS 0` in `MMA_SHADER_SRC`): the prefill

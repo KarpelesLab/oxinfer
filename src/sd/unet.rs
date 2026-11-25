@@ -66,12 +66,18 @@ impl Resnet {
     }
 }
 
+/// A cross-attention's keys and values of one text context.
+type TextKv = std::sync::Arc<(Vec<f32>, Vec<f32>)>;
+
 struct Attn {
     q: Linear,
     k: Linear,
     v: Linear,
     o: Linear,
     heads: usize,
+    /// Cross-attention: the keys and values of the contexts this generation's passes saw, by
+    /// context id ([`Unet::text_id`]): the text never changes between steps.
+    kv: std::sync::Mutex<Vec<(usize, TextKv)>>,
 }
 
 impl Attn {
@@ -82,31 +88,48 @@ impl Attn {
             v: Linear::load(t, &format!("{p}.to_v"))?,
             o: Linear::load(t, &format!("{p}.to_out.0"))?,
             heads,
+            kv: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// The keys and values of context `c` (`[m, ctx_dim]`, id `id`), computed on first use.
+    fn text_kv(&self, c: &[f32], m: usize, id: usize) -> TextKv {
+        let mut kv = self.kv.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, e)) = kv.iter().find(|e| e.0 == id) {
+            return e.clone();
+        }
+        let e = std::sync::Arc::new((self.k.forward(c, m), self.v.forward(c, m)));
+        kv.push((id, e.clone()));
+        e
     }
 
     /// Queries from `pre(x)` (`[n, dim]`), keys and values from `ctx` (`[m, ctx_dim]`; `pre(x)`
     /// itself for self-attention). On the device the norm is fused into each projection;
     /// otherwise `x` is normalized once.
-    fn forward(&self, x: &[f32], n: usize, pre: Pre, ctx: Option<(&[f32], usize)>) -> Vec<f32> {
-        let (q, k, v);
+    fn forward(&self, x: &[f32], n: usize, pre: Pre, ctx: Option<TextCtx>) -> Vec<f32> {
+        let q;
+        let (mut k, mut v) = (Vec::new(), Vec::new());
+        // Cross-attention: the text's keys and values, the same for every step.
+        let text = ctx.map(|c| self.text_kv(c.x, c.m, c.id));
         if self.q.on_device(n) {
             q = self.q.forward_pre(x, n, pre);
-            (k, v) = match ctx {
-                Some((c, m)) => (self.k.forward(c, m), self.v.forward(c, m)),
-                None => (self.k.forward_pre(x, n, pre), self.v.forward_pre(x, n, pre)),
-            };
+            if text.is_none() {
+                (k, v) = (self.k.forward_pre(x, n, pre), self.v.forward_pre(x, n, pre));
+            }
         } else {
             let xn = pre.apply(x, n);
             q = self.q.forward(&xn, n);
-            (k, v) = match ctx {
-                Some((c, m)) => (self.k.forward(c, m), self.v.forward(c, m)),
-                None => (self.k.forward(&xn, n), self.v.forward(&xn, n)),
-            };
+            if text.is_none() {
+                (k, v) = (self.k.forward(&xn, n), self.v.forward(&xn, n));
+            }
         }
-        let m = ctx.map_or(n, |(_, m)| m);
+        let (k, v) = match &text {
+            Some(t) => (&t.0, &t.1),
+            None => (&k, &v),
+        };
+        let m = ctx.map_or(n, |c| c.m);
         let d = self.q.n_out;
-        let a = attention(&q, &k, &v, n, m, self.heads, d / self.heads, false);
+        let a = attention(&q, k, v, n, m, self.heads, d / self.heads, false);
         self.o.forward(&a, n)
     }
 }
@@ -119,6 +142,14 @@ struct Block {
     n3: LayerNorm,
     ff1: Linear,
     ff2: Linear,
+}
+
+/// A text context of a pass: `[m, ctx_dim]` values and their id ([`Unet::text_id`]).
+#[derive(Clone, Copy)]
+struct TextCtx<'a> {
+    x: &'a [f32],
+    m: usize,
+    id: usize,
 }
 
 /// diffusers `Transformer2DModel` with one or more `BasicTransformerBlock`s.
@@ -156,12 +187,12 @@ impl SpatialTransformer {
         })
     }
 
-    fn forward(&self, x: &[f32], n: usize, ctx: &[f32], m: usize) -> Vec<f32> {
+    fn forward(&self, x: &[f32], n: usize, ctx: TextCtx) -> Vec<f32> {
         let mut h = self.proj_in.forward_pre(x, n, Pre::Group(&self.norm, false));
         for b in &self.blocks {
             let a = b.a1.forward(&h, n, Pre::Layer(&b.n1), None);
             add_inplace(&mut h, &a);
-            let a = b.a2.forward(&h, n, Pre::Layer(&b.n2), Some((ctx, m)));
+            let a = b.a2.forward(&h, n, Pre::Layer(&b.n2), Some(ctx));
             add_inplace(&mut h, &a);
             // GEGLU: the projection's first half is the value, the second half its gate.
             let g = b.ff1.forward_pre(&h, n, Pre::Layer(&b.n3));
@@ -217,7 +248,14 @@ pub struct Unet {
     /// Whether [`Unet::forward_batch`] tries the whole-pass device plan (default on, or
     /// `OXINFER_SD_GPU_PASS=0` for off).
     gpu_pass: std::sync::atomic::AtomicBool,
+    /// The text contexts the passes saw since [`Unet::clear_text_cache`] (index: their id), whose
+    /// cross-attention keys and values the transformer blocks keep.
+    texts: std::sync::Mutex<Vec<Vec<f32>>>,
 }
+
+/// Text contexts whose keys and values a [`Unet`] keeps at most (the guidance branches of a
+/// generation take two; more clears them).
+const TEXTS_KEPT: usize = 4;
 
 /// One image of a [`Unet::forward_batch`]: latents, text context and SDXL's added embedding.
 pub struct BatchItem<'a> {
@@ -320,7 +358,44 @@ impl Unet {
             add,
             gpu: std::sync::Mutex::new(None),
             gpu_pass: std::sync::atomic::AtomicBool::new(std::env::var("OXINFER_SD_GPU_PASS").map_or(true, |v| v != "0")),
+            texts: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    fn transformers(&self) -> impl Iterator<Item = &SpatialTransformer> {
+        let downs = self.downs.iter().flat_map(|b| &b.attns);
+        let ups = self.ups.iter().flat_map(|b| &b.attns);
+        downs.chain(std::iter::once(&self.mid_attn)).chain(ups)
+    }
+
+    /// Drops the cross-attention keys and values kept for the text contexts seen so far (the
+    /// pipeline does at the end of a generation; they are recomputed from the contexts when
+    /// needed, so this only frees memory).
+    pub fn clear_text_cache(&self) {
+        let mut texts = self.texts.lock().unwrap_or_else(|e| e.into_inner());
+        texts.clear();
+        for t in self.transformers() {
+            for b in &t.blocks {
+                b.a2.kv.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            }
+        }
+    }
+
+    /// The id of text context `ctx` (the same values give the same id until
+    /// [`Unet::clear_text_cache`]): its cross-attention keys and values are computed by the first
+    /// pass over it and reused by the next ones.
+    fn text_id(&self, ctx: &[f32]) -> usize {
+        let mut texts = self.texts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = texts.iter().position(|t| t[..] == *ctx) {
+            return i;
+        }
+        if texts.len() >= TEXTS_KEPT {
+            drop(texts);
+            self.clear_text_cache();
+            texts = self.texts.lock().unwrap_or_else(|e| e.into_inner());
+        }
+        texts.push(ctx.to_vec());
+        texts.len() - 1
     }
 
     /// How much the down path shrinks each side (2 per downsampler): the latent's sides must
@@ -358,6 +433,11 @@ impl Unet {
         // Every ResNet applies SiLU to the embedding before its projection.
         silu_inplace(&mut temb);
         let temb = Some(&temb[..]);
+        let ctx = TextCtx {
+            x: ctx,
+            m,
+            id: self.text_id(ctx),
+        };
 
         let (mut x, mut h, mut w) = self.conv_in.forward(latent, h, w, 1);
         let mut c = self.conv_in.cout;
@@ -367,7 +447,7 @@ impl Unet {
                 x = r.forward(&x, h, w, temb);
                 c = r.cout;
                 if let Some(a) = b.attns.get(j) {
-                    x = a.forward(&x, h * w, ctx, m);
+                    x = a.forward(&x, h * w, ctx);
                 }
                 skips.push((x.clone(), c));
             }
@@ -378,7 +458,7 @@ impl Unet {
             }
         }
         x = self.mid1.forward(&x, h, w, temb);
-        x = self.mid_attn.forward(&x, h * w, ctx, m);
+        x = self.mid_attn.forward(&x, h * w, ctx);
         x = self.mid2.forward(&x, h, w, temb);
         for b in &self.ups {
             for (j, r) in b.resnets.iter().enumerate() {
@@ -387,7 +467,7 @@ impl Unet {
                 x = r.forward(&cat, h, w, temb);
                 c = r.cout;
                 if let Some(a) = b.attns.get(j) {
-                    x = a.forward(&x, h * w, ctx, m);
+                    x = a.forward(&x, h * w, ctx);
                 }
             }
             if let Some(u) = &b.up {

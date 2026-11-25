@@ -47,9 +47,18 @@ channels-last layout (each image with a border of zero pixels), so a 3x3 convolu
 shifted GEMMs accumulated into the same tile on the matrix units (`matmul2d`, half inputs, bf16
 weights, f32 sums), with the group norm and SiLU applied while the half inputs are written;
 strided convolutions and narrow inputs (the 4 latent channels) go through an unfolded copy.
-Attention is a fused flash kernel over heads padded to a multiple of 16 (48 for SD 1.5's 40, 64,
-80, 128, 160; a VAE's single head of 512 in value chunks of 128; the probabilities scaled by 2^15
-on their way to half, so that the thousands of tiny ones of a long row keep their precision); layer norms, GEGLU, residual adds, skip concatenation and 2x
+The GEMM tiles are 128 rows x 64 outputs (64 x 64 where 128-row tiles would leave the GPU's
+cores with fewer than 128 threadgroups). Attention is a fused flash kernel over heads padded to a
+multiple of 16 (48 for SD 1.5's 40, 64, 80, 128, 160; a VAE's single head of 512 in value chunks
+of 128), with an online softmax in base 2 whose running row maximum moves only when a block's
+scores pass it by more than 5 (in log2 units), so most key blocks skip rescaling the output; the
+probabilities, at most 2^5, go to half scaled by 2^10, so that the thousands of tiny ones of a
+long row keep their precision. The text's cross-attention keys and values depend on the prompt
+only: the first pass of a generation computes them into buffers the session keeps, the other
+steps read them (the session compares the half-precision contexts of the batch with the ones
+they were computed from, so a new prompt recomputes them); the op-by-op path below keeps them
+per prompt in the UNet the same way (`Unet::clear_text_cache` frees them; the pipeline does at
+the end of each generation). Both give the same output bit for bit. Layer norms, GEGLU, residual adds, skip concatenation and 2x
 upsampling are fused into row kernels or the GEMMs' stores. Inputs without a norm are scaled by
 a power of two when their largest magnitude passes half's range (the SDXL VAE's activations
 do), and the products scaled back. `gpu_pass=0` (`Pipeline::set_gpu_pass(false)`, the
@@ -68,6 +77,27 @@ stream in f32 on the device, runs the projections on the matrix-unit GEMMs (scal
 and the causal attention on f32 operands: SD 1.5's text context 0.07 -> 0.01 s (3.9e-4 from the
 layer-by-layer encoder, the 20-step image 56.4 dB), SD-Turbo's OpenCLIP-H 0.10 -> 0.02 s (6.7e-4,
 58.6 dB), SDXL-Turbo's two encoders 0.19 -> 0.05 s (context 1.2e-4, pooled 2.4e-4, image 51.5 dB).
+
+**Why FLUX.1's encoder is further off.** Against the encoder in float32 on the CPU (1024x1024,
+the same picture), stage by stage (both paths stopped after each down block and around the middle
+block in a debugging build; relative L2 of the activations):
+
+| After | down 0 | down 1 | down 2 | down 3 | mid ResNet 1 | mid attention | mid ResNet 2 | latent means |
+|---|---|---|---|---|---|---|---|---|
+| FLUX.1 VAE | 1.2e-3 | 2.5e-3 | 1.6e-3 | 1.4e-3 | 2.9e-3 | 4.6e-3 | 5.1e-3 | 9.3e-3 |
+| SD 1.5 VAE | | | | | | | | 2.4e-3 |
+
+Nothing in the plan is wrong: each op's own error is that of rounding its GEMM inputs to half.
+The middle block's attention run in float64 on the plan's own input reproduces the plan's output
+to 1.6e-5, and its conv_out with half inputs adds 6e-5. What grows is the error coming in. The
+down blocks' half inputs leave 2.9e-3 by the middle block. Its single-head attention over the
+16384 latent pixels then amplifies that input error to 4.6e-3. That attention is extremely peaked
+in FLUX.1's VAE: scores reach 480 (the row maximum sits 26 above the median on average), against
+58 in SD 1.5's. The output norm and convolution amplify it again in the 16 mean channels, which
+are small next to the log-variance ones (moments overall 2.0e-3, means 9.3e-3; against the
+op-by-op Metal path, itself rounded to half, the 1.3e-2 above). Running these GEMMs at f32
+precision (hi / lo half pairs) would about double the encoder's GEMM time. The edits only see a 52.8 dB difference, so the
+half-precision encoder stays. `OXINFER_METAL_MMA=0` gives the exact one.
 
 Against the op-by-op path (512x512, same seed): the first guided SD 1.5 UNet output differs by
 5.2e-4 (relative L2), the image after 20 Euler steps at guidance 7.5 by 53.4 dB (8-bit PSNR; the
@@ -99,6 +129,43 @@ rows in threadgroup memory (kept), group-norm sums shifted by the group's first 
 the precision). The step's GPU time splits roughly as convolutions 33 ms, attention 29 ms, the
 transformer projections and feed-forward 22 ms, group norms 4 ms (`OXINFER_UNET_SKIP=conv3,flash,
 lin,qkv,gn,...` leaves kinds of dispatches out to measure them).
+
+A third round (November 2026; GPU time per guided SD 1.5 512x512 step, `OXINFER_PF_PROFILE=1
+OXINFER_UNET_TIME=1` prints each pass's): **94.8 -> 65.5 ms**, SDXL at 1024x1024 467 -> 361-373 ms.
+End to end (release builds interleaved, the GPU shared with a running `oxinfer serve`): SD 1.5
+512x512, 20 guided Euler steps, sampling 1.93-2.44 -> 1.33-1.89 s (0.067-0.095 s a step;
+stable-diffusion.cpp 4.33-5.35 s on the same runs), SDXL base 1024x1024 9.4-10.0 -> 7.2-7.7 s
+(0.36-0.39 s a step; stable-diffusion.cpp 0.83-1.04 s), text 0.06 -> 0.02 s and 0.18 -> 0.04-0.05
+s with the text encoders' plan (`src/metal_t5.rs`), the VAE decode unchanged.
+
+- **GEMM tiles.** The 128 x 128 output tiles taken when the outputs divide by 128 ran at 60-75% of
+  the speed of 128 x 64 tiles on every UNet shape (`metal::unet::tests::un_gemm_bench`, ignored:
+  8192 rows x 320 x 9 taps 0.47 -> 0.29 ms, 2048 x 640 x 9 0.44 -> 0.26 ms, 2048 x 640 -> 5120 0.42
+  -> 0.33 ms; 52-60 TFLOP/s now), and on the lowest levels (512 rows x 1280 x 9) 64 x 64 tiles
+  beat both (0.66 -> 0.25 ms): 94.8 -> 73.7 ms, the same output bit for bit (each output's sums
+  run over the same K in the same order). The prefill GEMMs over bf16 weights had the same
+  choice: on the matrix units their 128-token tiles now take 64 outputs too (FLUX.1 [schnell] in
+  bf16 at 1024^2 1.95 -> 1.7 s per step, Qwen3.5-4B bf16 prefill of 1800 tokens 3340-3530 ->
+  3730-3810 tok/s, the same results).
+- **Lazy softmax** (above): 73.7 -> 67.5 ms. The SD 1.5 image moves by 56.6 dB; the SDXL base
+  image against diffusers in float32 on the same noise is 44.5-44.7 dB, against 45.1 dB before
+  (the same difference as from exp2 alone, i.e. trajectory noise).
+- **Probabilities over the scores:** the half probabilities of a key block now overwrite its f32
+  scores in threadgroup memory (each pair of lanes reads its row into registers first, and the
+  pair runs in one SIMD-group) instead of a buffer of their own: 26 -> 17 KB a threadgroup,
+  67.5 -> 65.5 ms, the same output. FLUX.1's attention kernels (`flash_attn128_mma`,
+  `dit_flash128_hilo`) do the same (24 -> 16 KB; no change in FLUX.1's step time measurable on
+  the shared GPU, the same images).
+- **Text keys and values once per generation:** 94.8 -> 94.6 ms. They were 32 small GEMMs per
+  step, already encoded without barriers beside the query; the op-by-op path saves the same 1%.
+
+Left (min of interleaved runs, GPU shared): convolutions 21 ms (0.93 TFLOP per step at 45
+TFLOP/s), attention 17-19 ms (0.3 TFLOP with the heads padded to 48: score bound, about 80 G scores
+a second, faster than FLUX.1's 128-wide heads per score), the transformer projections and
+feed-forward 11 ms (0.34 TFLOP at 31 TFLOP/s: K of 320-1280), the group norms 4.6 ms, the
+attention's q / k / v projections 4 ms. A softmax on the score tiles in registers (no threadgroup round
+trip) is what attention would need next; the 8x8 level (200 rows) would gain 0.3 ms from 32-wide
+tiles.
 
 Op by op (other GPUs, or `gpu_pass=0`), convolutions, attention and the group and layer norms run on the GPU: each norm is fused
 into the convolution or projection that consumes it (a statistics kernel, then normalization and

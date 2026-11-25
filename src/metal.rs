@@ -1372,8 +1372,10 @@ kernel void silu_half(device const float* gu [[buffer(0)]], device half* ah [[bu
 // output. One threadgroup (4 SIMD-groups) per 64 queries of one head; keys stream in blocks of 64.
 // Scores S = Q K^T (f32) go through threadgroup memory for the online softmax, probabilities come
 // back as T in P for O += P V; O stays in a cooperative tensor, rescaled per query row as the max
-// moves. T = half is the fast kernel; T = float runs at f32 precision (P then reuses S: each thread
-// overwrites only the scores it has read).
+// moves. T = half is the fast kernel; T = float runs at f32 precision. P reuses S's memory (each
+// row of halves in the first half of its row of floats): each pair of lanes reads its row's
+// scores into registers before either writes probabilities over them, and the pair is in one
+// SIMD-group, so the reads complete first; the threadgroup holds 16 KB instead of 24.
 #if MMA_UNITS
 struct FAM { uint tq; uint tk; uint d; float scale; };
 template <typename T>
@@ -1386,7 +1388,8 @@ inline void flash_attn128_body(device const T* q, device const T* k, device cons
     tensor<device T, dextents<int32_t, 2>, tensor_inline> Kt((device T*)k, dextents<int32_t, 2>(p.d, tkp));
     tensor<device T, dextents<int32_t, 2>, tensor_inline> Vt((device T*)v, dextents<int32_t, 2>(p.d, tkp));
     tensor<threadgroup float, extents<int32_t, 64, 64>, tensor_inline> St(S, extents<int32_t, 64, 64>());
-    tensor<threadgroup T, extents<int32_t, 64, 64>, tensor_inline> Pt(P, extents<int32_t, 64, 64>());
+    constexpr int PLD = 64 * sizeof(float) / sizeof(T);
+    tensor<threadgroup T, dextents<int32_t, 2>, tensor_inline> Pt(P, dextents<int32_t, 2>(64, 64), array<int32_t, 2>{1, PLD});
     constexpr auto ds = matmul2d_descriptor(64, 64, 128, false, true, false);
     constexpr auto dov = matmul2d_descriptor(64, 128, 64, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<ds, execution_simdgroups<4>> ops;
@@ -1422,7 +1425,7 @@ inline void flash_attn128_body(device const T* q, device const T* k, device cons
         float alpha = grow ? exp(m - mn) : 1.0f;
         if (grow) rescale = 1;
         float ps = 0.0f;
-        for (uint j = 0; j < 32; j++) { float e = exp(x[j] - mn); P[r * 64 + part * 32 + j] = T(e); ps += e; }
+        for (uint j = 0; j < 32; j++) { float e = exp(x[j] - mn); P[r * PLD + part * 32 + j] = T(e); ps += e; }
         ps += simd_shuffle_xor(ps, 1);
         l = l * alpha + ps;
         m = mn;
@@ -1452,11 +1455,10 @@ kernel void flash_attn128_mma(device const half* q [[buffer(0)]], device const h
                               device const half* v [[buffer(2)]], device float* o [[buffer(3)]], constant FAM& p [[buffer(4)]],
                               uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float S[64 * 64];
-    threadgroup half P[64 * 64];
     threadgroup float A[64];
     threadgroup float L[64];
     threadgroup uint RS[1];
-    flash_attn128_body<half>(q, k, v, o, p, S, P, A, L, RS, tg, tid);
+    flash_attn128_body<half>(q, k, v, o, p, S, (threadgroup half*)S, A, L, RS, tg, tid);
 }
 kernel void flash_attn128_mma_f32(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]],
                                   device const float* v [[buffer(2)]], device float* o [[buffer(3)]], constant FAM& p [[buffer(4)]],
@@ -2223,12 +2225,31 @@ impl MetalBackend {
                 .and_then(|f| std::fs::read_to_string(f).ok())
                 .unwrap_or_default()
         };
+        // The first lines of a compiler log (for a warning; the whole log stays in `mma_error`).
+        let brief = |e: &str| -> String {
+            // Its errors (the log starts with warnings), else its first lines.
+            let errors: Vec<&str> = e.lines().filter(|l| l.contains("error")).take(3).collect();
+            let lines = if errors.is_empty() {
+                e.lines().filter(|l| !l.trim().is_empty()).take(4).collect()
+            } else {
+                errors
+            };
+            let mut b = lines.join(" / ");
+            if b.len() > 600 {
+                b.truncate(b.floor_char_boundary(600));
+                b.push_str("...");
+            }
+            b
+        };
         let sg_src = || format!("#define GTM {MMA_GTM}\n#define MMA_UNITS 0\n{base_src}{MMA_SHADER_SRC}{}", extra());
         let sg_lib = |e: Option<String>| -> Result<(Id, bool, bool, Option<String>)> {
             match compile(&sg_src(), false) {
                 Ok(l) => Ok((l, true, false, e)),
                 Err(e2) => {
-                    eprintln!("[metal: SIMD-group half GEMMs unavailable: {e2}]");
+                    crate::gpu::warn(format!(
+                        "metal: the SIMD-group half GEMM kernels failed to compile, so the GPU runs its f32 kernels only: {}",
+                        brief(&e2.to_string())
+                    ));
                     Ok((compile(&base_src, false)?, false, false, Some(e.unwrap_or_else(|| e2.to_string()))))
                 }
             }
@@ -2236,18 +2257,33 @@ impl MetalBackend {
         let (lib, has_mma, units, mma_error) = match want_mma {
             true => match compile(
                 &format!(
-                    "#define GTM {MMA_GTM}\n#define MMA_UNITS 1\n{base_src}{MMA_SHADER_SRC}{}{}{}{}{}",
+                    "#define GTM {MMA_GTM}\n#define MMA_UNITS 1\n{base_src}{MMA_SHADER_SRC}{}{}{}{}{}{}",
                     decode::PFM_SRC,
                     unet::SRC,
                     whisper::SRC,
                     dit::MMA_SRC,
-                    extra()
+                    extra(),
+                    // OXINFER_METAL_MMA_BREAK=1: a compile error in that library, to see the
+                    // degraded mode (`gpu::warnings`) without a broken kernel.
+                    if std::env::var_os("OXINFER_METAL_MMA_BREAK").is_some() {
+                        "\n#error OXINFER_METAL_MMA_BREAK\n"
+                    } else {
+                        ""
+                    }
                 ),
                 true,
             ) {
                 Ok(l) => (l, true, true, None),
                 Err(e) => {
-                    if apple10 || mma_env.is_some() || std::env::var_os("OXINFER_DEBUG").is_some() {
+                    if apple10 || mma_env.is_some() {
+                        // The GPU has matrix units but they go unused: everything (GEMMs,
+                        // attention, the whole-pass image / audio plans) runs 2-3x slower.
+                        crate::gpu::warn(format!(
+                            "metal: the matrix-unit kernels failed to compile, so this GPU runs the slower \
+                             SIMD-group kernels (2-3x slower GEMMs, no whole-pass image plans): {}",
+                            brief(&e.to_string())
+                        ));
+                    } else if std::env::var_os("OXINFER_DEBUG").is_some() {
                         eprintln!("[metal: matrix-unit kernels unavailable: {e}]");
                     }
                     sg_lib(Some(e.to_string()))?
@@ -2476,13 +2512,17 @@ impl MetalBackend {
         let void: MsgVoid = self.o.msg_send();
         unsafe { void(f, self.sels.release) };
         if p.is_null() {
-            if !err.is_null() {
+            let why = if err.is_null() {
+                "no error given".to_string()
+            } else {
                 let msg0: Msg0 = self.o.msg_send();
                 // SAFETY: `localizedDescription` returns an NSString owned by the NSError.
-                eprintln!("[metal: pipeline {name}: {}]", unsafe {
-                    self.o.nsstring_to_string(msg0(err, self.o.sel(c"localizedDescription")))
-                });
-            }
+                unsafe { self.o.nsstring_to_string(msg0(err, self.o.sel(c"localizedDescription"))) }
+            };
+            // The kernel exists but cannot run: whatever needed it takes a slower path.
+            crate::gpu::warn(format!(
+                "metal: the pipeline of kernel {name} failed, its users fall back to slower paths: {why}"
+            ));
             return None;
         }
         m.insert(name.to_string(), p);
@@ -2891,7 +2931,9 @@ impl MetalBackend {
         if tile == Tile::Mid {
             // Built on first use: the 128-token kernel's name with `_m`.
             let (base, tn) = match w {
-                WeightRef::Bf16(_) if n_out.is_multiple_of(128) => ("mma_bf128".to_string(), 128),
+                // On the matrix units 128-wide output tiles run at 70-75% of the 64-wide ones'
+                // speed (prefill and FLUX shapes, `metal::unet` `un_gemm_bench`).
+                WeightRef::Bf16(_) if n_out.is_multiple_of(128) && !m.units => ("mma_bf128".to_string(), 128),
                 WeightRef::Bf16(_) => ("mma_bf64".to_string(), 64),
                 WeightRef::Q8(_) => ("mma_q8".to_string(), 64),
                 WeightRef::Q4(_) if affine => ("mma_q4a".to_string(), 64),
@@ -2909,7 +2951,9 @@ impl MetalBackend {
         let pick = |big: Id, s: Id| if small { s } else { big };
         Some(match (w, tile) {
             (WeightRef::Bf16(_), Tile::Grouped) => (m.g_bf, 64),
-            (WeightRef::Bf16(_), _) if n_out.is_multiple_of(128) => (pick(m.bf[1], m.bf_s[1]), 128),
+            // Matrix units: 64-wide output tiles for the 128-token GEMMs (128-wide ones are 25-30%
+            // slower there); the 32-token ones keep 128 where they divide.
+            (WeightRef::Bf16(_), _) if n_out.is_multiple_of(128) && (small || !m.units) => (pick(m.bf[1], m.bf_s[1]), 128),
             (WeightRef::Bf16(_), _) => (pick(m.bf[0], m.bf_s[0]), 64),
             (WeightRef::Q8(_), Tile::Grouped) => (m.g_q8, 64),
             (WeightRef::Q8(_), _) => (pick(m.q8, m.q8_s), 64),

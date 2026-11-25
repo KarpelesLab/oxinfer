@@ -539,18 +539,25 @@ impl Pipeline {
             None => noise,
         };
         let total = steps - first;
+        // The prompts' context tokens and pooled embeddings through the transformer's text
+        // projections, once for all steps.
+        let cond_t = self.transformer.text(&cond.states, cond.tokens, &cond.pooled)?;
+        let uncond_t = match &uncond {
+            Some(u) => Some(self.transformer.text(&u.states, u.tokens, &u.pooled)?),
+            None => None,
+        };
         for i in first..steps {
             if self.cancel.load(Ordering::Relaxed) {
                 bail!("cancelled");
             }
             let t = plan.timesteps[i];
-            let mut v = self.transformer.forward(&x, lh, lw, &cond.states, cond.tokens, &cond.pooled, t)?;
+            let mut v = self.transformer.forward_text(&x, lh, lw, &cond_t, t)?;
             tm.transformer_calls += 1;
             if i == first {
                 dump("noise_pred0.bin", &vae::hwc_to_chw(&v, c, lh, lw));
             }
-            if let Some(u) = &uncond {
-                let nu = self.transformer.forward(&x, lh, lw, &u.states, u.tokens, &u.pooled, t)?;
+            if let Some(u) = &uncond_t {
+                let nu = self.transformer.forward_text(&x, lh, lw, u, t)?;
                 tm.transformer_calls += 1;
                 if i == first {
                     dump("noise_pred0_uncond.bin", &vae::hwc_to_chw(&nu, c, lh, lw));

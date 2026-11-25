@@ -54,7 +54,11 @@ scale / shift / gate vectors computed from the conditioning vector, runs one att
 norms on queries and keys, SD 3.5 medium (MMDiT-X) a second attention over the image tokens
 alone in its first 13 blocks, and the last block does not update the text stream. Guidance is
 classifier-free: with a scale above 1 each step runs a second pass on the negative prompt and
-combines `uncond + scale * (cond - uncond)`. The schedule is `FlowMatchEulerDiscreteScheduler`
+combines `uncond + scale * (cond - uncond)`. What a pass reads of a prompt and never changes (the
+333 text tokens through `context_embedder`, the pooled embeddings through their projection) is
+computed once per generation (`Transformer::text`, `forward_text`), not at every step, with the
+same result bit for bit; the joint blocks' text stream itself is modulated by the timestep, so
+it is not static. The schedule is `FlowMatchEulerDiscreteScheduler`
 with the config's constant shift (3 for every SD 3 model) or, when the config sets
 `use_dynamic_shifting`, the resolution-dependent `mu` from the number of image tokens; steps are
 Euler, `x += (sigma_next - sigma) * v`. Image to image encodes the input with the VAE (a sample of

@@ -50,6 +50,12 @@ void oxi_string_free(char *s);
 /* Detected CPU features and GPUs, as text. */
 char *oxi_devices(void);
 
+/* The degraded-mode warnings recorded so far, as a JSON array of strings ("[]" when none): the
+ * GPU's matrix-unit kernels failed to compile (everything then runs on slower kernels), a kernel's
+ * pipeline failed, the GPU backend failed to start and the CPU took over. Each is also printed to
+ * stderr as a "[WARNING: ...]" line when it happens. Free with oxi_string_free. */
+char *oxi_warnings(void);
+
 /* Downloads a model into the cache (or finds it there) and returns its local path:
  * "org/name" (safetensors repo) or "org/name:QUANT" (one GGUF file of a repo, e.g. Q4_K_M, with
  * its split parts, and the repo's top-level mmproj*.gguf vision projector beside it when it has

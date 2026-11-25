@@ -4345,10 +4345,12 @@ attention auto), mflux 0.24 on MLX 0.32.5.
 | SD 1.5 fp16, 512^2, CFG 7.5, Euler | oxinfer before (two UNet passes) | 0.60 s | 0.06 s | 0.56 s |
 | | oxinfer, whole-pass UNet plan (batched CFG) | 0.10-0.15 s | 0.06 s | 0.10 s |
 | | oxinfer, CLIP as one GPU pass | | 0.01 s | |
+| | oxinfer, 64-wide GEMM tiles, lazy softmax (interleaved) | 0.067-0.095 s (GPU 65.5 ms, was 94.8) | 0.02 s | 0.09-0.13 s |
 | | stable-diffusion.cpp (batched CFG) | 0.24-0.30 s | 0.43 s | 1.23 s |
 | SD-Turbo, 512^2, 1 step | oxinfer before / after | 0.30 / 0.08-0.09 s | 0.09-0.13 s | 0.57 / 0.10 s |
 | | stable-diffusion.cpp | 0.15-0.23 s | 0.24 s | 1.17-1.19 s |
 | SDXL base 1.0 fp16, 1024^2, CFG 5, 20 Euler steps | oxinfer, whole-pass UNet plan | 0.47-0.62 s | 0.18 s | 0.45-0.50 s |
+| | oxinfer, 64-wide GEMM tiles, lazy softmax, text plan (interleaved) | 0.36-0.39 s (was 0.47-0.50 on the same runs) | 0.04-0.05 s | 0.39-0.41 s |
 | | stable-diffusion.cpp (`--force-sdxl-vae-conv-scale`) | 0.83-1.04 s | 0.78-1.0 s | 4.1-4.3 s |
 
 FLUX.1: the transformer now runs as one GPU plan per pass (see [FLUX.1](flux.md), "Whole passes
@@ -4378,6 +4380,18 @@ Edit-2511 + Lightning pass over 8.3k tokens 16.5 -> 10-11 s. Its attention then 
 keys as hi / lo half pairs on the half-precision matrix units (scores as exact as with f32
 operands): 2.7 -> 2.4-2.7 s per pass (interleaved on a loaded GPU: 4.9 -> 4.4 s, the
 per-operation path 10.4 s, stable-diffusion.cpp 33-34 s per step against 8.6 s).
+
+UNet round (see [Stable Diffusion](stable-diffusion.md#image-generation), "A third round"): the
+UNet GEMMs took 128 x 128 output tiles wherever the outputs divided by 128, and those ran at
+60-75% of the speed of 128 x 64 tiles on every shape measured (64 x 64 on the lowest levels);
+with 64-wide tiles, a base-2 online softmax whose maximum moves lazily and the probabilities
+written over the scores, a guided SD 1.5 step takes 94.8 -> 65.5 ms of GPU time and an SDXL one
+467 -> ~365 ms, with the GEMMs' outputs the same bit for bit. The prefill GEMMs over bf16 weights
+had the same 128-wide tiles on the matrix units: FLUX.1 [schnell] from its bf16 diffusers folder
+1.95 -> 1.7 s per 1024^2 step, Qwen3.5-4B (bf16) prefill of 1800 tokens 3340-3530 -> 3730-3810
+tok/s, the same outputs. The text's cross-attention keys and values are now computed once per
+generation (SD, SDXL: the session keeps them; SD 3's `context_embedder` and pooled projection
+too), bit-identical and about 0.3% of a step.
 
 SDXL base (the public fp16 files, 1024^2, 20 steps): oxinfer samples in 9.6-12.9 s against
 18.0-20.4 s; on the same torch CPU noise and the same ("trailing") timesteps the images are
