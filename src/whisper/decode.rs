@@ -87,18 +87,17 @@ struct Run<'a> {
 /// Decodes the windows together and returns one attempt per job, in order. Stops at the next
 /// token when `cancel` is set (every attempt is then `cancelled`).
 pub(super) fn run(m: &WhisperModel, sp: &Special, jobs: &[Job], cancel: &AtomicBool) -> Vec<Attempt> {
-    let d = m.cfg.d_model;
     let v = m.cfg.vocab_size;
     // The prompts: one pass per window, exactly as when it is decoded alone.
     let mut runs: Vec<Run> = jobs
         .iter()
         .map(|job| {
             let mut st = m.new_state();
-            let h = m.decode(job.input, &mut st, job.cross);
             let t = job.input.len();
             // No-speech probability: the raw logits at <|startoftranscript|>.
-            let no_speech_prob = softmax_prob(&m.logits(&h[job.sot_index * d..(job.sot_index + 1) * d]), sp.no_speech as usize);
-            let logits = m.logits(&h[(t - 1) * d..t * d]);
+            let both = m.prompt_logits(job.input, &mut st, job.cross, &[job.sot_index, t - 1]);
+            let no_speech_prob = softmax_prob(&both[..v], sp.no_speech as usize);
+            let logits = both[v..].to_vec();
             let hyps = match job.search {
                 Search::Sample { temperature, n } => (0..n.max(1))
                     .map(|j| Hyp {

@@ -39,11 +39,16 @@ impl Drop for TinyDir {
 
 /// Writes a 2 + 2 layer Whisper with `d_model` 64 and random weights in the Hugging Face layout.
 fn tiny_checkpoint(name: &str) -> TinyDir {
+    tiny_checkpoint_heads(name, 2)
+}
+
+/// [`tiny_checkpoint`] with `heads` attention heads.
+fn tiny_checkpoint_heads(name: &str, heads: usize) -> TinyDir {
     let dir = std::env::temp_dir().join(format!("oxinfer-whisper-tiny-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = serde_json::json!({
         "model_type": "whisper", "d_model": D, "encoder_layers": 2, "decoder_layers": 2,
-        "encoder_attention_heads": 2, "decoder_attention_heads": 2, "encoder_ffn_dim": 2 * D,
+        "encoder_attention_heads": heads, "decoder_attention_heads": heads, "encoder_ffn_dim": 2 * D,
         "decoder_ffn_dim": 2 * D, "num_mel_bins": 80, "vocab_size": VOCAB,
         "max_source_positions": 1500, "max_target_positions": 448,
     });
@@ -207,6 +212,177 @@ fn encoder_batch_matches_single_windows() {
         let alone: Vec<Vec<f32>> = refs.iter().map(|w| m.encode(w)).collect();
         assert!(alone[0] != alone[1], "{precision}: the windows encode alike");
         assert!(m.encode_batch(&refs) == alone, "{precision}: windows encoded together differ");
+    }
+}
+
+/// The Metal encoder session ([`crate::gpu::whisper`]) against the CPU encoder, and its windows
+/// stacked against each alone (bit for bit). Skipped without a Metal device with matrix units.
+#[cfg(all(feature = "gpu", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn metal_encoder_session_matches_cpu() {
+    use crate::gpu::Backend;
+    let Ok(be) = crate::metal::MetalBackend::new() else { return };
+    let be: &'static crate::metal::MetalBackend = Box::leak(Box::new(be));
+    assert!(be.library_error().is_none(), "Metal library: {}", be.library_error().unwrap_or(""));
+    let Some(mut sess) = be.whisper_session() else { return };
+    let dir = tiny_checkpoint_heads("metal-enc", 1);
+    let mut lo = TranscriberOptions {
+        device: DevicePref::Cpu,
+        ..Default::default()
+    };
+    lo.set("precision", "bf16").unwrap();
+    let asr = Transcriber::load_dir(&dir.0, &lo).unwrap();
+    let m = asr.model();
+    let enc = m
+        .device_encoder(&|l, n_out, n_in| Some(&*Box::leak(Box::new(be.upload(&l.as_ref(), n_out, n_in)?))))
+        .unwrap();
+    let windows: Vec<Vec<f32>> = (0..3)
+        .map(|i| asr.window(&mel::log_mel(&audio(4.0 + 9.0 * i as f64, i), 80), 0))
+        .collect();
+    let refs: Vec<&[f32]> = windows.iter().map(|w| &w[..]).collect();
+    let mut stacked = vec![Vec::new(); 3];
+    assert!(sess.encode(&enc, &refs, &mut stacked, &[]).is_some());
+    for (i, w) in refs.iter().enumerate() {
+        let mut alone = vec![Vec::new()];
+        assert!(sess.encode(&enc, std::slice::from_ref(w), &mut alone, &[]).is_some());
+        assert!(alone[0] == stacked[i], "window {i}: stacked differs from alone");
+        let cpu = m.encode(w);
+        let (mut num, mut den) = (0f64, 0f64);
+        for (a, b) in alone[0].iter().zip(&cpu) {
+            num += ((a - b) as f64).powi(2);
+            den += (*b as f64).powi(2);
+        }
+        let rel = (num / den).sqrt();
+        assert!(rel < 1e-2, "window {i}: relative L2 {rel} from the CPU encoder");
+    }
+}
+
+/// The Metal decoder steps against the CPU decoder (over the same encoder output), and rows
+/// decoded together against each sequence alone (bit for bit).
+#[cfg(all(feature = "gpu", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn metal_decoder_session_matches_cpu() {
+    use crate::gpu::Backend;
+    use crate::gpu::whisper::Row;
+    let Ok(be) = crate::metal::MetalBackend::new() else { return };
+    let be: &'static crate::metal::MetalBackend = Box::leak(Box::new(be));
+    let Some(mut sess) = be.whisper_session() else { return };
+    let dir = tiny_checkpoint_heads("metal-dec", 1);
+    let mut lo = TranscriberOptions {
+        device: DevicePref::Cpu,
+        ..Default::default()
+    };
+    lo.set("precision", "bf16").unwrap();
+    let asr: &'static Transcriber = Box::leak(Box::new(Transcriber::load_dir(&dir.0, &lo).unwrap()));
+    let m = asr.model();
+    let (d, v) = (m.cfg.d_model, m.cfg.vocab_size);
+    let up = |l: &crate::model::Lin<'static>, n_out: usize, n_in: usize| -> Option<&'static crate::gpu::DeviceWeight> {
+        Some(&*Box::leak(Box::new(be.upload(&l.as_ref(), n_out, n_in)?)))
+    };
+    let enc = m.device_encoder(&up).unwrap();
+    let cross_lins = m.device_cross_with(&up).unwrap();
+    let dec = m.device_decoder_with(&up).unwrap();
+    assert!(sess.decodes(&dec));
+    let windows: Vec<Vec<f32>> = (0..2)
+        .map(|i| asr.window(&mel::log_mel(&audio(5.0 + 7.0 * i as f64, i), 80), 0))
+        .collect();
+    let refs: Vec<&[f32]> = windows.iter().map(|w| &w[..]).collect();
+    let mut outs = vec![Vec::new(); 2];
+    let mems = sess.encode(&enc, &refs, &mut outs, &cross_lins).unwrap();
+    let host: Vec<model::CrossKv> = outs.iter().map(|e| m.cross_kv(e)).collect();
+    // Three sequences: prompts of 1 to 3 tokens, then three steps each.
+    let prompts: [&[u32]; 3] = [&[SOT], &[SOT, 102], &[SOT, 102, 105]];
+    let steps: [[u32; 3]; 3] = [[5, 9, 40], [7, 3, 77], [60, 61, 62]];
+    let rel = |a: &[f32], b: &[f32]| {
+        let (mut num, mut den) = (0f64, 0f64);
+        for (x, y) in a.iter().zip(b) {
+            num += ((x - y) as f64).powi(2);
+            den += (*y as f64).powi(2);
+        }
+        (num / den).sqrt()
+    };
+    let embed = |tok: u32, pos: usize| {
+        let mut x = vec![0f32; d];
+        m.embed_row(tok, pos, &mut x);
+        x
+    };
+    // Each sequence alone: the prompt in one pass, then one step at a time.
+    let mut alone: Vec<Vec<f32>> = Vec::new();
+    for (i, p) in prompts.iter().enumerate() {
+        let kv = sess.new_kv(&dec).unwrap();
+        let xs: Vec<Vec<f32>> = p.iter().enumerate().map(|(j, &t)| embed(t, j)).collect();
+        let rows: Vec<Row> = xs
+            .iter()
+            .enumerate()
+            .map(|(j, x)| Row {
+                x,
+                pos: j,
+                kv: &*kv,
+                cross: &*mems[i % 2],
+            })
+            .collect();
+        let mut l = vec![0f32; v];
+        assert!(sess.decode(&dec, &rows, &[p.len() - 1], &mut l));
+        let mut st = m.new_state();
+        let cpu = m.logits(&m.decode(p, &mut st, &host[i % 2])[(p.len() - 1) * d..]);
+        assert!(rel(&l, &cpu) < 2e-2, "sequence {i}: prompt logits {} from the CPU's", rel(&l, &cpu));
+        let mut out = Vec::new();
+        for (k, &t) in steps[i].iter().enumerate() {
+            let pos = p.len() + k;
+            let x = embed(t, pos);
+            let row = [Row {
+                x: &x,
+                pos,
+                kv: &*kv,
+                cross: &*mems[i % 2],
+            }];
+            let mut l = vec![0f32; v];
+            assert!(sess.decode(&dec, &row, &[0], &mut l));
+            let cpu = m.logits(&m.decode(&[t], &mut st, &host[i % 2]));
+            assert!(
+                rel(&l, &cpu) < 2e-2,
+                "sequence {i} step {k}: logits {} from the CPU's",
+                rel(&l, &cpu)
+            );
+            out.extend(l);
+        }
+        alone.push(out);
+    }
+    // The three together, from their prompts.
+    let kvs: Vec<Box<dyn crate::gpu::whisper::DevMem>> = (0..3).map(|_| sess.new_kv(&dec).unwrap()).collect();
+    for (i, p) in prompts.iter().enumerate() {
+        let xs: Vec<Vec<f32>> = p.iter().enumerate().map(|(j, &t)| embed(t, j)).collect();
+        let rows: Vec<Row> = xs
+            .iter()
+            .enumerate()
+            .map(|(j, x)| Row {
+                x,
+                pos: j,
+                kv: &*kvs[i],
+                cross: &*mems[i % 2],
+            })
+            .collect();
+        let mut l = vec![0f32; v];
+        assert!(sess.decode(&dec, &rows, &[0], &mut l));
+    }
+    for k in 0..3 {
+        let xs: Vec<Vec<f32>> = (0..3).map(|i| embed(steps[i][k], prompts[i].len() + k)).collect();
+        let rows: Vec<Row> = (0..3)
+            .map(|i| Row {
+                x: &xs[i],
+                pos: prompts[i].len() + k,
+                kv: &*kvs[i],
+                cross: &*mems[i % 2],
+            })
+            .collect();
+        let mut l = vec![0f32; 3 * v];
+        assert!(sess.decode(&dec, &rows, &[0, 1, 2], &mut l));
+        for i in 0..3 {
+            assert!(
+                l[i * v..(i + 1) * v] == alone[i][k * v..(k + 1) * v],
+                "sequence {i} step {k} differs decoded with others"
+            );
+        }
     }
 }
 

@@ -258,6 +258,11 @@ pub struct WhisperModel {
     lm_head: Lin<'static>,
     /// Cross-attention keys and values held as bf16 (decoders below f16 precision).
     cross_bf16: bool,
+    /// Whole encoder passes on the device ([`crate::gpu::whisper`]), made on first use.
+    gpu: std::sync::Mutex<Option<Box<dyn crate::gpu::whisper::Session>>>,
+    /// Whether the whole decoder runs on the device (checked on first use).
+    dev_decodes: std::sync::OnceLock<bool>,
+    dec_prec: Precision,
 }
 
 /// Cross-attention keys or values, head-major (`[heads][n][dh]`, each head's rows contiguous):
@@ -417,16 +422,44 @@ impl CrossLayer {
     }
 }
 
-/// Cross-attention keys and values of one encoded window, per decoder layer.
+/// Cross-attention keys and values of one encoded window, per decoder layer: on the host, and
+/// on the device when the window was encoded there for a device decoder (the host copy is then
+/// made from the encoder output on first use, for word timestamps).
 pub struct CrossKv {
-    pub layers: Vec<CrossLayer>,
+    host: std::sync::OnceLock<Vec<CrossLayer>>,
+    /// The encoder output while `host` is not made.
+    enc: Vec<f32>,
+    dev: Option<Box<dyn crate::gpu::whisper::DevMem>>,
+    /// Encoder positions.
+    pub n: usize,
 }
 
-/// The decoder's self-attention cache.
-#[derive(Clone)]
+impl CrossKv {
+    /// The host keys and values of every decoder layer.
+    pub fn layers(&self, m: &WhisperModel) -> &[CrossLayer] {
+        self.host.get_or_init(|| m.cross_layers(&self.enc))
+    }
+}
+
+/// The decoder's self-attention cache: on the host, or on the device for a sequence decoded
+/// there (see [`WhisperModel::decode_step`]).
 pub struct DecState {
     pub layers: Vec<LayerCache>,
     pub pos: usize,
+    dev: Option<Box<dyn crate::gpu::whisper::DevMem>>,
+}
+
+impl Clone for DecState {
+    fn clone(&self) -> Self {
+        DecState {
+            layers: self.layers.clone(),
+            pos: self.pos,
+            dev: self
+                .dev
+                .as_ref()
+                .map(|d| d.duplicate(self.pos).expect("device memory for a copy of a decoder cache")),
+        }
+    }
 }
 
 impl DecState {
@@ -436,6 +469,26 @@ impl DecState {
         }
         self.pos = self.pos.min(pos);
     }
+}
+
+/// The active backend's state of a matrix.
+fn active_device_weight<'a>(l: &'a Lin<'static>, n_out: usize, n_in: usize) -> Option<&'a crate::gpu::DeviceWeight> {
+    l.device_weight(n_out, n_in)
+}
+
+/// A projection as a device session takes it, its device state from `dev`.
+fn device_lin<'a>(
+    p: &'a Proj,
+    n_in: usize,
+    dev: &dyn Fn(&'a Lin<'static>, usize, usize) -> Option<&'a crate::gpu::DeviceWeight>,
+) -> Option<crate::gpu::whisper::Lin<'a>> {
+    Some(crate::gpu::whisper::Lin {
+        w: p.w.as_ref(),
+        dev: dev(&p.w, p.n_out, n_in)?,
+        n_out: p.n_out,
+        n_in,
+        bias: p.b.as_deref(),
+    })
 }
 
 /// A torch conv1d weight `[cout, cin, k]` rearranged into unfolded-row order `[cout][k][cin]`,
@@ -527,6 +580,9 @@ impl WhisperModel {
             dec_ln: LayerNorm::load(files, "model.decoder.layer_norm", d)?,
             lm_head,
             cross_bf16: !matches!(dec, Precision::F32 | Precision::F16),
+            gpu: std::sync::Mutex::new(None),
+            dev_decodes: std::sync::OnceLock::new(),
+            dec_prec: dec,
             cfg,
         })
     }
@@ -550,6 +606,10 @@ impl WhisperModel {
     pub fn encode_batch(&self, mels: &[&[f32]]) -> Vec<Vec<f32>> {
         let mut out = Vec::with_capacity(mels.len());
         for group in mels.chunks(ENC_STACK) {
+            if let Some(ys) = self.encode_device(group) {
+                out.extend(ys);
+                continue;
+            }
             if group.len() > 1 && self.stackable(group.len()) {
                 out.extend(self.encode_stack(group));
             } else {
@@ -557,6 +617,76 @@ impl WhisperModel {
             }
         }
         out
+    }
+
+    /// The encoder over `mels` in one device session pass ([`crate::gpu::whisper`]), when the
+    /// active backend has one and takes every layer.
+    fn encode_device(&self, mels: &[&[f32]]) -> Option<Vec<Vec<f32>>> {
+        let be = crate::gpu::active()?;
+        if crate::gpu::exact() {
+            return None;
+        }
+        let enc = self.device_encoder(&active_device_weight)?;
+        let mut sess = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if sess.is_none() {
+            *sess = Some(be.whisper_session()?);
+        }
+        let mut out = vec![Vec::new(); mels.len()];
+        sess.as_mut()?.encode(&enc, mels, &mut out, &[])?;
+        Some(out)
+    }
+
+    /// The encoder as a device session takes it, each matrix's device state from `dev`.
+    pub(crate) fn device_encoder<'a>(
+        &'a self,
+        dev: &dyn Fn(&'a Lin<'static>, usize, usize) -> Option<&'a crate::gpu::DeviceWeight>,
+    ) -> Option<crate::gpu::whisper::Encoder<'a>> {
+        use crate::gpu::whisper::{Encoder, Layer, Lin as DLin, Norm};
+        let cfg = &self.cfg;
+        let (d, f) = (cfg.d_model, cfg.encoder_ffn_dim);
+        let lin = |p: &'a Proj, n_in: usize| -> Option<DLin<'a>> {
+            Some(DLin {
+                w: p.w.as_ref(),
+                dev: dev(&p.w, p.n_out, n_in)?,
+                n_out: p.n_out,
+                n_in,
+                bias: p.b.as_deref(),
+            })
+        };
+        let norm = |l: &'a LayerNorm| Norm {
+            w: l.weight(),
+            b: l.bias(),
+        };
+        let layers = self
+            .enc_layers
+            .iter()
+            .map(|l| {
+                Some(Layer {
+                    ln1: norm(&l.ln1),
+                    q: lin(&l.attn.q, d)?,
+                    k: lin(&l.attn.k, d)?,
+                    v: lin(&l.attn.v, d)?,
+                    o: lin(&l.attn.o, d)?,
+                    ln2: norm(&l.ln2),
+                    fc1: lin(&l.fc1, d)?,
+                    fc2: lin(&l.fc2, f)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Encoder {
+            d,
+            heads: cfg.encoder_attention_heads,
+            ffn: f,
+            n_mels: cfg.num_mel_bins,
+            n: cfg.max_source_positions,
+            conv1: lin(&self.conv1, self.conv1_in)?,
+            conv2: lin(&self.conv2, 3 * d)?,
+            pos: &self.enc_pos,
+            layers,
+            ln_post: norm(&self.enc_ln),
+            eps: LN_EPS,
+            half_attention: !crate::gpu::exact_attention(),
+        })
     }
 
     /// Whether `b` windows stacked go through the same matmul paths as one window.
@@ -650,17 +780,242 @@ impl WhisperModel {
 
     /// The cross-attention keys and values of every decoder layer for an encoded window.
     pub fn cross_kv(&self, enc: &[f32]) -> CrossKv {
+        let host = std::sync::OnceLock::new();
+        let _ = host.set(self.cross_layers(enc));
+        CrossKv {
+            host,
+            enc: Vec::new(),
+            dev: None,
+            n: enc.len() / self.cfg.d_model,
+        }
+    }
+
+    fn cross_layers(&self, enc: &[f32]) -> Vec<CrossLayer> {
         let d = self.cfg.d_model;
         let n = enc.len() / d;
         let nh = self.cfg.decoder_attention_heads;
         let ps: Vec<&Proj> = self.dec_layers.iter().flat_map(|l| [&l.cross.k, &l.cross.v]).collect();
         let ys = project(&ps, d, enc, n);
-        CrossKv {
-            layers: ys
-                .chunks(2)
-                .map(|kv| CrossLayer::new(&kv[0], &kv[1], n, nh, d / nh, self.cross_bf16))
-                .collect(),
+        ys.chunks(2)
+            .map(|kv| CrossLayer::new(&kv[0], &kv[1], n, nh, d / nh, self.cross_bf16))
+            .collect()
+    }
+
+    /// Encodes windows (as [`WhisperModel::encode_batch`]) into their cross-attention keys and
+    /// values: on the device when it runs the whole decoder there, else on the host.
+    pub fn encode_cross(&self, mels: &[&[f32]]) -> Vec<CrossKv> {
+        let mut out = Vec::with_capacity(mels.len());
+        for group in mels.chunks(ENC_STACK) {
+            if let Some(cs) = self.encode_device_cross(group) {
+                out.extend(cs);
+            } else {
+                out.extend(self.encode_batch(group).iter().map(|e| self.cross_kv(e)));
+            }
         }
+        out
+    }
+
+    /// The encoder and every decoder layer's cross-attention keys and values on the device.
+    fn encode_device_cross(&self, mels: &[&[f32]]) -> Option<Vec<CrossKv>> {
+        let be = crate::gpu::active()?;
+        if crate::gpu::exact() || !self.device_decodes() {
+            return None;
+        }
+        let enc = self.device_encoder(&active_device_weight)?;
+        let cross = self.device_cross_with(&active_device_weight)?;
+        let d = self.cfg.d_model;
+        let mut sess = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if sess.is_none() {
+            *sess = Some(be.whisper_session()?);
+        }
+        let mut outs = vec![Vec::new(); mels.len()];
+        let mems = sess.as_mut()?.encode(&enc, mels, &mut outs, &cross)?;
+        Some(
+            outs.into_iter()
+                .zip(mems)
+                .map(|(e, m)| CrossKv {
+                    host: std::sync::OnceLock::new(),
+                    n: e.len() / d,
+                    enc: e,
+                    dev: Some(m),
+                })
+                .collect(),
+        )
+    }
+
+    /// Every decoder layer's cross-attention key and value projections as a device session takes
+    /// them, each matrix's device state from `dev`.
+    pub(crate) fn device_cross_with<'a>(
+        &'a self,
+        dev: &dyn Fn(&'a Lin<'static>, usize, usize) -> Option<&'a crate::gpu::DeviceWeight>,
+    ) -> Option<Vec<crate::gpu::whisper::CrossLin<'a>>> {
+        let d = self.cfg.d_model;
+        self.dec_layers
+            .iter()
+            .map(|l| {
+                Some(crate::gpu::whisper::CrossLin {
+                    k: device_lin(&l.cross.k, d, dev)?,
+                    v: device_lin(&l.cross.v, d, dev)?,
+                })
+            })
+            .collect()
+    }
+
+    /// The decoder as a device session takes it.
+    fn device_decoder(&self) -> Option<crate::gpu::whisper::Decoder<'_>> {
+        self.device_decoder_with(&active_device_weight)
+    }
+
+    /// [`WhisperModel::device_decoder`] with each matrix's device state from `dev`.
+    pub(crate) fn device_decoder_with<'a>(
+        &'a self,
+        dev: &dyn Fn(&'a Lin<'static>, usize, usize) -> Option<&'a crate::gpu::DeviceWeight>,
+    ) -> Option<crate::gpu::whisper::Decoder<'a>> {
+        use crate::gpu::whisper::{DecLayer, Decoder, Norm};
+        let cfg = &self.cfg;
+        let (d, f) = (cfg.d_model, cfg.decoder_ffn_dim);
+        let lin = |p: &'a Proj, n_in: usize| device_lin(p, n_in, dev);
+        let norm = |l: &'a LayerNorm| Norm {
+            w: l.weight(),
+            b: l.bias(),
+        };
+        let layers = self
+            .dec_layers
+            .iter()
+            .map(|l| {
+                Some(DecLayer {
+                    ln1: norm(&l.ln1),
+                    q: lin(&l.self_attn.q, d)?,
+                    k: lin(&l.self_attn.k, d)?,
+                    v: lin(&l.self_attn.v, d)?,
+                    o: lin(&l.self_attn.o, d)?,
+                    ln_cross: norm(&l.ln_cross),
+                    cq: lin(&l.cross.q, d)?,
+                    co: lin(&l.cross.o, d)?,
+                    ln2: norm(&l.ln2),
+                    fc1: lin(&l.fc1, d)?,
+                    fc2: lin(&l.fc2, f)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Decoder {
+            d,
+            heads: cfg.decoder_attention_heads,
+            ffn: f,
+            vocab: cfg.vocab_size,
+            max_pos: cfg.max_target_positions,
+            layers,
+            ln: norm(&self.dec_ln),
+            head: crate::gpu::whisper::Lin {
+                w: self.lm_head.as_ref(),
+                dev: dev(&self.lm_head, cfg.vocab_size, d)?,
+                n_out: cfg.vocab_size,
+                n_in: d,
+                bias: None,
+            },
+            eps: LN_EPS,
+        })
+    }
+
+    /// Whether the decoder runs on the device (checked once).
+    fn device_decodes(&self) -> bool {
+        *self.dev_decodes.get_or_init(|| {
+            let Some(be) = crate::gpu::active() else {
+                return false;
+            };
+            if matches!(self.dec_prec, Precision::F32 | Precision::F16) {
+                return false;
+            }
+            let Some(dec) = self.device_decoder() else {
+                return false;
+            };
+            let mut sess = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+            if sess.is_none() {
+                match be.whisper_session() {
+                    Some(s) => *sess = Some(s),
+                    None => return false,
+                }
+            }
+            sess.as_ref().is_some_and(|s| s.decodes(&dec))
+        })
+    }
+
+    /// The input row of token `tok` at position `pos`: its embedding and the position's.
+    pub(crate) fn embed_row(&self, tok: u32, pos: usize, r: &mut [f32]) {
+        let d = self.cfg.d_model;
+        lin_row(&self.lm_head, d, tok as usize, r);
+        if self.cfg.scale_embedding {
+            crate::kernels::scale_inplace(r, (d as f32).sqrt());
+        }
+        crate::kernels::add_inplace(r, &self.dec_pos[pos * d..(pos + 1) * d]);
+    }
+
+    /// A device decoder pass: sequence `i` takes `tokens[i]` (consecutive rows) after the
+    /// positions of `sts[i]`, over `cross[i]`; returns the logits of rows `want`. None when the
+    /// device failed (the states are as they were).
+    fn decode_device(&self, tokens: &[&[u32]], sts: &mut [&mut DecState], cross: &[&CrossKv], want: &[usize]) -> Option<Vec<f32>> {
+        let d = self.cfg.d_model;
+        let dec = self.device_decoder()?;
+        let mut sess = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        let s = sess.as_mut()?;
+        for st in sts.iter_mut() {
+            if st.dev.is_none() {
+                st.dev = Some(s.new_kv(&dec)?);
+            }
+        }
+        let t: usize = tokens.iter().map(|x| x.len()).sum();
+        let mut x = vec![0f32; t * d];
+        let mut meta = Vec::with_capacity(t);
+        for (i, toks) in tokens.iter().enumerate() {
+            for (j, &tok) in toks.iter().enumerate() {
+                let p = sts[i].pos + j;
+                if p >= self.cfg.max_target_positions {
+                    return None;
+                }
+                let r = meta.len();
+                self.embed_row(tok, p, &mut x[r * d..(r + 1) * d]);
+                meta.push((i, p));
+            }
+        }
+        let rows: Vec<crate::gpu::whisper::Row> = meta
+            .iter()
+            .enumerate()
+            .map(|(r, &(i, pos))| {
+                Some(crate::gpu::whisper::Row {
+                    x: &x[r * d..(r + 1) * d],
+                    pos,
+                    kv: sts[i].dev.as_deref()?,
+                    cross: cross[i].dev.as_deref()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut logits = vec![0f32; want.len() * self.cfg.vocab_size];
+        if !s.decode(&dec, &rows, want, &mut logits) {
+            return None;
+        }
+        drop(rows);
+        for (st, toks) in sts.iter_mut().zip(tokens) {
+            st.pos += toks.len();
+        }
+        Some(logits)
+    }
+
+    /// Runs `tokens` through the decoder after the cached positions of `st` and returns the
+    /// logits of rows `want` (`[want.len(), vocab]`): on the device for a state decoded there
+    /// or a new state over device keys and values, else as [`WhisperModel::decode`] then
+    /// [`WhisperModel::logits`].
+    pub fn prompt_logits(&self, tokens: &[u32], st: &mut DecState, cross: &CrossKv, want: &[usize]) -> Vec<f32> {
+        if (st.dev.is_some() || (st.pos == 0 && cross.dev.is_some())) && self.device_decodes() {
+            if let Some(l) = self.decode_device(&[tokens], &mut [&mut *st], &[cross], want) {
+                return l;
+            }
+            assert!(st.pos == 0 || st.dev.is_none(), "the device decoder failed mid-sequence");
+            st.dev = None;
+        }
+        let d = self.cfg.d_model;
+        let h = self.decode(tokens, st, cross);
+        let rows: Vec<f32> = want.iter().flat_map(|&w| h[w * d..(w + 1) * d].iter().copied()).collect();
+        self.logits(&rows)
     }
 
     pub fn new_state(&self) -> DecState {
@@ -669,6 +1024,7 @@ impl WhisperModel {
         DecState {
             layers: (0..self.cfg.decoder_layers).map(|_| LayerCache::new(nh, hd)).collect(),
             pos: 0,
+            dev: None,
         }
     }
 
@@ -716,7 +1072,7 @@ impl WhisperModel {
             let c = &layer.cross;
             let mut q = project(&[&c.q], d, &hn, t).pop().unwrap();
             crate::kernels::scale_inplace(&mut q, scale);
-            cross.layers[l].attend(&q, t, &mut att);
+            cross.layers(self)[l].attend(&q, t, &mut att);
             let o = project(&[&c.o], d, &att, t).pop().unwrap();
             crate::kernels::add_inplace(&mut x, &o);
 
@@ -751,6 +1107,41 @@ impl WhisperModel {
         assert!(tokens.len() == sts.len() && tokens.len() == cross.len());
         let d = self.cfg.d_model;
         let v = self.cfg.vocab_size;
+        if sts.iter().any(|s| s.dev.is_some()) {
+            // Sequences decoded on the device stay there; the others run on the host.
+            let (on, off): (Vec<usize>, Vec<usize>) = (0..sts.len()).partition(|&i| sts[i].dev.is_some());
+            let mut out = vec![0f32; tokens.len() * v];
+            let toks: Vec<&[u32]> = on.iter().map(|&i| std::slice::from_ref(&tokens[i])).collect();
+            let cr: Vec<&CrossKv> = on.iter().map(|&i| cross[i]).collect();
+            let want: Vec<usize> = (0..on.len()).collect();
+            let logits = {
+                let mut refs: Vec<&mut DecState> = Vec::with_capacity(on.len());
+                let mut rest: Vec<&mut DecState> = Vec::with_capacity(off.len());
+                for (i, s) in sts.iter_mut().enumerate() {
+                    if on.binary_search(&i).is_ok() {
+                        refs.push(s);
+                    } else {
+                        rest.push(s);
+                    }
+                }
+                let l = self
+                    .decode_device(&toks, &mut refs, &cr, &want)
+                    .expect("the device decoder failed mid-sequence");
+                if !off.is_empty() {
+                    let t2: Vec<u32> = off.iter().map(|&i| tokens[i]).collect();
+                    let c2: Vec<&CrossKv> = off.iter().map(|&i| cross[i]).collect();
+                    let l2 = self.decode_step(&t2, &mut rest, &c2);
+                    for (k, &i) in off.iter().enumerate() {
+                        out[i * v..(i + 1) * v].copy_from_slice(&l2[k * v..(k + 1) * v]);
+                    }
+                }
+                l
+            };
+            for (k, &i) in on.iter().enumerate() {
+                out[i * v..(i + 1) * v].copy_from_slice(&logits[k * v..(k + 1) * v]);
+            }
+            return out;
+        }
         let mut out = vec![0f32; tokens.len() * v];
         let mut r0 = 0;
         for st in sts.chunks_mut(STEP_ROWS) {
@@ -812,7 +1203,7 @@ impl WhisperModel {
             crate::kernels::scale_inplace(&mut q, scale);
             for (i, cr) in cross.iter().enumerate() {
                 let r = i * d..(i + 1) * d;
-                cr.layers[l].attend(&q[r.clone()], 1, &mut att[r]);
+                cr.layers(self)[l].attend(&q[r.clone()], 1, &mut att[r]);
             }
             let o = project(&[&c.o], d, &att, t).pop().unwrap();
             crate::kernels::add_inplace(&mut x, &o);
@@ -841,7 +1232,7 @@ impl WhisperModel {
         let nh = cfg.decoder_attention_heads;
         let dh = d / nh;
         let scale = (dh as f32).powf(-0.5);
-        let n_src = cross.layers[0].n;
+        let n_src = cross.n;
         let last = heads.iter().map(|h| h.0).max().unwrap_or(0);
         let mut out = vec![Vec::new(); heads.len()];
         let mut st = self.new_state();
@@ -870,7 +1261,7 @@ impl WhisperModel {
             let c = &layer.cross;
             let mut q = project(&[&c.q], d, &hn, t).pop().unwrap();
             crate::kernels::scale_inplace(&mut q, scale);
-            let kv = &cross.layers[l];
+            let kv = &cross.layers(self)[l];
             for (hi, &(hl, hh)) in heads.iter().enumerate() {
                 if hl != l {
                     continue;

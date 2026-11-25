@@ -14,6 +14,8 @@ pub mod decode;
 pub mod dit;
 #[path = "gpu_unet.rs"]
 pub mod unet;
+#[path = "gpu_whisper.rs"]
+pub mod whisper;
 
 /// A weight matrix in one of the supported storage formats (`[n_out, n_in]`).
 pub enum WeightRef<'a> {
@@ -236,6 +238,11 @@ pub trait Backend: Send + Sync {
     /// A session running whole convolutional UNet passes on the device (see [`unet`]); None
     /// when the backend has none.
     fn unet_session(&'static self) -> Option<Box<dyn unet::Session>> {
+        None
+    }
+    /// A session running whole Whisper encoder passes on the device (see [`whisper`]); None when
+    /// the backend has none.
+    fn whisper_session(&'static self) -> Option<Box<dyn whisper::Session>> {
         None
     }
     /// See [`AttnJob`]. False when the backend does not run it (the caller then does).

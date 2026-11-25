@@ -688,7 +688,7 @@ impl Transcriber {
         }
         let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
         let feats = mel::log_mel(pcm, self.model.cfg.num_mel_bins);
-        let cross = self.model.cross_kv(&self.model.encode(&self.window(&feats, 0)));
+        let cross = self.model.encode_cross(&[&self.window(&feats, 0)]).pop().unwrap();
         Ok(self.language_probs(&cross))
     }
 
@@ -700,8 +700,7 @@ impl Transcriber {
 
     fn language_probs(&self, cross: &model::CrossKv) -> Vec<(String, f32)> {
         let mut st = self.model.new_state();
-        let h = self.model.decode(&[self.sp.sot], &mut st, cross);
-        let logits = self.model.logits(&h);
+        let logits = self.model.prompt_logits(&[self.sp.sot], &mut st, cross, &[0]);
         let langs = &self.sp.languages;
         let max = langs.iter().map(|l| logits[l.1 as usize]).fold(f32::NEG_INFINITY, f32::max);
         let mut p: Vec<(String, f32)> = langs.iter().map(|l| (l.0.clone(), (logits[l.1 as usize] - max).exp())).collect();
@@ -1011,7 +1010,7 @@ impl Transcriber {
             })
             .collect();
         let refs: Vec<&[f32]> = windows.iter().map(|w| &w[..]).collect();
-        let cross: Vec<model::CrossKv> = m.encode_batch(&refs).iter().map(|e| m.cross_kv(e)).collect();
+        let cross: Vec<model::CrossKv> = m.encode_cross(&refs);
         drop(windows);
         let encode_secs = te.elapsed().as_secs_f64();
 
@@ -1236,7 +1235,7 @@ impl Transcriber {
             return;
         }
         let scores = self.model.cross_attention_weights(&toks, cross, &sp.alignment_heads);
-        let n_src = cross.layers[0].n;
+        let n_src = cross.n;
         let n_frames = (seek_num / 2).clamp(1, n_src);
         let times = align::token_times(&scores, toks.len(), n_src, n_frames, sot.len());
         // Words over text + <|endoftext|>, grouped on Unicode boundaries first.
@@ -1317,9 +1316,7 @@ fn process(sp: &Special, logits: &mut [f32], done: &[u32], r: &Rules) {
         }
     }
     for (v, &s) in logits.iter_mut().zip(r.suppress) {
-        if s {
-            *v = ninf;
-        }
+        *v = if s { ninf } else { *v };
     }
     if !r.timestamps {
         return;
@@ -1352,16 +1349,11 @@ fn process(sp: &Special, logits: &mut [f32], done: &[u32], r: &Rules) {
             }
         }
     }
-    // Timestamps when their total probability beats every single text token.
-    let lp = log_softmax(logits);
-    let mx = lp[tb..].iter().copied().fold(ninf, f32::max);
-    let ts_lp = if mx == ninf {
-        ninf
-    } else {
-        mx + lp[tb..].iter().map(|&v| (v - mx).exp()).sum::<f32>().ln()
-    };
-    let text_max = lp[..tb].iter().copied().fold(ninf, f32::max);
-    if ts_lp > text_max {
+    // Timestamps when their total probability beats every single text token (log-probabilities
+    // compared without the log-softmax's common normalizer).
+    let ts_lse = log_sum_exp(&logits[tb..]);
+    let text_max = max_of(&logits[..tb]);
+    if ts_lse > text_max {
         logits[..tb].fill(ninf);
     }
 }
@@ -1419,16 +1411,48 @@ fn round_ms(t: f64) -> f64 {
     (t * 1000.0).round() / 1000.0
 }
 
+/// The maximum of `x` (-inf when empty), over 8 lanes.
+fn max_of(x: &[f32]) -> f32 {
+    let (c8, tail) = x.as_chunks::<8>();
+    let mut m8 = [f32::NEG_INFINITY; 8];
+    for c in c8 {
+        for (m, &v) in m8.iter_mut().zip(c) {
+            *m = m.max(v);
+        }
+    }
+    m8.iter().chain(tail).copied().fold(f32::NEG_INFINITY, f32::max)
+}
+
+/// `ln(sum(exp(x)))` (-inf when every value is -inf): a vocabulary's worth of exponentials at
+/// the CPU's vector width, summed in 8 lanes.
+fn log_sum_exp(x: &[f32]) -> f32 {
+    let max = max_of(x);
+    if max == f32::NEG_INFINITY {
+        return max;
+    }
+    let sum = crate::kernels::wide(
+        #[inline(always)]
+        || {
+            let (c8, tail) = x.as_chunks::<8>();
+            let mut s8 = [0f32; 8];
+            for c in c8 {
+                for (s, &v) in s8.iter_mut().zip(c) {
+                    *s += crate::kernels::fast_exp(v - max);
+                }
+            }
+            s8.iter().sum::<f32>() + tail.iter().map(|&v| crate::kernels::fast_exp(v - max)).sum::<f32>()
+        },
+    );
+    max + sum.ln()
+}
+
 fn log_softmax(x: &[f32]) -> Vec<f32> {
-    let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let lse = max + x.iter().map(|&v| (v - max).exp()).sum::<f32>().ln();
+    let lse = log_sum_exp(x);
     x.iter().map(|&v| v - lse).collect()
 }
 
 fn log_softmax_at(x: &[f32], i: usize) -> f32 {
-    let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let lse = max + x.iter().map(|&v| (v - max).exp()).sum::<f32>().ln();
-    x[i] - lse
+    x[i] - log_sum_exp(x)
 }
 
 fn softmax_prob(x: &[f32], i: usize) -> f32 {

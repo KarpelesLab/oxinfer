@@ -69,6 +69,12 @@ impl LayerNorm {
         }
         Ok(Self { w, b })
     }
+    pub(crate) fn weight(&self) -> &[f32] {
+        &self.w
+    }
+    pub(crate) fn bias(&self) -> &[f32] {
+        &self.b
+    }
     pub(crate) fn apply_rows(&self, x: &mut [f32], eps: f32) {
         let h = self.w.len();
         for_chunks(x, h, x.len() > 4 * h, |_, r| {
