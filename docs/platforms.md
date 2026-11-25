@@ -338,7 +338,7 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   (a build that skips it, `ggml_bench`: Q4_K 12288 x 4096 261 -> 160 us, Q6_K 355 -> 160). Q6_K
   reads its 2-byte aligned blocks as aligned words funnel-shifted and Q4_K its header in one
   16-byte load there too (Q6_K 355 -> 329 us, Q4_K 261 -> 247); and from 256 rows on the
-  stream-K GEMM takes 256 x 128 tiles (`gemmhk2_*`: 16 warps of 64 x 32 outputs, one 512-thread
+  stream-K GEMM takes 256 x 128 tiles (`gemmhk2_*`: then 16 warps of 64 x 32 outputs, one 512-thread
   block per SM, 60 KB of dynamic shared memory), so each weight value unpacked serves twice the
   rows: Q4_K 12288 x 4096 240 -> 207 us, 4096 x 12288 257 -> 231, 4096 x 4096 90 -> 79; Q6_K
   329 -> 222, 311 -> 214, 120 -> 84 (`OXINFER_CUDA_GEMM_256=0` keeps the 128-row tiles).
@@ -349,7 +349,20 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   weights (four a row in the 512-thread 256-row kernel and the 64 x 64 one, eight values each:
   half the threads did before; Q4_K 4096 x 12288 231 -> 197 us, Q6_K 222 -> 215 and 214 -> 206),
   and GEMMs of one input (q / k / v, gate / up) convert it to f16 once (the logits do not
-  change). RMSNorm, RoPE, the
+  change). Timed in the kernel (`clock64` per phase, a 256-row step of 32 values): the MMAs took
+  ~1870 cycles a warp against ~1020 at the tensor cores' rate, the next step's weight loads
+  ~490 (L2 latency: the L1 prefetch did not land in time) and their issue ~370, the barrier and
+  wait ~20, every warp in step. So the 256-row tile now runs on 8 warps of 64 x 64 outputs (256
+  threads, up to 255 registers: a third fewer fragment loads per MMA) and Q4_K (and Q6_K with
+  four threads a row) loads the next step's weight bytes into registers before the current
+  step's MMAs, unpacking them after: Q4_K 4096 x 12288 196 -> 170 us, 12288 x 4096 210 -> 186,
+  4096 x 4096 82 -> 71, the 128-row kernel 222 -> 204; Q6_K unchanged (205 / 216 -> 199 /
+  209: its loads early measured no faster with two threads a row); the same sums in the same
+  order (`pf_check` logits identical). Qwen3-8B Q4_K_M prompts 13240 -> 13470 tok/s at 512
+  tokens and 12669 -> 13234 at 2048, Llama-3.2-1B 58828 -> 61276 at 512 (idle GPU). Tried and
+  dropped: three stages of activations for the 256-row tile (92 KB of shared memory, less L1
+  for the weights: Q4_K 196 -> 202 us, Q6_K 205 -> 224); the next step's unpacking between
+  the two halves of a step's MMAs (no change). RMSNorm, RoPE, the
   activations, the Gated DeltaNet convolution and delta rule (the state in registers across the
   step's tokens) over all tokens in one launch; attention with the decode kernel, 32 tokens per
   launch; the hidden states, the new keys and values and the recurrent states come back to the

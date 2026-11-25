@@ -1673,6 +1673,112 @@ __device__ __forceinline__ void dq8h(const u8* row, u32 b, u32 qd, u32* q) {
     }
 }
 
+// `dq8h` in two parts for Q4_K and Q6_K: the bytes (`Dq8Raw`, loaded a step ahead, before the
+// current step's MMAs, so that their latency is behind them) and their unpacking (after).
+struct Dq8Raw {
+    uint4 h; // Q4_K: d, dmin and the scales; Q6_K: x = the quarter's scale byte, y = d
+    u32 lw[5], hw[5];
+};
+// `dq16h` (half a block) in the same two parts.
+template <int K>
+__device__ __forceinline__ void dq16h_load(const u8* row, u32 b, u32 h, Dq8Raw& r) {
+    if constexpr (K == K_Q4_K) {
+        const u8* B = row + 144 * (b >> 3);
+        u32 sub = b & 7;
+        r.h = *(const uint4*)B;
+        uint4 u = *(const uint4*)(B + 16 + 32 * (sub >> 1) + 16 * h);
+        r.lw[0] = u.x;
+        r.lw[1] = u.y;
+        r.lw[2] = u.z;
+        r.lw[3] = u.w;
+    } else if constexpr (K == K_Q6_K) {
+        const u8* B = row + 210 * (b >> 3);
+        u32 sub = b & 7, n = sub >> 2, qq = sub & 3;
+        r.h.x = B[192 + 8 * n + 2 * qq + h];
+        r.h.y = rd16(B + 208);
+        const u8* pl = B + 64 * n + 32 * (qq & 1) + 16 * h;
+        const u8* ph = B + 128 + 32 * n + 16 * h;
+        r.h.z = 8 * ((u32)(u64)pl & 2);
+        const u32* la = (const u32*)((u64)pl & ~(u64)3);
+        const u32* ha = (const u32*)((u64)ph & ~(u64)3);
+#pragma unroll
+        for (int i = 0; i < 5; i++) {
+            r.lw[i] = la[i];
+            r.hw[i] = ha[i];
+        }
+    }
+}
+template <int K>
+__device__ __forceinline__ constexpr bool dq8_split() {
+    return K == K_Q4_K || K == K_Q6_K;
+}
+template <int K>
+__device__ __forceinline__ void dq8h_load(const u8* row, u32 b, u32 qd, Dq8Raw& r) {
+    if constexpr (K == K_Q4_K) {
+        const u8* B = row + 144 * (b >> 3);
+        u32 sub = b & 7;
+        r.h = *(const uint4*)B;
+        uint2 u = *(const uint2*)(B + 16 + 32 * (sub >> 1) + 8 * qd);
+        r.lw[0] = u.x;
+        r.lw[1] = u.y;
+    } else if constexpr (K == K_Q6_K) {
+        const u8* B = row + 210 * (b >> 3);
+        u32 sub = b & 7, n = sub >> 2, qq = sub & 3;
+        r.h.x = B[192 + 8 * n + 2 * qq + (qd >> 1)];
+        r.h.y = rd16(B + 208);
+        const u8* pl = B + 64 * n + 32 * (qq & 1) + 8 * qd;
+        const u8* ph = B + 128 + 32 * n + 8 * qd;
+        r.h.z = 8 * ((u32)(u64)pl & 2);
+        const u32* la = (const u32*)((u64)pl & ~(u64)3);
+        const u32* ha = (const u32*)((u64)ph & ~(u64)3);
+#pragma unroll
+        for (int i = 0; i < 3; i++) {
+            r.lw[i] = la[i];
+            r.hw[i] = ha[i];
+        }
+    }
+}
+template <int K, int NW = 2>
+__device__ __forceinline__ void dq8h_unpack(u32 b, const Dq8Raw& r, u32* q) {
+    if constexpr (K == K_Q4_K) {
+        u32 sub = b & 7;
+        const uint4 hd = r.h;
+        u32 sh8 = 8 * (sub & 3), sc, mn;
+        if (sub < 4) {
+            sc = (hd.y >> sh8) & 63;
+            mn = (hd.z >> sh8) & 63;
+        } else {
+            u32 c = hd.w >> sh8;
+            sc = (c & 15) | (((hd.y >> sh8) >> 6 & 3) << 4);
+            mn = ((c >> 4) & 15) | (((hd.z >> sh8) >> 6 & 3) << 4);
+        }
+        float d1 = h2f(hd.x & 0xffff) * (float)sc, m1 = h2f(hd.x >> 16) * (float)mn;
+        u32 dd = pack_h2(d1, d1), mm = pack_h2(-m1, -m1);
+        u32 sh = 4 * (sub & 1);
+#pragma unroll
+        for (int i = 0; i < NW; i++) {
+            u32 lo, hi;
+            bytes_h2((r.lw[i] >> sh) & 0x0f0f0f0fu, 0x64006400u, lo, hi);
+            q[2 * i] = h2fma(lo, dd, mm);
+            q[2 * i + 1] = h2fma(hi, dd, mm);
+        }
+    } else if constexpr (K == K_Q6_K) {
+        u32 qq = (b & 7) & 3;
+        float d = h2f(r.h.y) * (float)(signed char)r.h.x;
+        u32 dd = pack_h2(d, d), fs = r.h.z;
+#pragma unroll
+        for (int i = 0; i < NW; i++) {
+            u32 ul = __funnelshift_r(r.lw[i], r.lw[i + 1], fs) >> (4 * (qq >> 1));
+            u32 uh = __funnelshift_r(r.hw[i], r.hw[i + 1], fs) >> (2 * qq);
+            u32 v = (ul & 0x0f0f0f0fu) | ((uh & 0x03030303u) << 4);
+            u32 lo, hi;
+            bytes_h2(v, 0x64206420u, lo, hi);
+            q[2 * i] = h2mul(lo, dd);
+            q[2 * i + 1] = h2mul(hi, dd);
+        }
+    }
+}
+
 // BM rows x BN outputs per block (128 x 128, 64 x 128 or 64 x 64: the launch picks the largest
 // that still fills the GPU, `gemmh_tile` in `cuda.rs`); 8 warps, 2 along the rows and 4 along the
 // outputs. Two 128 x 128 blocks per SM (`__launch_bounds__(256, 2)`: Qwen3-8B Q4_K_M prompts
@@ -1697,8 +1803,10 @@ __device__ __forceinline__ GhSmem<BM, BN>& gh_smem() {
 template <int K, int BM, int BN, int NTH = 256>
 __device__ __forceinline__ void gemmh_seg(const W& w, const GemmH& p, u32 m0, u32 n0, u32 kb0, u32 kb1, float* fix) {
     // NTH / 32 warps, 4 along the outputs; each warp RPW rows x BN / 4 outputs.
-    constexpr int WMW = NTH / 128, RPW = BM / WMW, RP = NTH / 4;
-    constexpr int MT = RPW / 16, NT = BN / 32; // 16-row and 8-column MMA tiles per warp
+    // NTH / 32 warps, WNW along the outputs (2 for the 256-row tile on 8 warps: 64 x 64 warp
+    // tiles, fewer fragment loads per MMA), else 4.
+    constexpr int WNW = NTH == 256 && BM == 256 ? 2 : 4, WMW = NTH / 32 / WNW, RPW = BM / WMW, RP = NTH / 4;
+    constexpr int MT = RPW / 16, NT = BN / (8 * WNW); // 16-row and 8-column MMA tiles per warp
     auto& sm = gh_smem<BM, BN>();
     auto& As = sm.A;
     auto& Bs = sm.B;
@@ -1725,6 +1833,19 @@ __device__ __forceinline__ void gemmh_seg(const W& w, const GemmH& p, u32 m0, u3
         for (int i = 0; i < BM / RP; i++) cp16(&As[st][(ar + RP * i) * HLD + ac], xa[i] + 32 * b, aok[i]);
         asm volatile("cp.async.commit_group;");
     };
+    // Q4_K / Q6_K with four threads a row: the next step's weight bytes into registers before
+    // the current step's MMAs, unpacked after them (`raw_b`, then `load_b`).
+    // (Q6_K with two threads a row measured no faster: 4096 x 12288 at 512 rows 199 -> 196 us in
+    // the 256-row tile, 305 -> 328 in the 128-row one; Q4_K 194 -> 170 and 222 -> 203.)
+    constexpr bool SPLIT = dq8_split<K>() && !BLOCK_SCALED(K) && (K == K_Q4_K || TPR == 4);
+    Dq8Raw raw;
+    auto raw_b = [&](u32 b) {
+        if constexpr (SPLIT && TPR == 4) {
+            if (bok) dq8h_load<K>(wrow, b, bh, raw);
+        } else if constexpr (SPLIT) {
+            if (bok) dq16h_load<K>(wrow, b, bh, raw);
+        }
+    };
     u32 bq[VPT / 2];
     auto load_b = [&](u32 b) {
         if (!bok) {
@@ -1740,15 +1861,21 @@ __device__ __forceinline__ void gemmh_seg(const W& w, const GemmH& p, u32 m0, u3
                 bq[2 * i] = pack_h2(v.x * sc, v.y * sc);
                 bq[2 * i + 1] = pack_h2(v.z * sc, v.w * sc);
             }
+        } else if constexpr (SPLIT) {
+            dq8h_unpack<K, TPR == 4 ? 2 : 4>(b, raw, bq);
         } else if constexpr (TPR == 2) {
             dq16h<K>(wrow, b, bh, bq);
         } else {
             dq8h<K>(wrow, b, bh, bq);
         }
     };
-    // The next step's weight bytes into L1 before the current step's MMAs, so that its
-    // dequantization (after them) does not wait for memory.
+    // Otherwise the next step's weight bytes into L1 before the current step's MMAs, so that
+    // its dequantization (after them) does not wait for memory.
     auto prefetch_b = [&](u32 b) {
+        if constexpr (SPLIT) {
+            raw_b(b);
+            return;
+        }
         if (!bok) return;
         constexpr u32 G = qgroup<K>(), GB = qgbytes<K>();
         if (b % G != 0 && b != 0) return;
@@ -1769,8 +1896,9 @@ __device__ __forceinline__ void gemmh_seg(const W& w, const GemmH& p, u32 m0, u3
         for (int b = 0; b < NT; b++)
 #pragma unroll
             for (int c = 0; c < 4; c++) acc[a][b][c] = 0.f;
-    u32 wm = (warp >> 2) * RPW, wn = (warp & 3) * (BN / 4);
+    u32 wm = (warp / WNW) * RPW, wn = (warp % WNW) * (BN / WNW);
     load_a(kb0, kb0 & 1);
+    raw_b(kb0);
     load_b(kb0);
     store_b(kb0 & 1);
     asm volatile("cp.async.wait_group 0;");
@@ -2028,7 +2156,7 @@ __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
     extern "C" __global__ void __launch_bounds__(256, 3) gemmhm_##K(W w, GemmH p) { gemmh_body<K, 64, 128>(w, p); }                 \
     extern "C" __global__ void __launch_bounds__(256, 3) gemmhs_##K(W w, GemmH p) { gemmh_body<K, 64, 64>(w, p); }                 \
     extern "C" __global__ void __launch_bounds__(256, 2) gemmhk_##K(W w, GemmH p, float* fix) { gemmhk_body<K, 128, 256>(w, p, fix); } \
-    extern "C" __global__ void __launch_bounds__(512, 1) gemmhk2_##K(W w, GemmH p, float* fix) { gemmhk_body<K, 256, 512>(w, p, fix); } \
+    extern "C" __global__ void __launch_bounds__(256, 1) gemmhk2_##K(W w, GemmH p, float* fix) { gemmhk_body<K, 256, 256>(w, p, fix); } \
     extern "C" __global__ void __launch_bounds__(256)                                                                                      \
         mvq_##K(W w, const u8* xq, const float2* xd, float* y, u32 n_in, u32 n_out, u32 ys, u32 mode) {                                  \
         mvq_body<K, false>(w, w, xq, xd, y, n_in, n_out, ys, mode);                                                                        \

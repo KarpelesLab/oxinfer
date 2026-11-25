@@ -58,7 +58,7 @@ pub(crate) const GEMMHK2_SHMEM: u32 = 2 * (256 + 128) * 40 * 2;
 /// The stream-K launch of the fast GEMM ([`GgKernels::gemmhk`]) for `n_out` outputs over `rows`
 /// rows of `n_in`: (kernel, blocks, threads, tile rows, dynamic shared memory), or None when the
 /// tiles of [`gemmh_tile`] fill the GPU's blocks evenly enough. From 256 rows on, 256 x 128
-/// tiles on one 512-thread block per SM ([`GgKernels::gemmhk2`]); else 128 x 128 on two
+/// tiles on one 256-thread block per SM ([`GgKernels::gemmhk2`]); else 128 x 128 on two
 /// 256-thread blocks per SM. `OXINFER_CUDA_STREAM_K=0` never takes it, `=1` always;
 /// `OXINFER_CUDA_GEMM_256=0` keeps the 128-row tiles.
 fn gemmh_stream_k(k: &GgKernels, n_out: u32, rows: u32, n_in: u32) -> Option<(*mut c_void, u32, u32, u32, u32)> {
@@ -68,7 +68,7 @@ fn gemmh_stream_k(k: &GgKernels, n_out: u32, rows: u32, n_in: u32) -> Option<(*m
     let big = *BIG.get_or_init(|| std::env::var("OXINFER_CUDA_GEMM_256").map_or(true, |v| v != "0")) && rows >= 256;
     let sms = SMS.load(Ordering::Relaxed);
     let (f, g, threads, bm, shm) = if big {
-        (k.gemmhk2, sms, 512, 256, GEMMHK2_SHMEM)
+        (k.gemmhk2, sms, 256, 256, GEMMHK2_SHMEM)
     } else {
         (k.gemmhk, 2 * sms, 256, 128, 0)
     };
@@ -449,8 +449,8 @@ struct GgKernels {
     /// ([`gemmh_stream_k`]).
     pub(crate) gemmhk: *mut c_void,
     pub(crate) gemmhk_fix: *mut c_void,
-    /// `gemmhk2_K`: stream-K over 256 x 128 tiles (512 threads, one block per SM, the tiles'
-    /// [`GEMMHK2_SHMEM`] bytes of dynamic shared memory): half the weights' unpacking per
+    /// `gemmhk2_K`: stream-K over 256 x 128 tiles (256 threads of 64 x 64 outputs, one block
+    /// per SM, the tiles' [`GEMMHK2_SHMEM`] bytes of dynamic shared memory): half the weights' unpacking per
     /// product of the 128-row tiles.
     pub(crate) gemmhk2: *mut c_void,
     /// `mvq_K` / `mvqp_K`: the int8 matvec and gate / up pair (Q4_K, Q6_K, Q8_0; null for the
@@ -3685,7 +3685,7 @@ mod tests {
                     }
                     // Stream-K, the tile split over blocks at a few points (and blocks with no
                     // steps).
-                    for (f, threads, bm, shm) in [(k.gemmhk, 256, 128u32, 0), (k.gemmhk2, 512, 256, GEMMHK2_SHMEM)] {
+                    for (f, threads, bm, shm) in [(k.gemmhk, 256, 128u32, 0), (k.gemmhk2, 256, 256, GEMMHK2_SHMEM)] {
                         for g in [1u32, 3, 7, 40] {
                             let mut fix = 0u64;
                             assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut fix, (g * bm) as usize * 128 * 4) }, 0);
@@ -4278,7 +4278,7 @@ mod tests {
                         ];
                         assert!(be.launch(k.gemmhk_fix, (g, bm / 8), 256, &mut a));
                     };
-                    let sk2 = || sk_with(k.gemmhk2, g / 2, 512, 256, GEMMHK2_SHMEM);
+                    let sk2 = || sk_with(k.gemmhk2, g / 2, 256, 256, GEMMHK2_SHMEM);
                     let tiles = || {
                         let (f, bm, bn) = gemmh_tile(&k, no, t as u32);
                         let mut a = [&w as *const _ as *mut c_void, &ph as *const _ as *mut c_void];
