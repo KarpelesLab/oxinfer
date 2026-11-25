@@ -508,6 +508,12 @@ fn pf_router_r() -> bool {
     std::env::var("OXINFER_PF_ROUTER").map_or(true, |v| v != "s")
 }
 
+/// Whether prefill plans' routed experts take the pair GEMMs (`mmagp_*` / `mmagq_*`, the
+/// activation in their stores; `OXINFER_PF_XPAIR=0`: the gate / up GEMMs and `silu_half`).
+fn pf_xpair() -> bool {
+    std::env::var("OXINFER_PF_XPAIR").map_or(true, |v| v != "0")
+}
+
 /// Whether prefill plans' dependences compare the columns of token rows (`OXINFER_PF_COLS=0`:
 /// spans of the buffers).
 fn pf_cols() -> bool {
@@ -2475,6 +2481,10 @@ struct XLora {
 struct PfExperts {
     /// Grouped GEMM pipelines (tiles of 32, 128 and 16 rows, see `super::group_tiles`).
     pipes: ([Id; 3], [Id; 3]),
+    /// The grouped pair GEMMs with the activation in their stores (`mmagp_*`, gate and up in one
+    /// tensor, or `mmagq_*`; `OXINFER_PF_XPAIR=0` keeps the gate / up GEMMs and `silu_half`),
+    /// the up rows' byte offset and scale offset in a fused tensor.
+    pair: Option<([Id; 3], u32, u32)>,
     up: Option<([Id; 3], u32)>,
     tabs: [Id; 3],
     row_bytes: (u32, u32),
@@ -2490,6 +2500,8 @@ struct PfExperts {
     n_exp: usize,
     /// GELU-tanh experts (Gemma 4), else SiLU.
     gelu: bool,
+    /// The combine adds to `y` (a shared expert wrote it first).
+    add: bool,
     /// Runtime LoRA updates of the experts (`Experts::lora`).
     lora: Option<PfXLora>,
     /// Whether the experts' outputs are combined into `y` here (else by the layer's
@@ -3713,7 +3725,9 @@ impl MetalBackend {
                     (vec![rng(x, h), rng(logits, rows)], vec![rng(logits, rows), rng(sel, 2 * k)])
                 }
                 Op::Experts(ref ex) if pf => {
-                    if ex.edits.is_some() || ex.add {
+                    // (Experts that add to their output, after a shared expert: the combine
+                    // adds; the fused tails of Gemma 4 write.)
+                    if ex.edits.is_some() || (ex.add && tails.iter().any(|t| t.experts == i)) {
                         return None;
                     }
                     let lora = match &ex.lora {
@@ -3792,11 +3806,53 @@ impl MetalBackend {
                     if !ex.h.is_multiple_of(64) || !ex.inter.is_multiple_of(64) {
                         return None;
                     }
+                    // The pair GEMMs (gate and up of one format, quantized, no LoRA updates): the
+                    // pipelines, then the up rows' byte offset in an expert's fused tensor and in
+                    // its scales; with gate and up apart (`mmagq_*`), the up tensors' row bytes.
+                    let (mi, h) = (ex.inter as u32, ex.h as u32);
+                    let up_rb = ex.up.as_ref().map(|u| row_bytes(&u[0]));
+                    let (pre, w_rows) = if fused { ("mmagp", mi) } else { ("mmagq", 0) };
+                    let same = ex
+                        .up
+                        .as_ref()
+                        .is_none_or(|u| std::mem::discriminant(&u[0]) == std::mem::discriminant(&ex.gate[0]));
+                    let pair = match &ex.gate[0] {
+                        _ if lora.is_some() || !pf_xpair() || !same => None,
+                        WeightRef::Gguf(gw)
+                            if gw.block_scales.is_none()
+                                && ex
+                                    .up
+                                    .as_ref()
+                                    .is_none_or(|u| matches!(&u[0], WeightRef::Gguf(ug) if ug.kind == gw.kind)) =>
+                        {
+                            Some((
+                                format!("{pre}_{}", gw.kind.name()),
+                                up_rb.unwrap_or(w_rows * row_bytes(&ex.gate[0])),
+                                0,
+                            ))
+                        }
+                        WeightRef::Q8(_) => Some((format!("{pre}_q8"), w_rows * h, w_rows * h / 32)),
+                        WeightRef::Q4(m)
+                            if m.offsets.is_none()
+                                && ex
+                                    .up
+                                    .as_ref()
+                                    .is_none_or(|u| matches!(&u[0], WeightRef::Q4(um) if um.offsets.is_none())) =>
+                        {
+                            Some((format!("{pre}_q4"), w_rows * h / 2, w_rows * h / 32))
+                        }
+                        _ => None,
+                    }
+                    .and_then(|(b, w_up, s_up)| {
+                        let p = |s: &str| self.named_pipeline(&format!("{b}{s}"));
+                        Some(([p("")?, p("_l")?, p("_s")?], w_up, s_up))
+                    });
                     emit.push(MOp::PfExperts(pf_experts.len(), PF_X_ALL));
                     let combine = !tails.iter().any(|t| t.experts == i);
                     pf_experts.push(PfExperts {
                         combine,
                         pipes: (pg3, pd3),
+                        pair,
                         up,
                         tabs: t16,
                         row_bytes: (row_bytes(&ex.gate[0]), row_bytes(&ex.down[0])),
@@ -3811,9 +3867,14 @@ impl MetalBackend {
                         k: ex.k,
                         n_exp: n,
                         gelu: ex.gelu,
+                        add: ex.add,
                         lora,
                     });
-                    (vec![rng(ex.x, ex.h), rng(ex.sel, 2 * ex.k)], vec![rng(ex.y, ex.h)])
+                    let mut reads = vec![rng(ex.x, ex.h), rng(ex.sel, 2 * ex.k)];
+                    if ex.add {
+                        reads.push(rng(ex.y, ex.h));
+                    }
+                    (reads, vec![rng(ex.y, ex.h)])
                 }
                 Op::Experts(ref ex) => {
                     if mt && ex.edits.is_some() {
@@ -6648,7 +6709,8 @@ impl MetalPlan<'_> {
                             n_exp: x.n_exp as u32,
                             sel_stride: x.sel_stride as u32,
                             max_tiles: pf.max_tiles as u32,
-                            gu_x: (if x.up.is_some() { mi } else { 2 * mi } / 64) as u32,
+                            // (The pair GEMMs: 32 outputs of each of gate and up a threadgroup.)
+                            gu_x: (if x.up.is_some() && x.pair.is_none() { mi } else { 2 * mi } / 64) as u32,
                             dn_x: (h / 64) as u32,
                             _p: 0,
                         },
@@ -6723,11 +6785,27 @@ impl MetalPlan<'_> {
                 };
                 if on(2) {
                     match x.up {
+                        Some((_, rb)) if let Some((pp, ..)) = x.pair => {
+                            // Gate and up apart: the up experts' table as buffer 6.
+                            let mut q = params(2 * mi, h, x.row_bytes.0);
+                            q._p = [mi as u32, rb, x.gelu as u32];
+                            e.buf(x.tabs[1], 0, 6);
+                            grouped(pp, x.tabs[0], st(3), st(5), st(4), &q, 3);
+                        }
                         Some((pu, rb)) => {
                             grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(mi, h, x.row_bytes.0), 3);
                             grouped(pu, x.tabs[1], st(3), up_at, st(4), &params(mi, h, rb), 3);
                         }
-                        None => grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(2 * mi, h, x.row_bytes.0), 3),
+                        None => match x.pair {
+                            // act(g) * u rows of `mi` (the gate / up grid: 32 outputs a threadgroup).
+                            Some((pp, w_up, s_up)) => {
+                                let mut q = params(2 * mi, h, x.row_bytes.0);
+                                q.rows = s_up;
+                                q._p = [mi as u32, w_up, x.gelu as u32];
+                                grouped(pp, x.tabs[0], st(3), st(5), st(4), &q, 3);
+                            }
+                            None => grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(2 * mi, h, x.row_bytes.0), 3),
+                        },
                     }
                     bar();
                 }
@@ -6778,7 +6856,25 @@ impl MetalPlan<'_> {
                     split: u32,
                     limit: f32,
                 }
-                if on(3) {
+                if on(3) && x.pair.is_some() {
+                    // The pair GEMMs' activations to the down projection's half rows.
+                    e.pipe(m.x_half);
+                    e.buf(sb, st(5), 0);
+                    e.buf(sb, st(6), 1);
+                    e.buf(sb, st(7), 2);
+                    e.bytes(
+                        &Xh {
+                            n: mi as u32,
+                            gather: 0,
+                            stride: mi as u32,
+                            _p: 0,
+                        },
+                        3,
+                    );
+                    e.buf(sb, st(0), 4);
+                    per_row(256);
+                    bar();
+                } else if on(3) {
                     e.pipe(m.silu_half);
                     e.buf(sb, st(5), 0);
                     e.buf(sb, st(6), 1);
@@ -6822,7 +6918,7 @@ impl MetalPlan<'_> {
                             n: h as u32,
                             k: x.k as u32,
                             ldo: x.y_stride,
-                            _p: 0,
+                            _p: x.add as u32,
                         },
                         3,
                     );

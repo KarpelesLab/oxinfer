@@ -1225,6 +1225,81 @@ MMAP(mmap_q8, Q8W, MK_Q8) MMAP(mmap_q4, Q4W, MK_Q4)
 #define GGP(T) MMAP(mmap_##T, T##W, MK_GG(T##W))
 GGP(Q4_0) GGP(Q4_1) GGP(Q5_0) GGP(Q5_1) GGP(Q8_0) GGP(IQ4_NL) GGP(IQ4_XS) GGP(MXFP4)
 GGP(Q2_K) GGP(Q3_K) GGP(Q4_K) GGP(Q5_K) GGP(Q6_K)
+// Prefill plans' routed experts with gate and up in one tensor (gate rows, then up rows): the
+// grouped GEMM tile of `mmag_*` with 32 gate rows and their 32 up rows (`mmagp_*`, as `mmap_*`),
+// storing act(g) * u for 32 outputs into rows of `p._p0` (the intermediate size). g and u are
+// rounded to f32 with the rows' scales first, as the gate / up GEMM's stores are, and the
+// activation is `act_mul4`'s, so the rows hold `silu_half`'s values before its half conversion;
+// the gate / up rows are never stored. p._p1: the up rows' byte offset in the expert's tensor,
+// p.rows: the up rows' offset in its scales (Q8 / Q4; the GGUF kernels read rows of p.s_off
+// bytes, and the grouped kernels take their rows from the tiles), p._p2: GELU (else SiLU).
+template <typename W, int TM>
+inline void mmag_pair_tile(W wg, W wu, device const half* xh, device const float* rs, device float* y, uint n_in, uint rows,
+                           uint ob, uint t0, uint tid, threadgroup half* Ws, threadgroup float* U, uint ldy, uint gelu) {
+    XT X((device half*)xh, dextents<int32_t, 2>(n_in, rows));
+    constexpr auto desc = matmul2d_descriptor(TM, 64, MKB, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    typedef tensor<threadgroup half, extents<int32_t, MKB, 64>, tensor_inline> WT;
+    WT Wt(Ws, extents<int32_t, MKB, 64>());
+    auto a0 = X.template slice<MKB, TM>(0, t0);
+    auto c = op.template get_destination_cooperative_tensor<decltype(a0), WT, float>();
+    zero(c);
+    uint row = tid / 2, blk = tid % 2;
+    W w = row < 32 ? wg : wu;
+    uint wrow = ob + row % 32;
+    threadgroup half4* wd = (threadgroup half4*)(Ws + row * MKB + blk * 32);
+    for (uint k0 = 0; k0 < n_in; k0 += MKB) {
+        half4 wv[8];
+        loadh(w, wrow, k0 / 32 + blk, wv);
+        for (uint i = 0; i < 8; i++) wd[i] = wv[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto a = X.template slice<MKB, TM>(k0, t0);
+        op.run(a, Wt, c);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+#pragma unroll
+    for (uint16_t i = 0; i < c.get_capacity(); ++i)
+        if (c.is_valid_element(i)) {
+            auto idx = c.get_multidimensional_index(i);
+            if (idx[0] >= 32) U[idx[1] * 33 + idx[0] - 32] = c[i] * rs[t0 + idx[1]];
+        }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+    for (uint16_t i = 0; i < c.get_capacity(); ++i)
+        if (c.is_valid_element(i)) {
+            auto idx = c.get_multidimensional_index(i);
+            if (idx[0] < 32) {
+                uint r = t0 + idx[1];
+                float g = c[i] * rs[r], u = U[idx[1] * 33 + idx[0]];
+                y[(ulong)r * ldy + ob + idx[0]] = gelu != 0 ? g / (1.0f + exp(-1.5957691f * (g + 0.044715f * g * g * g))) * u
+                                                             : g / (1.0f + exp(-g)) * u;
+            }
+        }
+}
+#define MMAGP_K(NAME, WT, TM, MK) \
+MMAG_SIG(NAME) { threadgroup half Ws[64 * MKB]; threadgroup float U[TM * 33]; \
+    GT g = tiles[tg.y]; device const void* qb = ep[g.e].q; device const void* sb = ep[g.e].s; \
+    MP p2 = p; p2.w_off = p._p1; p2.s_off = p.s_off + p.rows; \
+    mmag_pair_tile<WT, TM>(MK(qb, sb, p), MK(qb, sb, p2), xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p._p0, p.n_in, \
+                           g.rows, tg.x * 32, g.t0, tid, Ws, U, p._p0, p._p2); }
+// The same with gate and up in tensors of their own (`mmagq_*`): the up experts' addresses in
+// ep2, their row bytes (GGUF) in p._p1.
+#define MMAGQ_K(NAME, WT, TM, MK) \
+kernel void NAME(device const EP* ep [[buffer(0)]], device const GT* tiles [[buffer(1)]], device const half* xh [[buffer(2)]], \
+                 device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
+                 device const EP* ep2 [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
+    threadgroup half Ws[64 * MKB]; threadgroup float U[TM * 33]; \
+    GT g = tiles[tg.y]; MP p2 = p; p2.s_off = p._p1; \
+    mmag_pair_tile<WT, TM>(MK(ep[g.e].q, ep[g.e].s, p), MK(ep2[g.e].q, ep2[g.e].s, p2), xh + (ulong)g.r0 * p.n_in, rs + g.r0, \
+                           y + (ulong)g.r0 * p._p0, p.n_in, g.rows, tg.x * 32, g.t0, tid, Ws, U, p._p0, p._p2); }
+#define MMAGP(NAME, NAMEQ, WT, MAKE) \
+inline WT NAME##_w(device const void* qb, device const void* sb, MP p) { return MAKE; } \
+MMAGP_K(NAME, WT, GTM, NAME##_w) MMAGP_K(NAME##_l, WT, 128, NAME##_w) MMAGP_K(NAME##_s, WT, 16, NAME##_w) \
+MMAGQ_K(NAMEQ, WT, GTM, NAME##_w) MMAGQ_K(NAMEQ##_l, WT, 128, NAME##_w) MMAGQ_K(NAMEQ##_s, WT, 16, NAME##_w)
+MMAGP(mmagp_q8, mmagq_q8, Q8W, MK_Q8) MMAGP(mmagp_q4, mmagq_q4, Q4W, MK_Q4)
+#define GGXP(T) MMAGP(mmagp_##T, mmagq_##T, T##W, MK_GG(T##W))
+GGXP(Q4_0) GGXP(Q4_1) GGXP(Q5_0) GGXP(Q5_1) GGXP(Q8_0) GGXP(IQ4_NL) GGXP(IQ4_XS) GGXP(MXFP4)
+GGXP(Q2_K) GGXP(Q3_K) GGXP(Q4_K) GGXP(Q5_K) GGXP(Q6_K)
 #endif
 
 // Input rows (optionally gathered: row r is source row src[r], zeros for ~0) to half with a
@@ -1377,8 +1452,8 @@ kernel void flash_attn128_mma_f32(device const float* q [[buffer(0)]], device co
     flash_attn128_body<float>(q, k, v, o, p, S, S, A, L, tg, tid);
 }
 #endif
-// out[t] = sum over the token's k slots of weight * o[row].
-struct CB { uint n; uint k; uint ldo; uint _p; };
+// out[t] = sum over the token's k slots of weight * o[row] (`add`: out[t] += the sum).
+struct CB { uint n; uint k; uint ldo; uint add; };
 kernel void moe_combine(device const float* o [[buffer(0)]], device const float2* slots [[buffer(1)]], device float* out [[buffer(2)]],
                         constant CB& p [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
     uint c = gid.x * 4, t = gid.y;
@@ -1388,7 +1463,8 @@ kernel void moe_combine(device const float* o [[buffer(0)]], device const float2
         float2 s = slots[t * p.k + j];
         acc += s.y * *(device const float4*)(o + (ulong)as_type<uint>(s.x) * p.n + c);
     }
-    *(device float4*)(out + (ulong)t * p.ldo + c) = acc;
+    device float4* d = (device float4*)(out + (ulong)t * p.ldo + c);
+    *d = p.add != 0 ? *d + acc : acc;
 }
 // The routing of a prefill chunk's MoE layer on the device, as the host's `pf_route` lays it
 // out (so the GPU need not stop for the host at each MoE layer): per token, `k` expert ids (as
@@ -2381,6 +2457,13 @@ impl MetalBackend {
         let void: MsgVoid = self.o.msg_send();
         unsafe { void(f, self.sels.release) };
         if p.is_null() {
+            if !err.is_null() {
+                let msg0: Msg0 = self.o.msg_send();
+                // SAFETY: `localizedDescription` returns an NSString owned by the NSError.
+                eprintln!("[metal: pipeline {name}: {}]", unsafe {
+                    self.o.nsstring_to_string(msg0(err, self.o.sel(c"localizedDescription")))
+                });
+            }
             return None;
         }
         m.insert(name.to_string(), p);
@@ -2816,7 +2899,10 @@ impl MetalBackend {
             (WeightRef::Q4(_), _) if affine => (pick(m.q4a, m.q4a_s), 64),
             (WeightRef::Q4(_), _) => (pick(m.q4, m.q4_s), 64),
             (WeightRef::Gguf(g), _) if !fp8_ok(g) => return None,
-            (WeightRef::Gguf(g), Tile::Grouped) => (find(&m.g_gguf, g.kind)?, 64),
+            (WeightRef::Gguf(g), Tile::Grouped) => match self.gk_override(g.kind) {
+                Some((p, _)) => (p, 64),
+                None => (find(&m.g_gguf, g.kind)?, 64),
+            },
             (WeightRef::Gguf(g), _) => (pick(find(&m.gguf, g.kind)?, find(&m.gguf_s, g.kind)?), 64),
         })
     }
@@ -2842,16 +2928,28 @@ impl MetalBackend {
         ])
     }
 
+    /// Experiments: grouped kernels `{OXINFER_PF_GK}_{TYPE}` (with `_l` / `_s`) in place of
+    /// `mmag_{TYPE}`, when the library has them.
+    fn gk_override(&self, kind: GgmlType) -> Option<(Id, String)> {
+        let b = format!("{}_{}", std::env::var("OXINFER_PF_GK").ok()?, kind.name());
+        Some((self.named_pipeline(&b)?, b))
+    }
+
     /// The grouped (MoE) pipelines of a weight for tiles of `MMA_GTM`, 128 and 16 rows (see
     /// [`group_tiles`]); the latter two are built on first use.
     fn grouped_pipes(&self, w: &WeightRef, affine: bool, n_out: usize, n_in: usize) -> Option<[Id; 3]> {
         let p = self.mma_pipe(w, affine, n_out, n_in, Tile::Grouped)?.0;
-        let base = match w {
+        let mut base = match w {
             WeightRef::Bf16(_) => "mmag_bf".to_string(),
             WeightRef::Q8(_) => "mmag_q8".to_string(),
             WeightRef::Q4(_) => "mmag_q4".to_string(),
             WeightRef::Gguf(g) => format!("mmag_{}", g.kind.name()),
         };
+        if let WeightRef::Gguf(g) = w
+            && let Some((_, b)) = self.gk_override(g.kind)
+        {
+            base = b;
+        }
         Some([
             p,
             self.named_pipeline(&format!("{base}_l"))?,
@@ -4115,6 +4213,14 @@ mod tests {
         let uw: Vec<WeightRef> = um.iter().map(WeightRef::Gguf).collect();
         let dw: Vec<WeightRef> = dm.iter().map(WeightRef::Gguf).collect();
         let dev = be.upload_moe(&gw, Some(&uw), &dw, h, mi, act).unwrap();
+        // With an experimental kernel (OXINFER_PF_GK), the default kernels' results to compare.
+        let gk = std::env::var("OXINFER_PF_GK").ok();
+        let dref = gk.as_ref().map(|v| {
+            unsafe { std::env::remove_var("OXINFER_PF_GK") };
+            let d = be.upload_moe(&gw, Some(&uw), &dw, h, mi, act).unwrap();
+            unsafe { std::env::set_var("OXINFER_PF_GK", v) };
+            d
+        });
         // Recorded layers: (tokens, rows per expert).
         let recorded: Option<Vec<(usize, Vec<usize>)>> = std::env::var_os("OXINFER_MOE_ROUTES").map(|p| {
             let b = std::fs::read(p).unwrap();
@@ -4161,6 +4267,22 @@ mod tests {
             }
             let mut y = vec![0f32; t * h];
             assert!(be.moe(&x, t, h, mi, &routes, &dev, &mut y));
+            if let Some(d) = &dref {
+                let mut r = vec![0f32; t * h];
+                assert!(be.moe(&x, t, h, mi, &routes, d, &mut r));
+                eprintln!("t={t}: vs default kernels {:.3e}", row_err(&y, &r, h));
+            }
+            // Results of another run (`OXINFER_MOE_SAVE=DIR` writes them, `OXINFER_MOE_CMP=DIR`
+            // compares).
+            let file = |d: std::ffi::OsString| std::path::Path::new(&d).join(format!("moe{t}.f32"));
+            if let Some(d) = std::env::var_os("OXINFER_MOE_SAVE") {
+                std::fs::write(file(d), y.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+            }
+            if let Some(d) = std::env::var_os("OXINFER_MOE_CMP") {
+                let b = std::fs::read(file(d)).unwrap();
+                let r: Vec<f32> = b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
+                eprintln!("t={t}: vs saved {:.3e}", row_err(&y, &r, h));
+            }
             let n = 10;
             let g0 = be.stats.gpu_ns.load(Ordering::Relaxed);
             for _ in 0..n {
