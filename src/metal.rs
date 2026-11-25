@@ -1375,7 +1375,7 @@ struct FAM { uint tq; uint tk; uint d; float scale; };
 template <typename T>
 inline void flash_attn128_body(device const T* q, device const T* k, device const T* v, device float* o, constant FAM& p,
                                threadgroup float* S, threadgroup T* P, threadgroup float* A, threadgroup float* L,
-                               uint2 tg, uint tid) {
+                               threadgroup uint* RS, uint2 tg, uint tid) {
     uint q0 = tg.x * 64, h0 = tg.y * 128;
     uint tqp = (p.tq + 63) / 64 * 64, tkp = (p.tk + 63) / 64 * 64;
     tensor<device T, dextents<int32_t, 2>, tensor_inline> Qt((device T*)q, dextents<int32_t, 2>(p.d, tqp));
@@ -1393,6 +1393,8 @@ inline void flash_attn128_body(device const T* q, device const T* k, device cons
     zero(co);
     uint r = tid / 2, part = tid % 2;
     float m = -INFINITY, l = 0.0f;
+    threadgroup uint& rescale = RS[0];
+    if (tid == 0) rescale = 0;
     for (uint kb = 0; kb < p.tk; kb += 64) {
         auto kt = Kt.template slice<128, 64>(h0, kb);
         auto cs = ops.template get_destination_cooperative_tensor<decltype(qa), decltype(kt), float>();
@@ -1408,8 +1410,13 @@ inline void flash_attn128_body(device const T* q, device const T* k, device cons
             bm = max(bm, x[j]);
         }
         bm = max(bm, simd_shuffle_xor(bm, 1));
-        float mn = max(m, bm);
-        float alpha = exp(m - mn);
+        // Lazy rescaling: the running max moves only when a score exceeds it by more than 8
+        // (probabilities then stay below e^8, well within half range), so most key blocks skip
+        // rescaling the output.
+        bool grow = bm > m + 8.0f;
+        float mn = grow ? bm : m;
+        float alpha = grow ? exp(m - mn) : 1.0f;
+        if (grow) rescale = 1;
         float ps = 0.0f;
         for (uint j = 0; j < 32; j++) { float e = exp(x[j] - mn); P[r * 64 + part * 32 + j] = T(e); ps += e; }
         ps += simd_shuffle_xor(ps, 1);
@@ -1417,12 +1424,15 @@ inline void flash_attn128_body(device const T* q, device const T* k, device cons
         m = mn;
         if (part == 0) A[r] = alpha;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (rescale != 0) {
 #pragma unroll
-        for (uint16_t i = 0; i < co.get_capacity(); ++i)
-            if (co.is_valid_element(i)) { auto idx = co.get_multidimensional_index(i); co[i] *= A[idx[1]]; }
+            for (uint16_t i = 0; i < co.get_capacity(); ++i)
+                if (co.is_valid_element(i)) { auto idx = co.get_multidimensional_index(i); co[i] *= A[idx[1]]; }
+        }
         auto vt = Vt.template slice<128, 64>(h0, kb);
         opo.run(Pt, vt, co);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) rescale = 0;
     }
     if (part == 0) L[r] = 1.0f / l;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1441,7 +1451,8 @@ kernel void flash_attn128_mma(device const half* q [[buffer(0)]], device const h
     threadgroup half P[64 * 64];
     threadgroup float A[64];
     threadgroup float L[64];
-    flash_attn128_body<half>(q, k, v, o, p, S, P, A, L, tg, tid);
+    threadgroup uint RS[1];
+    flash_attn128_body<half>(q, k, v, o, p, S, P, A, L, RS, tg, tid);
 }
 kernel void flash_attn128_mma_f32(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]],
                                   device const float* v [[buffer(2)]], device float* o [[buffer(3)]], constant FAM& p [[buffer(4)]],
@@ -1449,7 +1460,8 @@ kernel void flash_attn128_mma_f32(device const float* q [[buffer(0)]], device co
     threadgroup float S[64 * 64];
     threadgroup float A[64];
     threadgroup float L[64];
-    flash_attn128_body<float>(q, k, v, o, p, S, S, A, L, tg, tid);
+    threadgroup uint RS[1];
+    flash_attn128_body<float>(q, k, v, o, p, S, S, A, L, RS, tg, tid);
 }
 #endif
 // out[t] = sum over the token's k slots of weight * o[row] (`add`: out[t] += the sum).

@@ -4346,6 +4346,14 @@ on the GPU"); per pass at 1024^2 the GEMMs take about 1.25 s (~83 TFLOP/s of the
 attention 0.55 s (13 TFLOP), the row kernels 0.1 s, the modulation vectors 5 ms (they took
 155 ms on the CPU). The VAE decoder (a CPU / GPU op mix) is what still trails MLX.
 
+Attention round (`flash_attn128_mma`, all its users): the running row maximum of the online
+softmax now moves only when a block's scores exceed it by more than 8 (probabilities stay below
+e^8, inside half range), and the output's rescaling is skipped for key blocks where no row of
+the threadgroup moved. FLUX.1 passes with the GEMMs left out (attention + row kernels) went from
+0.75-1.1 s to 0.67-0.91 s in interleaved runs on a shared GPU (about -20% of the attention);
+one-step FLUX.1 [schnell] at 512^2 against the CPU: 37.9 dB as before (49 dB from the previous
+GPU output).
+
 ## Quantization quality
 
 Q8 and Q4 are both measured against the bf16 output distribution (itself within 1e-4 of the
