@@ -261,13 +261,14 @@ with base and large-v3-turbo, 22 with large-v3; whisper.cpp 19 to 23).
   same pass makes every decoder layer's cross-attention keys and values and keeps them on the
   device (half precision); the host copy of the encoder output is read only for word
   timestamps. A large-v3-turbo window takes about 76 ms of GPU time (whisper.cpp: 101-107 ms).
-- A decoder step is a dozen dependent GPU stages per layer, each as short as it can be: a
+- A decoder step is eleven dependent GPU stages per layer, each as short as it can be: a
   LayerNorm kernel (one threadgroup a row), few-row matvecs of the decoder's weights (bf16, q8
   or q4; two output rows a threadgroup, each lane's weight chunks loaded before it reads the
   input) whose epilogue adds the residual and the bias or applies the bias and the exact GELU,
   self-attention over a per-sequence device cache (the attention kernel stores the row's new key
   and value itself), cross-attention over the window's keys and values in chunks of 128
-  positions merged per head, the logits of the rows asked for.
+  positions that the last of a head's chunks to finish merges (no stage of its own), the logits
+  of the rows asked for.
 - Greedy decoding (temperature 0, one sequence per window) chains 8 steps per submission, one
   command buffer per step committed as soon as it is encoded (the GPU runs a step while the next
   ones are encoded): the token choice runs on the GPU after each step (`whc_select`: the

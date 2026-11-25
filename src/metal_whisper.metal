@@ -280,17 +280,18 @@ kernel void wh_flash64_f32(device const float* q [[buffer(0)]], device const flo
 // One query row's attention over n cached positions in chunks of 128, one threadgroup (128
 // threads) per chunk and 64-wide head: q = (q + bias) * scale, keys and values of type T in rows
 // d apart. Each writes its chunk's max score, exponential sum and weighted values (68 floats at
-// part + (head * chunks + chunk) * 68); `whd_attn_merge` combines the chunks.
+// part + (head * chunks + chunk) * 68); with `merge`, the last chunk of a head to finish (by a
+// count per head in `cnt`, zero before and after) combines them into `o`.
 // With `fuse`, position n - 1 is the row's own: its key and value come from `nk` / `nv` (plus
 // `bk` / `bv`) and are stored into the cache by the chunk holding it (`k` / `v` then f32).
 // With one chunk the attention output goes straight to `o`.
-struct WDP { uint n; uint d; float scale; uint chunks; uint fuse; uint _p0; uint _p1; uint _p2; };
+struct WDP { uint n; uint d; float scale; uint chunks; uint fuse; uint merge; uint _p1; uint _p2; };
 template <typename T>
-inline void whd_part_body(device const float* q, device const float* qb, device T* k, device T* v, device float* part,
+inline void whd_part_body(device const float* q, device const float* qb, device T* k, device T* v, coherent(device) device float* part,
                           constant WDP& p, uint2 g, uint tid, uint sg, uint lane, threadgroup float* qs, threadgroup float* S,
                           threadgroup float* red, threadgroup float4* acc, device const float* nk, device const float* nv,
                           device const float* bk, device const float* bv, device float* o, threadgroup float* kn,
-                          threadgroup float* vn) {
+                          threadgroup float* vn, device atomic_uint* cnt, threadgroup uint* last) {
     uint h = g.y, c0 = g.x * 128;
     uint own = p.fuse != 0 ? p.n - 1 : 0xffffffffu;
     bool mine = own >= c0 && own < c0 + 128;
@@ -347,48 +348,57 @@ inline void whd_part_body(device const float* q, device const float* qb, device 
         }
         return;
     }
-    device float* out = part + ((ulong)h * p.chunks + g.x) * 68;
+    coherent(device) device float* out = part + ((ulong)h * p.chunks + g.x) * 68;
     if (tid < 16) {
         float4 t = acc[tid];
         for (uint j = 1; j < 8; j++) t += acc[j * 16 + tid];
-        ((device float4*)(out + 4))[tid] = t;
+        ((coherent(device) device float4*)(out + 4))[tid] = t;
     }
     if (tid == 0) { out[0] = m; out[1] = l; }
+    if (p.merge == 0) return;
+    // The head's last chunk to finish merges the chunks and resets
+    // the head's count for the next use.
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) last[0] = atomic_fetch_add_explicit(&cnt[h], 1u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (last[0] != p.chunks - 1) return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    if (tid < 64) {
+        coherent(device) device const float* ph = part + (ulong)h * p.chunks * 68;
+        float mm = -INFINITY;
+        for (uint c = 0; c < p.chunks; c++) mm = max(mm, ph[c * 68]);
+        float ll = 0.f, a = 0.f;
+        for (uint c = 0; c < p.chunks; c++) {
+            float w = exp(ph[c * 68] - mm);
+            ll += w * ph[c * 68 + 1];
+            a += w * ph[c * 68 + 4 + tid];
+        }
+        o[h * 64 + tid] = a / ll;
+    }
+    if (tid == 0) atomic_store_explicit(&cnt[h], 0u, memory_order_relaxed);
 }
 kernel void whd_part_f32(device const float* q [[buffer(0)]], device const float* qb [[buffer(1)]], device float* k [[buffer(2)]],
-                         device float* v [[buffer(3)]], device float* part [[buffer(4)]], constant WDP& p [[buffer(5)]],
+                         device float* v [[buffer(3)]], coherent(device) device float* part [[buffer(4)]], constant WDP& p [[buffer(5)]],
                          device const float* nk [[buffer(6)]], device const float* nv [[buffer(7)]], device const float* bk [[buffer(8)]],
-                         device const float* bv [[buffer(9)]], device float* o [[buffer(10)]],
+                         device const float* bv [[buffer(9)]], device float* o [[buffer(10)]], device atomic_uint* cnt [[buffer(11)]],
                          uint2 g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float qs[64], S[128], red[8], kn[64], vn[64];
     threadgroup float4 acc[128];
-    whd_part_body<float>(q, qb, k, v, part, p, g, tid, sg, lane, qs, S, red, acc, nk, nv, bk, bv, o, kn, vn);
+    threadgroup uint last[1];
+    whd_part_body<float>(q, qb, k, v, part, p, g, tid, sg, lane, qs, S, red, acc, nk, nv, bk, bv, o, kn, vn, cnt, last);
 }
 kernel void whd_part_h(device const float* q [[buffer(0)]], device const float* qb [[buffer(1)]], device half* k [[buffer(2)]],
-                       device half* v [[buffer(3)]], device float* part [[buffer(4)]], constant WDP& p [[buffer(5)]],
-                       device float* o [[buffer(10)]],
+                       device half* v [[buffer(3)]], coherent(device) device float* part [[buffer(4)]], constant WDP& p [[buffer(5)]],
+                       device float* o [[buffer(10)]], device atomic_uint* cnt [[buffer(11)]],
                        uint2 g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float qs[64], S[128], red[8], kn[64], vn[64];
     threadgroup float4 acc[128];
-    whd_part_body<half>(q, qb, k, v, part, p, g, tid, sg, lane, qs, S, red, acc, q, q, q, q, o, kn, vn);
+    threadgroup uint last[1];
+    whd_part_body<half>(q, qb, k, v, part, p, g, tid, sg, lane, qs, S, red, acc, q, q, q, q, o, kn, vn, cnt, last);
 }
-// The chunks of `whd_part_*` of one head (threadgroup, 64 threads: one per value) into o.
-kernel void whd_attn_merge(device const float* part [[buffer(0)]], device float* o [[buffer(1)]], constant WDP& p [[buffer(2)]],
-                           uint h [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-    device const float* ph = part + (ulong)h * p.chunks * 68;
-    float m = -INFINITY;
-    for (uint c = 0; c < p.chunks; c++) m = max(m, ph[c * 68]);
-    float l = 0.f, a = 0.f;
-    for (uint c = 0; c < p.chunks; c++) {
-        float w = exp(ph[c * 68] - m);
-        l += w * ph[c * 68 + 1];
-        a += w * ph[c * 68 + 4 + tid];
-    }
-    o[h * 64 + tid] = a / l;
-}
-
 // ---- Greedy decoding chained on the device ----
 // Per row of a chain: the token to decode next, the one before it, the last timestamp generated
 // (0xffffffff: none), the tokens generated so far, and whether the row applies the timestamp

@@ -130,7 +130,6 @@ struct Pipes {
     gate: Id,
     part_f32: Id,
     part_h: Id,
-    merge: Id,
     embed: Id,
     select: Id,
     ln: Id,
@@ -191,6 +190,7 @@ enum B {
     Df,
     Dlog,
     Dpart,
+    Dcnt,
     DConsts,
     // Chains.
     Cmask,
@@ -199,7 +199,7 @@ enum B {
     Cout,
     Cargs,
 }
-const NBUF: usize = 32;
+const NBUF: usize = 33;
 
 /// Weight chunks per lane of the decoder matvecs (`whd_mv_*`) at most, and values of a row of
 /// the decoder's LayerNorm kernel (`whd_ln`, 256 threads of 2 float4s).
@@ -239,7 +239,6 @@ impl MetalBackend {
             gate: pipe("whc_gate")?,
             part_f32: pipe("whd_part_f32")?,
             part_h: pipe("whd_part_h")?,
-            merge: pipe("whd_attn_merge")?,
             embed: pipe("whc_embed")?,
             select: pipe("whc_select")?,
             ln: pipe("whd_ln")?,
@@ -901,10 +900,14 @@ impl MetalWhisper {
             && self.ensure(B::Datt, t * d * 4)
             && self.ensure(B::Df, t * ffn * 4)
             && self.ensure(B::Dlog, nlog.max(1) * v * 4)
-            && self.ensure(B::Dpart, t * nh * DEC_CHUNKS * 68 * 4);
+            && self.ensure(B::Dpart, t * nh * DEC_CHUNKS * 68 * 4)
+            && self.ensure(B::Dcnt, t * nh * 4);
         if !ok {
             return false;
         }
+        // The attention's chunk counts start at zero (each merge resets its own).
+        // SAFETY: Dcnt holds t * nh u32s; the device is idle.
+        unsafe { std::ptr::write_bytes(self.host(B::Dcnt), 0, t * nh) };
         // The constants, made once per decoder.
         let key = dec.ln.w.as_ptr() as usize;
         if self.dconsts.as_ref().is_none_or(|(k, _)| *k != key) {
@@ -1073,9 +1076,9 @@ impl MetalWhisper {
             e.dispatch((t, 1), 256);
             e.barrier();
         };
-        // Attention of row i's query (Dq + bias) over `n` rows of keys and values: straight into
-        // Datt from one chunk, else the chunks into Dpart, then (`merge`, after a barrier) into
-        // Datt. With `fuse` (key and value biases), the row's own key and value (position n - 1)
+        // Attention of row i's query (Dq + bias) over `n` rows of keys and values into Datt:
+        // straight from one chunk, else the chunks into Dpart, which the head's last chunk to
+        // finish merges (Dcnt counts them). With `fuse` (key and value biases), the row's own key and value (position n - 1)
         // come from Dk / Dv and go to the cache there.
         let part =
             |e: &DEnc, pipe: Id, i: usize, qb: usize, kv: (Id, usize, usize), n: usize, elem: usize, fuse: Option<(usize, usize)>| {
@@ -1091,9 +1094,10 @@ impl MetalWhisper {
                 e.buf(id(B::Dpart), i * nh * DEC_CHUNKS * 68 * 4, 4);
                 let chunks = n.div_ceil(DEC_CHUNK);
                 e.bytes(
-                    &U8([n as u32, d as u32, scale.to_bits(), chunks as u32, fuse.is_some() as u32, 0, 0, 0]),
+                    &U8([n as u32, d as u32, scale.to_bits(), chunks as u32, fuse.is_some() as u32, 1, 0, 0]),
                     5,
                 );
+                e.buf(id(B::Dcnt), i * nh * 4, 11);
                 if let Some((bk, bv)) = fuse {
                     e.buf(id(B::Dk), i * d * 4, 6);
                     e.buf(id(B::Dv), i * d * 4, 7);
@@ -1107,16 +1111,6 @@ impl MetalWhisper {
                 e.buf(id(B::Datt), i * d * 4, 10);
                 e.dispatch((chunks, nh), DEC_CHUNK);
             };
-        let merge = |e: &DEnc, i: usize, n: usize| {
-            if skip_op("dmerge") {
-                return;
-            }
-            e.pipe(p.merge);
-            e.buf(id(B::Dpart), i * nh * DEC_CHUNKS * 68 * 4, 0);
-            e.buf(id(B::Datt), i * d * 4, 1);
-            e.bytes(&U4([n as u32, d as u32, 0, n.div_ceil(DEC_CHUNK) as u32]), 2);
-            e.dispatch((nh, 1), 64);
-        };
         let all: Vec<usize> = (0..t).collect();
         // A chain's steps after the first dispatch indirectly, from sizes a gate at the start of
         // the step copies from the ones written here, or zeros once every row has ended.
@@ -1204,12 +1198,6 @@ impl MetalWhisper {
                         }
                         e.barrier();
                     }
-                    if (0..t).any(|i| at(i) + 1 > DEC_CHUNK) {
-                        for i in (0..t).filter(|&i| at(i) + 1 > DEC_CHUNK) {
-                            merge(&e, i, at(i) + 1);
-                        }
-                        e.barrier();
-                    }
                     for _ in 0..reps("o") {
                         mv(&e, w0 + 3, id(B::Datt), 0, t, id(B::Dx), 0, 1, lb[3]);
                         e.barrier();
@@ -1223,12 +1211,6 @@ impl MetalWhisper {
                     for _ in 0..reps("cross") {
                         for (i, &(cid, n)) in cross_ids.iter().enumerate() {
                             part(&e, p.part_h, i, lb[4], (cid, 2 * li * n * d, (2 * li + 1) * n * d), n, 2, None);
-                        }
-                        e.barrier();
-                    }
-                    for _ in 0..reps("merge") {
-                        for (i, &(_, n)) in cross_ids.iter().enumerate() {
-                            merge(&e, i, n);
                         }
                         e.barrier();
                     }
