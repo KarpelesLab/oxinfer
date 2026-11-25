@@ -65,6 +65,11 @@ pub struct VaeDecoder {
     pub scaling_factor: f32,
     pub shift_factor: f32,
     pub latent_channels: usize,
+    /// The whole-pass device session ([`crate::gpu::unet`]), once made.
+    gpu: std::sync::Mutex<Option<Box<dyn crate::gpu::unet::Session>>>,
+    /// Whether [`VaeDecoder::decode`] tries the device plan (default on, or
+    /// `OXINFER_SD_GPU_PASS=0` for off).
+    gpu_pass: std::sync::atomic::AtomicBool,
 }
 
 impl VaeDecoder {
@@ -113,7 +118,14 @@ impl VaeDecoder {
             conv_out: Conv::load(t, &format!("{p}.conv_out"))?,
             scaling_factor,
             shift_factor,
+            gpu: std::sync::Mutex::new(None),
+            gpu_pass: std::sync::atomic::AtomicBool::new(std::env::var("OXINFER_SD_GPU_PASS").map_or(true, |v| v != "0")),
         })
+    }
+
+    /// Whether decoding runs as one device plan when the accelerator has one (default on).
+    pub fn set_gpu_pass(&self, on: bool) {
+        self.gpu_pass.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// `latent` (`[h*w, latent_channels]`, as produced by the denoiser) to RGB in [-1, 1]
@@ -122,6 +134,11 @@ impl VaeDecoder {
         let mut z: Vec<f32> = latent.iter().map(|&v| v / self.scaling_factor + self.shift_factor).collect();
         if let Some(pq) = &self.post_quant {
             z = pq.forward(&z, h * w);
+        }
+        if self.gpu_pass.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(r) = self.decode_device(&z, h, w)
+        {
+            return r;
         }
         let (mut x, mut h, mut w) = self.conv_in.forward(&z, h, w, 1);
         x = self.mid1.forward(&x, h, w, None);
@@ -140,6 +157,75 @@ impl VaeDecoder {
             }
         }
         (self.conv_out.forward_pre(&x, h, w, 1, Pre::Group(&self.norm_out, true)).0, h, w)
+    }
+}
+
+impl VaeDecoder {
+    /// [`VaeDecoder::decode`] of the (scaled) latents `z` as one device plan.
+    fn decode_device(&self, z: &[f32], h: usize, w: usize) -> Option<(Vec<f32>, usize, usize)> {
+        use super::unet::{conv_op, new_tensor};
+        use crate::gpu::unet::{Graph, Item, Op};
+        let be = crate::gpu::active()?;
+        if super::ops::gpu_check::on() || crate::gpu::exact() {
+            return None;
+        }
+        let _t = super::ops::timing::start(super::ops::timing::PASS);
+        let mut g = Graph {
+            tensors: vec![[h, w, self.latent_channels]],
+            ops: Vec::new(),
+            input: 0,
+            output: 0,
+            ctx_dim: 0,
+        };
+        let (mut h, mut w) = (h, w);
+        let mut x = new_tensor(&mut g, [h, w, self.conv_in.cout]);
+        g.ops.push(conv_op(&self.conv_in, 0, x, None, None, false)?);
+        x = self.mid1.plan(&mut g, x, &[], 1)?;
+        let a = &self.attn;
+        let s = g.tensors[x];
+        let y = new_tensor(&mut g, s);
+        g.ops.push(Op::Attention {
+            x,
+            out: y,
+            norm: a.norm.plan_norm(),
+            a: crate::gpu::unet::Attn {
+                q: a.q.plan_lin()?,
+                k: a.k.plan_lin()?,
+                v: a.v.plan_lin()?,
+                o: a.o.plan_lin()?,
+                heads: 1,
+            },
+        });
+        x = self.mid2.plan(&mut g, y, &[], 1)?;
+        for b in &self.ups {
+            for r in &b.resnets {
+                x = r.plan(&mut g, x, &[], 1)?;
+            }
+            if let Some(u) = &b.up {
+                let c = g.tensors[x][2];
+                (h, w) = (h * 2, w * 2);
+                let y = new_tensor(&mut g, [h, w, c]);
+                g.ops.push(conv_op(u, x, y, None, None, true)?);
+                x = y;
+            }
+        }
+        let y = new_tensor(&mut g, [h, w, self.conv_out.cout]);
+        g.ops
+            .push(conv_op(&self.conv_out, x, y, Some((self.norm_out.plan_norm(), true)), None, false)?);
+        g.output = y;
+        let mut sess = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if sess.is_none() {
+            *sess = Some(be.unet_session()?);
+        }
+        let item = Item {
+            latent: z,
+            ctx: &[],
+            ctx_len: 0,
+        };
+        let mut out = vec![Vec::new()];
+        sess.as_mut()?
+            .forward(&g, std::slice::from_ref(&item), &mut out)
+            .then(|| (out.pop().unwrap(), h, w))
     }
 }
 

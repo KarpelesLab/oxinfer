@@ -58,6 +58,8 @@ pub(crate) mod inkling;
 pub(crate) mod inkling_draft;
 #[path = "metal_prefill.rs"]
 mod prefill;
+#[path = "metal_unet.rs"]
+mod unet;
 
 const TILE: usize = 64; // out rows and tokens per threadgroup
 const MIN_T: usize = 16; // smaller token counts stay on the CPU
@@ -2232,8 +2234,9 @@ impl MetalBackend {
         let (lib, has_mma, units, mma_error) = match want_mma {
             true => match compile(
                 &format!(
-                    "#define GTM {MMA_GTM}\n#define MMA_UNITS 1\n{base_src}{MMA_SHADER_SRC}{}{}",
+                    "#define GTM {MMA_GTM}\n#define MMA_UNITS 1\n{base_src}{MMA_SHADER_SRC}{}{}{}",
                     decode::PFM_SRC,
+                    unet::SRC,
                     extra()
                 ),
                 true,
@@ -3734,6 +3737,10 @@ impl Backend for MetalBackend {
 
     fn flux_session(&'static self) -> Option<Box<dyn crate::gpu::dit::FluxSession>> {
         self.flux_session_impl()
+    }
+
+    fn unet_session(&'static self) -> Option<Box<dyn crate::gpu::unet::Session>> {
+        self.unet_session_impl()
     }
 
     fn attention_cached(&self, j: &mut crate::gpu::AttnJob) -> bool {

@@ -33,10 +33,54 @@ reference is the bf16 weight storage (47 dB).
 | | Text | UNet pass | VAE decode | SD-Turbo image | SD 1.5, 25 steps + guidance |
 |---|---|---|---|---|---|
 | CPU only (18 threads) | 0.08 s | 0.91 s | 2.87 s | 3.9 s | |
-| Metal | 0.08 s | 0.37 s | 0.66 s | 1.1 s | 16 s |
+| Metal, op by op (`gpu_pass=0`) | 0.08 s | 0.37 s | 0.66 s | 1.1 s | 16 s |
+| Metal, whole passes (default) | 0.07 s | 0.05 s (batch of 2: 0.10 s) | 0.10 s | 0.3 s | 2.8 s |
 | Browser (Chrome, WebGPU, one CPU thread) | 0.2 s | 1.1 s | 1.9 s | 3.2 s | |
 
-With a GPU, convolutions, attention and the group and layer norms run on it: each norm is fused
+**Whole passes on Metal.** On a GPU with matrix units (M5, A19), every UNet pass and the VAE
+decode run as one device plan (`src/gpu_unet.rs`, `src/metal_unet.rs`): the model describes the
+pass as a graph of convolutions, concatenations and transformer blocks, the activations stay in
+device buffers between ops and between steps, and the guidance branches of a step run as one batch
+(both CFG passes in one, InstructPix2Pix's three in one). Activations are f32 in a padded
+channels-last layout (each image with a border of zero pixels), so a 3x3 convolution is nine
+shifted GEMMs accumulated into the same tile on the matrix units (`matmul2d`, half inputs, bf16
+weights, f32 sums), with the group norm and SiLU applied while the half inputs are written;
+strided convolutions and narrow inputs (the 4 latent channels) go through an unfolded copy.
+Attention is a fused flash kernel over heads padded to 64 / 96 / 128 / 160 (a VAE's single head
+of 512 in value chunks of 128); layer norms, GEGLU, residual adds, skip concatenation and 2x
+upsampling are fused into row kernels or the GEMMs' stores. Inputs without a norm are scaled by
+a power of two when their largest magnitude passes half's range (the SDXL VAE's activations
+do), and the products scaled back. `gpu_pass=0` (`Pipeline::set_gpu_pass(false)`, the
+C API's and the server's load option, or `OXINFER_SD_GPU_PASS=0`) keeps the op-by-op path below;
+`OXINFER_GPU_CHECK=1` and exact mode (`OXINFER_METAL_MMA=0`) use it too. FLUX.1's VAE decoder is
+the same code, so it takes the same plan: 1024x1024 FLUX.1-schnell decodes in 0.57 s instead of 2.9 s
+(66.9 dB against the op-by-op decode of the same latents; mflux, on MLX, takes 0.5-0.7 s).
+
+Against the op-by-op path (512x512, same seed): the first guided SD 1.5 UNet output differs by
+5.2e-4 (relative L2), the image after 20 Euler steps at guidance 7.5 by 53.4 dB (8-bit PSNR; the
+latents 4.2e-3), the SD-Turbo image by 52.7 dB, SDXL-Turbo (2 steps) 50.1 dB with a first UNet
+output 2.3e-4 apart; the VAE alone (same latents) 66 dB. That is the half-precision rounding of
+the GEMM inputs (diffusers' fp16 inference rounds every activation), below the 47 dB the bf16
+weight storage already costs against the float32 reference.
+
+Against [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (master 82c19c8,
+Metal, flash attention, cond and uncond in one batch) on the same fp16 weights, M5 Max, 2026-11-26
+(the GPU shared with other jobs: ranges over interleaved runs):
+
+| | oxinfer | stable-diffusion.cpp |
+|---|---|---|
+| SD 1.5 512x512, 20 Euler steps, guidance 7.5: sampling | 2.05-2.90 s (0.10-0.15 s/step) | 4.72-6.02 s (0.24-0.30 s/step) |
+| text encoder | 0.06-0.07 s | 0.43 s |
+| VAE decode | 0.10 s | 1.21-1.26 s |
+| SD 1.5 768x768, same: sampling | 6.77-7.63 s (0.34-0.38 s/step) | 12.3-16.7 s |
+| VAE decode | 0.28 s | 2.39-2.50 s |
+| SD-Turbo 512x512, 1 step: text | 0.10-0.13 s | 0.24 s |
+| UNet | 0.09 s (the first pass, with the session's setup) | 0.15-0.23 s |
+| VAE decode | 0.10 s | 1.17-1.19 s |
+
+Before this (op by op, CFG branches one after the other): SD 1.5 0.60 s/step, VAE 0.56 s.
+
+Op by op (other GPUs, or `gpu_pass=0`), convolutions, attention and the group and layer norms run on the GPU: each norm is fused
 into the convolution or projection that consumes it (a statistics kernel, then normalization and
 SiLU applied while the input is loaded), and attention runs its two products as GPU matmuls with a
 softmax kernel between them. What stays on the CPU is element-wise: residual adds, the GEGLU gate,
@@ -252,7 +296,7 @@ let params = Params {
 let (img, timings) = pipe.generate_from(&params, &edit, &mut |i, n| eprint!("\r{i}/{n}"))?;
 ```
 
-**C API.** `oxi_sd_load(model, "device=auto;lora=FILE:SCALE", progress, user)`, then
+**C API.** `oxi_sd_load(model, "device=auto;lora=FILE:SCALE;gpu_pass=1", progress, user)`, then
 `oxi_sd_generate(s, prompt, options_json, on_image, on_step, user)` with `options_json` such as
 `{"init_image": "in.png", "mask": "mask.png", "strength": 0.8, "image_guidance": 1.5, "steps": 4,
 "guidance": 1, "seed": 1}` (text to image without `init_image`), or `oxi_sd_edit_rgb(s, prompt,

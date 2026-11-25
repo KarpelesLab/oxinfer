@@ -397,7 +397,7 @@ Model options: those of the engine for chat models (`quant`, `device`, `mmap`, `
 `draft`, `mtp`, `lookup`, `prompt_cache`, `max_context`, `prefill_chunk`, `gpu_decode`, `gpu_chain`, ...; see
 [As a library](library.md#as-a-library)),
 of the loader for the other kinds (Whisper `encoder` / `decoder` precision, Orpheus `snac` and
-`quant`, FLUX `transformer` / `base`, Stable Diffusion `lora`, ...), and:
+`quant`, FLUX `transformer` / `base`, Stable Diffusion `lora` and `gpu_pass`, ...), and:
 
 | Key | Meaning |
 |---|---|

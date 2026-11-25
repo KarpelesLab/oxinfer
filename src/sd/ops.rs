@@ -17,7 +17,7 @@ use std::path::Path;
 pub mod timing {
     use crate::clock::Instant;
     use std::sync::atomic::{AtomicU64, Ordering};
-    pub const NAMES: [&str; 7] = [
+    pub const NAMES: [&str; 8] = [
         "conv unfold",
         "conv matmul",
         "linear",
@@ -25,8 +25,9 @@ pub mod timing {
         "group norm",
         "layer norm",
         "other",
+        "device pass",
     ];
-    static NS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    static NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
     pub struct T(usize, Instant);
     pub fn start(k: usize) -> T {
         T(k, Instant::now())
@@ -52,6 +53,8 @@ pub mod timing {
     pub const ATTN: usize = 3;
     pub const GN: usize = 4;
     pub const LN: usize = 5;
+    /// Whole UNet passes on the accelerator (`crate::gpu::unet`).
+    pub const PASS: usize = 7;
 }
 
 /// One safetensors file of a diffusers component (`unet/`, `vae/`, `text_encoder/`), with the
@@ -327,6 +330,10 @@ pub struct Conv {
     pub cout: usize,
     /// Zero padding before (top / left) and after (bottom / right) the input.
     pad: (usize, usize),
+    /// For whole-pass device plans: the matrix with zero columns up to a multiple of 64 inputs
+    /// and zero rows up to a multiple of 64 outputs (made on first use; None when the rows cannot
+    /// be read).
+    plan_lin: std::sync::OnceLock<Option<Box<Linear>>>,
 }
 
 /// Upper bound on the unfold buffer of one convolution chunk.
@@ -363,6 +370,7 @@ impl Conv {
             cin,
             cout,
             pad: (k / 2, k / 2),
+            plan_lin: std::sync::OnceLock::new(),
         })
     }
 
@@ -686,6 +694,94 @@ impl Linear {
             return y;
         }
         self.forward(&pre.apply(x, rows), rows)
+    }
+}
+
+// ---- whole-pass device plans (crate::gpu::unet) ---------------------------------------------------
+
+impl Linear {
+    /// This layer as a whole-pass plan sees it (bf16 weights on the active accelerator; None for
+    /// split float32 layers).
+    pub fn plan_lin(&self) -> Option<crate::gpu::unet::Lin<'_>> {
+        if self.lo.is_some() || !matches!(self.w.as_ref(), crate::gpu::WeightRef::Bf16(_)) {
+            return None;
+        }
+        Some(crate::gpu::unet::Lin {
+            w: self.w.as_ref(),
+            dev: self.w.device_weight(self.n_out, self.n_in)?,
+            n_out: self.n_out,
+            n_in: self.n_in,
+            bias: self.b.as_deref(),
+        })
+    }
+
+    /// This layer with zero columns up to `n_in` inputs (appended to each row) and zero rows up
+    /// to `n_out` outputs.
+    fn zero_padded(&self, n_out: usize, n_in: usize) -> Option<Linear> {
+        let mut w = vec![0f32; self.n_out * self.n_in];
+        let idx: Vec<u32> = (0..self.n_out as u32).collect();
+        if self.lo.is_some() || !self.w.rows(&idx, self.n_in, &mut w) {
+            return None;
+        }
+        let mut wp = vec![0f32; n_out * n_in];
+        for (o, r) in w.chunks(self.n_in).enumerate() {
+            wp[o * n_in..o * n_in + self.n_in].copy_from_slice(r);
+        }
+        let b = self.b.as_ref().map(|b| {
+            let mut v = b.clone();
+            v.resize(n_out, 0.0);
+            v
+        });
+        Self::from_parts(&wp, n_out, n_in, b).ok()
+    }
+}
+
+impl Conv {
+    /// The convolution's matrix for a whole-pass plan: as loaded when its sizes suit the device
+    /// GEMMs, else a zero-padded copy (inputs to a multiple of 64 when `cin` is not a multiple of
+    /// 32, outputs to a multiple of 64: the first `cout` are the real ones).
+    pub fn plan_lin(&self) -> Option<crate::gpu::unet::Lin<'_>> {
+        let l = &self.lin;
+        if self.cin.is_multiple_of(32) && l.n_out.is_multiple_of(64) {
+            return l.plan_lin();
+        }
+        let n_in = if self.cin.is_multiple_of(32) {
+            l.n_in
+        } else {
+            l.n_in.next_multiple_of(64)
+        };
+        let p = self
+            .plan_lin
+            .get_or_init(|| l.zero_padded(l.n_out.next_multiple_of(64), n_in).map(Box::new))
+            .as_ref()?;
+        p.plan_lin()
+    }
+
+    /// Zero padding before the input (top / left).
+    pub fn pad_before(&self) -> usize {
+        self.pad.0
+    }
+}
+
+impl GroupNorm {
+    pub fn plan_norm(&self) -> crate::gpu::unet::Norm<'_> {
+        crate::gpu::unet::Norm {
+            gamma: &self.w,
+            beta: &self.b,
+            eps: self.eps,
+            groups: self.groups,
+        }
+    }
+}
+
+impl LayerNorm {
+    pub fn plan_norm(&self) -> crate::gpu::unet::Norm<'_> {
+        crate::gpu::unet::Norm {
+            gamma: &self.w,
+            beta: &self.b,
+            eps: self.eps,
+            groups: 0,
+        }
     }
 }
 

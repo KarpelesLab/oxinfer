@@ -1095,12 +1095,13 @@ fn load_image(ik: ImageKind, src: &str, opts: &[(&str, &str)], cache_dir: Option
     }
     Ok(match ik {
         ImageKind::Sd => {
-            let (mut device, mut loras) = (crate::platform::DevicePref::Auto, Vec::new());
+            let (mut device, mut loras, mut gpu_pass) = (crate::platform::DevicePref::Auto, Vec::new(), None);
             for (k, v) in opts {
                 match *k {
                     "device" => device = crate::platform::DevicePref::parse(v).with_context(|| format!("device: unknown device {v:?}"))?,
                     "lora" => loras.push(crate::sd::lora::LoraSpec::parse(v)?),
-                    k => bail!("unknown Stable Diffusion option {k:?} (device, lora)"),
+                    "gpu_pass" => gpu_pass = Some(crate::sd::parse_flag("gpu_pass", v)?),
+                    k => bail!("unknown Stable Diffusion option {k:?} (device, lora, gpu_pass)"),
                 }
             }
             for l in &mut loras {
@@ -1108,7 +1109,11 @@ fn load_image(ik: ImageKind, src: &str, opts: &[(&str, &str)], cache_dir: Option
             }
             let dir = crate::engine::resolve_model(src, cache_dir)?;
             crate::gpu::ensure(device)?;
-            ImageModel::Sd(crate::sd::Pipeline::load_with_loras(&dir, &loras, &mut |_| {})?)
+            let p = crate::sd::Pipeline::load_with_loras(&dir, &loras, &mut |_| {})?;
+            if let Some(on) = gpu_pass {
+                p.set_gpu_pass(on);
+            }
+            ImageModel::Sd(p)
         }
         ImageKind::Flux => ImageModel::Flux(crate::flux::Pipeline::load(
             src,

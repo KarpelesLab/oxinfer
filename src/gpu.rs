@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 pub mod decode;
 #[path = "gpu_dit.rs"]
 pub mod dit;
+#[path = "gpu_unet.rs"]
+pub mod unet;
 
 /// A weight matrix in one of the supported storage formats (`[n_out, n_in]`).
 pub enum WeightRef<'a> {
@@ -229,6 +231,11 @@ pub trait Backend: Send + Sync {
     /// A session running whole FLUX.1 transformer passes on the device; None when the backend
     /// has none.
     fn flux_session(&'static self) -> Option<Box<dyn dit::FluxSession>> {
+        None
+    }
+    /// A session running whole convolutional UNet passes on the device (see [`unet`]); None
+    /// when the backend has none.
+    fn unet_session(&'static self) -> Option<Box<dyn unet::Session>> {
         None
     }
     /// See [`AttnJob`]. False when the backend does not run it (the caller then does).

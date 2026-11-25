@@ -1900,7 +1900,7 @@ struct SdOptions {
 }
 
 /// Loads a diffusers Stable Diffusion folder or repo id (`key=value` options: device,
-/// cache_dir, lora=FILE[:SCALE] (repeatable)).
+/// cache_dir, lora=FILE[:SCALE] (repeatable), gpu_pass=0|1).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxi_sd_load(
     model: *const c_char,
@@ -1910,7 +1910,7 @@ pub unsafe extern "C" fn oxi_sd_load(
 ) -> *mut OxiSd {
     guard(std::ptr::null_mut(), || {
         let model = unsafe { str_arg(model, "model") }?;
-        let (mut device, mut cache_dir, mut loras) = (crate::platform::DevicePref::Auto, None, Vec::new());
+        let (mut device, mut cache_dir, mut loras, mut gpu_pass) = (crate::platform::DevicePref::Auto, None, Vec::new(), None);
         for item in unsafe { opt_str_arg(options, "options") }?.unwrap_or("").split(['\n', ';']) {
             let item = item.trim();
             if item.is_empty() || item.starts_with('#') {
@@ -1923,7 +1923,8 @@ pub unsafe extern "C" fn oxi_sd_load(
                 }
                 "cache_dir" => cache_dir = Some(std::path::PathBuf::from(v.trim())),
                 "lora" => loras.push(crate::sd::lora::LoraSpec::parse(v.trim())?),
-                k => bail!("unknown option {k:?} (device, cache_dir, lora)"),
+                "gpu_pass" => gpu_pass = Some(crate::sd::parse_flag("gpu_pass", v.trim())?),
+                k => bail!("unknown option {k:?} (device, cache_dir, lora, gpu_pass)"),
             }
         }
         let pipe = with_progress(progress, user, || {
@@ -1931,6 +1932,9 @@ pub unsafe extern "C" fn oxi_sd_load(
             crate::gpu::ensure(device)?;
             crate::sd::Pipeline::load_with_loras(&dir, &loras, &mut |_| {})
         })?;
+        if let Some(on) = gpu_pass {
+            pipe.set_gpu_pass(on);
+        }
         Ok(Box::into_raw(Box::new(OxiSd {
             cancel: pipe.cancel_flag(),
             pipe: Mutex::new(pipe),

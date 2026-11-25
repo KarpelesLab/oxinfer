@@ -899,7 +899,9 @@ typedef struct OxiSd OxiSd;
 /* Loads a pipeline. `options`: NULL or "key=value" pairs separated by newlines or ';':
  *   device=auto|cpu|metal|cuda|vulkan
  *   cache_dir=PATH        where repo ids are downloaded
- *   lora=FILE[:SCALE]     merge a LoRA (repeatable) */
+ *   lora=FILE[:SCALE]     merge a LoRA (repeatable)
+ *   gpu_pass=0|1          whole UNet passes on the GPU, guidance branches batched (default 1;
+ *                         Metal with matrix units, else ignored); 0 runs op by op */
 OxiSd *oxi_sd_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
 
 /* Frees a pipeline (NULL is ignored); no other call on it may be running. */

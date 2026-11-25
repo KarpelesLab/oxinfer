@@ -384,6 +384,15 @@ impl Pipeline {
         self.run(p, Some(e), progress)
     }
 
+    /// Runs every UNet pass of a step (its guidance branches in one batch) as one device plan
+    /// when the accelerator has one (Metal with matrix units: half-precision GEMM inputs, f32
+    /// accumulation), default on; off keeps the per-op path (`OXINFER_SD_GPU_PASS=0` sets the
+    /// default off). The C API's and the server's load option `gpu_pass=0|1`.
+    pub fn set_gpu_pass(&self, on: bool) {
+        self.unet.set_gpu_pass(on);
+        self.vae.set_gpu_pass(on);
+    }
+
     /// A flag that stops the running generation (from any thread) when set: it then fails with
     /// "cancelled" after the current denoising step. Each generation clears it when it starts.
     pub fn cancel_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
@@ -536,22 +545,38 @@ impl Pipeline {
                 Some((ex, ce)) => concat_channels(&xs, lc, ex, *ce, n),
                 None => xs.clone(),
             };
-            let unet = |x: &[f32], c: &Cond| self.unet.forward_added(x, lh, lw, t as f32, &c.ctx, m, c.added.as_deref());
-            let mut out = unet(&xin, &cond);
-            tm.unet_calls += 1;
+            fn item<'a>(x: &'a [f32], c: &'a Cond) -> unet::BatchItem<'a> {
+                unet::BatchItem {
+                    latent: x,
+                    ctx: &c.ctx,
+                    added: c.added.as_deref(),
+                }
+            }
+            // The guidance branches of the step, in one batch where the device runs whole passes.
+            let xin0 = match (&uncond, kind) {
+                (Some(_), Some(EditKind::Instruct)) => Some(concat_channels(&xs, lc, &zeros, lc, n)),
+                _ => None,
+            };
+            let mut items = vec![item(&xin, &cond)];
             if let Some(u) = &uncond {
-                if kind == Some(EditKind::Instruct) {
+                items.push(item(&xin, u));
+                if let Some(x0) = &xin0 {
                     // Three passes: text + image, image only, neither (image latents zeroed).
-                    let img = unet(&xin, u);
-                    let xin0 = concat_channels(&xs, lc, &zeros, lc, n);
-                    let un = unet(&xin0, u);
-                    tm.unet_calls += 2;
-                    for ((o, &im), &un) in out.iter_mut().zip(&img).zip(&un) {
+                    items.push(item(x0, u));
+                }
+            }
+            let outs = self.unet.forward_batch(&items, lh, lw, t as f32, m);
+            tm.unet_calls += items.len();
+            let mut outs = outs.into_iter();
+            let mut out = outs.next().unwrap();
+            if uncond.is_some() {
+                let un = outs.next().unwrap();
+                if let Some(un0) = outs.next() {
+                    let img = un;
+                    for ((o, &im), &un) in out.iter_mut().zip(&img).zip(&un0) {
                         *o = un + p.guidance * (*o - im) + image_guidance * (im - un);
                     }
                 } else {
-                    let un = unet(&xin, u);
-                    tm.unet_calls += 1;
                     for (o, &n) in out.iter_mut().zip(&un) {
                         *o = n + p.guidance * (*o - n);
                     }
@@ -596,6 +621,15 @@ struct Cond {
     ctx: Vec<f32>,
     /// SDXL's added embedding (pooled text + size ids).
     added: Option<Vec<f32>>,
+}
+
+/// A boolean option value (`1` / `true` / `yes` / `on`, `0` / `false` / `no` / `off`).
+pub fn parse_flag(key: &str, v: &str) -> Result<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => bail!("{key}: expected a boolean, got {v:?}"),
+    }
 }
 
 /// img2img's default strength (diffusers' `StableDiffusionImg2ImgPipeline`).
