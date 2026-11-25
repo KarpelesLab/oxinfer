@@ -1970,6 +1970,70 @@ The int8 prefill kernel already issues at the SDOT rate (~340 GOP/s on one core)
 faster per core. SME's int8 outer products (SMOPA) would be ~2x the SME f32 rate, but applying a
 per-block scale needs the int32 tiles read out every 32 values, which costs more than it gains.
 
+#### CPU prefill round 4 (November 2026)
+
+Measured again first: the llama.cpp table above predates [CPU round 3](#cpu-round-3-november-2026),
+which had already put Gemma 4 26B-A4B ahead (the 160 / 145 there was the SME-only experts). What
+was left behind llama.cpp's best thread count were the dense models' prompts, and the attention
+of long ones: a profile of Llama 3.2 1B Q8_0 at 2k tokens had attention at 0.4 of 1.1 ms per
+token. Two changes (`c9a1266`):
+
+- **Prompt attention on the NEON units of every core** (`attn_prefill.rs`, aarch64). The score and
+  value GEMMs of `attention_prefill` ran on the f32 prefill GEMM, so with SME every thread queued
+  on the few shared SME units with an inner dimension of 64-256, where the panel packing cost
+  about what the products did, in four parallel regions per block of 256 queries and KV head.
+  Now one region takes a task per KV head and tile of about 32 query rows: 4 x 16 register tiles
+  for the scores against keys transposed once per call into tiles of 16 (each tile passing every
+  group of rows while it is in L1), the same softmax, then 4 x 16 tiles of values read from the
+  cache by blocks of 128 keys (partial sums kept in the output between blocks). A tile only
+  passes the keys its rows see. Every score is the GEMM's fused multiply-add chain over the head
+  dimension from zero and every output its chain over the keys, so the results are
+  bit-identical (`neon_prefill_attention_matches_gemms`: windows, image spans, head sizes with a
+  tail of columns). 256 queries after 1792 keys, 18 threads: 0.91 against 0.53 TFLOP/s at 64
+  dimensions (32 heads, 8 KV heads), 1.03 against 0.81 at 128, 1.02 against 0.95 at 256 (16 / 8
+  heads), 1.02 against 0.49 at 128 after 256 keys; at 512 dimensions (16 / 2 heads) the SME GEMM
+  stays ahead (1.51 against 1.19), so with SME heads wider than 256 keep it.
+  `OXINFER_ATTN_PREFILL_GEMM=1` selects the GEMMs.
+- **CPU prefill chunks of 512 tokens** (`generate::CPU_PREFILL_CHUNK`, the CLI's and the
+  engine's default without a GPU backend) instead of 256: each matmul's rows are unpacked once
+  per chunk, a mixture of experts' experts get twice the tokens, and there are half the parallel
+  regions. 1024 measured no faster (Llama 1B 1616 / 1380 against 1607 / 1357; Qwen3-8B 241 / 216
+  against 239 / 218). `exact` gives the same bits at any chunk size.
+
+Interleaved `parity_bench device=cpu` against the previous master (`e9de36f`) and `llama-bench
+-ngl 0 -dev none -r 3` (llama.cpp `de30697`), tok/s pp512 / pp2048, best of two runs each in the
+order llama.cpp 16, before, after, llama.cpp 12, after, before, at load averages 20-23 from other
+agents. llama.cpp at 16 threads suffers most from the load, so its best runs of the day (and of
+the table above, in brackets) are given too:
+
+| model | llama.cpp 12 thr | 16 thr | 16 thr, best seen | before | after |
+|---|---|---|---|---|---|
+| Llama-3.2-1B Q8_0 | 1344 / 1098 | 1539 / 1245 | 1680 / 1372 | 1320 / 1084 | 1599 / 1288 |
+| Qwen3-8B Q8_0 | 191 / 149 | 224 / 148 | 248 / 215 | 212 / 194 | 231 / 203 |
+| Gemma 4 12B Q8_0 | 119 / 101 | 132 / 76 | (151 / 128) | 136 / 133 | 152 / 136 |
+| Qwen3-14B Q8_0 | 93 / 81 | 111 / 100 | 115 / 108 | 131 / 121 | 133 / 126 |
+| Gemma 4 26B-A4B Q4_0 | 248 / 217 | 314 / 266 | 327 / 267 (348 / 267) | 411 / 346 | 462 / 389 |
+
+On a nearly idle machine (load 1-3) the CLI prefilled Llama 1B at 1698 tok/s over 467 tokens and
+1509 over 2073, Qwen3-8B at 275 over 474.
+
+(The 26B-A4B's after column also has the MoE router and expert regions of the CPU decode work
+merged in between, `5102bc1` / `e2c2e59`.) Separately, A/B within one binary, three rounds each:
+the attention alone moved Llama 1B 1150 / 953 -> 1300 / 1090, Qwen3-8B 206 / 187 -> 221 / 205,
+Gemma 4 12B 154 / 145 -> 155 / 142 at 256-token chunks; chunks of 512 then 1300 / 1090 ->
+1385 / 1144, 221 / 205 -> 241 / 217, 154 / 142 -> 162 / 148. Qwen3-14B moved within the noise
+(124-130 / 114-123 in every configuration).
+
+Measured and not kept:
+
+- Rows per job and token splits of the dense int8 GEMM on Apple (jobs of 128 tokens: Llama 1B
+  1477 / 1259 against 1607 / 1357; 32-row jobs the same as the default), and its Linux column
+  blocking (`OXINFER_I8_KB=512`: within the noise).
+- More of the dense rows on SME in `fast` (`OXINFER_SME_SHARE` 7: the same as 5, 9: 0.75x), and
+  keeping the NEON threads off the SME queue: within the noise. SME's machine-wide f32 rate
+  stops at 2.0-2.4 TFLOP/s from three threads (1.5 at two, 1.0 at one on 2048 x 2048), where the
+  int8 GEMM gives 3.3 TOP/s on 18 threads.
+
 #### CPU decode round 4 (November 2026)
 
 The last CPU decode gap, Llama 3.2 1B Q8_0, profiled per parallel region (a timestamped trace of
