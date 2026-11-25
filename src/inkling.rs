@@ -2693,11 +2693,7 @@ impl<'a> Inkling2Model<'a> {
         let h = c.hidden_size;
         let ne = c.n_routed_experts;
         let mut logits = vec![0f32; t * ne];
-        for_chunks(&mut logits, ne, t > 1, |ti, lg| {
-            for (v, w) in lg.iter_mut().zip(layer.router.chunks(h)) {
-                *v = dot(w, &x[ti * h..(ti + 1) * h]);
-            }
-        });
+        crate::moe::router_logits(&layer.router, x, h, t, &mut logits);
         let routes: Vec<_> = logits
             .chunks(ne)
             .map(|lg| route_sigmoid(lg, &layer.bias, c.num_experts_per_tok, c.route_scale as f32))

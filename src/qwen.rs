@@ -3343,6 +3343,7 @@ impl Moe<'_> {
                 });
                 linear(lin, ne, h, x, t, &mut logits);
             }
+            _ if crate::moe::router_chunked(t, ne) => crate::moe::router_logits(&self.router, x, h, t, &mut logits),
             _ => {
                 // Blocks of tokens per router row (each row read once per block; the same dots).
                 const RB: usize = 8;

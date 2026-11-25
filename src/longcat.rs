@@ -1028,11 +1028,7 @@ impl<'a> LongcatModel<'a> {
         let h = c.hidden_size;
         let (nr, ne) = (c.n_routed_experts, c.n_routed_experts + c.zero_expert_num);
         let mut logits = vec![0f32; t * ne];
-        for_chunks(&mut logits, ne, t > 1, |ti, lg| {
-            for (v, w) in lg.iter_mut().zip(m.router.chunks(h)) {
-                *v = dot(w, &x[ti * h..(ti + 1) * h]);
-            }
-        });
+        crate::moe::router_logits(&m.router, x, h, t, &mut logits);
         let all: Vec<_> = logits
             .chunks(ne)
             .map(|lg| route(lg, &m.bias, c.moe_topk, c.routed_scaling_factor as f32))

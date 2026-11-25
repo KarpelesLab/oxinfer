@@ -909,11 +909,7 @@ impl<'a> NemotronModel<'a> {
         let (h, mi, ne) = (c.hidden_size, c.moe_intermediate_size, m.up.len());
         self.mlp_forward(&m.shared, x, t, y, hook.filter(|k| k.edits(Target::Shared)), Target::Shared);
         let mut logits = vec![0f32; t * ne];
-        for_chunks(&mut logits, ne, t > 1, |ti, lg| {
-            for (v, w) in lg.iter_mut().zip(m.router.chunks(h)) {
-                *v = dot(w, &x[ti * h..(ti + 1) * h]);
-            }
-        });
+        crate::moe::router_logits(&m.router, x, h, t, &mut logits);
         let routes: Vec<Vec<(usize, f32)>> = logits
             .chunks(ne)
             .map(|lg| route_sigmoid(lg, &m.bias, c.num_experts_per_tok, c.routed_scaling_factor as f32))

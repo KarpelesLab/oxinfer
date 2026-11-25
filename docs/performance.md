@@ -2605,6 +2605,72 @@ Not done:
 - The Q8_K form for x86-64 (its AVX2 kernels keep the per-32 activations; `cpu_q8k` has no
   effect there) and for the IQ formats.
 
+#### CPU decode round 10: the mixture of experts' fixed costs (November 2026)
+
+Re-measured first (master `e9de36f`; `parity_bench device=cpu lookup=0 draft=none mtp=0 reps=3`,
+best of 3, against `llama-bench -ngl 0 -dev none -r 3` at the same thread count, llama.cpp
+master of 2026-11-21; interleaved model by model; load averages 11-40 from other sessions'
+builds and benchmarks; tok/s, llama.cpp / oxinfer):
+
+| model | 8 threads | 12 | 16 | 18 |
+|---|---|---|---|---|
+| Llama-3.2-1B Q8_0 (tg128) | 157.5 / 160.1 | 174.2 / 171.1 | 74 (collapsed) / 182.7 | 10.7 / 187.4 |
+| Qwen3-8B Q8_0 (tg64) | 33.9 / 35.0 | 30.4 / 34.5 | 31.3 / 34.0 | |
+| Gemma 4 12B Q8_0 (tg64) | 17.6 / 21.7 | 18.5 / 18.5 | 16.8 / 20.8 | |
+| Gemma 4 26B-A4B Q4_0 (tg64) | 65.8 / 73.4 | 63.4 / 73.1 | 62.8 / 77.6 | |
+
+So at llama.cpp's best thread count oxinfer was ahead on all four (the table at the top of this
+section has llama.cpp's default 6 threads), level at equal threads on the dense Q8_0 models
+(Llama 1B and Gemma 12B at 12 threads), and the dense models are at the memory's limit: Qwen3-8B
+streams ~300 GB/s, Gemma 4 12B ~275. A sampled profile of a Llama 1B Q8_0 step (`sample`, 12
+threads, tg128 contexts) puts 60% of all threads' time in the Q8_0 kernel, ~11% in the workers'
+wait between regions and under 3% in everything serial (attention 1.5%). The MoE model streams
+far less than the memory gives (~180 GB/s): its per-layer fixed costs were the gap.
+
+**The router on one thread.** Gemma 4 26B-A4B's router is 128 f32 rows of the hidden width
+(2816), 1.4 MB a layer: per decode step 30 layers x 128 dot products, on the calling thread
+(`for_chunks` parallelizes over tokens, and a decode step has one), ~30 us a layer. Now a pass of
+at most 4 tokens computes the logits in chunks of 16 experts over the pool
+(`moe::router_logits`): the same dot products, so the same bits. The same serial router was in
+every MoE family's forward (Qwen3.5 / 3.6 MoE, Inkling-2, GLM-5, Kimi, LongCat, Nemotron, Mistral
+Large 4); they all take the helper now.
+
+**Fewer regions per MoE layer.** A Gemma 4 26B-A4B decode layer ran 9 parallel regions: Q/K/V,
+attention, O, the dense MLP's gate / up (with its activation and quantization), its down
+projection, the experts' gate / up, their activation, their down projections, plus the router
+on the calling thread and the experts' activations quantized there. Now 6:
+
+- the router's chunks run as extra tasks of the dense MLP's gate / up region (the router reads
+  the residual, the MLP its norm: both ready);
+- the experts' gate / up rows, their activation and their quantization for the down projections
+  run in one region, as the dense MLP's already did (`kernels::matmul_quant_glu_batch`: each task
+  takes whole blocks of 32 rows of one expert's gate and up, applies the activation and
+  quantizes them; a block of 256 is quantized by the task that completes it);
+- the dense MLP's down projection runs in that same region (`moe::Experts::forward_extra`): it
+  depends only on the dense activations, ready a region earlier.
+
+Each output is the same kernels' rows with the same elementwise activation and per-block
+quantization, so logits are bit-identical: `pf_check` (200-token prompt, 48 greedy tokens with
+the top-20 log-probabilities, CPU) writes the same file byte for byte before and after, and
+`moe::tests::batched_experts_match_one_at_a_time` now also checks `forward_extra` (experts and
+the extra matmul) bit for bit against running them apart, for Q8, Q4 and GGUF Q8_0, fused and
+split gate / up, 1-15 tokens.
+
+Same binary, the steps switched off one by one with a temporary environment switch, processes
+alternated (`reps=4`, best / median, three rounds at 16 threads and two at 8; tok/s):
+
+| | 16 threads | 8 threads |
+|---|---|---|
+| before | 69.8-70.2 / 68.9-69.3 | 64.7-65.1 / 64.2-64.5 |
+| router in parallel | 73.4-74.2 / 73.1-73.8 | 67.0-68.1 / 66.6-67.9 |
+| + experts' gate / up / activation / quantization in one region, with the dense down | 75.0-76.0 / 74.2-75.0 | 68.6 / 68.1-68.2 |
+| + the router in the dense MLP's region | 76.0-76.3 / 74.4-75.5 | 69.1-69.6 / 67.7-68.7 |
+
+So +9% at 16 threads and +6-7% at 8, most of it the router. Against llama.cpp afterwards (the
+first table's way, half an hour later at load 19-24, which slowed llama.cpp's 8 threads from
+65.8 to 62.3): 8 threads 62.3 / 70.4, 12 threads 62.6 / 72.3, 16 threads 11.1 (collapsed) /
+76.8 tok/s. The dense models' steps are unchanged by this round.
+
 #### x86-64 CPU prefill (November 2026)
 
 The same machine as above (Threadripper 9970X, 32 threads by default, AVX-512 with VNNI), still

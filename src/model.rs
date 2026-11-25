@@ -1266,6 +1266,84 @@ pub(crate) fn linear_glu_q(
     }
 }
 
+/// Several gated projections and plain matmuls in one parallel region on the CPU decode kernels
+/// ([`crate::kernels::matmul_quant_glu_batch`]): `glu` lists `(gate, g0, up, u0, x)`, rows
+/// `g0..g0 + inter` of `gate` and `u0..u0 + inter` of `up` against `xs[x]`; `plain` jobs are as
+/// [`linear_batch_q`]'s. Returns the activations quantized for the down projections (each job's
+/// rows in order), or None, with nothing done, unless every matrix has the same storage and
+/// passes [`cpu_decode_kernels`] and none has an active LoRA.
+#[allow(clippy::type_complexity)]
+pub(crate) fn linear_glu_batch_q(
+    xs: &[crate::quant::QAct],
+    glu: &[(&Lin, usize, &Lin, usize, usize)],
+    inter: usize,
+    act: crate::moe::Act,
+    plain: &mut [(&Lin, usize, &mut [f32])],
+    side: Option<(usize, &(dyn Fn(usize) + Sync))>,
+) -> Option<crate::quant::QAct> {
+    use crate::kernels::GluJob;
+    if !crate::kernels::glu_fused() || !inter.is_multiple_of(crate::quant::QBLOCK) {
+        return None;
+    }
+    // (n_out, n_in) of quantized storage.
+    fn dims(l: &Lin) -> Option<(usize, usize)> {
+        use crate::kernels::QMat;
+        match &l.w {
+            Weight::Q8(m) => Some((m.n_out(), m.n_in())),
+            Weight::Q4(m) => Some((m.n_out(), m.n_in())),
+            Weight::Gguf(m) => Some((m.n_out(), m.n_in())),
+            Weight::Bf16(..) => None,
+        }
+    }
+    let ok = |l: &Lin, t: usize| l.active_lora().is_none() && dims(l).is_some_and(|(n_out, n_in)| cpu_decode_kernels(l, n_out, n_in, t));
+    let fmt = |l: &Lin| match &l.w {
+        Weight::Q8(_) => 1,
+        Weight::Q4(_) => 2,
+        Weight::Gguf(_) => 3,
+        Weight::Bf16(..) => 0,
+    };
+    let f0 = glu.first().map_or(0, |j| fmt(j.0));
+    if f0 == 0
+        || glu
+            .iter()
+            .any(|&(g, _, u, _, x)| fmt(g) != f0 || fmt(u) != f0 || !ok(g, xs[x].t) || !ok(u, xs[x].t))
+        || plain.iter().any(|(l, i, _)| fmt(l) != f0 || !ok(l, xs[*i].t))
+    {
+        return None;
+    }
+    let f = |g: &mut [f32], u: &mut [f32]| act.apply_serial(g, u);
+    macro_rules! run {
+        ($v:ident) => {{
+            let jobs: Vec<GluJob<_>> = glu
+                .iter()
+                .map(|&(g, g0, u, u0, x)| match (&g.w, &u.w) {
+                    (Weight::$v(gm), Weight::$v(um)) => GluJob {
+                        gate: gm,
+                        g0,
+                        up: um,
+                        u0,
+                        x,
+                    },
+                    _ => unreachable!(),
+                })
+                .collect();
+            let mut pj: Vec<(_, usize, &mut [f32])> = plain
+                .iter_mut()
+                .map(|(l, i, y)| match &l.w {
+                    Weight::$v(m) => (m, *i, &mut **y),
+                    _ => unreachable!(),
+                })
+                .collect();
+            crate::kernels::matmul_quant_glu_batch(xs, &jobs, inter, &f, &mut pj, side)
+        }};
+    }
+    Some(match f0 {
+        1 => run!(Q8),
+        2 => run!(Q4),
+        _ => run!(Gguf),
+    })
+}
+
 pub(crate) fn linear(l: &Lin, n_out: usize, n_in: usize, x: &[f32], t: usize, y: &mut [f32]) {
     linear_multi(&mut [(l, n_out, y)], n_in, x, t);
 }
@@ -1300,17 +1378,39 @@ impl GemmaMoe<'_> {
     /// The routes (expert, weight) of each of the `t` rows of the residual `x`.
     fn route(&self, x: &[f32], t: usize, h: usize, eps: f32) -> Vec<Vec<(usize, f32)>> {
         let ne = self.experts.n_experts();
-        let k = self.experts.top_k;
         let mut logits = vec![0f32; t * ne];
-        for_chunks(&mut logits, ne, t > 1, |ti, l| {
-            let mut xn = x[ti * h..(ti + 1) * h].to_vec();
-            rmsnorm_inplace(&mut xn, None, eps);
-            for (v, w) in l.iter_mut().zip(self.router.chunks(h)) {
-                *v = dot(w, &xn);
-            }
-        });
+        if let Some(xn) = self.router_input(x, t, h, eps) {
+            crate::moe::router_logits(&self.router, &xn, h, t, &mut logits);
+        } else {
+            for_chunks(&mut logits, ne, t > 1, |ti, l| {
+                let mut xn = x[ti * h..(ti + 1) * h].to_vec();
+                rmsnorm_inplace(&mut xn, None, eps);
+                for (v, w) in l.iter_mut().zip(self.router.chunks(h)) {
+                    *v = dot(w, &xn);
+                }
+            });
+        }
+        self.routes(&logits)
+    }
+
+    /// The router's input rows (the residual RMS-normed) when its logits are computed in chunks
+    /// of experts ([`crate::moe::router_chunked`]).
+    fn router_input(&self, x: &[f32], t: usize, h: usize, eps: f32) -> Option<Vec<f32>> {
+        if !crate::moe::router_chunked(t, self.experts.n_experts()) {
+            return None;
+        }
+        let mut xn = x[..t * h].to_vec();
+        for r in xn.chunks_mut(h) {
+            rmsnorm_inplace(r, None, eps);
+        }
+        Some(xn)
+    }
+
+    /// The routes (expert, weight) of each row of router logits.
+    fn routes(&self, logits: &[f32]) -> Vec<Vec<(usize, f32)>> {
+        let k = self.experts.top_k;
         logits
-            .chunks(ne)
+            .chunks(self.experts.n_experts())
             .map(|l| {
                 let mut r = crate::moe::route_top_k(l, k);
                 for (e, w) in r.iter_mut() {
@@ -2328,16 +2428,52 @@ impl<'a> Model<'a> {
         let inter = layer.inter;
         let mut d = o; // reuse buffer [t, h]
         // Decoding on the CPU: projections, activation and quantization in one region.
-        let fused = hook.is_none()
-            && layer.down.active_lora().is_none()
-            && cpu_decode_kernels(&layer.down, h, inter, t)
-            && match linear_glu_q(&layer.gate, &layer.up, inter, h, &hn, t, crate::moe::Act::GeluTanh) {
+        let dense_q = hook.is_none() && layer.down.active_lora().is_none() && cpu_decode_kernels(&layer.down, h, inter, t);
+        let gelu = crate::moe::Act::GeluTanh;
+        // A decode step of a mixture-of-experts layer: the router's logits in the same region.
+        let mut routes_pre = None;
+        let moe_router = layer
+            .moe
+            .as_ref()
+            .filter(|_| dense_q && self.stream.is_none())
+            .and_then(|m| Some((m, m.router_input(x, t, h, eps)?)));
+        let glu = if let Some((m, xn)) = moe_router {
+            let ne = m.experts.n_experts();
+            let mut logits = vec![0f32; t * ne];
+            let lp = crate::moe::LogitsOut(logits.as_mut_ptr());
+            // SAFETY: task `i` writes chunk `i` of `logits` alone.
+            let side = |i: usize| unsafe { crate::moe::router_chunk(&m.router, &xn, h, ne, i, lp) };
+            let xq = crate::quant::quantize_act(&hn, t, h);
+            let jobs = [(&layer.gate, 0, &layer.up, 0, 0)];
+            match linear_glu_batch_q(
+                std::slice::from_ref(&xq),
+                &jobs,
+                inter,
+                gelu,
+                &mut [],
+                Some((t * ne / crate::moe::ROUTER_CHUNK, &side)),
+            ) {
                 Some(xa) => {
-                    linear_batch_q(std::slice::from_ref(&xa), &mut [(&layer.down, 0, &mut d)]);
-                    true
+                    routes_pre = Some(m.routes(&logits));
+                    Some(xa)
                 }
-                None => false,
-            };
+                None => linear_glu_q(&layer.gate, &layer.up, inter, h, &hn, t, gelu),
+            }
+        } else if dense_q {
+            linear_glu_q(&layer.gate, &layer.up, inter, h, &hn, t, gelu)
+        } else {
+            None
+        };
+        // With routed experts beside the MLP (not streamed), its down projection runs in the
+        // experts' first region (`Experts::forward_extra`), below.
+        let (fused, mut down_q) = match glu {
+            Some(xa) if layer.moe.is_some() && self.stream.is_none() => (true, Some(xa)),
+            Some(xa) => {
+                linear_batch_q(std::slice::from_ref(&xa), &mut [(&layer.down, 0, &mut d)]);
+                (true, None)
+            }
+            None => (false, None),
+        };
         if !fused {
             let mut g = vec![0f32; t * inter];
             let mut u = vec![0f32; t * inter];
@@ -2350,26 +2486,31 @@ impl<'a> Model<'a> {
         }
         if let Some(m) = &layer.moe {
             // The routed experts, beside the dense MLP, on the same residual.
-            rmsnorm_f32w_rows_inplace(&mut d, h, &m.ln_post_dense, eps);
-            let routes = m.route(x, t, h, eps);
+            let routes = routes_pre.take().unwrap_or_else(|| m.route(x, t, h, eps));
             rmsnorm_f32w_rows(x, h, &m.ln_pre, eps, &mut hn);
             let mut e = vec![0f32; t * h];
-            let unit = self.layer_unit(l);
-            let need = |ids: &[usize]| {
-                if let Some(s) = &self.stream {
-                    s.need_parts(unit, ids)
-                }
-            };
-            m.experts.forward(
-                &hn,
-                t,
-                h,
-                &routes,
-                &mut e,
-                self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])),
-                hook.as_ref(),
-                None,
-            );
+            if let Some(xa) = down_q.take() {
+                m.experts
+                    .forward_extra(&hn, t, h, &routes, &mut e, None, hook.as_ref(), (&layer.down, xa, &mut d));
+            } else {
+                let unit = self.layer_unit(l);
+                let need = |ids: &[usize]| {
+                    if let Some(s) = &self.stream {
+                        s.need_parts(unit, ids)
+                    }
+                };
+                m.experts.forward(
+                    &hn,
+                    t,
+                    h,
+                    &routes,
+                    &mut e,
+                    self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])),
+                    hook.as_ref(),
+                    None,
+                );
+            }
+            rmsnorm_f32w_rows_inplace(&mut d, h, &m.ln_post_dense, eps);
             rmsnorm_f32w_rows_inplace(&mut e, h, &m.ln_post, eps);
             add_inplace(&mut d, &e);
         }

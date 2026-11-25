@@ -1285,11 +1285,7 @@ impl<'a> Glm5Model<'a> {
         };
         let ne = m.experts.n_experts();
         let mut logits = vec![0f32; t * ne];
-        for_chunks(&mut logits, ne, t > 1, |ti, lg| {
-            for (v, w) in lg.iter_mut().zip(m.router.chunks(h)) {
-                *v = dot(w, &x[ti * h..(ti + 1) * h]);
-            }
-        });
+        crate::moe::router_logits(&m.router, x, h, t, &mut logits);
         let routes: Vec<_> = logits
             .chunks(ne)
             .map(|lg| route_sigmoid(lg, &m.bias, m.experts.top_k, c.routed_scaling_factor as f32))

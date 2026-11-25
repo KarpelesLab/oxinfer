@@ -81,6 +81,10 @@ impl Act {
     }
 }
 
+/// A matmul run beside the experts ([`Experts::forward_extra`]): the weight, its quantized
+/// input and its output.
+pub(crate) type Extra<'e, 'a> = (&'e Lin<'a>, crate::quant::QAct, &'e mut [f32]);
+
 /// Called with the routed experts of a MoE pass before they run (weight streaming reads them on
 /// demand).
 pub(crate) type NeedExperts<'f> = Option<&'f dyn Fn(&[usize])>;
@@ -189,6 +193,56 @@ pub(crate) struct Experts<'a> {
     /// The rows of a fused gate/up weight alternate (gate `j` at `2j`, up `j` at `2j + 1`:
     /// Inkling-2's `w13_weight`) instead of gate rows then up rows. CPU only.
     pub(crate) interleaved: bool,
+}
+
+/// Experts per task of a few-token router ([`router_logits`]).
+pub(crate) const ROUTER_CHUNK: usize = 16;
+
+/// Where the tasks of a region write router logits (disjoint chunks).
+#[derive(Clone, Copy)]
+pub(crate) struct LogitsOut(pub(crate) *mut f32);
+unsafe impl Send for LogitsOut {}
+unsafe impl Sync for LogitsOut {}
+
+/// Whether [`router_logits`] splits `t` tokens' logits over `ne` experts into chunks of
+/// [`ROUTER_CHUNK`] experts ([`router_chunk`]): few tokens (decoding, short verification passes)
+/// and whole chunks.
+pub(crate) fn router_chunked(t: usize, ne: usize) -> bool {
+    t <= 4 && ne.is_multiple_of(ROUTER_CHUNK)
+}
+
+/// Chunk `i` of the router logits `[t, ne]` at `out`: `dot(router row e, x row ti)` for the
+/// [`ROUTER_CHUNK`] experts of the chunk.
+///
+/// # Safety
+/// `out` holds `t * ne` floats; calls running together take distinct chunks.
+pub(crate) unsafe fn router_chunk(router: &[f32], x: &[f32], h: usize, ne: usize, i: usize, out: LogitsOut) {
+    let (ti, e0) = (i * ROUTER_CHUNK / ne, i * ROUTER_CHUNK % ne);
+    let xr = &x[ti * h..(ti + 1) * h];
+    // SAFETY: chunk `i` of the logits, in bounds and this call's alone (the contract).
+    let l = unsafe { std::slice::from_raw_parts_mut(out.0.add(i * ROUTER_CHUNK), ROUTER_CHUNK) };
+    for (v, w) in l.iter_mut().zip(router[e0 * h..].chunks(h)) {
+        *v = dot(w, xr);
+    }
+}
+
+/// Router logits `[t, ne]` of `t` rows of `x` (`[t, h]`) against `router` (`[ne, h]`, f32):
+/// `logits[ti * ne + e] = dot(router row e, x row ti)`. A decode step's (a few thousand dot
+/// products of the hidden width, 30-50 us on one thread per layer) run in chunks of experts over
+/// the pool, prompts a task per token; the same dot products either way, so the same bits.
+pub(crate) fn router_logits(router: &[f32], x: &[f32], h: usize, t: usize, logits: &mut [f32]) {
+    let ne = logits.len() / t.max(1);
+    if router.len() == ne * h && router_chunked(t, ne) {
+        let out = LogitsOut(logits.as_mut_ptr());
+        // SAFETY: task `i` writes chunk `i` of `logits` alone.
+        crate::pool::run(t * ne / ROUTER_CHUNK, &|i| unsafe { router_chunk(router, x, h, ne, i, out) });
+        return;
+    }
+    for_chunks(logits, ne, t > 1, |ti, lg| {
+        for (v, w) in lg.iter_mut().zip(router.chunks(h)) {
+            *v = dot(w, &x[ti * h..(ti + 1) * h]);
+        }
+    });
 }
 
 /// Indices and renormalized weights of the top-k experts of one token (softmax over all experts,
@@ -469,9 +523,10 @@ impl<'a> Experts<'a> {
         y: &mut [f32],
         hook: Option<&crate::intervene::NeuronHook>,
         shared: Option<&Shared>,
+        extra: Option<Extra>,
     ) -> bool {
         use crate::intervene::Target;
-        use crate::model::{cpu_decode_kernels, linear_batch_q};
+        use crate::model::linear_batch_q;
         let mi = self.inter;
         let mut used: Vec<usize> = routes.iter().flatten().map(|r| r.0).collect();
         used.sort_unstable();
@@ -480,18 +535,7 @@ impl<'a> Experts<'a> {
             .iter()
             .map(|&e| (0..t).filter(|&ti| routes[ti].iter().any(|r| r.0 == e)).collect())
             .collect();
-        let mut ok = shared.is_none_or(|s| {
-            let si = s.inter;
-            cpu_decode_kernels(s.gate, si, h, t) && cpu_decode_kernels(s.up, si, h, t) && cpu_decode_kernels(s.down, h, si, t)
-        });
-        for (&e, tk) in used.iter().zip(&toks) {
-            let n = tk.len();
-            ok &= match &self.gate_up[e] {
-                GateUp::Fused(l) => cpu_decode_kernels(l, 2 * mi, h, n),
-                GateUp::Split(g, u) => cpu_decode_kernels(g, mi, h, n) && cpu_decode_kernels(u, mi, h, n),
-            } && cpu_decode_kernels(&self.down[e], h, mi, n);
-        }
-        if !ok {
+        if !self.batched_ok(t, h, routes, shared) {
             return false;
         }
         // Inputs: all of x (experts that every token uses), then each other expert's rows.
@@ -509,6 +553,37 @@ impl<'a> Experts<'a> {
             })
             .collect();
         xs.insert(0, xa);
+        // The extra matmul's input (see `Extra`), last.
+        let ex_i = xs.len();
+        let mut extra = extra.map(|(l, q, y)| {
+            xs.push(q);
+            (l, y)
+        });
+        // Gate / up, activation and quantization for the down projections in one region (with
+        // the extra matmul), when nothing has to see the float activations in between: the
+        // same rows as below, so the same bits.
+        let total: usize = toks.iter().map(|tk| tk.len()).sum();
+        if hook.is_none() && shared.is_none() && !self.interleaved && !self.lora_active() {
+            let glu: Vec<(&Lin, usize, &Lin, usize, usize)> = used
+                .iter()
+                .zip(&input)
+                .map(|(&e, &i)| match &self.gate_up[e] {
+                    GateUp::Fused(l) => (l, 0, l, mi, i),
+                    GateUp::Split(g, u) => (g, 0, u, 0, i),
+                })
+                .collect();
+            let mut plain: Vec<(&Lin, usize, &mut [f32])> = Vec::new();
+            if let Some((l, ey)) = extra.as_mut() {
+                plain.push((*l, ex_i, &mut **ey));
+            }
+            if let Some(aq) = crate::model::linear_glu_batch_q(&xs, &glu, mi, self.act, &mut plain, None) {
+                drop(plain);
+                return self.down_batched(&aq, &toks, &used, h, routes, y);
+            }
+        }
+        if let Some((l, ey)) = extra {
+            linear_batch_q(&xs, &mut [(l, ex_i, ey)]);
+        }
         // Gate/up: per expert [n, 2 mi] (fused: rows of gate then up) or gate [n, mi] then up [n, mi].
         let mut gu: Vec<Vec<f32>> = toks.iter().map(|tk| vec![0f32; tk.len() * 2 * mi]).collect();
         // The shared expert's gate then up ([t, inter] each).
@@ -546,7 +621,6 @@ impl<'a> Experts<'a> {
         }
         // Activations of all experts, one after another ([sum n, mi]), and the shared expert's,
         // in one parallel region (a task per expert, each the elementwise steps of `Act::apply`).
-        let total: usize = toks.iter().map(|tk| tk.len()).sum();
         let mut a = vec![0f32; total * mi];
         let offs: Vec<usize> = toks
             .iter()
@@ -670,6 +744,99 @@ impl<'a> Experts<'a> {
         true
     }
 
+    /// Whether [`Experts::forward_batched`] takes these routes (every matrix on the CPU decode
+    /// kernels).
+    fn batched_ok(&self, t: usize, h: usize, routes: &[Vec<(usize, f32)>], shared: Option<&Shared>) -> bool {
+        use crate::model::cpu_decode_kernels;
+        let mi = self.inter;
+        let mut used: Vec<usize> = routes.iter().flatten().map(|r| r.0).collect();
+        used.sort_unstable();
+        used.dedup();
+        let toks: Vec<Vec<usize>> = used
+            .iter()
+            .map(|&e| (0..t).filter(|&ti| routes[ti].iter().any(|r| r.0 == e)).collect())
+            .collect();
+        let mut ok = shared.is_none_or(|s| {
+            let si = s.inter;
+            cpu_decode_kernels(s.gate, si, h, t) && cpu_decode_kernels(s.up, si, h, t) && cpu_decode_kernels(s.down, h, si, t)
+        });
+        for (&e, tk) in used.iter().zip(&toks) {
+            let n = tk.len();
+            ok &= match &self.gate_up[e] {
+                GateUp::Fused(l) => cpu_decode_kernels(l, 2 * mi, h, n),
+                GateUp::Split(g, u) => cpu_decode_kernels(g, mi, h, n) && cpu_decode_kernels(u, mi, h, n),
+            } && cpu_decode_kernels(&self.down[e], h, mi, n);
+        }
+        ok
+    }
+
+    /// The down projections of [`Experts::forward_batched`]'s fused path: `aq` holds every
+    /// expert's activations (its tokens' rows, experts in the order of `used`), quantized.
+    #[allow(clippy::too_many_arguments)]
+    fn down_batched(
+        &self,
+        aq: &crate::quant::QAct,
+        toks: &[Vec<usize>],
+        used: &[usize],
+        h: usize,
+        routes: &[Vec<(usize, f32)>],
+        y: &mut [f32],
+    ) -> bool {
+        let mut row = 0;
+        let xs: Vec<crate::quant::QAct> = toks
+            .iter()
+            .map(|tk| {
+                let rows: Vec<usize> = (row..row + tk.len()).collect();
+                row += tk.len();
+                aq.gather(&rows)
+            })
+            .collect();
+        let mut outs: Vec<Vec<f32>> = toks.iter().map(|tk| vec![0f32; tk.len() * h]).collect();
+        let mut jobs: Vec<(&Lin, usize, &mut [f32])> = used
+            .iter()
+            .zip(outs.iter_mut())
+            .enumerate()
+            .map(|(i, (&e, o))| (&self.down[e], i, &mut o[..]))
+            .collect();
+        crate::model::linear_batch_q(&xs, &mut jobs);
+        drop(jobs);
+        for (ti, r) in routes.iter().enumerate() {
+            let yr = &mut y[ti * h..(ti + 1) * h];
+            for &(e, w) in r {
+                let j = used.binary_search(&e).unwrap();
+                let i = toks[j].iter().position(|&x| x == ti).unwrap();
+                axpy(yr, w, &outs[j][i * h..(i + 1) * h]);
+            }
+        }
+        true
+    }
+
+    /// [`Experts::forward`] of a decode step (or a short pass) with one more matmul of its own
+    /// input run in the experts' first parallel region (`(weight, quantized input, output)`:
+    /// a dense MLP's down projection beside the experts, as Gemma 4 26B-A4B has). The extra
+    /// output is the same as [`crate::model::linear_batch_q`]'s, whichever path runs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_extra(
+        &self,
+        x: &[f32],
+        t: usize,
+        h: usize,
+        routes: &[Vec<(usize, f32)>],
+        y: &mut [f32],
+        need: NeedExperts,
+        hook: Option<&crate::intervene::NeuronHook>,
+        extra: Extra,
+    ) {
+        if need.is_none() && t < TN && crate::kernels::moe_batched() && self.batched_ok(t, h, routes, None) {
+            let done = self.forward_batched(x, t, h, routes, y, hook, None, Some(extra));
+            debug_assert!(done);
+            return;
+        }
+        let (l, q, ey) = extra;
+        crate::model::linear_batch_q(std::slice::from_ref(&q), &mut [(l, 0, ey)]);
+        self.forward(x, t, h, routes, y, need, hook, None);
+    }
+
     /// Adds the routed experts' output to `y` (`[t, H]`): token `i` of `x` goes through the
     /// experts `routes[i]` lists (expert, weight). `need` is told the experts used before they run
     /// (weight streaming reads them on demand).
@@ -698,7 +865,7 @@ impl<'a> Experts<'a> {
         }
         let mi = self.inter;
         let act = self.act;
-        if t < TN && crate::kernels::moe_batched() && self.forward_batched(x, t, h, routes, y, hook, shared) {
+        if t < TN && crate::kernels::moe_batched() && self.forward_batched(x, t, h, routes, y, hook, shared, None) {
             return;
         }
         if let Some(s) = shared {
@@ -1123,7 +1290,7 @@ mod tests {
                             if t < TN {
                                 switch.store(true, std::sync::atomic::Ordering::SeqCst);
                                 let mut y = vec![0.5f32; t * h];
-                                assert!(ex.forward_batched(&x, t, h, &routes, &mut y, None, None), "{what} t={t}");
+                                assert!(ex.forward_batched(&x, t, h, &routes, &mut y, None, None, None), "{what} t={t}");
                                 assert!(on.iter().zip(&y).all(|(a, b)| a.to_bits() == b.to_bits()), "{what} t={t}");
                             }
                             continue;
@@ -1243,6 +1410,7 @@ mod tests {
                     .into_iter()
                     .map(|si| (lin(si, h), lin(si, h), lin(h, si), si))
                     .collect();
+                let extra = lin(h, 2 * mi);
                 let ex = Experts {
                     gate_up,
                     down,
@@ -1278,7 +1446,7 @@ mod tests {
                         let run = |batched: bool| {
                             let mut y = vec![0.5f32; t * h];
                             if batched {
-                                assert!(ex.forward_batched(&x, t, h, &routes, &mut y, None, shared.as_ref()));
+                                assert!(ex.forward_batched(&x, t, h, &routes, &mut y, None, shared.as_ref(), None));
                             } else {
                                 crate::kernels::set_moe_batched(false);
                                 ex.forward(&x, t, h, &routes, &mut y, None, None, shared.as_ref());
@@ -1288,6 +1456,28 @@ mod tests {
                         };
                         assert_eq!(run(true), run(false), "format {fmt} fused {fused} t={t} shared {si:?}");
                     }
+                    // A matmul beside the experts (`forward_extra`): the same outputs as alone.
+                    let xe: Vec<f32> = (0..t * 2 * mi).map(|_| lcg(&mut seed)).collect();
+                    let qe = crate::quant::quantize_act(&xe, t, 2 * mi);
+                    let (mut ye, mut y) = (vec![0f32; t * h], vec![0.5f32; t * h]);
+                    ex.forward_extra(
+                        &x,
+                        t,
+                        h,
+                        &routes,
+                        &mut y,
+                        None,
+                        None,
+                        (&extra, qe.gather(&(0..t).collect::<Vec<_>>()), &mut ye),
+                    );
+                    let (mut ye1, mut y1) = (vec![0f32; t * h], vec![0.5f32; t * h]);
+                    crate::model::linear_batch_q(std::slice::from_ref(&qe), &mut [(&extra, 0, &mut ye1)]);
+                    crate::kernels::set_moe_batched(false);
+                    ex.forward(&x, t, h, &routes, &mut y1, None, None, None);
+                    crate::kernels::set_moe_batched(true);
+                    let bits = |v: &[f32]| v.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&y), bits(&y1), "extra: format {fmt} fused {fused} t={t}");
+                    assert_eq!(bits(&ye), bits(&ye1), "extra output: format {fmt} fused {fused} t={t}");
                 }
             }
         }

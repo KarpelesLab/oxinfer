@@ -2809,6 +2809,196 @@ pub(crate) fn matmul_quant_glu<M: QMat>(gate: &M, up: &M, x: &[f32], t: usize, a
     fill.finish()
 }
 
+/// One gated projection of [`matmul_quant_glu_batch`]: `act(gate rows g0..g0 + inter, up rows
+/// u0..u0 + inter)` of the input `xs[x]` (gate and up may be one matrix, as a mixture of experts'
+/// fused gate / up projection).
+pub(crate) struct GluJob<'m, M> {
+    pub gate: &'m M,
+    pub g0: usize,
+    pub up: &'m M,
+    pub u0: usize,
+    pub x: usize,
+}
+
+/// [`matmul_quant_glu`] for several gated projections with their own (quantized) inputs, and the
+/// plain matmuls `plain` (as [`matmul_quant_batch`] runs them), all in one parallel region: a
+/// mixture of experts' gate / up projections, activation and quantization for its down
+/// projections (and, beside them, a matmul that does not depend on them). The result has the
+/// rows of every job in order (`xs[job.x].t` rows each), each the same as quantizing the
+/// activation of [`matmul_quant_batch`]'s gate and up rows: the same kernels' rows, elementwise
+/// activation, per-block quantization. `inter` is a multiple of 32; no matrix is float-stored and
+/// no input has more than [`decode_max_tokens`] rows. `side`: `(n, f)`, `f(i)` for `i < n` run in
+/// the region too (first: short tasks the step waits for, as a router).
+pub(crate) fn matmul_quant_glu_batch<M: QMat>(
+    xs: &[QAct],
+    glu: &[GluJob<M>],
+    inter: usize,
+    act: &(dyn Fn(&mut [f32], &mut [f32]) + Sync),
+    plain: &mut [(&M, usize, &mut [f32])],
+    side: Option<(usize, &(dyn Fn(usize) + Sync))>,
+) -> QAct {
+    assert!(inter.is_multiple_of(QBLOCK));
+    let decode_max = decode_max_tokens();
+    let _timer = prof::start(Cat::Matmul);
+    let mut total = 0usize;
+    for j in glu {
+        let xa = &xs[j.x];
+        assert!(j.gate.n_in() == xa.n_in && j.up.n_in() == xa.n_in && j.g0 + inter <= j.gate.n_out() && j.u0 + inter <= j.up.n_out());
+        assert!(!j.gate.dense() && !j.up.dense() && xa.t <= decode_max);
+        total += (j.gate.bytes() / j.gate.n_out() + j.up.bytes() / j.up.n_out()) * inter;
+    }
+    let mut plain_bytes = 0usize;
+    let prefs: Vec<(QJobRef<M>, usize)> = plain
+        .iter_mut()
+        .map(|(m, i, y)| {
+            let xa = &xs[*i];
+            assert_eq!(m.n_in(), xa.n_in, "input shape mismatch");
+            assert_eq!(y.len(), xa.t * m.n_out(), "output shape mismatch");
+            assert!(!m.dense() && xa.t <= decode_max);
+            plain_bytes += m.bytes();
+            (
+                QJobRef {
+                    m: *m,
+                    y: SendPtr(y.as_mut_ptr()),
+                },
+                *i,
+            )
+        })
+        .collect();
+    prof::add_bytes(total + plain_bytes);
+    let all = total + plain_bytes;
+    let target = (all / (pool::threads() * 8)).max(128 * 1024);
+    // Output rows: job `j`'s start, and the gate / up outputs of each job (`[t, n_out]` of the
+    // whole matrix, as the decode kernels write them; one buffer when gate and up are one).
+    let mut row0 = Vec::with_capacity(glu.len());
+    let mut rows = 0;
+    for j in glu {
+        row0.push(rows);
+        rows += xs[j.x].t;
+    }
+    let mut bufs: Vec<(Vec<f32>, Vec<f32>)> = glu
+        .iter()
+        .map(|j| {
+            let t = xs[j.x].t;
+            let same = std::ptr::eq(j.gate, j.up);
+            (
+                scratch(t * j.gate.n_out()),
+                if same { Vec::new() } else { scratch(t * j.up.n_out()) },
+            )
+        })
+        .collect();
+    let ptrs: Vec<(SendPtr, SendPtr)> = bufs
+        .iter_mut()
+        .map(|(g, u)| {
+            let gp = SendPtr(g.as_mut_ptr());
+            (gp, if u.is_empty() { gp } else { SendPtr(u.as_mut_ptr()) })
+        })
+        .collect();
+    let fill = crate::quant::QActFill::new(rows, inter);
+    use crate::quant::QK8K;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let done: Vec<AtomicUsize> = (0..if fill.has_k() { rows * inter / QK8K } else { 0 })
+        .map(|_| AtomicUsize::new(0))
+        .collect();
+    // Tasks: (job, r0, r1), gated jobs first (job < glu.len()), then the plain ones.
+    let mut blocks: Vec<(u32, u32, u32)> = Vec::new();
+    for (ji, j) in glu.iter().enumerate() {
+        if xs[j.x].t == 0 {
+            continue;
+        }
+        // Whole blocks of 32 rows of gate and up, as `matmul_quant_glu` sizes them.
+        let per_row = j.gate.bytes() / j.gate.n_out() + j.up.bytes() / j.up.n_out();
+        let rb = ((target / per_row.max(1) + QBLOCK / 2) / QBLOCK * QBLOCK).max(QBLOCK);
+        let mut r = 0;
+        while r < inter {
+            let r1 = (r + rb).min(inter);
+            blocks.push((ji as u32, r as u32, r1 as u32));
+            r = r1;
+        }
+    }
+    let ng = glu.len();
+    if plain_bytes > 0 {
+        let bytes_per_row = (plain_bytes / prefs.iter().map(|j| j.0.m.n_out()).sum::<usize>().max(1)).max(1);
+        let rpb = (target / bytes_per_row).max(16) / 16 * 16;
+        for (j, (job, i)) in prefs.iter().enumerate() {
+            if xs[*i].t == 0 {
+                continue;
+            }
+            let mut r = 0;
+            while r < job.m.n_out() {
+                let r1 = (r + rpb).min(job.m.n_out());
+                blocks.push(((ng + j) as u32, r as u32, r1 as u32));
+                r = r1;
+            }
+        }
+    }
+    let mode = multi_token_kernels();
+    let multi = |t: usize| (3..=MULTI_MAX).contains(&t) && mode != MultiTokenKernels::Pairs;
+    let i8mm = mode == MultiTokenKernels::Auto && cpu_has_i8mm();
+    let pairs: Vec<Option<PairAct>> = xs
+        .iter()
+        .enumerate()
+        .map(|(i, xa)| {
+            let wants = glu
+                .iter()
+                .filter(|j| j.x == i)
+                .any(|j| j.gate.multi(xa.t) == Some(true) || j.up.multi(xa.t) == Some(true))
+                || prefs.iter().any(|(j, ji)| *ji == i && j.m.multi(xa.t) == Some(true));
+            (i8mm && multi(xa.t) && wants).then(|| PairAct::new(xa))
+        })
+        .collect();
+    let ns = side.map_or(0, |s| s.0);
+    pool::run(ns + blocks.len(), &|b| {
+        if b < ns {
+            return (side.unwrap().1)(b);
+        }
+        let (j, r0, r1) = blocks[b - ns];
+        let (j, r0, r1) = (j as usize, r0 as usize, r1 as usize);
+        if j >= ng {
+            let (job, i) = prefs[j - ng];
+            let xa = &xs[i];
+            unsafe { decode_rows(job.m, xa, pairs[i].as_ref(), multi(xa.t), job.y.get(), r0, r1) };
+            return;
+        }
+        let job = &glu[j];
+        let xa = &xs[job.x];
+        let (gp, up_) = ptrs[j];
+        let (gn, un) = (job.gate.n_out(), job.up.n_out());
+        // SAFETY: tasks write disjoint rows of every token's gate and up outputs (and the
+        // matching blocks of `fill`), which outlive the region; a block of 256 is read whole by
+        // the one task that counts its last rows, after the other tasks' writes (as in
+        // `matmul_quant_glu`).
+        unsafe {
+            let p = pairs[job.x].as_ref();
+            decode_rows(job.gate, xa, p, multi(xa.t), gp.get(), job.g0 + r0, job.g0 + r1);
+            decode_rows(job.up, xa, p, multi(xa.t), up_.get(), job.u0 + r0, job.u0 + r1);
+            for c in 0..xa.t {
+                let gs = std::slice::from_raw_parts_mut(gp.get().add(c * gn + job.g0 + r0), r1 - r0);
+                let us = std::slice::from_raw_parts_mut(up_.get().add(c * un + job.u0 + r0), r1 - r0);
+                act(gs, us);
+                let row = row0[j] + c;
+                fill.fill(row, r0, gs);
+                if fill.has_k() {
+                    for kb in r0 / QK8K..r1.div_ceil(QK8K) {
+                        let n = r1.min((kb + 1) * QK8K) - r0.max(kb * QK8K);
+                        if done[row * inter / QK8K + kb].fetch_add(n, Ordering::AcqRel) + n == QK8K {
+                            let blk = std::slice::from_raw_parts(gp.get().add(c * gn + job.g0 + kb * QK8K), QK8K);
+                            fill.fill_k(row, kb * QK8K, blk);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    for (g, u) in bufs {
+        recycle(g);
+        if !u.is_empty() {
+            recycle(u);
+        }
+    }
+    fill.finish()
+}
+
 /// Tuning of the cache-blocked AVX-512 prefill GEMM ([`gemm_blocked`]): columns per block
 /// (`OXINFER_GEMM_KB`, a multiple of 256), rows per pool job (`OXINFER_GEMM_ROWS`, a multiple of
 /// 16) and tokens per pool job (`OXINFER_GEMM_TOKENS`, a multiple of 16). None of them changes a
