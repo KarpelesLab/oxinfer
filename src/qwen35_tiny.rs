@@ -230,10 +230,8 @@ mod tests {
         (m, files)
     }
 
-    /// Every pass of these tests is up to 7 tokens or more than 15: a pass of 8 to 15 runs the
-    /// decode kernels or the prefill GEMM (other rounding) after the process-wide
-    /// `kernels::set_decode_max_tokens`, which other tests of this process raise and restore
-    /// while these run, so the passes compared could part.
+    /// Test tokens. (In lib tests `kernels::set_decode_max_tokens` is per thread, so the passes
+    /// of 8 to 15 tokens of a test keep one kernel choice whatever other tests set.)
     fn toks(n: usize, seed: u32) -> Vec<u32> {
         (0..n as u32).map(|i| (i * 37 + seed * 11 + 5) % super::SPECIAL_BASE).collect()
     }

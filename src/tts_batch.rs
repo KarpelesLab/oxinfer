@@ -220,14 +220,6 @@ impl<'o> Voice<'o> {
     }
 }
 
-/// Restores the process-wide row limit of the decode kernels when dropped.
-struct RestoreDecodeMax(usize);
-impl Drop for RestoreDecodeMax {
-    fn drop(&mut self) {
-        crate::kernels::set_decode_max_tokens(self.0);
-    }
-}
-
 impl Speaker {
     /// Speaks several utterances together (see the module docs): `out[i]` is what
     /// [`Speaker::speak_detailed`] returns for `items[i]` alone, generated in shared passes.
@@ -277,12 +269,10 @@ impl Speaker {
         bs.prefill_secs = t0.elapsed().as_secs_f64();
 
         // Quantized weights: up to 15 columns on the int8 decode kernels (7 by default), whose
-        // columns keep the bits of a one-token pass. Process-wide, restored afterwards; set
-        // after the prefill, whose short prompts must take the same kernels as alone.
-        let restore = RestoreDecodeMax(crate::kernels::decode_max_tokens());
-        if n > restore.0 {
-            crate::kernels::set_decode_max_tokens(n);
-        }
+        // columns keep the bits of a one-token pass. For this thread's passes only (and its pool
+        // jobs), until the batch ends; set after the prefill, whose short prompts must take the
+        // same kernels as alone.
+        let decode_max = (n > crate::kernels::decode_max_tokens()).then(|| crate::kernels::decode_max_scope(n));
         bs.width = self.model.batch_width().max(1);
 
         let tg = Instant::now();
@@ -347,7 +337,7 @@ impl Speaker {
             live = next;
         }
         bs.generate_secs = tg.elapsed().as_secs_f64();
-        drop(restore);
+        drop(decode_max);
         drop(sessions);
 
         // The audio of all utterances in shared SNAC passes.

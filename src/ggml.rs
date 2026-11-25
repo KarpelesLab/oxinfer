@@ -2040,15 +2040,6 @@ mod tests {
         assert_eq!(GgmlType::Q4_K.row_bytes(5120), 20 * 144);
     }
 
-    fn close(y: &[f32], yr: &[f32], tol: f32) -> bool {
-        let (mut max, mut scale) = (0f32, 0f32);
-        for (a, b) in y.iter().zip(yr) {
-            max = max.max((a - b).abs());
-            scale = scale.max(b.abs());
-        }
-        max <= tol * scale.max(1e-3)
-    }
-
     fn check(name: &str, y: &[f32], yr: &[f32], tol: f32) {
         let (mut max, mut scale) = (0f32, 0f32);
         for (a, b) in y.iter().zip(yr) {
@@ -2327,20 +2318,14 @@ mod tests {
             m.dequantize_rows(0, n_out, &mut wf);
             for t in [1usize, 2, 3, 4, 5, 8, 11] {
                 let x: Vec<f32> = (0..t * n_in).map(|_| (lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0).collect();
-                let yr = if t >= 8 || kind.is_float() {
+                // (`decode_max_tokens` is this test thread's own: 7.)
+                let yr = if t > crate::kernels::decode_max_tokens() || kind.is_float() {
                     f32_reference(&wf, n_out, n_in, &x, t)
                 } else {
                     int8_reference(&m, &x, t)
                 };
                 let mut y = vec![0f32; t * n_out];
                 matmul_quant_multi(&mut [(&m, &mut y[..])], &x, t);
-                // Passes of 8 to 15 tokens take the int8 decode kernels instead of the GEMM when
-                // another test of this process has raised `kernels::set_decode_max_tokens`.
-                let yr = if (8..=15).contains(&t) && !kind.is_float() && !close(&y, &yr, 1e-4) {
-                    int8_reference(&m, &x, t)
-                } else {
-                    yr
-                };
                 check(&format!("{kind} t={t}"), &y, &yr, 1e-4);
                 // Sanity check of the int8 path against the exact product.
                 check(&format!("{kind} t={t} vs f32"), &y, &f32_reference(&wf, n_out, n_in, &x, t), 3e-2);

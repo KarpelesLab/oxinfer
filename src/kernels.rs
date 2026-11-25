@@ -2070,17 +2070,103 @@ impl<M: QMat> Copy for QJobRef<'_, M> {}
 /// whose rows are bit-identical whatever the token count; more use the prefill GEMM.
 static DECODE_MAX_TOKENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(7);
 
-/// See [`set_decode_max_tokens`].
+thread_local! {
+    /// This thread's [`decode_max_tokens`] over the process-wide one (0: none), set by
+    /// [`decode_max_scope`] and carried into the pool jobs the thread runs ([`ThreadSettings`]).
+    // Already const; clippy (1.100) still flags it on Android's thread-local implementation.
+    #[allow(clippy::missing_const_for_thread_local)]
+    static DECODE_MAX_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// This thread's [`moe_batched`] over the process-wide one (0: none, 1 batched, 2 not); only
+    /// lib tests set it (see [`set_moe_batched`]).
+    #[allow(clippy::missing_const_for_thread_local)]
+    static MOE_BATCHED_HERE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// See [`set_decode_max_tokens`] (and [`decode_max_scope`], which overrides it on one thread).
 pub fn decode_max_tokens() -> usize {
-    DECODE_MAX_TOKENS.load(std::sync::atomic::Ordering::Relaxed)
+    match DECODE_MAX_HERE.with(|c| c.get()) {
+        0 => DECODE_MAX_TOKENS.load(std::sync::atomic::Ordering::Relaxed),
+        n => n,
+    }
 }
 
 /// Runs quantized matmuls of up to `n` tokens (clamped to 7..=15) with the batch-invariant
 /// decode kernels instead of the prefill GEMM (default 7). Speculative verification of `n`
 /// tokens then reproduces one-token decoding bit for bit; the decode kernels are slower than the
 /// GEMM when compute-bound, which matters little when the weights stream from storage.
+///
+/// Process-wide, except in this crate's lib tests, where it is the calling thread's (as
+/// [`decode_max_scope`] without the restore): tests run in parallel, and one raising the limit
+/// would move another's passes of 8 to 15 tokens between the decode kernels and the GEMM, whose
+/// rounding differs, while it compares them bit for bit.
 pub fn set_decode_max_tokens(n: usize) {
+    #[cfg(test)]
+    DECODE_MAX_HERE.with(|c| c.set(n.clamp(7, 15)));
+    #[cfg(not(test))]
     DECODE_MAX_TOKENS.store(n.clamp(7, 15), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Restores the calling thread's previous [`decode_max_tokens`] when dropped (see
+/// [`decode_max_scope`]).
+#[must_use]
+pub(crate) struct DecodeMaxScope(usize);
+
+impl Drop for DecodeMaxScope {
+    fn drop(&mut self) {
+        DECODE_MAX_HERE.with(|c| c.set(self.0));
+    }
+}
+
+/// [`set_decode_max_tokens`] for the calling thread only (and the pool jobs it runs) until the
+/// returned guard drops: for one call's batched passes, without touching the passes other
+/// threads run meanwhile or the limit a speculative decoder raised process-wide.
+pub(crate) fn decode_max_scope(n: usize) -> DecodeMaxScope {
+    DecodeMaxScope(DECODE_MAX_HERE.with(|c| c.replace(n.clamp(7, 15))))
+}
+
+/// The per-thread settings a pool job takes from the thread that runs the region: the
+/// prompt-processing flag ([`lm_prefill`]), [`decode_max_scope`]'s limit and (lib tests) the
+/// MoE batching switch.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ThreadSettings {
+    lm_prefill: bool,
+    decode_max: usize,
+    moe_batched: u8,
+}
+
+impl ThreadSettings {
+    /// The calling thread's.
+    pub(crate) fn current() -> Self {
+        ThreadSettings {
+            lm_prefill: in_lm_prefill(),
+            decode_max: DECODE_MAX_HERE.with(|c| c.get()),
+            moe_batched: MOE_BATCHED_HERE.with(|c| c.get()),
+        }
+    }
+
+    /// Runs `f` with these settings on the calling thread (a pool worker), restoring its own
+    /// afterwards.
+    pub(crate) fn run<R>(self, f: impl FnOnce() -> R) -> R {
+        struct Restore(ThreadSettings);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                self.0.install();
+            }
+        }
+        let own = ThreadSettings::current();
+        if self == own {
+            return f();
+        }
+        let _restore = Restore(own);
+        self.install();
+        f()
+    }
+
+    fn install(self) {
+        LM_PREFILL.with(|c| c.set(self.lm_prefill));
+        DECODE_MAX_HERE.with(|c| c.set(self.decode_max));
+        MOE_BATCHED_HERE.with(|c| c.set(self.moe_batched));
+    }
 }
 
 /// Whether decode passes run a gated MLP's projections, activation and quantization in one
@@ -2269,14 +2355,6 @@ pub(crate) fn in_lm_prefill() -> bool {
     LM_PREFILL.with(|c| c.get())
 }
 
-/// Sets the [`lm_prefill`] flag of a pool worker to its caller's for one job.
-pub(crate) fn with_lm_prefill<R>(on: bool, f: impl FnOnce() -> R) -> R {
-    if !on {
-        return f();
-    }
-    lm_prefill(f)
-}
-
 /// The selected prefill GEMM with `Auto` and `Exact` resolved (`Fast` and `Sme`).
 fn prefill_effective() -> PrefillGemm {
     match prefill_gemm() {
@@ -2333,14 +2411,23 @@ static MOE_UNBATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 
 /// For benchmarks: `false` runs the routed experts of MoE decode and verification passes one
 /// matmul at a time (the older path) instead of one batch per stage. Results are identical.
+///
+/// In this crate's lib tests it is the calling thread's (see [`set_decode_max_tokens`]), so that
+/// tests comparing both paths in parallel each run the path they ask for.
 #[doc(hidden)]
 pub fn set_moe_batched(on: bool) {
+    #[cfg(test)]
+    MOE_BATCHED_HERE.with(|c| c.set(if on { 1 } else { 2 }));
+    #[cfg(not(test))]
     MOE_UNBATCHED.store(!on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// See [`set_moe_batched`].
 pub(crate) fn moe_batched() -> bool {
-    !MOE_UNBATCHED.load(std::sync::atomic::Ordering::Relaxed)
+    match MOE_BATCHED_HERE.with(|c| c.get()) {
+        0 => !MOE_UNBATCHED.load(std::sync::atomic::Ordering::Relaxed),
+        v => v == 1,
+    }
 }
 
 /// Whether this CPU has the int8 matrix-multiply instructions (Arm i8mm: SMMLA).

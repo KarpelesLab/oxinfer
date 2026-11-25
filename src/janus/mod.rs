@@ -758,17 +758,10 @@ impl Janus {
         let t1 = Instant::now();
         // Quantized weights: the int8 decode kernels up to 15 rows (several images' CFG pairs);
         // past the default 7 rows the matmul would dequantize into the prefill GEMM, ~3x slower
-        // at these sizes. Process-wide, restored afterwards.
-        struct Restore(usize);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                crate::kernels::set_decode_max_tokens(self.0);
-            }
-        }
-        let _restore = Restore(crate::kernels::decode_max_tokens());
-        if (8..=15).contains(&(2 * n)) {
-            crate::kernels::set_decode_max_tokens(2 * n);
-        }
+        // at these sizes. For this thread's passes only (and its pool jobs), until the images
+        // are done.
+        let _decode_max =
+            ((8..=15).contains(&(2 * n)) && 2 * n > crate::kernels::decode_max_tokens()).then(|| crate::kernels::decode_max_scope(2 * n));
         let mut sampler = Sampler::new(opts.temperature, opts.top_k, opts.top_p, opts.seed);
         let mut grids: Vec<Vec<u32>> = vec![Vec::with_capacity(steps); n];
         let codes = g.vq.codes;

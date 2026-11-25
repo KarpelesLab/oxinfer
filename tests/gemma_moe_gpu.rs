@@ -177,8 +177,13 @@ fn worst_row(a: &[f32], b: &[f32], n: usize) -> f32 {
         .fold(0f32, f32::max)
 }
 
+/// One test at a time: each switches the process-wide `gpu::set_exact` and `gpu::set_decode`
+/// between its reference and its device passes.
+static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn gpu_prefill_plan_and_decode_match_cpu() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
     // Prefill plan steps of 64 tokens: a 300-token prompt crosses four step boundaries.
     unsafe { std::env::set_var("OXINFER_PREFILL_TOKENS", "64") };
     let plat = oxinfer::platform::detect();
@@ -265,6 +270,7 @@ fn gpu_prefill_plan_and_decode_match_cpu() {
 /// first layers filled; both must give the CPU's results up to rounding.
 #[test]
 fn gpu_prefill_skips_kv_shared_rows() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
     unsafe { std::env::set_var("OXINFER_PREFILL_TOKENS", "64") };
     let plat = oxinfer::platform::detect();
     let Ok(Some(_)) = oxinfer::gpu::init(&plat, oxinfer::platform::DevicePref::Auto) else {

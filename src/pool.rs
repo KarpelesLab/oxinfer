@@ -343,9 +343,10 @@ impl Pool {
             return;
         }
         REGIONS.fetch_add(1, Relaxed);
-        // The caller's prompt-processing flag (`kernels::lm_prefill`) holds in the workers too.
-        let lm = crate::kernels::in_lm_prefill();
-        let scoped = move |i: usize| crate::kernels::with_lm_prefill(lm, || f(i));
+        // The caller's per-thread settings (`kernels::lm_prefill`, `kernels::decode_max_scope`)
+        // hold in the workers too.
+        let settings = crate::kernels::ThreadSettings::current();
+        let scoped = move |i: usize| settings.run(|| f(i));
         let f: &(dyn Fn(usize) + Sync) = &scoped;
         let s = &self.shared;
         // SAFETY: the region outlives every access: the pointer is cleared and every `busy`
