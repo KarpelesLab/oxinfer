@@ -2032,7 +2032,17 @@ Measured and not kept:
 - More of the dense rows on SME in `fast` (`OXINFER_SME_SHARE` 7: the same as 5, 9: 0.75x), and
   keeping the NEON threads off the SME queue: within the noise. SME's machine-wide f32 rate
   stops at 2.0-2.4 TFLOP/s from three threads (1.5 at two, 1.0 at one on 2048 x 2048), where the
-  int8 GEMM gives 3.3 TOP/s on 18 threads.
+  int8 GEMM gives 3.3 TOP/s on 18 threads. At a lighter load (`gemm_bench`, Q8_0, 512 tokens,
+  18 threads) `fast` gave 4.1-5.3 TOP/s against `int8`'s 4.0-4.9 over Llama 1B's and Qwen3-8B's
+  shapes: the SME tiles add at most 8%, nothing for inner dimensions of 8192 and more; shares of
+  0, 3, 5 and 7 sixteenths put 5 ahead or level everywhere.
+- The SME blocks of `fast` in half precision (operands rounded to f16 with power-of-two scales,
+  widening `FMOPA`s of two inputs each, so the operands of a tile are half the bytes): 0.77-0.82
+  against 1.23-1.32 TFLOP/s for the f32 SME GEMM on one thread. The f32 kernel alone reaches 2.15
+  TFLOP/s with its panels in cache and 1.1-1.5 streaming the activation tiles; the widening
+  instruction does twice the products at half the rate, so halving the bytes gains nothing.
+- Query tiles of 16 or 64 rows instead of 32 in the NEON prompt attention, value blocks of 64 or
+  256 keys instead of 128: within 5%, none ahead everywhere.
 
 #### CPU decode round 4 (November 2026)
 
