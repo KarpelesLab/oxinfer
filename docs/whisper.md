@@ -45,10 +45,13 @@ What runs, following transformers' `WhisperFeatureExtractor` and
   (a mixed-radix FFT of 400) and the filterbank run in f64.
 - **Encoder**: two convolutions (kernel 3, the second with stride 2) with GELU, sinusoidal
   positions, pre-LayerNorm transformer layers, all through the shared matmul (SIMD kernels, GPU
-  backends for the big products) and a fused attention kernel on Metal.
+  backends for the big products). On Metal with matrix units (M5, A19) the whole encoder is one
+  device pass per batch of windows (see "On Metal" below).
 - **Decoder**: learned positions, causal self-attention over a KV cache, cross-attention over the
   window's encoder output (keys and values computed once per window, kept head-major and attended
-  with the keys split across threads), the output projection tied to the token embedding.
+  with the keys split across threads), the output projection tied to the token embedding. On
+  Metal the decoder steps run on the device too, and greedy decoding chains several steps per
+  submission.
 - **Decoding**: greedy by default (`TranscribeOptions::temperatures` for sampling and fallback);
   language detection from the first-token distribution over the language tokens (`language` then
   holds the code and its probability); `suppress_tokens` and `begin_suppress_tokens`; the rules of
@@ -195,7 +198,7 @@ whisper-tiny with `--beam 5 --timestamps --batch 5` (bf16, CPU), whisper-base wi
 random-weight model without downloaded weights (`src/whisper/batch_tests.rs`: batched encoder and
 decoder steps bit for bit in f32, bf16, q8 and q4, whole transcripts with beam search, sampling,
 fallback and word timestamps, and the beam search against a slow transcription of
-openai-whisper's Python). Not run: batches on Metal and WebGPU (no such device here).
+openai-whisper's Python). On Metal: see "On Metal" below; not run on WebGPU.
 
 With the default bf16 weights, transcripts stay close but are not always token-identical. On the
 100 s clip, whisper-large-v3-turbo in bf16 on Metal gives the f32 transcript token for token;
@@ -204,33 +207,81 @@ decoder, or f16 weights throughout, are token-identical). A q8 decoder: 0 or 1 w
 whisper-small, 1 of 210 on large-v3-turbo; q4 decoders drift (7 words of 210 on large-v3-turbo,
 50 of 206 on whisper-small): not recommended for Whisper.
 
-**Speed** on the M5 Max, 100 s of speech (long-form), wall time including features, language
-detection and every window (real-time factor = time / audio duration; lower is faster). Best of
-three runs, load average 4-8 from other jobs (one core busy with a compile during the first
-rows); `--threads 6` approximates a phone's core count:
+**Speed against whisper.cpp** (M5 Max, November 2026). The audio is LibriSpeech test-clean
+chapter 672-122797 (Andersen's *The Fir Tree*, 77 utterances in order, 496.2 s, 1109 words of
+reference transcript), transcribed long-form by both engines with the same settings: greedy, no
+temperature fallback, no previous-text conditioning, language fixed to English, timestamps on
+(oxinfer `--language en`; whisper.cpp `-l en -bs 1 -bo 1 -nf -mc 0`). oxinfer runs the Hugging
+Face checkpoints in bf16, whisper.cpp master 092fa10 (Metal, flash attention on by default) its
+ggml f16 files. Times are each engine's own (oxinfer's `total`: features, encoder, decoder;
+whisper.cpp's `total time`, which also counts its 40-150 ms model load), the best of two runs
+alternated between the engines, after a warm-up run; word error rate against the reference after
+lowercasing and stripping punctuation (`mr` read as `mister`), the same normalizer for both.
 
-| Model | Device | Encoder | Decoder | Total | RTF | Speed |
+On Metal:
+
+| Model | oxinfer encoder / decoder | oxinfer total | whisper.cpp encoder / decoder | whisper.cpp total | Speedup | WER oxinfer / whisper.cpp |
 |---|---|---|---|---|---|---|
-| whisper-small | CPU, 18 threads | 2.17 s | 0.66 s (299 tokens) | 2.84 s | 0.028 | 35x real time |
-| whisper-small | CPU, 6 threads | 4.58 s | 0.82 s | 5.43 s | 0.054 | 18x |
-| whisper-small | Metal | 0.66 s | 0.65 s | 1.32 s | 0.013 | 76x |
-| whisper-small, q8 decoder | Metal | 0.54 s | 0.54 s | 1.09 s | 0.011 | 92x |
-| whisper-large-v3-turbo | CPU, 18 threads | 9.66 s | 0.57 s (304 tokens) | 10.24 s | 0.102 | 10x |
-| whisper-large-v3-turbo | CPU, 6 threads | 19.58 s | 0.70 s | 20.32 s | 0.203 | 5x |
-| whisper-large-v3-turbo | Metal | 1.39 s | 0.58 s | 1.99 s | 0.020 | 50x |
-| whisper-large-v3-turbo, q8 decoder | Metal | 1.34 s | 0.39 s | 1.76 s | 0.018 | 57x |
+| tiny | 0.07 / 0.67 s | **0.80 s** (621x real time) | 0.10 / 1.35 s | 1.59 s | 1.99x | 6.40% / 7.30% |
+| base | 0.15 / 1.05 s | **1.26 s** (393x) | 0.16 / 1.92 s | 2.25 s | 1.79x | 3.70% / 4.33% |
+| small | 0.34 / 2.32 s | **2.72 s** (182x) | 0.42 / 3.55 s | 4.21 s | 1.55x | 1.89% / 1.89% |
+| large-v3-turbo | 1.57 / 1.60 s | **3.27 s** (152x) | 2.13 / 2.24 s | 4.85 s | 1.48x | 0.90% / 0.90% |
+| medium | 0.94 / 5.60 s | **6.59 s** (75x) | 1.19 / 7.97 s | 9.62 s | 1.46x | 1.71% / 1.62% |
+| large-v3 | 1.88 / 8.89 s | **10.87 s** (46x) | 2.61 / 10.64 s | 14.05 s | 1.29x | 1.17% / 1.08% |
 
-On Metal the encoder's attention is one fused kernel (`flash_attn64`: about 3.6 ms per
-large-v3-turbo layer, against 10 ms for the GEMM + softmax + GEMM path it replaced, which other
-head sizes still use); a large-v3-turbo window then splits into ~160 ms of matmuls, ~115 ms of
-attention and ~100 ms of CPU-side layer norms, GELU and residual adds.
+(whisper.cpp's decoder column is its `decode`, `batchd` and `sample` times together: its token
+choice runs on the CPU between steps.) Before the device sessions, oxinfer took 1.66 / 2.54 / 6.25
+/ 10.30 s for tiny / base / small / large-v3-turbo on Metal (encoder 0.59 / 1.02 / 2.63 / 7.43 s,
+CPU decoder 1.01 / 1.47 / 3.56 / 2.77 s, in a busier moment of the shared machine).
 
-The encoder (30 s per window, 1500 positions) is the heavy part: its matmuls and attention go to
-the GPU when one is active (Metal, CUDA, WebGPU); decoding is one token at a time on the CPU
-(one row per beam and per input of a batch),
+On the CPU (oxinfer `--device cpu`, 18 threads; whisper.cpp `-ng -t 12`, its fastest thread count
+here, with the Accelerate BLAS backend for the encoder):
+
+| Model | oxinfer encoder / decoder | oxinfer total | whisper.cpp encoder / decoder | whisper.cpp total | Speedup |
+|---|---|---|---|---|---|
+| tiny | 0.65 / 0.65 s | **1.36 s** (365x) | 0.95 / 1.39 s | 2.43 s | 1.79x |
+| base | 1.48 / 1.15 s | **2.69 s** (185x) | 2.06 / 2.15 s | 4.32 s | 1.61x |
+| small | 4.85 / 3.34 s | **8.25 s** (60x) | 6.94 / 4.90 s | 12.02 s | 1.46x |
+| large-v3-turbo | 27.0 / 2.43 s | **29.5 s** (17x) | 38.2 / 3.82 s | 42.4 s | 1.44x |
+| medium | 16.2 / 9.28 s | **25.6 s** (19x) | 20.3 / 11.3 s | 32.0 s | 1.25x |
+| large-v3 | 34.8 / 14.7 s | **49.7 s** (10x) | 46.3 / 21.8 s | 68.8 s | 1.38x |
+
+The CPU and Metal transcripts are the same from small up (tiny and base differ by 3 and 1 of the
+1109 words; the CPU's tiny scores 6.40% as well). The word error rates match whisper.cpp's within
+a word from small up and are lower on tiny and base (whisper.cpp reads f16 weights, oxinfer
+bf16, and oxinfer seeks from the last timestamp as transformers does: 19 windows on this clip, 20
+with base and large-v3-turbo, 22 with large-v3; whisper.cpp 19 to 23).
+
+**On Metal** (GPUs with matrix units: M5, A19; `crate::gpu::whisper`, `src/metal_whisper.rs`):
+
+- The encoder is one device pass per batch of up to 8 windows: the convolutions as GEMMs over
+  unfolded rows, LayerNorms, biases, exact GELU and residual adds in row kernels that write the
+  next GEMM's half-precision input, the matrix-unit GEMMs, a fused 64-wide attention on the
+  matrix units (`wh_flash64`, its running maximum moved lazily as in `flash_attn128_mma`). The
+  same pass makes every decoder layer's cross-attention keys and values and keeps them on the
+  device (half precision); the host copy of the encoder output is read only for word
+  timestamps. A large-v3-turbo window takes about 76 ms of GPU time (whisper.cpp: 101-107 ms).
+- A decoder step is one command buffer: few-row matvecs of the decoder's weights (bf16, q8 or
+  q4), self-attention over a per-sequence device cache (the attention kernel stores the row's
+  new key and value itself), cross-attention over the window's keys and values in chunks of 128
+  positions merged per head, the logits of the rows asked for.
+- Greedy decoding (temperature 0, one sequence per window) chains 8 steps per command buffer: the
+  token choice runs on the GPU after each step (`whc_select`: the suppressed tokens, the
+  timestamp rules of `process`, the argmax and its log-probability) and the next step's input is
+  gathered from the chosen token there, so a step costs no round trip to the host. The host keeps
+  the tokens up to where the window ends (the rest of the 8 steps is discarded). Beam search and
+  sampling choose on the host, one step per submission.
+- Batches stay exact: every window and every row gets the bits it gets alone (each kernel
+  computes a row from that row alone, a window's attention from its own rows). Checked on three
+  inputs (90 s, 5 s, 45 s) with whisper-base (bf16, Metal), greedy, `--beam 5`, and `--fallback
+  --best-of 3 --word-timestamps`: each file's JSON is the one it gets alone; the unit tests check
+  the sessions on a random model (`metal_*` in `src/whisper/batch_tests.rs`).
+
+Without matrix units, with f32 / f16 weights, or with `gpu_exact` set, the per-operation path
+runs instead: the encoder's big matmuls go to the GPU (Metal, CUDA, WebGPU) and the rest to the
+CPU, and decoding is one token at a time on the CPU (one row per beam and per input of a batch),
 where the bf16 / q8 / q4 kernels of the language models apply. Without a GPU (iOS and Android
-builds without one, `--device cpu`), everything runs on the SIMD CPU kernels. f32 and f16 weights
-run on the CPU only (the GPU backends take bf16, q8 and q4).
+builds without one, `--device cpu`), everything runs on the SIMD CPU kernels.
 
 Not supported: batching the windows of one long file (they are sequential: each starts at the
 previous one's last timestamp), transformers' own beam search (`num_beams`, a different
