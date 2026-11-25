@@ -124,13 +124,17 @@ pub struct Options {
     /// Whole transformer passes on the accelerator (default on; off: op by op, see
     /// [`transformer::Transformer::set_device_passes`]).
     pub device_passes: bool,
+    /// In those passes, attention on half-precision matrix units with split (hi + lo) queries
+    /// and keys (default on; off: float32 operands; see
+    /// [`transformer::Transformer::set_split_attention`]).
+    pub split_attention: bool,
 }
 
 impl Options {
     /// Sets an option by name (the C API's `key=value` options): `quant` and `text_quant` (bf16,
     /// q8, q4), `mmap`, `transformer` (a GGUF or safetensors file, or a folder), `controlnet`
     /// (a folder or repo id), `lora` (`FILE[:SCALE]`, repeatable), `keep_text_encoder`, `stream`,
-    /// `device`, `device_passes`.
+    /// `device`, `device_passes`, `split_attention`.
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         let flag = || match value.to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => Ok(true),
@@ -148,13 +152,14 @@ impl Options {
             "keep_text_encoder" => self.keep_text_encoder = flag()?,
             "stream" => self.stream = flag()?.then(crate::stream::StreamOptions::default),
             "device_passes" => self.device_passes = flag()?,
+            "split_attention" => self.split_attention = flag()?,
             "device" => {
                 self.device = crate::platform::DevicePref::parse(value)
                     .with_context(|| format!("device: unknown device {value:?} (auto|cpu|cuda|metal|vulkan)"))?
             }
             _ => {
                 bail!(
-                    "unknown option {key:?} (quant, text_quant, mmap, transformer, controlnet, lora, keep_text_encoder, stream, device, device_passes)"
+                    "unknown option {key:?} (quant, text_quant, mmap, transformer, controlnet, lora, keep_text_encoder, stream, device, device_passes, split_attention)"
                 )
             }
         }
@@ -239,6 +244,7 @@ impl Default for Options {
             keep_text_encoder: false,
             device: crate::platform::DevicePref::Auto,
             device_passes: transformer::device_passes_default(),
+            split_attention: transformer::split_attention_default(),
         }
     }
 }
@@ -810,6 +816,7 @@ impl Pipeline {
         };
         let mut t = Transformer::load(self.tcfg.clone(), &ld)?;
         t.set_device_passes(self.opts.device_passes);
+        t.set_split_attention(self.opts.split_attention);
         self.lora_report.clear();
         if let Some(l) = &lora {
             for (f, n) in &l.files {

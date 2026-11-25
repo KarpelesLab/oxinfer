@@ -2236,10 +2236,11 @@ impl MetalBackend {
         let (lib, has_mma, units, mma_error) = match want_mma {
             true => match compile(
                 &format!(
-                    "#define GTM {MMA_GTM}\n#define MMA_UNITS 1\n{base_src}{MMA_SHADER_SRC}{}{}{}{}",
+                    "#define GTM {MMA_GTM}\n#define MMA_UNITS 1\n{base_src}{MMA_SHADER_SRC}{}{}{}{}{}",
                     decode::PFM_SRC,
                     unet::SRC,
                     whisper::SRC,
+                    dit::MMA_SRC,
                     extra()
                 ),
                 true,

@@ -123,6 +123,10 @@ pub struct FluxModel<'a> {
     pub proj_out: Lin<'a>,
     /// Attention with half-precision operands (else float32 ones).
     pub half_attention: bool,
+    /// Without `half_attention`: queries and keys as pairs of halves (hi + lo, 22 bits) on the
+    /// half-precision matrix units where the device has that kernel, instead of float32
+    /// operands (scores as exact; probabilities and values in half precision).
+    pub split_attention: bool,
 }
 
 /// One FLUX.1 call: the packed latent tokens, the T5 states, the rotary tables and the

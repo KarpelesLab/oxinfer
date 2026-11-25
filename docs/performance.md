@@ -4337,7 +4337,7 @@ attention auto), mflux 0.24 on MLX 0.32.5.
 | FLUX.1 [schnell] Q8_0, 1024^2 | oxinfer before / after | 5.0 s / ~2.5 s | | |
 | | mflux `-q 8` | 3.8 s | 0.1-0.4 s | 0.6-1.0 s |
 | Qwen-Image-2512 Q4_0, 1024^2, true CFG 4 (2 passes) | oxinfer before (per-operation) | 10.1 s | 3.3 s | 2.0 s |
-| | oxinfer, whole-pass GPU plan | 5.4 s | 3.4 s | 2.4 s |
+| | oxinfer, whole-pass GPU plan | 4.9-5.4 s | 3.4 s | 2.4 s |
 | | stable-diffusion.cpp | 12.4 s | 12.8 s | 46 s (untiled) |
 | SD 1.5 fp16, 512^2, CFG 7.5, Euler | oxinfer (two UNet passes) | 0.60 s | 0.06 s | 0.56 s |
 | | stable-diffusion.cpp (batched CFG) | 0.30 s | 0.43 s | 1.23 s |
@@ -4358,7 +4358,10 @@ GPU output).
 Qwen-Image runs FLUX.1's plan with double blocks only (text padded to the GEMM tile, compact
 attention operands, f32 attention, Edit-2511's reference-token modulation, LoRA side paths; see
 [Qwen-Image](qwen-image.md)): 5.2 -> 2.7 s per pass at 1024^2, of which attention ~1.15 s; an
-Edit-2511 + Lightning pass over 8.3k tokens 16.5 -> 10-11 s.
+Edit-2511 + Lightning pass over 8.3k tokens 16.5 -> 10-11 s. Its attention then takes queries and
+keys as hi / lo half pairs on the half-precision matrix units (scores as exact as with f32
+operands): 2.7 -> 2.4-2.7 s per pass (interleaved on a loaded GPU: 4.9 -> 4.4 s, the
+per-operation path 10.4 s, stable-diffusion.cpp 33-34 s per step against 8.6 s).
 
 ## Quantization quality
 

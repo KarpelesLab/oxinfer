@@ -188,6 +188,8 @@ pub struct Transformer<'a> {
     pub(crate) stream: Option<crate::stream::StreamHook>,
     /// Whole passes on the device ([`Transformer::set_device_passes`]).
     device_passes: std::sync::atomic::AtomicBool,
+    /// Split-precision attention in those passes ([`Transformer::set_split_attention`]).
+    split_attention: std::sync::atomic::AtomicBool,
     gpu: std::sync::Mutex<Option<Box<dyn crate::gpu::dit::FluxSession>>>,
     /// The modulations of the last noise level (shared by a step's guided and unguided passes).
     mods: std::sync::Mutex<Option<(ModKey, Mods)>>,
@@ -299,6 +301,7 @@ impl<'a> Transformer<'a> {
             inv_freq: [inv(ax[0]), inv(ax[1]), inv(ax[2])],
             stream: None,
             device_passes: std::sync::atomic::AtomicBool::new(device_passes_default()),
+            split_attention: std::sync::atomic::AtomicBool::new(split_attention_default()),
             gpu: std::sync::Mutex::new(None),
             mods: std::sync::Mutex::new(None),
             cfg,
@@ -557,6 +560,14 @@ impl<'a> Transformer<'a> {
         }
     }
 
+    /// In whole device passes, attention with the queries and keys as pairs of half-precision
+    /// values (hi + lo, 22 bits; scores as exact as with float32 operands) on the
+    /// half-precision matrix units (the default; also `OXINFER_QWEN_IMAGE_SPLIT_ATTN=0`); off,
+    /// float32 operands (about a quarter slower overall at 1024x1024).
+    pub fn set_split_attention(&self, on: bool) {
+        self.split_attention.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Drops the device session's buffers (made again on the next device pass).
     pub fn release_device(&self) {
         *self.gpu.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -608,6 +619,7 @@ impl<'a> Transformer<'a> {
             singles: Vec::new(),
             proj_out: dit_lin(proj_out)?,
             half_attention: !crate::gpu::exact_attention(),
+            split_attention: self.split_attention.load(std::sync::atomic::Ordering::Relaxed),
         };
         let t0 = std::time::Instant::now();
         let key = (sigma.to_bits(), extra.t_cond, zero);
@@ -779,6 +791,12 @@ pub(super) fn gelu_tanh_exact(x: f32) -> f32 {
 /// (`OXINFER_QWEN_IMAGE_DEVICE_PASS=0` turns them off).
 pub(crate) fn device_passes_default() -> bool {
     std::env::var("OXINFER_QWEN_IMAGE_DEVICE_PASS").map_or(true, |v| v != "0")
+}
+
+/// Whether whole device passes use split-precision attention unless told otherwise
+/// (`OXINFER_QWEN_IMAGE_SPLIT_ATTN=0` turns it off).
+pub(crate) fn split_attention_default() -> bool {
+    std::env::var("OXINFER_QWEN_IMAGE_SPLIT_ATTN").map_or(true, |v| v != "0")
 }
 
 /// A layer as the device's whole-pass plan sees it, its run-time LoRA update as a side path;

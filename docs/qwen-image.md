@@ -255,14 +255,26 @@ buffers for all 60 blocks, ten command buffers per pass, the layer norms under t
 biases, QK RMS norms with the interleaved MSRoPE, GELU-tanh and the gated residuals as row
 kernels that write the next GEMM's half-precision input. The text rows are padded to the GEMMs'
 128-row tile, and the attention operands are written compact (the padding never reaches the
-attention, which keeps f32 operands); Edit-2511's reference tokens take their own modulation
-rows; a run-time LoRA (Lightning on bf16 or GGUF weights) runs as side GEMMs beside each layer
-(the rank padded to 64 with zeros). The modulations (120 matrix-vector products of
+attention); Edit-2511's reference tokens take their own modulation rows; a run-time LoRA
+(Lightning on bf16 or GGUF weights) runs as side GEMMs beside each layer (the rank padded to 64
+with zeros; the side paths of layers that share an input run together). The modulations (120 matrix-vector products of
 `silu(temb)`, and of `silu(temb(0))` for the reference tokens) are one f32 submission per step,
 shared by the guided and unguided passes; the exact input channels of load-time quantized
 modulation layers, LoRA updates and biases are added on the CPU. ControlNet residuals and
 streamed weights take the per-operation path, and the plan's buffers (1-2 GB) are released
 before the VAE decode.
+
+*Split-precision attention* (default; `split_attention=0` or `OXINFER_QWEN_IMAGE_SPLIT_ATTN=0`
+keeps f32 operands): the logits run into the thousands, so half-precision queries and keys are
+not enough (they move the velocity ~10%), but f32 operands run the matrix units at a quarter of
+their half-precision rate. The heads kernel writes each query and key as two halves, hi =
+half(x) and lo = half(x - hi) (22 bits of x), and `dit_flash128_hilo` (`src/metal_dit_mma.metal`)
+computes the scores as Qh Kh^T + Qh Kl^T + Ql Kh^T with f32 accumulation (the dropped Ql Kl^T is
+2^-22 of a score), the probabilities and values in half precision as in the fast kernel: three
+half-precision score products and one value product instead of two f32 ones, attention about a
+quarter faster. Against f32 operands: first velocity 7.1e-4, final latents 2.7e-3, 55.7 dB
+(2512 Q4_0, 3 steps CFG 4); Edit-2511 + Lightning 1.8e-3, 9.8e-3, 45.9 dB, both below the
+device-pass-against-per-operation differences above.
 
 Against the per-operation path (same GEMMs and attention kernel; the row work in f32 on the GPU
 instead of f64 / f32 on the CPU), Qwen-Image-2512 Q4_0, 1024x1024, 3 steps, CFG 4: first
@@ -276,14 +288,20 @@ Metal, the same GGUF, `qwen_2.5_vl_7b.safetensors`, the ComfyUI VAE, Euler):
 | run | engine | per step (per pass) | text | VAE decode |
 |---|---|---|---|---|
 | Qwen-Image-2512 GGUF Q4_0, 1024x1024, true CFG 4 (two passes a step) | oxinfer per-operation (before) | 10.1-10.4 s (5.0-5.2 s) | 3.3 s | 2.2 s |
-| | oxinfer, whole passes | 5.4 s (2.7 s) | 3.4 s | 2.4 s |
+| | oxinfer, whole passes, f32 attention operands | 5.4-5.5 s (2.7 s) | 3.4 s | 2.4 s |
+| | oxinfer, whole passes, split attention (default) | 4.9-5.4 s (2.4-2.7 s) | 3.4 s | 2.4 s |
 | | stable-diffusion.cpp | 12.4 s | 12.8 s | 46 s (untiled) |
 | Edit-2511 bf16 + Lightning, 1024x1024 edit of a 1024x1024 image (8192 + ~100 tokens, 4 steps) | oxinfer per-operation (before) | 16.5 s | 3.3 s | 1.9 s |
 | | oxinfer, whole passes | 10-11 s (first 11.4 s with the uploads) | 2.6 s | 2.1 s |
 
-Per text-to-image pass about 1.15 s is attention (f32 operands, ~12 TFLOP/s), 1.4 s the GEMMs,
-0.14 s the row kernels and 12 ms the modulations; the edit's 8.3k-token attention is most of its
-pass.
+Per text-to-image pass with f32 attention operands, about 1.15 s is attention (~12 TFLOP/s),
+1.4 s the GEMMs, 0.14 s the row kernels and 12 ms the modulations; the edit's 8.3k-token
+attention is most of its pass. Later in the day, with the GPU shared with other jobs, the same
+runs interleaved gave per pass 10.4 s per-operation, 4.9 s with f32 attention operands and
+4.4 s with split attention, and stable-diffusion.cpp 33-34 s per step (text 19.9 s, VAE 65 s)
+against oxinfer's 8.6 s. Running the guided and unguided passes as one batch (as MOSS-Image's
+plan does) would not pay here: at 4096 image tokens the GEMMs are compute-bound and their
+weight tiles are dequantized per row tile anyway, and attention stays per sequence.
 
 ## Qwen-Image-2.1 and Qwen-Image-2.1-Turbo
 

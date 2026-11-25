@@ -81,6 +81,7 @@ pub fn run(args: &Args) -> Result<()> {
         keep_text_encoder: false,
         device: args.device,
         device_passes: !args.flux.no_device_passes && Options::default().device_passes,
+        split_attention: Options::default().split_attention,
     };
     let t0 = Instant::now();
     let mut pipe = Pipeline::load(&args.model.to_string_lossy(), opts)?;

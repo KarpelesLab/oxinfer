@@ -234,7 +234,7 @@ kernel void flux_ln_mod(device const float* x [[buffer(0)]], device const float*
 // Attention operands of 128-wide heads: head h of row r from src (rows ld_src floats apart) plus
 // a bias, RMS-normed with weight w (with `norm`), rotated by interleaved pairs (dims 2i, 2i + 1 by
 // the row's angle i, tables of 64 per row; with `rope`), into dst rows of heads * 128 (half or
-// f32). Rows below `split` take weights / biases A, the others B and come from source row
+// f32, or with out_half 2 as hi / lo halves into dst and dst_lo). Rows below `split` take weights / biases A, the others B and come from source row
 // r + gap (the joint rows are compact, the source's text rows padded to a GEMM tile). One
 // SIMD-group per (row, head), lane l holding dims 4 l .. 4 l + 3.
 struct FHD { uint ld_src; uint norm; uint rope; uint out_half; float eps; uint heads; uint split; uint has_bias;
@@ -243,7 +243,7 @@ kernel void flux_heads(device const float* src [[buffer(0)]], device void* dst [
                        device const float* wa [[buffer(2)]], device const float* wb [[buffer(3)]],
                        device const float* ba [[buffer(4)]], device const float* bb [[buffer(5)]],
                        device const float* cs [[buffer(6)]], device const float* sn [[buffer(7)]], constant FHD& p [[buffer(8)]],
-                       uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+                       device half* dst_lo [[buffer(9)]], uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
     uint r = tg.x, h = tg.y;
     bool a = r < p.split;
     float4 x = *(device const float4*)(src + (ulong)(a ? r : r + p.gap) * p.ld_src + h * 128 + lane * 4);
@@ -259,7 +259,12 @@ kernel void flux_heads(device const float* src [[buffer(0)]], device void* dst [
         x = float4(x.x * c.x - x.y * s.x, x.y * c.x + x.x * s.x, x.z * c.y - x.w * s.y, x.w * c.y + x.z * s.y);
     }
     ulong o = (ulong)r * p.heads * 128 + h * 128 + lane * 4;
-    if (p.out_half != 0) *(device half4*)((device half*)dst + o) = half4(x);
+    if (p.out_half == 2) {
+        // hi / lo halves (dit_flash128_hilo).
+        half4 hi = half4(x);
+        *(device half4*)((device half*)dst + o) = hi;
+        *(device half4*)(dst_lo + o) = half4(x - float4(hi));
+    } else if (p.out_half != 0) *(device half4*)((device half*)dst + o) = half4(x);
     else *(device float4*)((device float*)dst + o) = x;
 }
 

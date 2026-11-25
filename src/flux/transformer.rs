@@ -680,6 +680,7 @@ impl FluxTransformer {
             singles,
             proj_out: dit_lin(&self.proj_out)?,
             half_attention: !crate::gpu::exact_attention(),
+            split_attention: false,
         };
         // The modulations of this timestep.
         let t0 = std::time::Instant::now();

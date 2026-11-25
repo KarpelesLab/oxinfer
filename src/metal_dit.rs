@@ -10,9 +10,18 @@ use super::*;
 use crate::gpu::dit::{FluxInput, FluxModel, FluxSession, Lin, Model, Seq, Session};
 
 pub(crate) const SRC: &str = include_str!("metal_dit.metal");
+/// Kernels on the matrix units (appended after `MMA_SHADER_SRC`).
+pub(crate) const MMA_SRC: &str = include_str!("metal_dit_mma.metal");
 
 /// Blocks per command buffer (the GPU starts on the first while the rest is encoded).
 const BLOCKS_PER_CB: usize = 6;
+
+/// A layer whose LoRA side path runs: (layer, input, rows, output, output row stride).
+type SideJob<'l, 'a> = (&'l Lin<'a>, Xh, usize, (Id, usize), usize);
+
+/// LoRA side paths a FLUX / Qwen-Image pass runs side by side (a double block's q, k, v of both
+/// streams).
+const SIDE_SLOTS: usize = 6;
 
 /// Profiling (`OXINFER_DIT_SKIP=qkv,att,o,up,down`): ops left out of the passes.
 fn skip_op(op: &str) -> bool {
@@ -255,6 +264,12 @@ impl Enc<'_, '_> {
 
     /// f32 rows (`ld` apart) to scaled half rows.
     fn to_half(&self, x: (Id, usize), ld: usize, n: usize, rows: usize, out: Xh) {
+        self.to_half_nb(x, ld, n, rows, out);
+        self.e.barrier();
+    }
+
+    /// [`Self::to_half`] without the barrier after it.
+    fn to_half_nb(&self, x: (Id, usize), ld: usize, n: usize, rows: usize, out: Xh) {
         let m = self.be.mma.as_ref().unwrap();
         let e = self.e;
         e.pipe(m.x_half);
@@ -264,7 +279,6 @@ impl Enc<'_, '_> {
         e.bytes(&U4([n as u32, 0, ld as u32, 0]), 3);
         e.buf(x.0, x.1, 4);
         e.dispatch((rows, 1), 256);
-        e.barrier();
     }
 }
 
@@ -638,6 +652,8 @@ struct FluxPipes {
     cat: Id,
     gated: Id,
     bias: Id,
+    /// Split-precision attention (`dit_flash128_hilo`), when the library has it.
+    hilo: Option<Id>,
 }
 
 /// FLUX.1 and Qwen-Image passes ([`FluxSession`]): the joint sequence `[text; image]` in one
@@ -653,7 +669,7 @@ pub(crate) struct MetalFlux {
 // SAFETY: as MetalDit.
 unsafe impl Send for MetalFlux {}
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum F {
     H = 0,
     Xh,
@@ -673,8 +689,10 @@ enum F {
     U,
     Uh,
     Urs,
+    Ql,
+    Kl,
 }
-const NFBUF: usize = 18;
+const NFBUF: usize = 20;
 
 #[repr(C)]
 struct Fln {
@@ -708,6 +726,7 @@ impl MetalBackend {
             cat: pipe("flux_cat_half")?,
             gated: pipe("flux_gated_add")?,
             bias: pipe("dit_bias_rows")?,
+            hilo: pipe("dit_flash128_hilo"),
         };
         Some(Box::new(MetalFlux {
             be: self,
@@ -826,9 +845,18 @@ impl FluxSession for MetalFlux {
             .unwrap_or(0);
         let ri = ni.next_multiple_of(MMA_TM);
         let rg = rt + ri;
-        let half_att = m.half_attention;
-        let eb = if half_att { 2 } else { 4 };
+        // Attention operands: 1 half, 2 hi / lo halves, 0 f32.
+        let hilo = !m.half_attention && m.split_attention && self.p.hilo.is_some();
+        let att_mode = if m.half_attention {
+            1
+        } else if hilo {
+            2
+        } else {
+            0
+        };
+        let eb = if att_mode == 0 { 4 } else { 2 };
         let ok = self.ensure(F::H, rg * d * 4)
+            && (!hilo || self.ensure(F::Ql, rg * d * 2) && self.ensure(F::Kl, rg * d * 2))
             && self.ensure(F::Xh, rg * wide * 2)
             && self.ensure(F::Rs, rg * 4)
             && self.ensure(F::Qkv, 3 * rg * d * 4)
@@ -843,9 +871,9 @@ impl FluxSession for MetalFlux {
             && self.ensure(F::Img, ri * cin * 4)
             && self.ensure(F::Txt, rt * cj * 4)
             && (rmax == 0
-                || self.ensure(F::U, ri.max(rt) * rmax * 4)
-                    && self.ensure(F::Uh, ri.max(rt) * rmax * 2)
-                    && self.ensure(F::Urs, ri.max(rt) * 4));
+                || self.ensure(F::U, SIDE_SLOTS * ri.max(rt) * rmax * 4)
+                    && self.ensure(F::Uh, SIDE_SLOTS * ri.max(rt) * rmax * 2)
+                    && self.ensure(F::Urs, SIDE_SLOTS * ri.max(rt) * 4));
         if !ok {
             return false;
         }
@@ -984,12 +1012,19 @@ impl FluxSession for MetalFlux {
             e.buf(cst, b.1.unwrap_or(0), 5);
             e.buf(id(F::Cos), 0, 6);
             e.buf(id(F::Sin), 0, 7);
+            let lo = match dst {
+                F::Q if att_mode == 2 => F::Ql,
+                F::K if att_mode == 2 => F::Kl,
+                _ => dst,
+            };
+            e.buf(id(lo), 0, 9);
             e.bytes(
                 &Fhd {
                     ld_src: d as u32,
                     norm: norm.is_some() as u32,
                     rope: norm.is_some() as u32,
-                    out_half: half_att as u32,
+                    // Values stay plain half with hi / lo queries and keys.
+                    out_half: if att_mode == 2 && dst == F::V { 1 } else { att_mode },
                     eps: EPS,
                     heads: heads as u32,
                     split: split as u32,
@@ -1005,27 +1040,51 @@ impl FluxSession for MetalFlux {
             if skip_op("att") {
                 return;
             }
-            e.pipe(if half_att { mma.flash128 } else { mma.flash128_f32 });
+            e.pipe(match att_mode {
+                1 => mma.flash128,
+                2 => p.hilo.unwrap(),
+                _ => mma.flash128_f32,
+            });
             e.buf(id(F::Q), 0, 0);
             e.buf(id(F::K), 0, 1);
             e.buf(id(F::V), 0, 2);
             e.buf(id(F::Att), 0, 3);
             e.bytes(&U4([n as u32, n as u32, d as u32, (1.0 / (hd as f32).sqrt()).to_bits()]), 4);
+            if att_mode == 2 {
+                e.buf(id(F::Ql), 0, 5);
+                e.buf(id(F::Kl), 0, 6);
+            }
             e.dispatch((n.div_ceil(64), heads), 128);
             e.barrier();
         };
-        // A layer's LoRA side path (after its main GEMM and a barrier): y += up (down x).
-        let side = |en: &Enc, l: &Lin, x: Xh, rows: usize, y: (Id, usize), ldy: usize| {
-            let Some((dn, up)) = &l.side else { return };
-            let r = dn.n_out;
-            let u = Xh {
-                xh: at(F::Uh, 0),
-                rs: at(F::Urs, 0),
+        // The LoRA side paths of layers that ran together (after their main GEMMs and a
+        // barrier), side by side: y += up (down x) for each (layer, x, rows, y, ldy).
+        let su = ri.max(rt);
+        let sides = |en: &Enc, jobs: &[SideJob]| {
+            let jobs: Vec<_> = jobs.iter().filter_map(|j| j.0.side.as_ref().map(|s| (s, j))).collect();
+            if jobs.is_empty() {
+                return;
+            }
+            debug_assert!(jobs.len() <= SIDE_SLOTS);
+            let u = |k: usize| at(F::U, k * su * rmax * 4);
+            let uh = |k: usize| Xh {
+                xh: at(F::Uh, k * su * rmax * 2),
+                rs: at(F::Urs, k * su * 4),
             };
-            en.gemm(dn, x, rows, at(F::U, 0), r, false);
-            en.to_half(at(F::U, 0), r, r, rows, u);
-            en.gemm(up, u, rows, y, ldy, true);
+            for (k, ((dn, _), j)) in jobs.iter().enumerate() {
+                en.gemm_nb(dn, j.1, j.2, u(k), dn.n_out, false);
+            }
+            en.e.barrier();
+            for (k, ((dn, _), j)) in jobs.iter().enumerate() {
+                en.to_half_nb(u(k), dn.n_out, dn.n_out, j.2, uh(k));
+            }
+            en.e.barrier();
+            for (k, ((_, up), j)) in jobs.iter().enumerate() {
+                en.gemm_nb(up, uh(k), j.2, j.3, j.4, true);
+            }
+            en.e.barrier();
         };
+        let side = |en: &Enc, l: &Lin, x: Xh, rows: usize, y: (Id, usize), ldy: usize| sides(en, &[(l, x, rows, y, ldy)]);
         let total = nd + ns;
         let parts: Vec<std::ops::Range<usize>> = (0..total.div_ceil(BLOCKS_PER_CB))
             .map(|c| c * BLOCKS_PER_CB..((c + 1) * BLOCKS_PER_CB).min(total))
@@ -1067,10 +1126,15 @@ impl FluxSession for MetalFlux {
                             en.gemm_nb(&b.txt_qkv[j], xh(0, d), rt, qkv_at(j, 0), d, false);
                         }
                         e.barrier();
-                        for j in 0..3 {
-                            side(&en, &b.img_qkv[j], xh(rt, d), ri, qkv_at(j, rt), d);
-                            side(&en, &b.txt_qkv[j], xh(0, d), rt, qkv_at(j, 0), d);
-                        }
+                        let jobs: Vec<_> = (0..3)
+                            .flat_map(|j| {
+                                [
+                                    (&b.img_qkv[j], xh(rt, d), ri, qkv_at(j, rt), d),
+                                    (&b.txt_qkv[j], xh(0, d), rt, qkv_at(j, 0), d),
+                                ]
+                            })
+                            .collect();
+                        sides(&en, &jobs);
                     }
                     heads_op(e, 0, F::Q, Some((nr[2], nr[0])), (bi.tq[0], bi.iq[0]), nx);
                     heads_op(e, 1, F::K, Some((nr[3], nr[1])), (bi.tq[1], bi.iq[1]), nx);
@@ -1088,8 +1152,10 @@ impl FluxSession for MetalFlux {
                         en.gemm_nb(&b.img_out, xh(rt, d), ri, tmp_at(rt), d, false);
                         en.gemm_nb(&b.txt_out, xh(0, d), rt, tmp_at(0), d, false);
                         e.barrier();
-                        side(&en, &b.img_out, xh(rt, d), ri, tmp_at(rt), d);
-                        side(&en, &b.txt_out, xh(0, d), rt, tmp_at(0), d);
+                        sides(
+                            &en,
+                            &[(&b.img_out, xh(rt, d), ri, tmp_at(rt), d), (&b.txt_out, xh(0, d), rt, tmp_at(0), d)],
+                        );
                     }
                     gated_img(e, i, 2, bi.io);
                     gated(e, 0, nx, tm(2), bi.to);
@@ -1104,8 +1170,13 @@ impl FluxSession for MetalFlux {
                         en.gemm_nb(&b.img_mlp[0], xh(rt, d), ri, hg_at(rt), f, false);
                         en.gemm_nb(&b.txt_mlp[0], xh(0, d), rt, hg_at(0), f, false);
                         e.barrier();
-                        side(&en, &b.img_mlp[0], xh(rt, d), ri, hg_at(rt), f);
-                        side(&en, &b.txt_mlp[0], xh(0, d), rt, hg_at(0), f);
+                        sides(
+                            &en,
+                            &[
+                                (&b.img_mlp[0], xh(rt, d), ri, hg_at(rt), f),
+                                (&b.txt_mlp[0], xh(0, d), rt, hg_at(0), f),
+                            ],
+                        );
                     }
                     for (r0, rows, bb) in [(rt, ni, bi.im[0]), (0, nx, bi.tm[0])] {
                         e.pipe(p.gelu);
@@ -1121,8 +1192,13 @@ impl FluxSession for MetalFlux {
                         en.gemm_nb(&b.img_mlp[1], xh(rt, f), ri, tmp_at(rt), d, false);
                         en.gemm_nb(&b.txt_mlp[1], xh(0, f), rt, tmp_at(0), d, false);
                         e.barrier();
-                        side(&en, &b.img_mlp[1], xh(rt, f), ri, tmp_at(rt), d);
-                        side(&en, &b.txt_mlp[1], xh(0, f), rt, tmp_at(0), d);
+                        sides(
+                            &en,
+                            &[
+                                (&b.img_mlp[1], xh(rt, f), ri, tmp_at(rt), d),
+                                (&b.txt_mlp[1], xh(0, f), rt, tmp_at(0), d),
+                            ],
+                        );
                     }
                     gated_img(e, i, 5, bi.im[1]);
                     gated(e, 0, nx, tm(5), bi.tm[1]);
