@@ -102,6 +102,59 @@ impl Checksum {
     }
 }
 
+/// A fast 64-bit hash of `bytes` (the snapshots' checksum; not cryptographic): what tells
+/// attachments' soft tokens apart ([`MediaMarks`]).
+pub fn hash_fast(bytes: &[u8]) -> u64 {
+    let mut c = Checksum::new();
+    c.update(bytes);
+    c.finish()
+}
+
+/// The soft tokens a cache holds, or a prompt feeds: `(position, identity)` of each, in position
+/// order. The identity is a hash of the attachment's embeddings and the row's index in them
+/// ([`crate::mm::soft_token_marks`]), so that a cache whose tokens match a prompt's is only
+/// reused as far as the attachments in it are the same ones ([`media_agree`]): placeholder tokens
+/// alone are the same for every image.
+pub type MediaMarks = Vec<(usize, u64)>;
+
+/// How much of the first `n` positions two token sequences that are equal there (a cache's and
+/// a prompt's) share once their soft tokens are compared too: `n`, or the first position where
+/// one has a soft token the other has not, or another one.
+pub fn media_agree(a: &[(usize, u64)], b: &[(usize, u64)], n: usize) -> usize {
+    let (mut i, mut j) = (0, 0);
+    loop {
+        let pa = a.get(i).map_or(usize::MAX, |m| m.0);
+        let pb = b.get(j).map_or(usize::MAX, |m| m.0);
+        let p = pa.min(pb);
+        if p >= n {
+            return n;
+        }
+        if pa != pb || a[i].1 != b[j].1 {
+            return p;
+        }
+        i += 1;
+        j += 1;
+    }
+}
+
+/// `media` as a snapshot footer's `media` value: `[position, identity]` pairs (the identity as a
+/// hexadecimal string: JSON readers may not keep 64-bit integers exact).
+pub fn media_meta(media: &[(usize, u64)]) -> Value {
+    Value::Array(media.iter().map(|&(p, h)| json!([p, format!("{h:016x}")])).collect())
+}
+
+/// The soft tokens a snapshot footer lists ([`media_meta`]; none when it has no `media`).
+pub fn media_from_meta(meta: &Value) -> MediaMarks {
+    meta["media"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| Some((m[0].as_u64()? as usize, u64::from_str_radix(m[1].as_str()?, 16).ok()?)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// A stable 64-bit FNV-1a hash (model fingerprints, token lists, file names).
 pub fn hash64(parts: &[&[u8]]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -559,6 +612,8 @@ pub struct CacheEntry {
     /// The model fingerprint hash it belongs to.
     pub model: String,
     pub tokens: Vec<u32>,
+    /// Its soft tokens ([`MediaMarks`]; the footer's `media`, none in older snapshots).
+    pub media: MediaMarks,
     pub bytes: u64,
     /// Last use (file modification time).
     pub used: std::time::SystemTime,
@@ -627,29 +682,38 @@ impl PromptCache {
         if tokens.len() != n {
             bail!("token count mismatch");
         }
+        let media = media_from_meta(r.meta());
         Ok(CacheEntry {
             path: p.to_path_buf(),
             model,
             tokens,
+            media,
             bytes: md.len(),
             used: md.modified().unwrap_or(std::time::UNIX_EPOCH),
         })
     }
 
-    /// The file name of the snapshot of `tokens` for `model`.
-    pub fn path_for(&self, model: &str, tokens: &[u32]) -> PathBuf {
-        let h = hash64(&[model.as_bytes(), &tokens_bytes(tokens)]);
+    /// The file name of the snapshot of `tokens` (with soft tokens `media`) for `model`.
+    pub fn path_for(&self, model: &str, tokens: &[u32], media: &[(usize, u64)]) -> PathBuf {
+        let m: Vec<u8> = media
+            .iter()
+            .flat_map(|&(p, h)| [(p as u64).to_le_bytes(), h.to_le_bytes()])
+            .flatten()
+            .collect();
+        let h = hash64(&[model.as_bytes(), &tokens_bytes(tokens), &m]);
         self.dir.join(format!("{h:016x}-{}.{EXT}", tokens.len()))
     }
 
     /// The snapshot of `model` that saves the most of `ids`: `(entry, tokens usable)`. A
     /// snapshot is usable up to its common prefix with `ids` when the state can be cut back
     /// (`truncatable`), else only when `ids` starts with all of it; at least one token of `ids`
-    /// is left to feed.
-    pub fn best(&self, model: &str, ids: &[u32], truncatable: bool) -> Option<(&CacheEntry, usize)> {
+    /// is left to feed. The prompt's soft tokens (`media`, see [`MediaMarks`]) must be the
+    /// snapshot's in the part used.
+    pub fn best(&self, model: &str, ids: &[u32], media: &[(usize, u64)], truncatable: bool) -> Option<(&CacheEntry, usize)> {
         let mut best: Option<(&CacheEntry, usize)> = None;
         for e in self.entries.iter().filter(|e| e.model == model) {
             let common = e.tokens.iter().zip(ids).take_while(|(a, b)| a == b).count();
+            let common = media_agree(&e.media, media, common);
             let usable = if truncatable {
                 common.min(ids.len().saturating_sub(1))
             } else if common == e.tokens.len() && common < ids.len() {
@@ -664,12 +728,19 @@ impl PromptCache {
         best
     }
 
-    /// Whether a snapshot of exactly `tokens` (or, `truncatable`, of tokens starting with them)
-    /// is stored for `model`.
-    pub fn covers(&self, model: &str, tokens: &[u32], truncatable: bool) -> bool {
-        self.entries
-            .iter()
-            .any(|e| e.model == model && (e.tokens == tokens || (truncatable && e.tokens.starts_with(tokens))))
+    /// The snapshot of exactly `tokens` with soft tokens `media` (or, `truncatable`, of tokens
+    /// starting with them) stored for `model`, if any.
+    pub fn covering(&self, model: &str, tokens: &[u32], media: &[(usize, u64)], truncatable: bool) -> Option<&CacheEntry> {
+        self.entries.iter().find(|e| {
+            e.model == model
+                && (e.tokens == tokens || (truncatable && e.tokens.starts_with(tokens)))
+                && media_agree(&e.media, media, tokens.len()) == tokens.len()
+        })
+    }
+
+    /// Whether [`Self::covering`] finds one.
+    pub fn covers(&self, model: &str, tokens: &[u32], media: &[(usize, u64)], truncatable: bool) -> bool {
+        self.covering(model, tokens, media, truncatable).is_some()
     }
 
     /// Marks a snapshot as just used.
@@ -683,23 +754,28 @@ impl PromptCache {
         }
     }
 
-    /// Stores a snapshot of `tokens` for `model`, written by `write`; with `truncatable`,
-    /// snapshots of this model whose tokens are a prefix of `tokens` are removed (this one
-    /// serves them). Then the least recently used snapshots go until the cache fits its cap.
+    /// Stores a snapshot of `tokens` (with soft tokens `media`, which `write` puts in its footer
+    /// with [`media_meta`]) for `model`, written by `write`; with `truncatable`, snapshots of
+    /// this model whose tokens are a prefix of `tokens` are removed (this one serves them). Then
+    /// the least recently used snapshots go until the directory fits the cap, those that other
+    /// caches of the directory (other models, other processes) wrote included.
     pub fn store(
         &mut self,
         model: &str,
         tokens: &[u32],
+        media: &[(usize, u64)],
         truncatable: bool,
         write: impl FnOnce(&mut std::io::BufWriter<File>) -> Result<()>,
     ) -> Result<PathBuf> {
-        let path = self.path_for(model, tokens);
+        let path = self.path_for(model, tokens, media);
         let bytes = write_atomic(&path, write)?;
+        // (What others wrote since: the cap is the directory's.)
+        self.rescan();
         self.entries.retain(|e| e.path != path);
         if truncatable {
-            let (keep, drop): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries)
-                .into_iter()
-                .partition(|e| !(e.model == model && tokens.starts_with(&e.tokens)));
+            let (keep, drop): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries).into_iter().partition(|e| {
+                !(e.model == model && tokens.starts_with(&e.tokens) && media_agree(&e.media, media, e.tokens.len()) == e.tokens.len())
+            });
             for e in drop {
                 let _ = std::fs::remove_file(&e.path);
             }
@@ -709,6 +785,7 @@ impl PromptCache {
             path: path.clone(),
             model: model.to_string(),
             tokens: tokens.to_vec(),
+            media: media.to_vec(),
             bytes,
             used: std::time::SystemTime::now(),
         });
@@ -823,20 +900,21 @@ mod tests {
             }
         };
         let mut c = PromptCache::open(&dir, 1 << 20).unwrap();
-        c.store("m", &[1, 2, 3, 4], false, write(&[1, 2, 3, 4], 10)).unwrap();
-        c.store("m", &[1, 2, 3, 4, 5, 6], false, write(&[1, 2, 3, 4, 5, 6], 10)).unwrap();
+        c.store("m", &[1, 2, 3, 4], &[], false, write(&[1, 2, 3, 4], 10)).unwrap();
+        c.store("m", &[1, 2, 3, 4, 5, 6], &[], false, write(&[1, 2, 3, 4, 5, 6], 10))
+            .unwrap();
         // Recurrent: only whole snapshots the prompt starts with.
-        let (e, n) = c.best("m", &[1, 2, 3, 4, 5, 6, 7], false).unwrap();
+        let (e, n) = c.best("m", &[1, 2, 3, 4, 5, 6, 7], &[], false).unwrap();
         assert_eq!((e.tokens.len(), n), (6, 6));
-        let (e, n) = c.best("m", &[1, 2, 3, 4, 5, 9], false).unwrap();
+        let (e, n) = c.best("m", &[1, 2, 3, 4, 5, 9], &[], false).unwrap();
         assert_eq!((e.tokens.len(), n), (4, 4));
-        assert!(c.best("m", &[1, 2, 3, 4], false).is_none(), "a token must be left to feed");
-        assert!(c.best("other", &[1, 2, 3, 4, 5], false).is_none());
+        assert!(c.best("m", &[1, 2, 3, 4], &[], false).is_none(), "a token must be left to feed");
+        assert!(c.best("other", &[1, 2, 3, 4, 5], &[], false).is_none());
         // Truncatable: any common prefix.
-        let (_, n) = c.best("m", &[1, 2, 3, 4, 5, 9], true).unwrap();
+        let (_, n) = c.best("m", &[1, 2, 3, 4, 5, 9], &[], true).unwrap();
         assert_eq!(n, 5);
         // A truncatable store replaces its prefixes; reopening finds the snapshots again.
-        c.store("m", &[1, 2, 3, 4, 5, 6, 7], true, write(&[1, 2, 3, 4, 5, 6, 7], 10))
+        c.store("m", &[1, 2, 3, 4, 5, 6, 7], &[], true, write(&[1, 2, 3, 4, 5, 6, 7], 10))
             .unwrap();
         assert_eq!(c.entries().len(), 1);
         let c2 = PromptCache::open(&dir, 1 << 20).unwrap();
@@ -844,18 +922,81 @@ mod tests {
         assert_eq!(c2.entries()[0].tokens, [1, 2, 3, 4, 5, 6, 7]);
         // The cap evicts the least recently used.
         let mut c = PromptCache::open(&dir, 300_000).unwrap();
-        c.store("m", &[9, 9], false, write(&[9, 9], 50_000)).unwrap();
+        c.store("m", &[9, 9], &[], false, write(&[9, 9], 50_000)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        c.store("m", &[8, 8], false, write(&[8, 8], 50_000)).unwrap();
+        c.store("m", &[8, 8], &[], false, write(&[8, 8], 50_000)).unwrap();
         assert!(c.entries().len() <= 2);
         assert!(c.entries().iter().any(|e| e.tokens == [8, 8]));
         // Cleared by model, then all of it.
-        c.store("other", &[7, 7], false, write(&[7, 7], 10)).unwrap();
+        c.store("other", &[7, 7], &[], false, write(&[7, 7], 10)).unwrap();
         let n = c.entries().len();
         assert_eq!(c.clear(Some("other")).0, 1);
         assert_eq!(c.entries().len(), n - 1);
         assert_eq!(c.clear(None).0, n - 1);
         assert!(c.entries().is_empty() && PromptCache::open(&dir, 1 << 20).unwrap().entries().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn media_marks_agree() {
+        let a = [(2, 7), (3, 8), (9, 1)];
+        assert_eq!(media_agree(&a, &a, 20), 20);
+        assert_eq!(media_agree(&a, &[(2, 7), (3, 9)], 20), 3, "another soft token");
+        assert_eq!(media_agree(&a, &[(2, 7), (3, 8)], 20), 9, "one the other has not");
+        assert_eq!(media_agree(&a, &[(2, 7), (3, 8)], 6), 6);
+        assert_eq!(media_agree(&[], &a, 20), 2);
+        assert_eq!(media_agree(&[], &[], 5), 5);
+        assert_eq!(
+            media_from_meta(&json!({"media": media_meta(&[(4, u64::MAX), (5, 1)])})),
+            [(4, u64::MAX), (5, 1)]
+        );
+        assert!(media_from_meta(&json!({})).is_empty());
+    }
+
+    /// Snapshots with attachments serve prompts with the same ones only; the cap holds for the
+    /// directory when two caches (two models of a server) share it.
+    #[test]
+    fn cache_media_and_shared_directory() {
+        let dir = tmp("cache-media");
+        let write = |toks: &[u32], media: &[(usize, u64)], model: &str, pad: usize| {
+            let (toks, media, model) = (toks.to_vec(), media.to_vec(), model.to_string());
+            move |f: &mut std::io::BufWriter<File>| -> Result<()> {
+                let mut w = SnapWriter::new(f)?;
+                w.u32s("tokens", &toks)?;
+                w.f32s("pad", &vec![0.0; pad])?;
+                w.finish(json!({"model": model, "tokens": toks.len(), "media": media_meta(&media)}))?;
+                Ok(())
+            }
+        };
+        let toks = [1, 2, 9, 9, 3, 4];
+        let m1 = [(2, 11), (3, 12)];
+        let mut c = PromptCache::open(&dir, 1 << 30).unwrap();
+        c.store("m", &toks, &m1, false, write(&toks, &m1, "m", 10)).unwrap();
+        let ids = [1, 2, 9, 9, 3, 4, 5];
+        assert_eq!(c.best("m", &ids, &m1, false).unwrap().1, 6);
+        assert!(c.best("m", &ids, &[(2, 11), (3, 13)], false).is_none(), "another picture");
+        assert_eq!(c.best("m", &ids, &[(2, 11), (3, 13)], true).unwrap().1, 3, "cut back before it");
+        assert!(c.covers("m", &toks, &m1, false) && !c.covers("m", &toks, &[], false));
+        // Indexed again from the footer.
+        assert_eq!(PromptCache::open(&dir, 1 << 30).unwrap().entries()[0].media, m1);
+        // Two caches of one directory: the second one's store evicts the first one's snapshots.
+        let mut a = PromptCache::open(&dir, 300_000).unwrap();
+        let mut b = PromptCache::open(&dir, 300_000).unwrap();
+        a.store("a", &[5, 5], &[], false, write(&[5, 5], &[], "a", 50_000)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        b.store("b", &[6, 6], &[], false, write(&[6, 6], &[], "b", 50_000)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        b.store("b", &[7, 7], &[], false, write(&[7, 7], &[], "b", 50_000)).unwrap();
+        let on_disk: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        assert!(on_disk <= 300_000, "{on_disk} bytes on disk");
+        assert!(
+            !b.entries().iter().any(|e| e.model == "a"),
+            "the oldest, another cache's, went first"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1215,6 +1215,101 @@ fn inkling_chat_reuses_the_cache_after_thinking() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A 24-bit BMP of `w x h` pixels, a gradient that `seed` shifts.
+fn bmp(w: usize, h: usize, seed: u8) -> Vec<u8> {
+    let row = (w * 3).next_multiple_of(4);
+    let size = 54 + row * h;
+    let mut b = Vec::with_capacity(size);
+    b.extend_from_slice(b"BM");
+    b.extend_from_slice(&(size as u32).to_le_bytes());
+    b.extend_from_slice(&[0, 0, 0, 0]);
+    b.extend_from_slice(&54u32.to_le_bytes());
+    b.extend_from_slice(&40u32.to_le_bytes());
+    b.extend_from_slice(&(w as i32).to_le_bytes());
+    b.extend_from_slice(&(h as i32).to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&24u16.to_le_bytes());
+    b.extend_from_slice(&[0; 4]);
+    b.extend_from_slice(&((row * h) as u32).to_le_bytes());
+    b.extend_from_slice(&[0; 16]);
+    for y in 0..h {
+        for x in 0..w {
+            let v = (x * 13 + y * 7) as u8;
+            b.extend_from_slice(&[v.wrapping_add(seed), v.wrapping_mul(3), seed.wrapping_mul(5).wrapping_add(y as u8)]);
+        }
+        b.resize(b.len() + row - w * 3, 0);
+    }
+    b
+}
+
+/// An agent's long conversation on a tiny random Inkling-2-Mini with a vision tower, as opencode
+/// sends it: tool calls, their results (thousands of tokens each), and after some of them a user
+/// message holding the pictures a tool returned. Every request reuses the cache up to the
+/// previous prompt, the pictures in it included (they used to make each request start over from
+/// the system prompt), and after a restart the last one comes back from the prompt cache.
+#[test]
+fn inkling_agent_conversation_with_images_reuses_the_cache() {
+    let dir = std::env::temp_dir().join(format!("oxinfer-ink-server-vision-{}", std::process::id()));
+    let cache = std::env::temp_dir().join(format!("oxinfer-ink-server-vision-pc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cache);
+    oxinfer::inkling::tiny::write_tiny_vision(&dir, 5).unwrap();
+    let spec = format!(
+        "model=ink={},device=cpu,prompt_cache={},prompt_cache_min_tokens=8",
+        dir.display(),
+        cache.display()
+    );
+    let tools = json!([{"type": "function", "function": {"name": "read", "description": "Reads a file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]);
+    let ask = |addr: SocketAddr, messages: &[Value]| {
+        let req = json!({"model": "ink", "messages": messages, "tools": tools, "temperature": 0, "max_tokens": 6});
+        let (st, body) = request(addr, "POST", "/v1/chat/completions", &req.to_string());
+        assert_eq!(st, 200, "{body}");
+        serde_json::from_str::<Value>(&body).unwrap()
+    };
+    let s = serve(&spec);
+    let mut convo = vec![
+        json!({"role": "system", "content": "You are a coding agent. ".repeat(20)}),
+        json!({"role": "user", "content": "Check the figures of the paper."}),
+    ];
+    let (mut prompt, mut last) = (0, Value::Null);
+    for turn in 0..5 {
+        let v = ask(s.addr(), &convo);
+        let usage = &v["usage"];
+        let cached = usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0) as usize;
+        if turn > 0 {
+            assert!(
+                cached + 1 >= prompt,
+                "turn {turn}: {cached} cached tokens of the previous prompt's {prompt}: {usage}"
+            );
+        }
+        prompt = usage["prompt_tokens"].as_u64().unwrap() as usize;
+        last = v["choices"][0]["message"].clone();
+        let id = format!("call_{turn}");
+        convo.push(json!({"role": "assistant", "content": last["content"].as_str().unwrap_or_default(),
+            "tool_calls": [{"id": id, "type": "function", "function": {"name": "read", "arguments": format!("{{\"path\":\"fig{turn}.png\"}}")}}]}));
+        let text: String = (0..120).map(|i| format!("{turn} {i:4}: some file content here\n")).collect();
+        convo.push(json!({"role": "tool", "tool_call_id": id, "content": text}));
+        if turn % 2 == 0 {
+            let url = format!("data:image/bmp;base64,{}", b64_encode(&bmp(16 + 8 * turn, 16, turn as u8 * 30)));
+            convo.push(json!({"role": "user", "content": [
+                {"type": "text", "text": "Attached media from tool result:"},
+                {"type": "image_url", "image_url": {"url": url}}]}));
+        }
+    }
+    assert!(prompt > 15_000, "{prompt} tokens");
+    s.stop().unwrap();
+    // After a restart: the last request again, from the disk (its prompt but the last token).
+    convo.truncate(convo.len() - 3);
+    let s = serve(&spec);
+    let v = ask(s.addr(), &convo);
+    let cached = v["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0) as usize;
+    assert!(cached + 1 >= prompt, "{cached} of {prompt} restored: {v}");
+    assert_eq!(v["choices"][0]["message"]["content"], last["content"]);
+    s.stop().unwrap();
+    std::fs::remove_dir_all(&cache).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The same on tiny random DeepSeek V4 and V4.1 models, thinking on, with a prompt cache: the
 /// second turn reuses the cache up to the previous prompt (in-memory checkpoints), and
 /// after a restart the conversation comes back from the disk snapshots with the same reply.

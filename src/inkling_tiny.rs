@@ -68,10 +68,14 @@ struct Tensors {
 impl Tensors {
     /// `bias + scale * U(-1, 1)`.
     fn uni(&mut self, name: &str, shape: &[usize], scale: f32, bias: f32) {
+        self.raw(&format!("model.llm.{name}"), shape, scale, bias);
+    }
+    /// [`Self::uni`] under the name as given.
+    fn raw(&mut self, name: &str, shape: &[usize], scale: f32, bias: f32) {
         let v = (0..shape.iter().product::<usize>())
             .map(|_| bias + scale * self.rng.next())
             .collect();
-        self.list.push((format!("model.llm.{name}"), shape.to_vec(), v));
+        self.list.push((name.to_string(), shape.to_vec(), v));
     }
     /// A matrix of unit-variance outputs for unit-variance inputs, times `gain`.
     fn mat(&mut self, name: &str, shape: &[usize], gain: f32) {
@@ -153,11 +157,24 @@ pub(crate) fn byte_tokenizer(special: &[&str], base: u32) -> Value {
 /// Writes the checkpoint folder `dir` (`config.json`, `model.safetensors`, `tokenizer.json`);
 /// the weights depend on `seed` only.
 pub fn write_tiny(dir: &Path, seed: u64) -> Result<()> {
+    write_tiny_with(dir, seed, false)
+}
+
+/// [`write_tiny`] with a vision tower (`model.visual.*`: a ViT of one layer, 32 wide, on native
+/// patches of 4 pixels merged 2 x 2, so one soft token per 8 x 8 tile of an image).
+pub fn write_tiny_vision(dir: &Path, seed: u64) -> Result<()> {
+    write_tiny_with(dir, seed, true)
+}
+
+/// The vision tower's width, layers' hidden size, patch, merge, position grid and projection.
+const VIS: (usize, usize, usize, usize, usize, usize) = (32, 64, 4, 2, 4, 32);
+
+fn write_tiny_with(dir: &Path, seed: u64, vision: bool) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
     let end_turn = SPECIAL_BASE + SPECIAL.iter().position(|s| *s == "<|content_model_end_sampling|>").unwrap() as u32;
     let image = SPECIAL_BASE + SPECIAL.len() as u32 - 1;
     let layer_types: Vec<&str> = (0..LAYERS).map(|l| if sliding(l) { "hybrid_sliding" } else { "hybrid" }).collect();
-    let config = json!({
+    let mut config = json!({
         "model_type": "inkling2_loop",
         "architectures": ["Inkling2LoopForConditionalGeneration"],
         "image_token_id": image,
@@ -176,6 +193,14 @@ pub fn write_tiny(dir: &Path, seed: u64) -> Result<()> {
             "loop_gate_rank": RANK, "layer_types": layer_types,
         },
     });
+    let (vh, vinter, patch, merge, grid, proj) = VIS;
+    if vision {
+        config["vision_config"] = json!({
+            "model_type": "inkling2_vision", "hidden_size": vh, "num_hidden_layers": 1, "num_attention_heads": 4,
+            "intermediate_size": vinter, "patch_size": patch, "spatial_merge_size": merge, "posemb_grid_size": grid,
+            "projection_hidden_dim": proj, "layer_norm_eps": 1e-5, "text_hidden_size": H,
+        });
+    }
     std::fs::write(dir.join("config.json"), serde_json::to_vec_pretty(&config)?)?;
     std::fs::write(dir.join("tokenizer.json"), serde_json::to_vec(&tokenizer_json())?)?;
 
@@ -238,6 +263,36 @@ pub fn write_tiny(dir: &Path, seed: u64) -> Result<()> {
             }
             t.uni(&format!("{p}loop_msg_query"), &[4, H], 1.0, 0.0);
         }
+    }
+    if vision {
+        let v = "model.visual.";
+        let e = format!("{v}backbone.embeddings.");
+        let d = 3 * patch * patch;
+        t.raw(&format!("{e}patch_embedding.weight"), &[vh, d], (3.0 / d as f32).sqrt(), 0.0);
+        t.raw(&format!("{e}class_embedding"), &[vh], 1.0, 0.0);
+        t.raw(&format!("{e}cls_position_embedding"), &[vh], 0.3, 0.0);
+        t.raw(&format!("{e}position_embedding"), &[grid * grid, vh], 0.3, 0.0);
+        for n in ["backbone.ln_pre", "backbone.layers.0.ln_1", "backbone.layers.0.ln_2"] {
+            t.raw(&format!("{v}{n}.weight"), &[vh], 0.2, 1.0);
+            t.raw(&format!("{v}{n}.bias"), &[vh], 0.1, 0.0);
+        }
+        let l = format!("{v}backbone.layers.0.");
+        for (n, o, i) in [
+            ("self_attn.q_proj", vh, vh),
+            ("self_attn.k_proj", vh, vh),
+            ("self_attn.v_proj", vh, vh),
+            ("self_attn.out_proj", vh, vh),
+            ("mlp.c_fc", vinter, vh),
+            ("mlp.c_proj", vh, vinter),
+        ] {
+            t.raw(&format!("{l}{n}.weight"), &[o, i], (3.0 / i as f32).sqrt(), 0.0);
+            t.raw(&format!("{l}{n}.bias"), &[o], 0.1, 0.0);
+        }
+        t.raw(&format!("{l}ls_1.gamma"), &[vh], 0.1, 0.5);
+        t.raw(&format!("{l}ls_2.gamma"), &[vh], 0.1, 0.5);
+        let m2 = merge * merge * vh;
+        t.raw(&format!("{v}proj_in.weight"), &[proj, m2], (3.0 / m2 as f32).sqrt(), 0.0);
+        t.raw(&format!("{v}proj_out.weight"), &[H, proj], (3.0 / proj as f32).sqrt(), 0.0);
     }
     t.write(&dir.join("model.safetensors"))
 }

@@ -1477,18 +1477,19 @@ impl Lm {
             _ => {}
         }
     }
-    /// Runs `ids` into the cache without generating.
-    fn prefill_only(&mut self, ids: &[u32], chunk: usize) -> Result<()> {
+    /// Runs `ids` into the cache without generating, the soft tokens `over` (positions in
+    /// `ids`) in place of their placeholders.
+    fn prefill_only(&mut self, ids: &[u32], chunk: usize, over: &[(usize, Vec<f32>)]) -> Result<()> {
         match self {
-            Lm::Gemma { model, sess, .. } => drop(generate::prefill(*model, sess, ids, chunk, &[])),
-            Lm::Qwen { model, sess } => drop(generate::prefill(*model, sess, ids, chunk, &[])),
-            Lm::QwenMtp { dec } => drop(dec.prefill(ids, chunk)),
-            Lm::QwenDspark { dec } => drop(dec.prefill(ids, chunk)),
-            Lm::GemmaDspark { dec } => drop(dec.prefill(ids, chunk)),
-            Lm::Inkling2 { model, sess } => drop(generate::prefill(*model, sess, ids, chunk, &[])),
-            Lm::DeepSeek4 { model, sess } => drop(generate::prefill(*model, sess, ids, chunk, &[])),
-            Lm::Inkling2Dspark { dec } => drop(dec.prefill(ids, chunk)),
-            Lm::DeepSeek4Dspark { dec } => drop(dec.prefill(ids, chunk)),
+            Lm::Gemma { model, sess, .. } => drop(generate::prefill(*model, sess, ids, chunk, over)),
+            Lm::Qwen { model, sess } => drop(generate::prefill(*model, sess, ids, chunk, over)),
+            Lm::QwenMtp { dec } => drop(dec.prefill_mm(ids, chunk, over)),
+            Lm::QwenDspark { dec } => drop(dec.prefill_mm(ids, chunk, over)),
+            Lm::GemmaDspark { dec } => drop(dec.prefill_mm(ids, chunk, over)),
+            Lm::Inkling2 { model, sess } => drop(generate::prefill(*model, sess, ids, chunk, over)),
+            Lm::DeepSeek4 { model, sess } => drop(generate::prefill(*model, sess, ids, chunk, over)),
+            Lm::Inkling2Dspark { dec } => drop(dec.prefill_mm(ids, chunk, over)),
+            Lm::DeepSeek4Dspark { dec } => drop(dec.prefill_mm(ids, chunk, over)),
             _ => bail!("not supported for this model family"),
         }
         Ok(())
@@ -1694,6 +1695,9 @@ pub struct Engine {
     lookup: Option<crate::lookup::Lookup>,
     /// The tokens in the cache (valid when as long as the cache).
     history: Vec<u32>,
+    /// The attachments' soft tokens among them ([`crate::snapshot::MediaMarks`]): a prompt
+    /// reuses the cache past one only when it has the same one there.
+    history_media: crate::snapshot::MediaMarks,
     /// The vocabulary and compiled grammars of constrained replies ([`ChatConfig::response_format`]).
     constrain: crate::constrain::Cache,
     /// The per-reply token hook ([`Engine::set_token_hook`]).
@@ -2617,6 +2621,7 @@ impl Engine {
             },
             lookup,
             history: Vec::new(),
+            history_media: Vec::new(),
             constrain: Default::default(),
             token_hook: None,
             pcache,
@@ -2695,6 +2700,7 @@ impl Engine {
             iv: IvState::default(),
             lookup: None,
             history: Vec::new(),
+            history_media: Vec::new(),
             constrain: Default::default(),
             token_hook: None,
             pcache: None,
@@ -2799,6 +2805,23 @@ impl Engine {
         }
     }
 
+    /// The attachments' soft tokens among [`Engine::session_tokens`] (see
+    /// [`crate::snapshot::MediaMarks`]).
+    pub fn session_media(&self) -> &[(usize, u64)] {
+        if self.history.len() == self.context_len() {
+            &self.history_media
+        } else {
+            &[]
+        }
+    }
+
+    /// Keeps the first `n` tokens of the history (and their soft tokens).
+    fn truncate_history(&mut self, n: usize) {
+        self.history.truncate(n);
+        let keep = self.history_media.partition_point(|m| m.0 < n);
+        self.history_media.truncate(keep);
+    }
+
     /// Writes the session (KV caches, recurrent states, positions, speculative decoders' caches,
     /// and the tokens) to `path` (created mode 0600, replaced atomically), for
     /// [`Engine::load_session`] on this model with the same options, in this process or another.
@@ -2865,11 +2888,12 @@ impl Engine {
         let toks = self.session_tokens().to_vec();
         let truncatable = self.lm.truncatable();
         let Some(pc) = &self.pcache else { return Ok(false) };
-        if toks.len() < self.pcache_min || pc.covers(&self.fingerprint, &toks, truncatable) {
+        let media = self.session_media().to_vec();
+        if toks.len() < self.pcache_min || pc.covers(&self.fingerprint, &toks, &media, truncatable) {
             return Ok(false);
         }
         let mut pc = self.pcache.take().unwrap();
-        let r = pc.store(&self.fingerprint, &toks, truncatable, |f| self.write_snapshot(f));
+        let r = pc.store(&self.fingerprint, &toks, &media, truncatable, |f| self.write_snapshot(f));
         self.pcache = Some(pc);
         r.map(|_| true)
     }
@@ -2886,6 +2910,7 @@ impl Engine {
             "model": self.fingerprint,
             "model_type": self.info.model_type,
             "tokens": toks.len(),
+            "media": crate::snapshot::media_meta(self.session_media()),
             "turns": self.turns,
             // The last reply's final token when the model has not run it: the next turn feeds it
             // first (see `Engine::unfed`).
@@ -2914,6 +2939,8 @@ impl Engine {
             .as_u64()
             .map(|t| t as u32)
             .filter(|&t| (t as usize) < self.info.vocab_size);
+        let mut media = crate::snapshot::media_from_meta(r.meta());
+        media.retain(|m| m.0 < n);
         self.reset();
         let res = (|| -> Result<Vec<u32>> {
             let toks = r.u32s("tokens", n)?;
@@ -2936,6 +2963,7 @@ impl Engine {
                     l.set_tokens(&toks);
                 }
                 self.history = toks.clone();
+                self.history_media = media;
                 self.chat_ids = Some(toks);
                 self.turns = turns;
                 self.unfed = unfed;
@@ -2961,6 +2989,7 @@ impl Engine {
             l.reset();
         }
         self.history.clear();
+        self.history_media.clear();
         self.turns = 0;
         self.unfed = None;
         self.chat_ids = None;
@@ -3660,6 +3689,20 @@ impl Engine {
 
     /// [`Engine::turn`] for encoded tokens, fed as they are.
     fn turn_ids(&mut self, ids: Vec<u32>, feats: &[mm::MmFeature], think: bool) -> Result<PendingTurn> {
+        let media = if feats.is_empty() {
+            TurnMedia::default()
+        } else {
+            TurnMedia {
+                overrides: mm::overrides(&ids, feats, self.info.hidden_size)?,
+                spans: mm::vision_spans(&ids, feats)?,
+                marks: mm::soft_token_marks(&ids, feats)?,
+            }
+        };
+        self.turn_prepared(ids, media, think)
+    }
+
+    /// [`Engine::turn_ids`] with the soft tokens placed ([`TurnMedia`], positions in `ids`).
+    fn turn_prepared(&mut self, ids: Vec<u32>, media: TurnMedia, think: bool) -> Result<PendingTurn> {
         let pos = self.context_len();
         if let Some(max) = self.max_context
             && pos + ids.len() > max
@@ -3669,19 +3712,46 @@ impl Engine {
                 ids.len()
             );
         }
-        let (overrides, spans) = if feats.is_empty() {
-            (Vec::new(), Vec::new())
-        } else {
-            (mm::overrides(&ids, feats, self.info.hidden_size)?, mm::vision_spans(&ids, feats)?)
-        };
+        let TurnMedia { overrides, spans, marks } = media;
         self.prepare_iv(&ids)?;
         self.unfed = None;
         Ok(PendingTurn {
             ids,
             overrides,
             spans,
+            marks,
             think,
         })
+    }
+}
+
+/// The attachments' soft tokens of a turn's tokens: their embeddings, Qwen's M-RoPE spans and
+/// their identities ([`crate::snapshot::MediaMarks`]), at positions in the turn's tokens.
+#[derive(Default)]
+pub(crate) struct TurnMedia {
+    pub(crate) overrides: Vec<(usize, Vec<f32>)>,
+    pub(crate) spans: Vec<(usize, usize, usize)>,
+    pub(crate) marks: crate::snapshot::MediaMarks,
+}
+
+impl TurnMedia {
+    /// Those at or after position `from`, at positions counted from there.
+    pub(crate) fn from(&self, from: usize) -> TurnMedia {
+        TurnMedia {
+            overrides: self
+                .overrides
+                .iter()
+                .filter(|o| o.0 >= from)
+                .map(|(p, e)| (p - from, e.clone()))
+                .collect(),
+            spans: self
+                .spans
+                .iter()
+                .filter(|s| s.0 >= from)
+                .map(|&(p, h, w)| (p - from, h, w))
+                .collect(),
+            marks: self.marks.iter().filter(|m| m.0 >= from).map(|&(p, h)| (p - from, h)).collect(),
+        }
     }
 }
 
@@ -3691,6 +3761,8 @@ struct PendingTurn {
     overrides: Vec<(usize, Vec<f32>)>,
     /// Qwen M-RoPE vision spans `(index in ids, rows, cols)`.
     spans: Vec<(usize, usize, usize)>,
+    /// The soft tokens' identities (positions in ids).
+    marks: crate::snapshot::MediaMarks,
     think: bool,
 }
 
@@ -3702,12 +3774,13 @@ impl PendingTurn {
             ids,
             overrides,
             spans,
+            marks,
             think,
         } = self;
         // The tokens in the cache: known when the history is as long as the cache. The prompt
         // lookup drafters follow them.
         let base = e.lm.context_len();
-        e.history.truncate(base);
+        e.truncate_history(base);
         let known = e.history.len() == base;
         if known {
             if let Some(l) = &mut e.lookup {
@@ -4150,7 +4223,8 @@ impl PendingTurn {
         if known {
             e.history.extend_from_slice(&ids);
             e.history.extend_from_slice(&d.tokens);
-            e.history.truncate(e.lm.context_len());
+            e.history_media.extend(marks.iter().map(|&(p, h)| (base + p, h)));
+            e.truncate_history(e.lm.context_len());
         }
         Ok(Reply {
             text,
@@ -4582,6 +4656,125 @@ mod tests {
         if r1.tokens.len() > crate::inkling::ROLLBACK + 1 {
             assert_eq!(r2.stats.cached_tokens, 0);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A 24-bit BMP of `w x h` pixels, a gradient that `seed` shifts.
+    #[cfg(feature = "media")]
+    fn bmp(path: &Path, w: usize, h: usize, seed: u8) {
+        let row = (w * 3).next_multiple_of(4);
+        let size = 54 + row * h;
+        let mut b = Vec::with_capacity(size);
+        b.extend_from_slice(b"BM");
+        b.extend_from_slice(&(size as u32).to_le_bytes());
+        b.extend_from_slice(&[0, 0, 0, 0]);
+        b.extend_from_slice(&54u32.to_le_bytes());
+        b.extend_from_slice(&40u32.to_le_bytes());
+        b.extend_from_slice(&(w as i32).to_le_bytes());
+        b.extend_from_slice(&(h as i32).to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&24u16.to_le_bytes());
+        b.extend_from_slice(&[0; 4]);
+        b.extend_from_slice(&((row * h) as u32).to_le_bytes());
+        b.extend_from_slice(&[0; 16]);
+        for y in 0..h {
+            for x in 0..w {
+                let v = (x * 13 + y * 7) as u8;
+                b.extend_from_slice(&[v.wrapping_add(seed), v.wrapping_mul(3), seed.wrapping_mul(5).wrapping_add(y as u8)]);
+            }
+            b.resize(b.len() + row - w * 3, 0);
+        }
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// An agent's conversation with images (tool results showing pictures, as opencode sends
+    /// them: a user message of attachments after the tool's): every next turn still reuses the
+    /// cache up to the previous prompt, also from the prompt cache in another engine, and the
+    /// replies are those of an engine that ran the whole conversation at once. Another picture
+    /// in place of an earlier one is not reused.
+    #[cfg(feature = "media")]
+    #[test]
+    fn inkling_chat_reuses_the_cache_past_images() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-ink-engine-vision-{}", std::process::id()));
+        crate::inkling::tiny::write_tiny_vision(&dir, 3).unwrap();
+        let cache = std::env::temp_dir().join(format!("oxinfer-ink-pc-vision-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+        let pics: Vec<PathBuf> = (0..3u8)
+            .map(|i| {
+                let p = dir.join(format!("pic{i}.bmp"));
+                bmp(&p, 24 + 8 * i as usize, 16, i * 40);
+                p
+            })
+            .collect();
+        let pic = |i: usize| Attachments {
+            images: vec![pics[i].clone()],
+            ..Default::default()
+        };
+        let mut o = cpu_options();
+        o.set("prompt_cache", cache.to_str().unwrap()).unwrap();
+        o.set("prompt_cache_min_tokens", "8").unwrap();
+        let load = || {
+            let mut e = Engine::load(dir.to_str().unwrap(), &o).unwrap();
+            e.config_mut().max_tokens = 6;
+            e
+        };
+        let mut e = load();
+        let mut convo = vec![
+            Message::system("You look at pictures. ".repeat(4)),
+            Message::user("What changed in the pictures?"),
+        ];
+        let mut prompt = 0;
+        for turn in 0..4 {
+            let r = e.chat(&convo, &mut quiet).unwrap();
+            if turn > 0 {
+                assert!(
+                    r.stats.cached_tokens + 1 >= prompt,
+                    "turn {turn}: {} cached of the previous prompt's {prompt}",
+                    r.stats.cached_tokens
+                );
+                assert_eq!(r.stats.restored_tokens, 0, "turn {turn}: from the cache in memory");
+            }
+            prompt = r.stats.cached_tokens + r.stats.prompt_tokens;
+            convo.push(Message::assistant(format!("{}.", r.text)));
+            convo.push(Message::user(format!("Here is picture {turn}.")).with_media(pic(turn % 3)));
+        }
+        // The same conversation in one go gives the same reply.
+        let r = e.chat(&convo, &mut quiet).unwrap();
+        assert!(r.stats.cached_tokens + 1 >= prompt);
+        e.flush_prompt_cache().unwrap();
+        let mut fresh = Engine::load(dir.to_str().unwrap(), &cpu_options()).unwrap();
+        fresh.config_mut().max_tokens = 6;
+        let f = fresh.chat(&convo, &mut quiet).unwrap();
+        assert_eq!(f.tokens, r.tokens);
+        // From the disk in another engine: all of the previous prompt but its last token.
+        let mut again = load();
+        let a = again.chat(&convo, &mut quiet).unwrap();
+        assert_eq!(
+            a.stats.restored_tokens + 1,
+            r.stats.cached_tokens + r.stats.prompt_tokens,
+            "restored"
+        );
+        assert_eq!(a.tokens, r.tokens);
+        // Another picture in place of the second: reused up to it at most.
+        let ids = |c: &[Message]| e.tok.encode(e.render(c).unwrap().0, false).unwrap().get_ids().to_vec();
+        let mut swapped = convo.clone();
+        let i = swapped.iter().position(|m| !m.media.is_empty()).unwrap();
+        // (The first placeholder of the picture.)
+        let from = ids(&swapped[..i]).len();
+        let ph = e.tok.token_to_id(crate::chat::InklingChat::IMAGE_TOKEN).unwrap();
+        let before = from + ids(&swapped).iter().skip(from).position(|&t| t == ph).unwrap();
+        swapped[i].media = pic(2);
+        let s = e.chat(&swapped, &mut quiet).unwrap();
+        assert!(
+            s.stats.cached_tokens <= before,
+            "{} cached past the picture at {before}",
+            s.stats.cached_tokens
+        );
+        let s2 = again.chat(&swapped, &mut quiet).unwrap();
+        assert!(s2.stats.cached_tokens <= before && s2.stats.restored_tokens <= before);
+        let f = fresh.chat(&swapped, &mut quiet).unwrap();
+        assert_eq!(f.tokens, s.tokens);
+        std::fs::remove_dir_all(&cache).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 

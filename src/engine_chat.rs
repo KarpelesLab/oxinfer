@@ -110,16 +110,31 @@ impl Engine {
     /// ([`EngineOptions::prompt_checkpoints`]: the shared system prefix and each prompt but its
     /// last token, so a next turn whose past reply lost its thinking reuses the whole previous
     /// prompt). Otherwise the conversation starts over, or, with a prompt cache
-    /// ([`EngineOptions::prompt_cache`]), from the stored snapshot that saves the most. Prompts
-    /// with attachments in the reused part always start over (the cached soft tokens might be of
-    /// other media).
+    /// ([`EngineOptions::prompt_cache`]), from the stored snapshot that saves the most.
+    /// Attachments in the reused part must be the ones the cache holds there (their soft tokens'
+    /// embeddings are compared, see [`crate::snapshot::MediaMarks`]); Qwen models, whose images
+    /// take position tables of their own, start over when the reused part has any.
     pub fn chat(&mut self, messages: &[Message], on_delta: &mut dyn FnMut(&Delta) -> Flow) -> Result<Reply> {
         let (text, feats) = self.render(messages)?;
         let ids = self.tok.encode(text, false).map_err(|e| anyhow!("encode: {e}"))?.get_ids().to_vec();
         if ids.is_empty() {
             bail!("empty prompt");
         }
-        let placeholder = |t: &u32| feats.iter().any(|f| f.token_id == *t);
+        let media = if feats.is_empty() {
+            TurnMedia::default()
+        } else {
+            TurnMedia {
+                overrides: mm::overrides(&ids, &feats, self.info.hidden_size)?,
+                spans: mm::vision_spans(&ids, &feats)?,
+                marks: mm::soft_token_marks(&ids, &feats)?,
+            }
+        };
+        // Attachments' soft tokens are reused where the cache holds the same ones (their
+        // identities, `media.marks`, match). Except with Qwen's M-RoPE spans, whose position
+        // tables are the session's: prompts with soft tokens in the reused part start over.
+        let spans = !media.spans.is_empty();
+        let first_soft = media.marks.first().map_or(usize::MAX, |m| m.0);
+        let marks_before = |b: usize| &media.marks[..media.marks.partition_point(|m| m.0 < b)];
         let truncatable = self.lm.truncatable();
         let common = |c: &[u32]| c.iter().zip(&ids).take_while(|(a, b)| a == b).count();
         // What the cache in memory saves: all of it when the conversation extends it, else the
@@ -127,7 +142,7 @@ impl Engine {
         // of it; Inkling-2, DeepSeek V4, Qwen3.5: to a checkpoint, see `prompt_checkpoints`).
         let mut skip = match self.chat_ids.take() {
             Some(c) if self.context_len() == c.len() => {
-                let n = common(&c);
+                let n = crate::snapshot::media_agree(self.session_media(), &media.marks, common(&c));
                 if n == c.len() && n < ids.len() {
                     n
                 } else {
@@ -136,16 +151,29 @@ impl Engine {
             }
             _ => 0,
         };
-        if ids[..skip].iter().any(placeholder) {
+        if spans && skip > first_soft {
             skip = 0;
         }
-        // A stored snapshot that saves more.
-        let stored = self
-            .pcache
-            .as_ref()
-            .and_then(|pc| pc.best(&self.fingerprint, &ids, truncatable))
-            .filter(|(_, n)| *n > skip && !ids[..*n].iter().any(placeholder))
-            .map(|(e, n)| (e.path.clone(), n));
+        // A stored snapshot that saves more (when another cache of the directory removed the
+        // one found since this one indexed it: from the directory read again).
+        let mut stored = None;
+        for again in [false, true] {
+            let Some(pc) = self.pcache.as_mut() else { break };
+            if again {
+                pc.rescan();
+            }
+            match pc
+                .best(&self.fingerprint, &ids, &media.marks, truncatable)
+                .filter(|(_, n)| *n > skip && !(spans && *n > first_soft))
+            {
+                Some((e, n)) if e.path.is_file() => {
+                    stored = Some((e.path.clone(), n));
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
         let mut restored = 0;
         if let Some((path, n)) = stored {
             self.flush_prompt_cache_logged();
@@ -157,7 +185,7 @@ impl Engine {
                     }
                     if len > n {
                         self.lm.truncate_to(n);
-                        self.history.truncate(n);
+                        self.truncate_history(n);
                     }
                     skip = n;
                     restored = n;
@@ -174,7 +202,7 @@ impl Engine {
         } else if skip > 0 && skip < self.context_len() {
             self.flush_prompt_cache_logged();
             if self.lm.cut_to(skip) {
-                self.history.truncate(skip);
+                self.truncate_history(skip);
             } else {
                 skip = 0;
             }
@@ -188,34 +216,44 @@ impl Engine {
         // conversation with this system prompt and tools shares, and the whole prompt but its
         // last token (a request sent again, a reply regenerated, or the next turn, whose
         // rendering of this reply differs from the tokens the model wrote: its thinking goes),
-        // the first time each is computed. Inkling-2, DeepSeek V4 and Qwen3.5 also keep
-        // checkpoints of them in memory, to go back to the next time.
+        // the first time each is computed (one stored already is marked as used, so that the
+        // shared prefix outlives the conversations' larger snapshots). Inkling-2, DeepSeek V4 and
+        // Qwen3.5 also keep checkpoints of them in memory, to go back to the next time.
         let (cached, mut pre_secs) = (skip, 0.0);
         let checkpoints = self.checkpoints > 0 && self.lm.checkpoints();
         if (self.pcache.is_some() && !truncatable) || checkpoints {
             let shared = self.shared_prefix_len(messages, &ids);
             for b in [shared, ids.len() - 1] {
-                if b == 0 || b < skip || b >= ids.len() || ids[..b].iter().any(placeholder) {
+                if b == 0 || b < skip || b >= ids.len() || (spans && b > first_soft) {
                     continue;
                 }
-                let store = self.pcache.is_some()
-                    && !truncatable
-                    && b > skip
-                    && b >= self.pcache_min
-                    && !self
-                        .pcache
-                        .as_ref()
-                        .is_some_and(|pc| pc.covers(&self.fingerprint, &ids[..b], false));
+                let covering = match &self.pcache {
+                    Some(pc) if !truncatable => pc
+                        .covering(&self.fingerprint, &ids[..b], marks_before(b), false)
+                        .map(|e| e.path.clone()),
+                    _ => None,
+                };
+                if let (Some(path), Some(pc)) = (&covering, &mut self.pcache) {
+                    pc.touch(path);
+                }
+                let store = self.pcache.is_some() && !truncatable && b > skip && b >= self.pcache_min && covering.is_none();
                 let checkpoint = checkpoints && !self.lm.has_checkpoint(b);
                 if !store && !checkpoint {
                     continue;
                 }
                 let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
                 if b > skip {
+                    let over: Vec<(usize, Vec<f32>)> = media
+                        .overrides
+                        .iter()
+                        .filter(|o| o.0 >= skip && o.0 < b)
+                        .map(|(p, e)| (p - skip, e.clone()))
+                        .collect();
                     let t = Instant::now();
-                    self.lm.prefill_only(&ids[skip..b], self.prefill_chunk)?;
+                    self.lm.prefill_only(&ids[skip..b], self.prefill_chunk, &over)?;
                     pre_secs += t.elapsed().as_secs_f64();
                     self.history.extend_from_slice(&ids[skip..b]);
+                    self.history_media.extend(media.marks.iter().filter(|m| m.0 >= skip && m.0 < b));
                     skip = b;
                     self.chat_ids = None;
                 }
@@ -233,14 +271,20 @@ impl Engine {
         let think = self.config.think;
         // Prompt parts fed above count as fed.
         let pre = (skip - cached, pre_secs);
-        let mut reply = self.turn_ids(ids[skip..].to_vec(), &feats, think)?.finish(self, on_delta)?;
+        let mut reply = self
+            .turn_prepared(ids[skip..].to_vec(), media.from(skip), think)?
+            .finish(self, on_delta)?;
         reply.stats.cached_tokens = cached;
         reply.stats.prompt_tokens += pre.0;
         reply.stats.prefill_secs += pre.1;
         reply.stats.restored_tokens = restored;
         reply.stats.restore_secs = restore_secs;
         self.stats = reply.stats.clone();
-        if self.pcache.is_some() {
+        // The conversation with the reply, to store before the cache moves on: for models whose
+        // snapshots are cut back to any prefix. Others could only use it when the next prompt
+        // has the reply as the model wrote it (its thinking: not with most clients), and the
+        // whole prompt but its last token is stored already.
+        if self.pcache.is_some() && truncatable {
             self.pcache_pending = true;
         }
         // The cache holds the prompt and the reply up to the tokens the model has not run (the
@@ -287,7 +331,7 @@ impl Engine {
     }
 
     /// The conversation's prompt text and the soft tokens of its attachments, in order.
-    fn render(&self, messages: &[Message]) -> Result<(String, Vec<mm::MmFeature>)> {
+    pub(crate) fn render(&self, messages: &[Message]) -> Result<(String, Vec<mm::MmFeature>)> {
         let (fmt, c) = (self.fmt, &self.config);
         let think = c.think;
         let sys: Vec<&str> = messages

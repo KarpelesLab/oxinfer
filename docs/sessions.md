@@ -19,16 +19,58 @@ token prefix, with a size cap (`prompt_cache_gb`, default 20; least recently use
 `Engine::chat` restores the snapshot that saves the most of the prompt: for models without
 recurrent state (Gemma, Qwen3, Llama, with their drafts) any common prefix (the restored caches
 are cut back), for Qwen3.5 / 3.6 / 3.8, Inkling-2 and DeepSeek V4 / V4.1 (recurrent, convolution or
-compressor state cannot be cut back) a whole snapshot the prompt starts with. It stores each conversation after its reply (left pending so the reply is not
-delayed: the server writes it on another thread once the response is sent; the next request, an
-explicit `Engine::flush_prompt_cache` or the engine's drop also write it) and, for the recurrent
-models, the prefix every conversation with the same system prompt and tools shares (the first
-turn rendered with an empty message, tokenized, compared with the prompt) and the prompt but its
-last token (a request sent again, a reply regenerated), the first time each is computed (the
-prompt is then fed in two or three parts). For the models without recurrent state, a stored
-conversation replaces the snapshots of its own prefixes. In memory, `Engine::chat` now also keeps the common prefix with the previous
+compressor state cannot be cut back) a whole snapshot the prompt starts with. For the models
+without recurrent state it stores each conversation after its reply (left pending so the reply is
+not delayed: the server writes it on another thread once the response is sent; the next request,
+an explicit `Engine::flush_prompt_cache` or the engine's drop also write it), which replaces the
+snapshots of its own prefixes. For the recurrent models it stores the prefix every conversation
+with the same system prompt and tools shares (the first turn rendered with an empty message,
+tokenized, compared with the prompt) and the prompt but its last token (a request sent again, a
+reply regenerated, the next turn), the first time each is computed (the prompt is then fed in two
+or three parts); not the conversation after the reply, which a next prompt only starts with when
+its client sends the reply back as the model wrote it, thinking included (most do not), and which
+cost a whole snapshot each turn (9.4 GB at 136k tokens for Inkling-2-Mini with f32 caches). A
+prefix found stored already is marked as used, so that the shared one outlives the
+conversations' larger snapshots in the least-recently-used order. The cap holds for the
+directory: before evicting, a store reads the directory again, so the snapshots that other
+engines (a server's other models) or processes wrote count too. In memory, `Engine::chat` now also keeps the common prefix with the previous
 conversation for these models (it used to start over unless the new conversation extended the
 old one).
+
+**Attachments.** Placeholder tokens are the same for every image, so a cache (or a snapshot)
+whose tokens match a prompt's may hold other pictures there. Each soft token is identified by a
+hash of its attachment's embeddings and its row in them (`snapshot::MediaMarks`,
+`mm::soft_token_marks`), kept beside the cache's tokens and in the snapshots' footers (`media`);
+`Engine::chat` reuses the cache, a checkpoint or a snapshot only as far as the soft tokens in it
+are the prompt's, and feeds the rest with the prompt's own (the parts fed before a checkpoint
+too). Qwen models, whose images take M-RoPE position tables of their own in the session, still
+start over when the reused part holds any. Before, any soft token in the reused part made the
+request start over: an agent whose tool results show pictures (opencode attaches them as a user
+message after the tool's) had its whole conversation from the first picture on prefilled again
+at every request. On the user's session (Inkling-2-Mini, Metal, `--prompt-cache`), from the
+first of six pictures at position 31586, each request reused only the 9967-token system prefix
+and prefilled the other ~28k tokens again (60-80 s a request).
+
+Measured with unsloth's Inkling-2-Mini UD-IQ3_XXS (mmproj BF16 beside it) on Metal through the
+server, `--prompt-cache`: an agent's conversation (a 900-token system prompt and tools; each turn
+a tool call, a ~8.4k-token tool result and, every other turn, a 320x240 picture of 48 soft
+tokens), prompt tokens fed per request:
+
+| turn (prompt tokens) | 2 (17826) | 3 (26261) | 4 (34758) | 5 (43193) | 6 (51690) | 7 (60125) |
+|---|---|---|---|---|---|---|
+| before (reused: the 9328 tokens before the first picture) | 8496 | 16933 | 25430 | 33865 | 42362 | 50797 |
+| after (reused: the previous prompt) | 8496 | 8434 | 8496 | 8434 | 8496 | 8434 |
+| after, a new server process (from the prompt cache) | 1 | 1 | 1 | 1 | 1 | 1 |
+
+(The GPU was shared with another server prefilling 30k-token prompts, so times are not
+compared; before, the last request took 269 s.) The towers' embeddings are computed again at each
+request (0.1-0.2 s an image here), as the identities are those of the embeddings.
+Tests: `engine::tests::inkling_chat_reuses_the_cache_past_images` (a tiny random Inkling-2 with
+a vision tower, `inkling::tiny::write_tiny_vision`: reuse in memory and from the disk, the replies
+those of a fresh engine, another picture in place of one not reused),
+`tests/server.rs` `inkling_agent_conversation_with_images_reuses_the_cache` (an opencode-like
+16k-token conversation with pictures, then a restart), `snapshot::tests::media_marks_agree`,
+`cache_media_and_shared_directory`.
 
 **Inkling-2 in memory: prompt checkpoints.** A chat client sends each turn the conversation with
 the last reply as returned; the template renders past replies without their thinking, so the

@@ -1013,6 +1013,29 @@ pub fn overrides(ids: &[u32], feats: &[MmFeature], hidden: usize) -> Result<Vec<
     Ok(out)
 }
 
+/// The identity of each soft token of `feats` at its position in `ids`, as [`overrides`] places
+/// them: a hash of its attachment's embeddings and its row in them (see
+/// [`crate::snapshot::MediaMarks`]).
+pub fn soft_token_marks(ids: &[u32], feats: &[MmFeature]) -> Result<crate::snapshot::MediaMarks> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    for f in feats {
+        // SAFETY: f32 has no padding and every bit pattern is a valid byte.
+        let bytes = unsafe { std::slice::from_raw_parts(f.emb.as_ptr() as *const u8, f.emb.len() * 4) };
+        let h = crate::snapshot::hash_fast(bytes) ^ (u64::from(f.token_id) << 32) ^ f.n as u64;
+        for k in 0..f.n {
+            let pos = ids[cursor..]
+                .iter()
+                .position(|&t| t == f.token_id)
+                .context("fewer placeholder tokens than soft tokens")?
+                + cursor;
+            out.push((pos, (h ^ k as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(23)));
+            cursor = pos + 1;
+        }
+    }
+    Ok(out)
+}
+
 /// Qwen M-RoPE: `(position in ids, rows, cols)` of each run of placeholder tokens (see
 /// `MmFeature::grids`), to declare with `QwenSession::add_vision_span` before the prefill.
 pub fn vision_spans(ids: &[u32], feats: &[MmFeature]) -> Result<Vec<(usize, usize, usize)>> {
