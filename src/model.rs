@@ -3023,6 +3023,27 @@ pub(crate) fn attention_prefill(
             return;
         }
     }
+    // aarch64: tiles of queries per KV head on every core's NEON units (the same bits).
+    #[cfg(target_arch = "aarch64")]
+    if crate::attn_prefill::supported(hd) {
+        return crate::attn_prefill::attention(q, cache, nh, t, &lo_of, &hi_of, out);
+    }
+    attention_prefill_gemm(q, cache, nh, t, lo_of, hi_of, out)
+}
+
+/// [`attention_prefill`] on the f32 prefill GEMM: per block of queries and KV head, the scores
+/// GEMM, the softmax, then the values GEMM.
+fn attention_prefill_gemm(
+    q: &[f32],
+    cache: &LayerCache,
+    nh: usize,
+    t: usize,
+    lo_of: impl Fn(usize) -> usize + Sync + Copy,
+    hi_of: impl Fn(usize) -> usize + Sync + Copy,
+    out: &mut [f32],
+) {
+    let (hd, n_kv) = (cache.hd, cache.n_kv);
+    let rep = nh / n_kv;
     let dhp = hd.next_multiple_of(32);
     // Query blocks keep the score matrix to a few tens of MB.
     let max_keys = (0..t).map(hi_of).max().unwrap_or(0) - lo_of(0);
@@ -3194,6 +3215,50 @@ mod tests {
             attention_prefill(&q, &cache, nh, t, start, window, None, &mut got);
             for (i, (a, b)) in got.iter().zip(&want).enumerate() {
                 assert!((a - b).abs() <= 1e-5, "start {start} t {t} window {window:?} [{i}]: {a} vs {b}");
+            }
+        }
+    }
+
+    /// The NEON prefill attention gives the GEMMs' bits: head sizes with and without a tail of
+    /// 16 columns, grouped and plain heads, windows, chunks after earlier positions, and image
+    /// spans that see later keys (`ext`).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_prefill_attention_matches_gemms() {
+        crate::pool::init(4);
+        let mut seed = 5u64;
+        let mut r = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 40) % 2001) as f32 / 1000.0 - 1.0
+        };
+        for (nh, n_kv, hd, start, t, window, ext) in [
+            (8usize, 2usize, 64usize, 0usize, 40usize, None, false),
+            (8, 2, 64, 13, 300, None, false),
+            (4, 4, 128, 5, 97, Some(64usize), false),
+            (6, 2, 72, 200, 33, Some(50), false),
+            (16, 2, 256, 3, 70, None, true),
+            (4, 1, 20, 0, 129, Some(17), true),
+        ] {
+            let mut cache = LayerCache::new(n_kv, hd);
+            let n = start + t;
+            let k: Vec<f32> = (0..n * n_kv * hd).map(|_| r()).collect();
+            let v: Vec<f32> = (0..n * n_kv * hd).map(|_| r()).collect();
+            cache.push(&k, &v, n);
+            let q: Vec<f32> = (0..t * nh * hd).map(|_| 0.3 * r()).collect();
+            // Tokens 10..30 an image that sees itself whole.
+            let e: Vec<usize> = (0..t).map(|i| if (10..30).contains(&i) { start + 30 } else { 0 }).collect();
+            let ext = ext.then_some(&e[..]);
+            let lo_of = |ti: usize| window.map_or(0, |w| (start + ti + 1).saturating_sub(w));
+            let hi_of = |ti: usize| ext.map_or(start + ti + 1, |e| e[ti].max(start + ti + 1));
+            let mut want = vec![f32::NAN; t * nh * hd];
+            let mut got = vec![f32::NAN; t * nh * hd];
+            attention_prefill_gemm(&q, &cache, nh, t, lo_of, hi_of, &mut want);
+            crate::attn_prefill::attention(&q, &cache, nh, t, &lo_of, &hi_of, &mut got);
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    a.to_bits() == b.to_bits() || (*a == 0.0 && *b == 0.0),
+                    "hd {hd} start {start} t {t} [{i}]: {a} vs {b}"
+                );
             }
         }
     }

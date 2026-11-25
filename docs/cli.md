@@ -42,7 +42,7 @@ Useful flags:
 | `--gpu-decode on\|off` | generate a whole token per GPU submission (default `on` where supported; see [Decoding on the GPU](performance.md#decoding-on-the-gpu)); engine / speaker option `gpu_decode` |
 | `--gpu-chain on\|off` | greedy decoding chained on the device where tokens decode whole on the GPU: the argmax and the next token's embedding on the GPU, the next pass queued before the host reads a token (default `on`; the same tokens; see [Greedy decoding chained on the device](performance.md#greedy-decoding-chained-on-the-device-november-2026)); engine option `gpu_chain`, `OXINFER_GPU_CHAIN=0` |
 | `--gpu-kv f16\|f32` | how the device holds its copies of the attention caches where whole-pass GPU plans run (Metal with matrix units): half-precision rows (default; half the attention's memory traffic at long contexts, as llama.cpp's f16 cache) or f32 ones; QSA caches stay f32 (see [Long contexts](performance.md#long-contexts-november-2026)); engine / server / C API option `gpu_kv`, `OXINFER_GPU_KV=f32` |
-| `--prefill-chunk N` | tokens per prefill chunk (default 256 on the CPU, 1024 when a GPU backend is active) |
+| `--prefill-chunk N` | tokens per prefill chunk (default 512 on the CPU, 1024 when a GPU backend is active) |
 | `--profile` | per-operation timing and bandwidth breakdown |
 | `--dump-logits FILE` | write the logits for the last prompt token (for reference checks) |
 | `--show-tokens` | print token ids |

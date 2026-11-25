@@ -40,6 +40,8 @@ mod fullrust_libm {
 pub mod anemll;
 pub mod arktts;
 mod attn;
+#[cfg(target_arch = "aarch64")]
+mod attn_prefill;
 pub mod audio;
 #[cfg(feature = "oxideav")]
 pub mod av;

@@ -16,6 +16,12 @@ use crate::qwen_mtp::MtpDecoder;
 use crate::sampler::{Sampler, argmax};
 use crate::tokenizer::Tokenizer;
 
+/// Tokens per prefill chunk on the CPU (the CLI's and the engine's default without a GPU
+/// backend). Each matmul's weight rows are unpacked once per chunk and a mixture of experts'
+/// experts get twice the tokens of 256: on an M5 Max, pp512 / pp2048 +5-10% against 256 (Qwen3-8B
+/// Q8_0, Gemma 4 12B and 26B-A4B, Llama 3.2 1B), 1024 no faster.
+pub const CPU_PREFILL_CHUNK: usize = 512;
+
 /// Common surface of the model families (Gemma 4 / Gemma 3, Qwen 3.5/3.8 and Qwen3) used by the
 /// generation loops.
 pub trait TextLm {

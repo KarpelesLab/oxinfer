@@ -277,7 +277,7 @@ fn usage() -> ! {
          \x20 --kv-cache f32|f16|q8  Inkling-2: how the attention caches store keys and values (default f32)\n\
          \x20 --preload            with --mmap, touch all weight pages before starting\n\
          \x20 --profile            print per-operation timing breakdown\n\
-         \x20 --prefill-chunk N    tokens per prefill chunk (default 256 on CPU, 1024 with a GPU backend)\n\
+         \x20 --prefill-chunk N    tokens per prefill chunk (default 512 on CPU, 1024 with a GPU backend)\n\
          \x20 --draft DIR          speculative decoding with a DSpark draft (Qwen, Gemma 4, Mistral Large 4,\n\
          \x20                      DeepSeek V4: a Hugging Face draft folder / repo id or a dflash GGUF; greedy\n\
          \x20                      and sampled, same output distribution; `auto`: the one beside the model or\n\
@@ -1845,7 +1845,7 @@ fn run(mut args: Args) -> Result<()> {
         None => eprintln!("[device: cpu]"),
     }
     // Bigger prefill chunks keep the GPU busier (577 vs 431 tok/s on E4B q4 at 1024 vs 256);
-    // on the CPU 256 keeps the activations in cache.
+    // on the CPU `generate::CPU_PREFILL_CHUNK`.
     // (Inkling-2: big chunks for its 128 experts, see `oxinfer::inkling::default_prefill_chunk`.)
     let inkling = config::model_type(&args.model).is_ok_and(|m| oxinfer::inkling::is_model_type(&m));
     args.prefill_chunk = Some(args.prefill_chunk.unwrap_or(if inkling {
@@ -1853,7 +1853,7 @@ fn run(mut args: Args) -> Result<()> {
     } else if gpu.is_some() {
         1024
     } else {
-        256
+        oxinfer::generate::CPU_PREFILL_CHUNK
     }));
     if oxinfer::omnigen2::is_omnigen2(&args.model) {
         if !omnigen2_cli::is_understanding(&args) {
