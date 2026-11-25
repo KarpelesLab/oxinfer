@@ -791,6 +791,86 @@ pub(crate) struct Gate<'a> {
     pub(crate) gain: Lin<'a>,   // [H, rank]
 }
 
+/// The rows of a float matrix as stored (a gate's: f32 in the GGUF files, bf16 in the release),
+/// for the passes of a few tokens, which take them one dot product at a time.
+enum FloatRows<'m> {
+    F32(&'m [f32]),
+    Bf16(&'m [u16]),
+}
+
+impl<'m> FloatRows<'m> {
+    /// None for a quantized matrix, one with a LoRA update, a folded input or block scales.
+    fn of(l: &'m Lin) -> Option<Self> {
+        if l.has_lora() || l.fold.is_some() {
+            return None;
+        }
+        match &l.w {
+            crate::model::Weight::Bf16(w, _) => Some(FloatRows::Bf16(&w[..])),
+            crate::model::Weight::Gguf(m) if m.kind == crate::ggml::GgmlType::F32 && m.block_scales.is_none() => {
+                let b = &m.data[..];
+                // SAFETY: f32 values read in place where the bytes are aligned for them (a GGUF
+                // tensor starts on a multiple of 32 bytes of a page-aligned buffer).
+                (b.as_ptr() as usize)
+                    .is_multiple_of(4)
+                    .then(|| FloatRows::F32(unsafe { std::slice::from_raw_parts(b.as_ptr() as *const f32, b.len() / 4) }))
+            }
+            _ => None,
+        }
+    }
+
+    /// Row `r` (of `n` values) times `x`.
+    #[inline]
+    fn dot(&self, r: usize, x: &[f32]) -> f32 {
+        let n = x.len();
+        match self {
+            FloatRows::F32(w) => dot(&w[r * n..(r + 1) * n], x),
+            FloatRows::Bf16(w) => dot_bf16(&w[r * n..(r + 1) * n], x),
+        }
+    }
+}
+
+/// A message gate over the tokens of a short pass: `d = down cat` (`cat`: `[t][2 h]`, the
+/// RMS-normed input and message), then `out = (1 - tanh(forget d)) x + tanh(gain d) m`.
+///
+/// The three float matrices are 2.4 MB of Inkling-2 Mini that a step reads once. Through the
+/// prompt GEMM's tiles (one token in tiles of 16, three parallel regions) and with the two tanh
+/// per value on the calling thread, a gate took 120 us of a DGX Spark's 20 cores, 96 times a
+/// token. Here: two regions, the low-rank rows as plain dot products, then each output's two dot
+/// products with its tanh mix. Every token is computed as it would be alone.
+#[allow(clippy::too_many_arguments)]
+fn gate_rows(
+    wd: &FloatRows,
+    wf: &FloatRows,
+    wg: &FloatRows,
+    cat: &[f32],
+    x: &[f32],
+    m: &[f32],
+    h: usize,
+    r: usize,
+    d: &mut [f32],
+    out: &mut [f32],
+) {
+    // (Tasks of whole parts of a token's rows: 16 for the low-rank rows, 24 for the outputs.)
+    let dc = if r.is_multiple_of(16) { r / 16 } else { r };
+    for_chunks(d, dc, true, |i, o| {
+        let (ti, r0) = (i * dc / r, i * dc % r);
+        let row = &cat[ti * 2 * h..(ti + 1) * 2 * h];
+        for (k, v) in o.iter_mut().enumerate() {
+            *v = wd.dot(r0 + k, row);
+        }
+    });
+    let d = &*d;
+    let oc = if h.is_multiple_of(24) { h / 24 } else { h };
+    for_chunks(out, oc, true, |i, o| {
+        let (ti, j0) = (i * oc / h, i * oc % h);
+        let dr = &d[ti * r..(ti + 1) * r];
+        for (k, v) in o.iter_mut().enumerate() {
+            let (j, at) = (j0 + k, ti * h + j0 + k);
+            *v = (1.0 - wf.dot(j, dr).tanh()) * x[at] + wg.dot(j, dr).tanh() * m[at];
+        }
+    });
+}
+
 /// What a looped layer has for the passes after the first.
 pub(crate) struct LoopIn<'a> {
     /// The gates of the query, key, value and MLP inputs.
@@ -2673,6 +2753,18 @@ impl<'a> Inkling2Model<'a> {
             rms_unit(&mut row[h..], eps);
         });
         let mut d = vec![0f32; t * r];
+        // Passes of a few tokens (decoding, verification) with float gates: [`gate_rows`]
+        // (`OXINFER_INKLING_GATE_ROWS=0`: the GEMMs, as prompts).
+        static ROWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if t < TN
+            && r > 0
+            && *ROWS.get_or_init(|| std::env::var("OXINFER_INKLING_GATE_ROWS").map_or(true, |v| v != "0"))
+            && let (Some(wd), Some(wf), Some(wg)) = (FloatRows::of(&g.down), FloatRows::of(&g.forget), FloatRows::of(&g.gain))
+        {
+            let mut out = scratch(t * h);
+            gate_rows(&wd, &wf, &wg, &cat, x, m, h, r, &mut d, &mut out);
+            return out;
+        }
         linear(&g.down, r, 2 * h, &cat, t, &mut d);
         let (mut f, mut gn) = (Scratch::new(t * h), Scratch::new(t * h));
         linear_multi(&mut [(&g.forget, h, &mut f[..]), (&g.gain, h, &mut gn[..])], r, &d, t);
@@ -3528,6 +3620,60 @@ mod tests {
     }
 
     /// Without block states the mix is the RMS-normed input; a zero query averages.
+    /// The short passes' message gate against its definition in f64, with f32 and bf16 rows,
+    /// one token and three.
+    #[test]
+    fn gate_rows_match_definition() {
+        crate::pool::init(3);
+        let (h, r) = (96usize, 32usize);
+        let mut seed = 9u64;
+        let mut rnd = |n: usize, amp: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * amp
+                })
+                .collect()
+        };
+        let (wd, wf, wg) = (rnd(r * 2 * h, 0.1), rnd(h * r, 0.3), rnd(h * r, 0.3));
+        let bf = |w: &[f32]| -> Vec<u16> { w.iter().map(|&v| half::bf16::from_f32(v).to_bits()).collect() };
+        let back = |w: &[u16]| -> Vec<f32> { w.iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect() };
+        let (bd, bfo, bg) = (bf(&wd), bf(&wf), bf(&wg));
+        for t in [1usize, 3] {
+            let (cat, x, m) = (rnd(t * 2 * h, 1.0), rnd(t * h, 2.0), rnd(t * h, 2.0));
+            for bf16 in [false, true] {
+                let (rows, vals) = if bf16 {
+                    (
+                        [FloatRows::Bf16(&bd), FloatRows::Bf16(&bfo), FloatRows::Bf16(&bg)],
+                        [back(&bd), back(&bfo), back(&bg)],
+                    )
+                } else {
+                    (
+                        [FloatRows::F32(&wd), FloatRows::F32(&wf), FloatRows::F32(&wg)],
+                        [wd.clone(), wf.clone(), wg.clone()],
+                    )
+                };
+                let (mut d, mut out) = (vec![0f32; t * r], vec![0f32; t * h]);
+                gate_rows(&rows[0], &rows[1], &rows[2], &cat, &x, &m, h, r, &mut d, &mut out);
+                for ti in 0..t {
+                    let dd: Vec<f64> = (0..r)
+                        .map(|i| (0..2 * h).map(|c| vals[0][i * 2 * h + c] as f64 * cat[ti * 2 * h + c] as f64).sum())
+                        .collect();
+                    for j in 0..h {
+                        let f: f64 = (0..r).map(|i| vals[1][j * r + i] as f64 * dd[i]).sum();
+                        let g: f64 = (0..r).map(|i| vals[2][j * r + i] as f64 * dd[i]).sum();
+                        let want = (1.0 - f.tanh()) * x[ti * h + j] as f64 + g.tanh() * m[ti * h + j] as f64;
+                        let have = out[ti * h + j] as f64;
+                        assert!(
+                            (have - want).abs() < 2e-5,
+                            "bf16 {bf16}, {t} tokens, token {ti} output {j}: {have} against {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn mix_is_a_softmax_over_normed_states() {
         let h = 4;
