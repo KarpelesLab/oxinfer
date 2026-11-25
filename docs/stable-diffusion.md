@@ -214,7 +214,53 @@ SDXL InstructPix2Pix, and single-file checkpoints (`sd_xl_base_1.0.safetensors`:
 only the diffusers folder layout is read). A dedicated 9-channel SDXL inpainting UNet takes the
 same code path as the SD 1.x one but was not run. Repo ids download the full-precision
 safetensors when a repo has both (about 14 GB for SDXL base); a folder holding only the `.fp16`
-files (7 GB) loads the same, and the weights are kept in bf16 either way.
+files (7 GB) loads the same, and the weights are kept in bf16 either way. To fetch only those,
+take `model_index.json`, `scheduler/scheduler_config.json`, the four `tokenizer*/` files of each
+tokenizer, each component's `config.json` and `text_encoder/model.fp16.safetensors`,
+`text_encoder_2/model.fp16.safetensors`, `unet/diffusion_pytorch_model.fp16.safetensors`,
+`vae/diffusion_pytorch_model.fp16.safetensors` from
+`https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/` (ungated) into a
+folder and pass that folder to `--model`.
+
+**Against stable-diffusion.cpp** (master 82c19c8, Metal, flash attention, cond and uncond in one
+batch), the same fp16 SDXL base 1.0 files on both sides (stable-diffusion.cpp reads the diffusers
+folder's components with `--diffusion-model unet/... --clip_l text_encoder/... --clip_g
+text_encoder_2/... --vae vae/...`; its `-m FOLDER` misses `text_encoder_2`), 1024x1024, 20 Euler
+steps, guidance 5, M5 Max, 2026-11-26, the GPU shared with other jobs (ranges over interleaved
+runs; a sustained run warms the GPU and oxinfer's steps go from 0.47 to 0.61 s within 20 steps):
+
+| | oxinfer (whole-pass UNet plan) | stable-diffusion.cpp |
+|---|---|---|
+| sampling, 20 steps | 9.6-12.9 s | 18.0-20.4 s (22-28 s with the GPU busier) |
+| per step, steady (cond + uncond) | 0.47-0.62 s | 0.83-1.04 s |
+| text encoders (both CLIPs, prompt + negative) | 0.18 s | 0.78-1.0 s |
+| VAE decode | 0.45-0.50 s | 4.1-4.3 s |
+| peak memory footprint | 11.6 GB (weights in bf16, 6.9 GB) | 7.8 GB |
+
+stable-diffusion.cpp decodes the original SDXL VAE in half precision and overflows: without
+`--force-sdxl-vae-conv-scale` (or madebyollin's fp16-fix VAE) its image is plain white. oxinfer
+runs the VAE in f32 on the CPU path and scales the inputs that leave half's range on the matrix
+units, so the original VAE works as it is.
+
+Quality, against diffusers 0.43 in float32 (the fp16 weights upcast, `tools/ref_sdxl.py`, CPU)
+on the same initial noise: `torch.randn` of seed 42 on the CPU, which oxinfer reads from the
+reference folder (`OXINFER_SD_DUMP`) and stable-diffusion.cpp draws itself with `--rng cpu`. The
+two engines' default Euler schedules differ (diffusers' and oxinfer's follow the model's
+"leading" timestep spacing, 951 ... 1; stable-diffusion.cpp's `discrete` scheduler its own), so
+the like-for-like rows use "trailing" timesteps (999 ... 49): oxinfer `--sampler euler_trailing`,
+stable-diffusion.cpp `--scheduler sgm_uniform`, diffusers `timestep_spacing="trailing"`:
+
+| | image vs diffusers (8-bit PSNR) |
+|---|---|
+| oxinfer, default (leading) | 45.1 dB (text context 1.2e-3, first UNet output 6.2e-4, final latents 1.5e-2) |
+| oxinfer, `euler_trailing` | 47.6 dB (latents 9.0e-3) |
+| stable-diffusion.cpp, `sgm_uniform` | 44.9 dB |
+| stable-diffusion.cpp, default `discrete` (against the trailing / leading references) | 29.4 / 23.2 dB (same picture, other timesteps) |
+| oxinfer against stable-diffusion.cpp, both trailing | 43.5 dB |
+
+Both stay close to the float32 reference; oxinfer's gap is mostly the bf16 storage of the
+weights (with the reference's weights rounded to bf16 too, the shorter runs of the table above
+agree to 68-80 dB), stable-diffusion.cpp's its fp16 weights and activations.
 
 ## Editing images
 

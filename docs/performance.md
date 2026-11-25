@@ -4346,6 +4346,8 @@ attention auto), mflux 0.24 on MLX 0.32.5.
 | | stable-diffusion.cpp (batched CFG) | 0.24-0.30 s | 0.43 s | 1.23 s |
 | SD-Turbo, 512^2, 1 step | oxinfer before / after | 0.30 / 0.08-0.09 s | 0.09-0.13 s | 0.57 / 0.10 s |
 | | stable-diffusion.cpp | 0.15-0.23 s | 0.24 s | 1.17-1.19 s |
+| SDXL base 1.0 fp16, 1024^2, CFG 5, 20 Euler steps | oxinfer, whole-pass UNet plan | 0.47-0.62 s | 0.18 s | 0.45-0.50 s |
+| | stable-diffusion.cpp (`--force-sdxl-vae-conv-scale`) | 0.83-1.04 s | 0.78-1.0 s | 4.1-4.3 s |
 
 FLUX.1: the transformer now runs as one GPU plan per pass (see [FLUX.1](flux.md), "Whole passes
 on the GPU"); per pass at 1024^2 the GEMMs take about 1.25 s (~83 TFLOP/s of the 104 TFLOP),
@@ -4369,6 +4371,11 @@ Edit-2511 + Lightning pass over 8.3k tokens 16.5 -> 10-11 s. Its attention then 
 keys as hi / lo half pairs on the half-precision matrix units (scores as exact as with f32
 operands): 2.7 -> 2.4-2.7 s per pass (interleaved on a loaded GPU: 4.9 -> 4.4 s, the
 per-operation path 10.4 s, stable-diffusion.cpp 33-34 s per step against 8.6 s).
+
+SDXL base (the public fp16 files, 1024^2, 20 steps): oxinfer samples in 9.6-12.9 s against
+18.0-20.4 s; on the same torch CPU noise and the same ("trailing") timesteps the images are
+47.6 dB (oxinfer) and 44.9 dB (stable-diffusion.cpp) from diffusers in float32, 43.5 dB from each
+other (see [Stable Diffusion XL](stable-diffusion.md#stable-diffusion-xl)).
 
 ## Speech to text against whisper.cpp
 
