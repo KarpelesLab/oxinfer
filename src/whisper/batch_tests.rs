@@ -386,6 +386,166 @@ fn metal_decoder_session_matches_cpu() {
     }
 }
 
+/// Greedy steps chained on the device against the same steps with the token chosen on the host
+/// (`process`, argmax, log-softmax), with and without timestamps, and rows chained together
+/// against each alone (bit for bit).
+#[cfg(all(feature = "gpu", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn metal_greedy_chain_matches_host_choices() {
+    use crate::gpu::Backend;
+    use crate::gpu::whisper::{ChainRow, DevMem, Greedy, Row};
+    let Ok(be) = crate::metal::MetalBackend::new() else { return };
+    let be: &'static crate::metal::MetalBackend = Box::leak(Box::new(be));
+    let Some(mut sess) = be.whisper_session() else { return };
+    let dir = tiny_checkpoint_heads("metal-chain", 1);
+    let mut lo = TranscriberOptions {
+        device: DevicePref::Cpu,
+        ..Default::default()
+    };
+    lo.set("precision", "bf16").unwrap();
+    let asr: &'static Transcriber = Box::leak(Box::new(Transcriber::load_dir(&dir.0, &lo).unwrap()));
+    let m = asr.model();
+    let sp = asr.special();
+    let (d, v) = (m.cfg.d_model, m.cfg.vocab_size);
+    let up = |l: &crate::model::Lin<'static>, n_out: usize, n_in: usize| -> Option<&'static crate::gpu::DeviceWeight> {
+        Some(&*Box::leak(Box::new(be.upload(&l.as_ref(), n_out, n_in)?)))
+    };
+    let enc = m.device_encoder(&up).unwrap();
+    let cross_lins = m.device_cross_with(&up).unwrap();
+    let dec = m.device_decoder_with(&up).unwrap();
+    assert!(sess.chains(&dec));
+    let windows: Vec<Vec<f32>> = (0..2)
+        .map(|i| asr.window(&mel::log_mel(&audio(6.0 + 5.0 * i as f64, i + 3), 80), 0))
+        .collect();
+    let refs: Vec<&[f32]> = windows.iter().map(|w| &w[..]).collect();
+    let mut outs = vec![Vec::new(); 2];
+    let mems = sess.encode(&enc, &refs, &mut outs, &cross_lins).unwrap();
+    let mut suppress = vec![false; v];
+    for &t in &sp.suppress {
+        suppress[t as usize] = true;
+    }
+    let mut mask: Vec<u8> = suppress.iter().map(|&s| s as u8).collect();
+    for &t in &sp.begin_suppress {
+        mask[t as usize] |= 2;
+    }
+    let g = Greedy {
+        embed_scale: 1.0,
+        pos: m.dec_positions(),
+        mask: &mask,
+        timestamp_begin: sp.timestamp_begin,
+        eot: sp.eot,
+        no_timestamps: sp.no_timestamps,
+        max_initial: sp.max_initial_timestamp_index,
+    };
+    let prompt = [SOT, 102, 105];
+    let embed = |tok: u32, pos: usize| {
+        let mut x = vec![0f32; d];
+        m.embed_row(tok, pos, &mut x);
+        x
+    };
+    // The prompt of window w into a new cache; the first token chosen on the host.
+    let start = |sess: &mut Box<dyn crate::gpu::whisper::Session>, w: usize, rules: &Rules| -> (Box<dyn DevMem>, u32) {
+        let kv = sess.new_kv(&dec).unwrap();
+        let xs: Vec<Vec<f32>> = prompt.iter().enumerate().map(|(j, &t)| embed(t, j)).collect();
+        let rows: Vec<Row> = xs
+            .iter()
+            .enumerate()
+            .map(|(j, x)| Row {
+                x,
+                pos: j,
+                kv: &*kv,
+                cross: &*mems[w],
+            })
+            .collect();
+        let mut l = vec![0f32; v];
+        assert!(sess.decode(&dec, &rows, &[2], &mut l));
+        process(sp, &mut l, &[], rules);
+        (kv, crate::sampler::argmax(&l))
+    };
+    let steps = 6;
+    for timestamps in [false, true] {
+        let rules = Rules {
+            suppress: &suppress,
+            begin_suppress: &sp.begin_suppress,
+            timestamps,
+        };
+        let mut alone: Vec<Vec<(u32, f32)>> = Vec::new();
+        for w in 0..2 {
+            // On the host.
+            let (kv, first) = start(&mut sess, w, &rules);
+            let mut done = vec![first];
+            let mut host = Vec::new();
+            for k in 0..steps {
+                let x = embed(*done.last().unwrap(), prompt.len() + k);
+                let row = [Row {
+                    x: &x,
+                    pos: prompt.len() + k,
+                    kv: &*kv,
+                    cross: &*mems[w],
+                }];
+                let mut l = vec![0f32; v];
+                assert!(sess.decode(&dec, &row, &[0], &mut l));
+                process(sp, &mut l, &done, &rules);
+                let tok = crate::sampler::argmax(&l);
+                host.push((tok, log_softmax_at(&l, tok as usize)));
+                done.push(tok);
+            }
+            // Chained.
+            let (kv, first2) = start(&mut sess, w, &rules);
+            assert_eq!(first, first2);
+            let mut out = vec![(0u32, 0f32); steps];
+            let rows = [ChainRow {
+                kv: &*kv,
+                cross: &*mems[w],
+                tokens: &[first],
+                pos: prompt.len(),
+                timestamps,
+            }];
+            assert!(sess.greedy(&dec, &g, &rows, steps, &mut out));
+            for (k, (a, b)) in out.iter().zip(&host).enumerate() {
+                assert_eq!(a.0, b.0, "window {w} timestamps {timestamps}: step {k} chose another token");
+                assert!(
+                    (a.1 - b.1).abs() < 1e-3,
+                    "window {w} step {k}: log-probability {} against {}",
+                    a.1,
+                    b.1
+                );
+            }
+            alone.push(out);
+        }
+        // Both windows chained together.
+        let (kv0, f0) = start(&mut sess, 0, &rules);
+        let (kv1, f1) = start(&mut sess, 1, &rules);
+        let rows = [
+            ChainRow {
+                kv: &*kv0,
+                cross: &*mems[0],
+                tokens: &[f0],
+                pos: prompt.len(),
+                timestamps,
+            },
+            ChainRow {
+                kv: &*kv1,
+                cross: &*mems[1],
+                tokens: &[f1],
+                pos: prompt.len(),
+                timestamps,
+            },
+        ];
+        let mut out = vec![(0u32, 0f32); 2 * steps];
+        assert!(sess.greedy(&dec, &g, &rows, steps, &mut out));
+        for w in 0..2 {
+            for k in 0..steps {
+                let (a, b) = (out[w * steps + k], alone[w][k]);
+                assert!(
+                    a.0 == b.0 && a.1.to_bits() == b.1.to_bits(),
+                    "window {w} step {k} differs chained with another"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn decoder_step_rows_match_single_sequences() {
     for precision in ["f32", "bf16", "q8", "q4"] {

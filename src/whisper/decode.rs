@@ -8,11 +8,15 @@
 //! self-attention cache per beam: a beam continued once hands its cache on, a beam continued
 //! several times is copied (openai-whisper's `rearrange_kv_cache`).
 
-use super::model::{CrossKv, DecState, WhisperModel};
+use super::model::{ChainRules, CrossKv, DecState, WhisperModel};
 use super::tokens::Special;
 use super::{Rules, log_softmax, log_softmax_at, process, softmax_prob};
 use crate::sampler::{Sampler, argmax};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Greedy steps chained on the device at most per submission (a sequence that ends within
+/// them wastes the rest).
+const CHAIN_STEPS: usize = 8;
 
 /// How the tokens of a window are chosen.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -82,6 +86,10 @@ struct Run<'a> {
     /// Token choices made (beam search: updates).
     iters: usize,
     complete: bool,
+    /// Greedy steps run chained on the device: the next token is chosen there.
+    chained: bool,
+    /// The run had its chained steps in this round of [`chain`].
+    chain_done: bool,
 }
 
 /// Decodes the windows together and returns one attempt per job, in order. Stops at the next
@@ -135,6 +143,8 @@ pub(super) fn run(m: &WhisperModel, sp: &Special, jobs: &[Job], cancel: &AtomicB
                 steps: 0,
                 iters: 0,
                 complete: job.max_new == 0,
+                chained: false,
+                chain_done: false,
             }
         })
         .collect();
@@ -145,14 +155,19 @@ pub(super) fn run(m: &WhisperModel, sp: &Special, jobs: &[Job], cancel: &AtomicB
             cancelled = true;
             break;
         }
-        for r in runs.iter_mut().filter(|r| !r.complete) {
+        for r in runs.iter_mut().filter(|r| !r.complete && !r.chained) {
             r.advance(m, sp);
         }
-        // One decoder step for every sequence still going, of every window.
+        // Greedy sequences on the device go on there, several steps at a time.
+        for r in runs.iter_mut().filter(|r| !r.complete) {
+            r.chained = r.chained || r.chainable(m);
+        }
+        chain(m, sp, &mut runs);
+        // One decoder step for every other sequence still going, of every window.
         let mut toks: Vec<u32> = Vec::new();
         let mut sts: Vec<&mut DecState> = Vec::new();
         let mut cross: Vec<&CrossKv> = Vec::new();
-        for r in runs.iter_mut().filter(|r| !r.complete) {
+        for r in runs.iter_mut().filter(|r| !r.complete && !r.chained) {
             for h in r.hyps.iter_mut().filter(|h| h.live) {
                 toks.push(*h.tokens.last().unwrap());
                 sts.push(&mut h.st);
@@ -164,7 +179,7 @@ pub(super) fn run(m: &WhisperModel, sp: &Special, jobs: &[Job], cancel: &AtomicB
         }
         let logits = m.decode_step(&toks, &mut sts, &cross);
         let mut rows = logits.chunks(v);
-        for r in runs.iter_mut().filter(|r| !r.complete) {
+        for r in runs.iter_mut().filter(|r| !r.complete && !r.chained) {
             for h in r.hyps.iter_mut().filter(|h| h.live) {
                 h.logits.copy_from_slice(rows.next().unwrap());
             }
@@ -185,7 +200,87 @@ pub(super) fn run(m: &WhisperModel, sp: &Special, jobs: &[Job], cancel: &AtomicB
         .collect()
 }
 
+/// Runs the chained greedy sequences of `runs` (those of one set of token rules together) for a
+/// few steps, and keeps each one's tokens up to where it ends.
+fn chain(m: &WhisperModel, sp: &Special, runs: &mut [Run]) {
+    let max_pos = m.cfg.max_target_positions;
+    // Group by group: the chained runs going on with the first one's rules.
+    while let Some(first) = runs.iter().position(|r| r.chained && !r.complete && !r.chain_done) {
+        let rules = runs[first].job.rules;
+        let same =
+            |r: &Run| std::ptr::eq(r.job.rules.suppress, rules.suppress) && std::ptr::eq(r.job.rules.begin_suppress, rules.begin_suppress);
+        let group: Vec<usize> = (0..runs.len())
+            .filter(|&i| runs[i].chained && !runs[i].complete && !runs[i].chain_done && same(&runs[i]))
+            .collect();
+        let mut mask = vec![0u8; m.cfg.vocab_size];
+        for (k, &s) in mask.iter_mut().zip(rules.suppress) {
+            *k = s as u8;
+        }
+        for &t in rules.begin_suppress {
+            if let Some(k) = mask.get_mut(t as usize) {
+                *k |= 2;
+            }
+        }
+        let cr = ChainRules {
+            mask,
+            timestamp_begin: sp.timestamp_begin,
+            eot: sp.eot,
+            no_timestamps: sp.no_timestamps,
+            max_initial: sp.max_initial_timestamp_index,
+        };
+        // As many steps as every sequence has positions for, and some sequence has tokens for.
+        let room = group.iter().map(|&i| max_pos - runs[i].hyps[0].st.pos).min().unwrap_or(1);
+        let want = group
+            .iter()
+            .map(|&i| runs[i].job.max_new.saturating_sub(runs[i].hyps[0].tokens.len()))
+            .max()
+            .unwrap_or(1);
+        let steps = CHAIN_STEPS.min(room).min(want).max(1);
+        let out = {
+            let seqs: Vec<(&DecState, &CrossKv, &[u32], bool)> = group
+                .iter()
+                .map(|&i| {
+                    let r = &runs[i];
+                    (&r.hyps[0].st, r.job.cross, &r.hyps[0].tokens[..], r.job.rules.timestamps)
+                })
+                .collect();
+            m.greedy_chain(&seqs, &cr, steps).expect("the device decoder failed mid-sequence")
+        };
+        for (k, &i) in group.iter().enumerate() {
+            let r = &mut runs[i];
+            let job = r.job;
+            let h = &mut r.hyps[0];
+            for &(tok, lp) in &out[k * steps..(k + 1) * steps] {
+                // The step decoded the last token, then chose this one.
+                h.st.pos += 1;
+                h.logprobs.push(lp);
+                h.sum += lp;
+                h.tokens.push(tok);
+                r.steps += 1;
+                r.iters += 1;
+                h.live = tok != sp.eot && h.st.pos < max_pos && h.tokens.len() < job.max_new;
+                if !h.live {
+                    break;
+                }
+            }
+            r.complete = !h.live;
+            r.chain_done = true;
+        }
+    }
+    for r in runs.iter_mut() {
+        r.chain_done = false;
+    }
+}
+
 impl Run<'_> {
+    /// Whether this run's steps can chain on the device: one greedy sequence decoded there.
+    fn chainable(&self, m: &WhisperModel) -> bool {
+        matches!(self.job.search, Search::Sample { temperature, n: 1 } if temperature <= 0.0)
+            && self.hyps.len() == 1
+            && self.hyps[0].live
+            && m.chains(&self.hyps[0].st)
+    }
+
     /// Chooses the next token of every sequence from its logits.
     fn advance(&mut self, m: &WhisperModel, sp: &Special) {
         let job = self.job;

@@ -262,6 +262,8 @@ pub struct WhisperModel {
     gpu: std::sync::Mutex<Option<Box<dyn crate::gpu::whisper::Session>>>,
     /// Whether the whole decoder runs on the device (checked on first use).
     dev_decodes: std::sync::OnceLock<bool>,
+    /// Whether greedy steps chain on the device (checked on first use).
+    dev_chains: std::sync::OnceLock<bool>,
     dec_prec: Precision,
 }
 
@@ -441,6 +443,16 @@ impl CrossKv {
     }
 }
 
+/// The token rules of greedy steps chained on the device ([`WhisperModel::greedy_chain`]).
+pub(crate) struct ChainRules {
+    /// Per token: bit 0 suppressed, bit 1 suppressed as the first generated token.
+    pub mask: Vec<u8>,
+    pub timestamp_begin: u32,
+    pub eot: u32,
+    pub no_timestamps: u32,
+    pub max_initial: Option<u32>,
+}
+
 /// The decoder's self-attention cache: on the host, or on the device for a sequence decoded
 /// there (see [`WhisperModel::decode_step`]).
 pub struct DecState {
@@ -582,6 +594,7 @@ impl WhisperModel {
             cross_bf16: !matches!(dec, Precision::F32 | Precision::F16),
             gpu: std::sync::Mutex::new(None),
             dev_decodes: std::sync::OnceLock::new(),
+            dev_chains: std::sync::OnceLock::new(),
             dec_prec: dec,
             cfg,
         })
@@ -938,6 +951,67 @@ impl WhisperModel {
             }
             sess.as_ref().is_some_and(|s| s.decodes(&dec))
         })
+    }
+
+    /// Whether greedy steps of a sequence in state `st` chain on the device
+    /// ([`WhisperModel::greedy_chain`]).
+    pub fn chains(&self, st: &DecState) -> bool {
+        st.dev.is_some()
+            && *self.dev_chains.get_or_init(|| {
+                let Some(dec) = self.device_decoder() else {
+                    return false;
+                };
+                let sess = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+                sess.as_ref().is_some_and(|s| s.chains(&dec))
+            })
+    }
+
+    /// `steps` greedy steps of each sequence chained on the device: sequence `i` (its state, its
+    /// window, the tokens generated so far, the last of which it decodes next, whether timestamps
+    /// apply) gets `steps` (token, log-probability) pairs at `[i * steps..]`, each chosen from the
+    /// logits after the one before as [`super::decode`] chooses greedily (the rules of `rules`).
+    /// The states' positions are left as they were: the caller moves them by the tokens it keeps.
+    pub(crate) fn greedy_chain(
+        &self,
+        seqs: &[(&DecState, &CrossKv, &[u32], bool)],
+        rules: &ChainRules,
+        steps: usize,
+    ) -> Option<Vec<(u32, f32)>> {
+        let dec = self.device_decoder()?;
+        let g = crate::gpu::whisper::Greedy {
+            embed_scale: if self.cfg.scale_embedding {
+                (self.cfg.d_model as f32).sqrt()
+            } else {
+                1.0
+            },
+            pos: &self.dec_pos,
+            mask: &rules.mask,
+            timestamp_begin: rules.timestamp_begin,
+            eot: rules.eot,
+            no_timestamps: rules.no_timestamps,
+            max_initial: rules.max_initial,
+        };
+        let rows = seqs
+            .iter()
+            .map(|(st, cross, tokens, ts)| {
+                Some(crate::gpu::whisper::ChainRow {
+                    kv: st.dev.as_deref()?,
+                    cross: cross.dev.as_deref()?,
+                    tokens,
+                    pos: st.pos,
+                    timestamps: *ts,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut out = vec![(0u32, 0f32); seqs.len() * steps];
+        let mut sess = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        sess.as_mut()?.greedy(&dec, &g, &rows, steps, &mut out).then_some(out)
+    }
+
+    /// The decoder's learned positions (`[max_target_positions, d_model]`).
+    #[cfg(all(test, feature = "gpu", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn dec_positions(&self) -> &[f32] {
+        &self.dec_pos
     }
 
     /// The input row of token `tok` at position `pos`: its embedding and the position's.

@@ -110,6 +110,34 @@ pub struct Row<'a> {
     pub cross: &'a dyn DevMem,
 }
 
+/// Greedy decoding chained on the device ([`Session::greedy`]): the token choice of
+/// `crate::whisper`'s greedy search (suppressed tokens, the timestamp rules, the most likely
+/// token, its log-probability) runs there too, each step's token the next step's input.
+pub struct Greedy<'a> {
+    /// The input of token `t` at position `p`: row `t` of the decoder's output projection (bf16)
+    /// times `embed_scale`, plus row `p` of `pos` (`[max_pos, d]`).
+    pub embed_scale: f32,
+    pub pos: &'a [f32],
+    /// Per token: bit 0 suppressed, bit 1 suppressed as the first generated token.
+    pub mask: &'a [u8],
+    pub timestamp_begin: u32,
+    pub eot: u32,
+    pub no_timestamps: u32,
+    /// The latest timestamp allowed first (index after `timestamp_begin`).
+    pub max_initial: Option<u32>,
+}
+
+/// One sequence of a chain.
+pub struct ChainRow<'a> {
+    pub kv: &'a dyn DevMem,
+    pub cross: &'a dyn DevMem,
+    /// The tokens generated so far (at least one: the last is the next to decode, at `pos`).
+    pub tokens: &'a [u32],
+    pub pos: usize,
+    /// Whether the timestamp rules apply.
+    pub timestamps: bool,
+}
+
 /// Device state kept between calls (activation buffers).
 pub trait Session: Send {
     /// Encodes the windows of log-mel frames `mels` (each `[2 n, n_mels]`, time-major) into `out`
@@ -131,6 +159,18 @@ pub trait Session: Send {
     /// order) into `logits`. A row gets the same values whatever rows it runs with. False when
     /// the device failed.
     fn decode(&mut self, _dec: &Decoder, _rows: &[Row], _want: &[usize], _logits: &mut [f32]) -> bool {
+        false
+    }
+    /// Whether [`Session::greedy`] takes this decoder.
+    fn chains(&self, _dec: &Decoder) -> bool {
+        false
+    }
+    /// `steps` greedy steps of every row: decode the row's last token, choose the next one from
+    /// the logits (as `crate::whisper` does on the host), and so on; row `i`'s tokens and their
+    /// log-probabilities into `out[i * steps..]`, whether or not the row ended on the way. Each
+    /// row gets the same tokens whatever rows run with it. False when the device failed (the
+    /// caches then hold what the host must not rely on).
+    fn greedy(&mut self, _dec: &Decoder, _g: &Greedy, _rows: &[ChainRow], _steps: usize, _out: &mut [(u32, f32)]) -> bool {
         false
     }
 }

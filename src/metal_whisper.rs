@@ -11,7 +11,7 @@
 
 use super::decode::{FastEnc, Fns, MvParams, MvWeight, run_concurrent};
 use super::*;
-use crate::gpu::whisper::{CrossLin, Decoder, DevMem, Encoder, Lin, Row, Session};
+use crate::gpu::whisper::{ChainRow, CrossLin, Decoder, DevMem, Encoder, Greedy, Lin, Row, Session};
 
 pub(crate) const SRC: &str = include_str!("metal_whisper.metal");
 
@@ -44,6 +44,9 @@ struct Pipes {
     part_f32: Id,
     part_h: Id,
     merge: Id,
+    embed: Id,
+    select: Id,
+    ln: Id,
 }
 
 pub(crate) struct MetalWhisper {
@@ -54,6 +57,9 @@ pub(crate) struct MetalWhisper {
     /// The decoder's constants (biases, norms) in `B::DConsts`: the address of the decoder's
     /// first norm weight they were made from, and their offsets.
     dconsts: Option<(usize, DecConsts)>,
+    /// The mask and position table in `B::Cmask` / `B::Cpos` (a copy of the mask, the address of
+    /// the table).
+    chain_consts: Option<(Vec<u8>, usize)>,
 }
 
 /// Byte offsets in `B::DConsts`: zeros, then per layer the biases (q, k, v, o, cross q, cross
@@ -99,8 +105,13 @@ enum B {
     Dlog,
     Dpart,
     DConsts,
+    // Chains.
+    Cmask,
+    Cpos,
+    Cstate,
+    Cout,
 }
-const NBUF: usize = 27;
+const NBUF: usize = 31;
 
 /// Positions per threadgroup of the decoder's attention (`whd_part_*`), and chunks at most.
 const DEC_CHUNK: usize = 128;
@@ -135,6 +146,9 @@ impl MetalBackend {
             part_f32: pipe("whd_part_f32")?,
             part_h: pipe("whd_part_h")?,
             merge: pipe("whd_attn_merge")?,
+            embed: pipe("whc_embed")?,
+            select: pipe("whc_select")?,
+            ln: pipe("whd_ln")?,
         };
         Some(Box::new(MetalWhisper {
             be: self,
@@ -147,6 +161,7 @@ impl MetalBackend {
                 })
                 .collect(),
             dconsts: None,
+            chain_consts: None,
         }))
     }
 
@@ -622,54 +637,155 @@ impl Session for MetalWhisper {
     }
 
     fn decode(&mut self, dec: &Decoder, rows: &[Row], want: &[usize], logits: &mut [f32]) -> bool {
-        let be = self.be;
-        let (d, ffn, nh, v, nl) = (dec.d, dec.ffn, dec.heads, dec.vocab, dec.layers.len());
+        let (d, v) = (dec.d, dec.vocab);
         let t = rows.len();
         if t == 0 || logits.len() < want.len() * v || want.iter().any(|&w| w >= t) || rows.iter().any(|r| r.x.len() != d) {
             return false;
         }
-        // The rows' sequences: runs of rows sharing a cache, at consecutive positions.
-        let mems: Vec<(&WhMem, &WhMem)> = match rows
+        let Some(mems) = rows
             .iter()
             .map(|r| Some((r.kv.as_any().downcast_ref::<WhMem>()?, r.cross.as_any().downcast_ref::<WhMem>()?)))
             .collect::<Option<Vec<_>>>()
-        {
-            Some(m) => m,
-            None => return false,
+        else {
+            return false;
         };
-        let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
-        for i in 0..t {
-            match runs.last_mut() {
-                Some(r) if std::ptr::eq(mems[r.start].0, mems[i].0) && rows[i].pos == rows[i - 1].pos + 1 => r.end = i + 1,
-                _ => runs.push(i..i + 1),
-            }
-        }
-        for r in &runs {
-            let (kv, _) = mems[r.start];
-            if kv.blocks != 2 * nl || kv.d != d || rows[r.end - 1].pos >= dec.max_pos || !kv.reserve(rows[r.end - 1].pos + 1) {
-                return false;
-            }
-        }
-        if mems.iter().any(|(_, c)| c.blocks != 2 * nl || c.d != d) {
+        let pos: Vec<usize> = rows.iter().map(|r| r.pos).collect();
+        if !self.prepare(dec, &mems, &pos, 1, want.len()) {
             return false;
         }
-        let mut ws = Vec::with_capacity(nl * 8 + 1);
-        for l in dec
-            .layers
-            .iter()
-            .flat_map(|l| [&l.q, &l.k, &l.v, &l.o, &l.cq, &l.co, &l.fc1, &l.fc2])
-            .chain([&dec.head])
-        {
-            let Some(w) = MvWeight::new(&l.w, l.dev, l.n_out, l.n_in) else {
-                return false;
-            };
-            let Some((pipe, nr, ks)) = be.mvt_pipe(w.fmt, l.n_in) else {
-                return false;
-            };
-            if let Some(mw) = l.dev.downcast_ref::<MetalWeight>() {
-                mw.keep_resident(&be.residency);
+        // SAFETY: Dx holds t rows of d floats.
+        unsafe {
+            let x = self.host(B::Dx);
+            for (i, r) in rows.iter().enumerate() {
+                std::ptr::copy_nonoverlapping(r.x.as_ptr(), x.add(i * d), d);
             }
-            ws.push((w, pipe, nr, ks));
+        }
+        if !self.steps(dec, &mems, &pos, 1, Some(want)) {
+            return false;
+        }
+        // SAFETY: Dlog holds want.len() rows of the vocabulary.
+        unsafe { par_copy(logits.as_mut_ptr(), self.host(B::Dlog), want.len() * v) };
+        true
+    }
+
+    fn chains(&self, dec: &Decoder) -> bool {
+        self.decodes(dec) && matches!(dec.head.w, WeightRef::Bf16(_)) && dec.head.n_in == dec.d
+    }
+
+    fn greedy(&mut self, dec: &Decoder, g: &Greedy, rows: &[ChainRow], steps: usize, out: &mut [(u32, f32)]) -> bool {
+        let (d, v) = (dec.d, dec.vocab);
+        let t = rows.len();
+        if t == 0 || steps == 0 || out.len() < t * steps || g.mask.len() != v || g.pos.len() < dec.max_pos * d || !self.chains(dec) {
+            return false;
+        }
+        if rows
+            .iter()
+            .any(|r| r.tokens.is_empty() || r.tokens.iter().any(|&x| x as usize >= v))
+        {
+            return false;
+        }
+        let Some(mems) = rows
+            .iter()
+            .map(|r| Some((r.kv.as_any().downcast_ref::<WhMem>()?, r.cross.as_any().downcast_ref::<WhMem>()?)))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        // Each row its own sequence.
+        if (1..t).any(|i| (0..i).any(|j| std::ptr::eq(mems[i].0, mems[j].0))) {
+            return false;
+        }
+        let pos: Vec<usize> = rows.iter().map(|r| r.pos).collect();
+        if !self.prepare(dec, &mems, &pos, steps, t) {
+            return false;
+        }
+        let ok = self.ensure(B::Cmask, v)
+            && self.ensure(B::Cpos, dec.max_pos * d * 4)
+            && self.ensure(B::Cstate, t * 32)
+            && self.ensure(B::Cout, t * steps * 8);
+        if !ok {
+            return false;
+        }
+        // The mask and positions, uploaded when they change.
+        let key = g.pos.as_ptr() as usize;
+        if self.chain_consts.as_ref().is_none_or(|(m, k)| m[..] != g.mask[..] || *k != key) {
+            // SAFETY: sized above; the device is idle.
+            unsafe {
+                std::ptr::copy_nonoverlapping(g.mask.as_ptr(), self.host(B::Cmask) as *mut u8, v);
+                par_copy(self.host(B::Cpos), g.pos.as_ptr(), dec.max_pos * d);
+            }
+            self.chain_consts = Some((g.mask.to_vec(), key));
+        }
+        // SAFETY: Cstate holds t states of 8 u32s.
+        unsafe {
+            let st = self.host(B::Cstate) as *mut u32;
+            for (i, r) in rows.iter().enumerate() {
+                let n = r.tokens.len();
+                let last_ts = r
+                    .tokens
+                    .iter()
+                    .rev()
+                    .find(|&&x| x >= g.timestamp_begin)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                let s = [
+                    r.tokens[n - 1],
+                    if n >= 2 { r.tokens[n - 2] } else { 0 },
+                    last_ts,
+                    n as u32,
+                    r.timestamps as u32,
+                    0,
+                    0,
+                    0,
+                ];
+                std::ptr::copy_nonoverlapping(s.as_ptr(), st.add(i * 8), 8);
+            }
+        }
+        let chain = ChainSpec { g, steps };
+        if !self.steps_chain(dec, &mems, &pos, &chain) {
+            return false;
+        }
+        // SAFETY: Cout holds t * steps (token, log-probability) pairs.
+        unsafe {
+            let o = self.host(B::Cout) as *const u32;
+            for (k, x) in out.iter_mut().take(t * steps).enumerate() {
+                *x = (*o.add(2 * k), f32::from_bits(*o.add(2 * k + 1)));
+            }
+        }
+        true
+    }
+}
+
+/// What a chain's steps need besides the decoder pass.
+struct ChainSpec<'a> {
+    g: &'a Greedy<'a>,
+    steps: usize,
+}
+
+impl MetalWhisper {
+    /// Sizes the step buffers for `t` rows (`nlog` rows of logits), checks the caches and makes
+    /// room in them for `steps` positions from `pos`, makes the decoder's constants.
+    fn prepare(&mut self, dec: &Decoder, mems: &[(&WhMem, &WhMem)], pos: &[usize], steps: usize, nlog: usize) -> bool {
+        let (d, ffn, nh, v, nl) = (dec.d, dec.ffn, dec.heads, dec.vocab, dec.layers.len());
+        let t = pos.len();
+        for (i, (kv, c)) in mems.iter().enumerate() {
+            let end = pos[i] + steps;
+            if kv.blocks != 2 * nl || kv.d != d || c.blocks != 2 * nl || c.d != d || end > dec.max_pos {
+                return false;
+            }
+        }
+        // The furthest position of each cache.
+        for (i, (kv, _)) in mems.iter().enumerate() {
+            let end = mems
+                .iter()
+                .zip(pos)
+                .filter(|(m, _)| std::ptr::eq(m.0, *kv))
+                .map(|(_, &p)| p + steps)
+                .max()
+                .unwrap_or(pos[i] + steps);
+            if !kv.reserve(end) {
+                return false;
+            }
         }
         let ok = self.ensure(B::Dx, t * d * 4)
             && self.ensure(B::Dh, t * d * 4)
@@ -678,7 +794,7 @@ impl Session for MetalWhisper {
             && self.ensure(B::Dv, t * d * 4)
             && self.ensure(B::Datt, t * d * 4)
             && self.ensure(B::Df, t * ffn * 4)
-            && self.ensure(B::Dlog, want.len().max(1) * v * 4)
+            && self.ensure(B::Dlog, nlog.max(1) * v * 4)
             && self.ensure(B::Dpart, t * nh * DEC_CHUNKS * 68 * 4);
         if !ok {
             return false;
@@ -695,11 +811,11 @@ impl Session for MetalWhisper {
             };
             let zeros = put(&vec![0f32; d]);
             let mut bias = |l: &Lin| l.bias.map_or(zeros, &mut put);
-            let layers: Vec<([usize; 8], [usize; 6])> = dec
+            let biases: Vec<[usize; 8]> = dec
                 .layers
                 .iter()
                 .map(|l| {
-                    let b = [
+                    [
                         bias(&l.q),
                         bias(&l.k),
                         bias(&l.v),
@@ -708,14 +824,13 @@ impl Session for MetalWhisper {
                         bias(&l.co),
                         bias(&l.fc1),
                         bias(&l.fc2),
-                    ];
-                    (b, [0; 6])
+                    ]
                 })
                 .collect();
-            let layers: Vec<([usize; 8], [usize; 6])> = layers
+            let layers: Vec<([usize; 8], [usize; 6])> = biases
                 .into_iter()
                 .zip(&dec.layers)
-                .map(|((b, _), l)| {
+                .map(|(b, l)| {
                     (
                         b,
                         [
@@ -737,12 +852,57 @@ impl Session for MetalWhisper {
             unsafe { par_copy(self.host(B::DConsts), consts.as_ptr(), consts.len()) };
             self.dconsts = Some((key, DecConsts { zeros, layers, ln }));
         }
-        // SAFETY: Dx holds t rows of d floats.
-        unsafe {
-            let x = self.host(B::Dx);
-            for (i, r) in rows.iter().enumerate() {
-                std::ptr::copy_nonoverlapping(r.x.as_ptr(), x.add(i * d), d);
+        true
+    }
+
+    /// One decoder pass over the rows in Dx, the logits of rows `want` into Dlog.
+    fn steps(&self, dec: &Decoder, mems: &[(&WhMem, &WhMem)], pos: &[usize], steps: usize, want: Option<&[usize]>) -> bool {
+        self.run_steps(dec, mems, pos, steps, want, None)
+    }
+
+    /// `chain.steps` chained greedy steps.
+    fn steps_chain(&self, dec: &Decoder, mems: &[(&WhMem, &WhMem)], pos: &[usize], chain: &ChainSpec) -> bool {
+        self.run_steps(dec, mems, pos, chain.steps, None, Some(chain))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_steps(
+        &self,
+        dec: &Decoder,
+        mems: &[(&WhMem, &WhMem)],
+        pos: &[usize],
+        steps: usize,
+        want: Option<&[usize]>,
+        chain: Option<&ChainSpec>,
+    ) -> bool {
+        let be = self.be;
+        let (d, ffn, nh, v, nl) = (dec.d, dec.ffn, dec.heads, dec.vocab, dec.layers.len());
+        let t = pos.len();
+        // The rows' sequences: runs of rows sharing a cache, at consecutive positions.
+        let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+        for i in 0..t {
+            match runs.last_mut() {
+                Some(r) if std::ptr::eq(mems[r.start].0, mems[i].0) && pos[i] == pos[i - 1] + 1 => r.end = i + 1,
+                _ => runs.push(i..i + 1),
             }
+        }
+        let mut ws = Vec::with_capacity(nl * 8 + 1);
+        for l in dec
+            .layers
+            .iter()
+            .flat_map(|l| [&l.q, &l.k, &l.v, &l.o, &l.cq, &l.co, &l.fc1, &l.fc2])
+            .chain([&dec.head])
+        {
+            let Some(w) = MvWeight::new(&l.w, l.dev, l.n_out, l.n_in) else {
+                return false;
+            };
+            let Some((pipe, nr, ks)) = be.mvt_pipe(w.fmt, l.n_in) else {
+                return false;
+            };
+            if let Some(mw) = l.dev.downcast_ref::<MetalWeight>() {
+                mw.keep_resident(&be.residency);
+            }
+            ws.push((w, pipe, nr, ks));
         }
         let ids: [Id; NBUF] = std::array::from_fn(|i| self.bufs[i].id);
         let id = |b: B| ids[b as usize];
@@ -792,32 +952,47 @@ impl Session for MetalWhisper {
         };
         // Dx += bias, then its LayerNorm into Dh.
         let res_ln = |e: &FastEnc, bias: usize, norm: [usize; 2]| {
-            e.pipe(p.res_ln);
+            e.pipe(p.ln);
             e.buf(id(B::Dx), 0, 0);
             e.buf(cst, bias, 1);
-            e.buf(cst, dcs.zeros, 2);
-            e.buf(cst, norm[0], 3);
-            e.buf(cst, norm[1], 4);
-            e.buf(id(B::Dh), 0, 5);
-            e.buf(id(B::Dh), 0, 6);
-            e.bytes(&U8([d as u32, 0, 1, 0, 1, 1, dec.eps.to_bits(), 0]), 7);
-            e.dispatch((t, 1), 256);
+            e.buf(cst, norm[0], 2);
+            e.buf(cst, norm[1], 3);
+            e.buf(id(B::Dh), 0, 4);
+            e.bytes(&U4([d as u32, dec.eps.to_bits(), 0, 0]), 5);
+            e.dispatch((t, 1), 32);
             e.barrier();
         };
-        // Attention of row i's query (Dq + bias) over `n` rows of keys and values: the chunks
-        // into Dpart, then (`merge`, after a barrier) into Datt.
-        let part = |e: &FastEnc, pipe: Id, i: usize, qb: usize, kv: (Id, usize, usize), n: usize, elem: usize| {
-            let (buf, k_off, v_off) = kv;
-            e.pipe(pipe);
-            e.buf(id(B::Dq), i * d * 4, 0);
-            e.buf(cst, qb, 1);
-            e.buf(buf, k_off * elem, 2);
-            e.buf(buf, v_off * elem, 3);
-            e.buf(id(B::Dpart), i * nh * DEC_CHUNKS * 68 * 4, 4);
-            let chunks = n.div_ceil(DEC_CHUNK);
-            e.bytes(&U4([n as u32, d as u32, scale.to_bits(), chunks as u32]), 5);
-            e.dispatch((chunks, nh), DEC_CHUNK);
-        };
+        // Attention of row i's query (Dq + bias) over `n` rows of keys and values: straight into
+        // Datt from one chunk, else the chunks into Dpart, then (`merge`, after a barrier) into
+        // Datt. With `fuse` (key and value biases), the row's own key and value (position n - 1)
+        // come from Dk / Dv and go to the cache there.
+        let part =
+            |e: &FastEnc, pipe: Id, i: usize, qb: usize, kv: (Id, usize, usize), n: usize, elem: usize, fuse: Option<(usize, usize)>| {
+                let (buf, k_off, v_off) = kv;
+                e.pipe(pipe);
+                e.buf(id(B::Dq), i * d * 4, 0);
+                e.buf(cst, qb, 1);
+                e.buf(buf, k_off * elem, 2);
+                e.buf(buf, v_off * elem, 3);
+                e.buf(id(B::Dpart), i * nh * DEC_CHUNKS * 68 * 4, 4);
+                let chunks = n.div_ceil(DEC_CHUNK);
+                e.bytes(
+                    &U8([n as u32, d as u32, scale.to_bits(), chunks as u32, fuse.is_some() as u32, 0, 0, 0]),
+                    5,
+                );
+                if let Some((bk, bv)) = fuse {
+                    e.buf(id(B::Dk), i * d * 4, 6);
+                    e.buf(id(B::Dv), i * d * 4, 7);
+                    e.buf(cst, bk, 8);
+                    e.buf(cst, bv, 9);
+                } else if elem == 4 {
+                    for j in 6..10 {
+                        e.buf(id(B::Dq), 0, j);
+                    }
+                }
+                e.buf(id(B::Datt), i * d * 4, 10);
+                e.dispatch((chunks, nh), DEC_CHUNK);
+            };
         let merge = |e: &FastEnc, i: usize, n: usize| {
             e.pipe(p.merge);
             e.buf(id(B::Dpart), i * nh * DEC_CHUNKS * 68 * 4, 0);
@@ -825,87 +1000,131 @@ impl Session for MetalWhisper {
             e.bytes(&U4([n as u32, d as u32, 0, n.div_ceil(DEC_CHUNK) as u32]), 2);
             e.dispatch((nh, 1), 64);
         };
+        let all: Vec<usize> = (0..t).collect();
         let (ok, _) = run_concurrent(be, &self.f, std::slice::from_ref(&(0..1)), |e, _| {
-            let mut prev_bias = dcs.zeros;
-            for (li, (lb, ln)) in dcs.layers.iter().enumerate() {
-                let w0 = li * 8;
-                // Self-attention.
-                res_ln(e, prev_bias, [ln[0], ln[1]]);
-                mv(e, w0, id(B::Dh), 0, t, id(B::Dq), 0, false);
-                mv(e, w0 + 1, id(B::Dh), 0, t, id(B::Dk), 0, false);
-                mv(e, w0 + 2, id(B::Dh), 0, t, id(B::Dv), 0, false);
-                e.barrier();
-                for r in &runs {
-                    let (kid, cap) = kv_ids[r.start];
-                    let p0 = rows[r.start].pos;
-                    for (j, (src, b)) in [(B::Dk, lb[1]), (B::Dv, lb[2])].into_iter().enumerate() {
-                        e.pipe(p.bias);
-                        e.buf(id(src), r.start * d * 4, 0);
-                        e.buf(cst, b, 1);
-                        e.buf(kid, ((2 * li + j) * cap + p0) * d * 4, 2);
-                        e.bytes(&U4([d as u32, 1, 0, 0]), 3);
-                        e.dispatch(((d / 4).div_ceil(256), r.len()), 256);
+            for step in 0..steps {
+                if let Some(c) = chain {
+                    // The rows' inputs from their last tokens.
+                    let rp: Vec<f32> = pos.iter().map(|&x| f32::from_bits((x + step) as u32)).collect();
+                    e.pipe(p.embed);
+                    e.buf(ws[nl * 8].0.data, ws[nl * 8].0.data_off as usize, 0);
+                    e.buf(id(B::Cpos), 0, 1);
+                    e.buf(id(B::Cstate), 0, 2);
+                    e.buf(id(B::Dx), 0, 3);
+                    e.bytes(&U4([d as u32, c.g.embed_scale.to_bits(), 0, 0]), 4);
+                    e.bytes_slice(&rp, 5);
+                    e.dispatch((d.div_ceil(256), t), 256);
+                    e.barrier();
+                }
+                let at = |i: usize| pos[i] + step;
+                let mut prev_bias = dcs.zeros;
+                for (li, (lb, ln)) in dcs.layers.iter().enumerate() {
+                    let w0 = li * 8;
+                    // Self-attention.
+                    res_ln(e, prev_bias, [ln[0], ln[1]]);
+                    mv(e, w0, id(B::Dh), 0, t, id(B::Dq), 0, false);
+                    mv(e, w0 + 1, id(B::Dh), 0, t, id(B::Dk), 0, false);
+                    mv(e, w0 + 2, id(B::Dh), 0, t, id(B::Dv), 0, false);
+                    e.barrier();
+                    // A row alone in its sequence stores its key and value in the attention.
+                    let fused = runs.iter().all(|r| r.len() == 1);
+                    if !fused {
+                        for r in &runs {
+                            let (kid, cap) = kv_ids[r.start];
+                            let p0 = at(r.start);
+                            for (j, (src, b)) in [(B::Dk, lb[1]), (B::Dv, lb[2])].into_iter().enumerate() {
+                                e.pipe(p.bias);
+                                e.buf(id(src), r.start * d * 4, 0);
+                                e.buf(cst, b, 1);
+                                e.buf(kid, ((2 * li + j) * cap + p0) * d * 4, 2);
+                                e.bytes(&U4([d as u32, 1, 0, 0]), 3);
+                                e.dispatch(((d / 4).div_ceil(256), r.len()), 256);
+                            }
+                        }
+                        e.barrier();
                     }
+                    for i in 0..t {
+                        let (kid, cap) = kv_ids[i];
+                        let kv = (kid, 2 * li * cap * d, (2 * li + 1) * cap * d);
+                        part(e, p.part_f32, i, lb[0], kv, at(i) + 1, 4, fused.then_some((lb[1], lb[2])));
+                    }
+                    e.barrier();
+                    if (0..t).any(|i| at(i) + 1 > DEC_CHUNK) {
+                        for i in (0..t).filter(|&i| at(i) + 1 > DEC_CHUNK) {
+                            merge(e, i, at(i) + 1);
+                        }
+                        e.barrier();
+                    }
+                    mv(e, w0 + 3, id(B::Datt), 0, t, id(B::Dx), 0, true);
+                    e.barrier();
+                    // Cross-attention.
+                    res_ln(e, lb[3], [ln[2], ln[3]]);
+                    mv(e, w0 + 4, id(B::Dh), 0, t, id(B::Dq), 0, false);
+                    e.barrier();
+                    for (i, &(cid, n)) in cross_ids.iter().enumerate() {
+                        part(e, p.part_h, i, lb[4], (cid, 2 * li * n * d, (2 * li + 1) * n * d), n, 2, None);
+                    }
+                    e.barrier();
+                    for (i, &(_, n)) in cross_ids.iter().enumerate() {
+                        merge(e, i, n);
+                    }
+                    e.barrier();
+                    mv(e, w0 + 5, id(B::Datt), 0, t, id(B::Dx), 0, true);
+                    e.barrier();
+                    // Feed-forward.
+                    res_ln(e, lb[5], [ln[4], ln[5]]);
+                    mv(e, w0 + 6, id(B::Dh), 0, t, id(B::Df), 0, false);
+                    e.barrier();
+                    e.pipe(p.gelu);
+                    e.buf(id(B::Df), 0, 0);
+                    e.buf(cst, lb[6], 1);
+                    e.bytes(&U4([ffn as u32, 0, 0, 0]), 2);
+                    e.dispatch(((ffn / 4).div_ceil(256), t), 256);
+                    e.barrier();
+                    mv(e, w0 + 7, id(B::Df), 0, t, id(B::Dx), 0, true);
+                    e.barrier();
+                    prev_bias = lb[7];
                 }
-                e.barrier();
-                for (i, row) in rows.iter().enumerate() {
-                    let (kid, cap) = kv_ids[i];
-                    let kv = (kid, 2 * li * cap * d, (2 * li + 1) * cap * d);
-                    part(e, p.part_f32, i, lb[0], kv, row.pos + 1, 4);
+                res_ln(e, prev_bias, dcs.ln);
+                // The logits of the rows asked for (every row in a chain), consecutive ones
+                // together.
+                let want = want.unwrap_or(&all[..]);
+                let mut k = 0;
+                while k < want.len() {
+                    let mut n = 1;
+                    while k + n < want.len() && want[k + n] == want[k] + n {
+                        n += 1;
+                    }
+                    mv(e, nl * 8, id(B::Dh), want[k], n, id(B::Dlog), k, false);
+                    k += n;
                 }
-                e.barrier();
-                for (i, row) in rows.iter().enumerate() {
-                    merge(e, i, row.pos + 1);
+                if let Some(c) = chain {
+                    e.barrier();
+                    let g = c.g;
+                    e.pipe(p.select);
+                    e.buf(id(B::Dlog), 0, 0);
+                    e.buf(id(B::Cmask), 0, 1);
+                    e.buf(id(B::Cstate), 0, 2);
+                    e.buf(id(B::Cout), 0, 3);
+                    e.bytes(
+                        &U8([
+                            v as u32,
+                            g.timestamp_begin,
+                            g.eot,
+                            g.no_timestamps,
+                            g.max_initial.unwrap_or(u32::MAX),
+                            step as u32,
+                            steps as u32,
+                            0,
+                        ]),
+                        4,
+                    );
+                    e.dispatch((t, 1), 1024);
+                    e.barrier();
                 }
-                e.barrier();
-                mv(e, w0 + 3, id(B::Datt), 0, t, id(B::Dx), 0, true);
-                e.barrier();
-                // Cross-attention.
-                res_ln(e, lb[3], [ln[2], ln[3]]);
-                mv(e, w0 + 4, id(B::Dh), 0, t, id(B::Dq), 0, false);
-                e.barrier();
-                for (i, &(cid, n)) in cross_ids.iter().enumerate() {
-                    part(e, p.part_h, i, lb[4], (cid, 2 * li * n * d, (2 * li + 1) * n * d), n, 2);
-                }
-                e.barrier();
-                for (i, &(_, n)) in cross_ids.iter().enumerate() {
-                    merge(e, i, n);
-                }
-                e.barrier();
-                mv(e, w0 + 5, id(B::Datt), 0, t, id(B::Dx), 0, true);
-                e.barrier();
-                // Feed-forward.
-                res_ln(e, lb[5], [ln[4], ln[5]]);
-                mv(e, w0 + 6, id(B::Dh), 0, t, id(B::Df), 0, false);
-                e.barrier();
-                e.pipe(p.gelu);
-                e.buf(id(B::Df), 0, 0);
-                e.buf(cst, lb[6], 1);
-                e.bytes(&U4([ffn as u32, 0, 0, 0]), 2);
-                e.dispatch(((ffn / 4).div_ceil(256), t), 256);
-                e.barrier();
-                mv(e, w0 + 7, id(B::Df), 0, t, id(B::Dx), 0, true);
-                e.barrier();
-                prev_bias = lb[7];
-            }
-            res_ln(e, prev_bias, dcs.ln);
-            // The logits of the rows asked for, consecutive ones together.
-            let mut k = 0;
-            while k < want.len() {
-                let mut n = 1;
-                while k + n < want.len() && want[k + n] == want[k] + n {
-                    n += 1;
-                }
-                mv(e, nl * 8, id(B::Dh), want[k], n, id(B::Dlog), k, false);
-                k += n;
             }
         });
-        if !ok {
-            return false;
-        }
-        // SAFETY: Dlog holds want.len() rows of the vocabulary.
-        unsafe { par_copy(logits.as_mut_ptr(), self.host(B::Dlog), want.len() * v) };
-        true
+        ok
     }
 }
 
