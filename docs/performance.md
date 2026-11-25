@@ -648,8 +648,11 @@ Where oxinfer is still behind:
   those points (the RoPE into the projection GEMMs) or putting the head into the pass's last
   command buffer (the prompt's logits take a command buffer of their own, ~0.25 ms beyond their
   GPU time on Llama 1B) would remove more. The 26B-A4B's routed experts' grouped GEMMs are
-  ~2.4x the weights' streaming time: their dequantization and products barely overlap (round
-  7's probes). In the kernels alone (`mma_gemm_bench`, 512 tokens) the
+  ~2.4x the weights' streaming time: their loads and products barely overlap, and the many
+  kernel designs [round 8](#metal-prefill-round-8-the-routed-experts-november-2026) measured
+  (producer / consumer SIMD-groups, register operands, other tile shapes, prefetching) did not
+  change that. Qwen3.5 / 3.6 MoE checkpoints (a shared expert) take the prefill plan since round
+  8 (1.16x llama.cpp at 512 tokens, 1.47x at 2048; they ran op by op at 0.26x). In the kernels alone (`mma_gemm_bench`, 512 tokens) the
   dense GEMMs reach 40-50 TFLOP/s on Q8_0 / Q4_0 / Q4_K / Q5_K / Q6_K and wide outputs, less on
   2048-wide outputs (35-40) and the 512-wide key / value projections; with this tiling the matrix
   units reach ~51-56 TFLOP/s with the weights' dequantization taken out. Half-precision K-quant
@@ -666,8 +669,8 @@ Where oxinfer is still behind:
   feed-forward now runs beside them, and the routing's small steps (router, top-k, routing,
   gather) are the rest of the layer's critical path. Covering each expert with fewer, fuller
   tiles (64- and 128-row) was slower than the 128 / 32 / 16-row tiling, and loading the next
-  K step's weights early gained nothing. Fusing gate and up is moot for this checkpoint (one fused
-  tensor).
+  K step's weights early gained nothing. Since round 8 gate and up run as one grouped GEMM with
+  the activation in its stores (bit-identical, a few % at most).
 - **CPU prefill against llama.cpp on 12-16 threads**: level or ahead on the models measured in
   [CPU round 3](#cpu-round-3-november-2026) (the 26B-A4B's routed experts now take the int8
   GEMM too, and Qwen / Llama prompts no longer attend with a per-head loop), on a machine too
@@ -776,6 +779,101 @@ Measured and dropped:
   step (37.6 -> 39.6 ms) made them overlap more.
 - RoPE and the q / k norms a SIMD-group per head and token (no threadgroup memory or barriers):
   no faster on Llama 1B or 26B-A4B, and fast math rounded the rotation otherwise.
+
+#### Metal prefill round 8: the routed experts (November 2026)
+
+The target was the 26B-A4B's routed-expert GEMMs (56 of ~118 ms a 512-token pass, round 7).
+Measured first with `moe_bench` at its shapes and its recorded 512-token routing (ms per layer,
+the whole `Backend::moe`: gather, gate / up, activation, down, combine), probes that drop parts
+of the grouped kernel (wrong results): the kernel as it is 2.60-2.65; nothing but the loops and
+the other kernels 0.89-0.93; the weights' loads and dequantization without threadgroup stores or
+products 1.82-2.02, the same with the raw blocks only XORed (no dequantization) 1.87-1.95; the
+products of constant weights 1.86-2.47. So the loads are ~1.0 ms over the base, about the
+weights' streaming time (~390 GB/s: the dequantization's arithmetic costs nothing measurable), the
+products ~1.2 ms (~50 TFLOP/s counting the 16-row padding, the matrix units' rate), and together
+1.7 ms. Splitting the tiles in half, even tiles loading only and odd tiles multiplying only, took
+2.19-2.79 ms: the two kinds of work running side by side slow each other down rather than
+overlap. Everything tried to make them overlap failed (below); llama.cpp's `mul_mm_id` (64 x 32
+tiles, K steps of 32, weights through threadgroup memory) and MLX's `gather_qmm_rhs_nax` (the
+same, with NAX register fragments for the products) are built the same way as oxinfer's.
+
+What changed:
+
+- **Experts that add to a shared expert's output take the prefill plan.** The plans refused
+  `Experts::add` (the routed sum added to what the shared expert wrote), so Qwen3.5 / 3.6 MoE
+  checkpoints (a shared expert in every layer) had no prefill plan at all and ran op by op:
+  Qwen3.5-35B-A3B Q4_K_M prefilled at 780-850 tok/s at 512 tokens (llama.cpp: 3250). The combine
+  now adds (`moe_combine`'s `add`), and the op reads its output for the scheduling: 4.5-5x.
+- **Gate / up pairs as one grouped GEMM** (`mmagp_*` for gate and up in one tensor, Gemma 4's
+  layout; `mmagq_*` for tensors of their own, Qwen's GGUF): as round 7's dense `mmap_*`, a grouped
+  tile's 64 weight rows are 32 gate and the 32 matching up rows, the activation runs in the stores
+  (`act_mul4`'s expression), and the down projection's half rows come from `x_half`. The gate / up
+  rows (rows x 2 x inter f32) are no longer written and read back by `silu_half`. Logits bit for
+  bit the previous build's (the same values in the same order). `OXINFER_PF_XPAIR=0` keeps the
+  two GEMMs and `silu_half`. +0.5-1% at 512 tokens on the 26B-A4B (`pf_ab`, 114.2 / 114.7 against
+  115.0 / 115.6 ms), a few % at 2048 tokens in a noisy window.
+
+Measured on 2026-11-26, one lock window per model and round (load averages 5-11, other agents'
+jobs on the GPU), `llama-bench -p 512,2048 -n 0 -r 4` (llama.cpp master `de30697`) and
+`parity_bench` of master `ee33a51` (before) and this round's build, interleaved, two rounds; best
+of each, tok/s pp512 / pp2048:
+
+| model | llama.cpp | before | after | after / llama.cpp |
+|---|---|---|---|---|
+| Qwen3.5-35B-A3B Q4_K_M | 3265 / 3232 | 849 / 1008 | 3802 / 4741 | 1.16 / 1.47 |
+| Gemma 4 26B-A4B Q4_0 | 4144 / 3688 | 4427 / 5142 | 4459 / 5193 | 1.08 / 1.41 |
+| Gemma 4 26B-A4B Q8_0 | 3573 / 3338 | 3219 / 3097 | 3768 / 4785 | 1.05 / 1.43 |
+
+The Q8_0 rows moved the most with the GPU's other work: alternating the previous build, this one
+with `OXINFER_PF_XPAIR=0` and this one in two more windows gave 3410 / 3357, 3464 / 3444, 3718 /
+3533 and 3347 / 3356, 3661 / 3853, 3782 / 4143 (and on Q4_0 4466 / 4133, 4459 / 4144, 4437 / 4317
+and 4449 / 4226, 4467 / 4361, 4494 / 4749): the pair GEMM is worth a few % at most; the rest of
+the spread is the window.
+
+Correctness (`pf_check`, raw corpus text, `draft=none lookup=0 mtp=0`):
+- The pair GEMMs against `OXINFER_PF_XPAIR=0`: the first step's top-20 log-probabilities and the
+  32 greedy tokens identical on Gemma 4 26B-A4B Q4_0 at 1500 and 4000 tokens (two plan steps),
+  Q8_0 at 1500, and Qwen3.5-35B-A3B at 4000 (`mmagq_*`); `tests/gemma_moe_gpu.rs` (Q8 / Q4 fused
+  experts in the plan) gives the same worst-row errors as before.
+- Qwen3.5-35B-A3B, plan against the previous build's op-by-op GPU path / against the CPU
+  (`device=cpu`): at 1500 tokens KL (top-20) 1.5e-3 with the 32 greedy tokens the same / 6.2e-4
+  (the old GPU path against the CPU: 6.9e-4, both 3 of 32 greedy tokens, a near-uniform raw-text
+  continuation); at 4000 tokens 6.4e-3 / 7.4e-3 (the old path against the CPU: 1.2e-2).
+
+Measured and dropped (`moe_bench`, ms per layer at 512 tokens against 2.60-2.65 for the kernel as
+it is, unless noted; results compared with the default kernels' through `OXINFER_MOE_SAVE` /
+`OXINFER_MOE_CMP`, all bit-identical but the probes):
+
+- **Producer / consumer** SIMD-groups (8 per threadgroup: 4 dequantize the next K step into a
+  second weight tile while 4 run the product, one barrier a step): 2.52-2.59; in the pass +0.5-1%
+  at 512 tokens and 5% slower at 2048 (128-row tiles). Three weight tiles (24 KB, one threadgroup
+  a core): 2.77-2.81. Producers keeping 1, 2 or 4 steps of raw blocks in registers: 2.54-2.64.
+- **The next K step's raw blocks loaded after the barrier that publishes the current one** (their
+  latency under the products, in case barriers wait for loads in flight): 2.72-2.73.
+- **Asynchronous copies into threadgroup memory**: the `air.simdgroup_async_copy_*` intrinsics
+  are refused by the runtime compiler (`illegal string literal in 'asm'`).
+- **Register operands for the products** (MLX's NAX fragments: `matmul2d` 16 x 32 x 16 on
+  cooperative tensors filled in registers, the weights dequantized straight into the fragments,
+  no threadgroup memory and no barriers): right, and 8.0 ms (2 SIMD-groups of 32 outputs) or 10.2
+  (one of 64).
+- **Each K step's weights dequantized once for a whole segment** (an expert's rows past its
+  128-row tiles as one tile, 32-row products one after another): 3.03-3.05; one product of exactly
+  the segment's rows (16-112, a kernel per size): 2.64.
+- **Smaller or larger threadgroup tiles**: K steps of 32 (4 KB of weights, more threadgroups a
+  core) 2.78-2.80; 128 outputs a threadgroup (the token rows read half as often) 3.04, and in the
+  pass 121.4 against 116.2 ms; 8-row products for the 16-row tiles 2.92-2.96 (the matrix units'
+  rows come in 16s: the padding to 16 rows stays); 32-row tiles as two 16-row products ~2.9.
+- **Other operand paths**: the weights' blocks as 32-bit words (5 loads a block instead of 9
+  halfwords) 2.75; the token rows staged in threadgroup memory beside the weights 2.83-2.85.
+- **Occupancy**: 3 KB more threadgroup memory a threadgroup 2.63, 8 KB more (half the
+  threadgroups a core) 2.77-2.81: occupancy is not what limits it.
+- **Barriers between the tile sizes' grids** in the pass (128-, 32- and 16-row tiles one after
+  another): 120.8 against 114.2 ms; their grids running together is worth 6%.
+
+So the grouped GEMMs stay at the sum of their weights' streaming time and their products' time
+less ~30%: on this GPU the matrix units and the memory traffic of the dequantizing loads do not
+run at full rate together, in one threadgroup or across threadgroups. What is left is less work:
+fewer padded rows (16-row granularity is the hardware's) or fewer weight bytes.
 
 #### Metal decode round (November 2026)
 
