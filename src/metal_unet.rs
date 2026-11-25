@@ -913,7 +913,6 @@ impl Cx<'_, '_> {
     /// normalized with `norm` (stats in `S::Stats`) first, upsampled from `src` when `dst` is
     /// twice its size.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn prep(&self, e: &FastEnc, x: Id, src: Lay, dst: Lay, c: usize, norm: Option<(&Norm, bool)>, compact: bool, out: Id) {
         self.prep_scaled(e, x, src, dst, c, norm, compact, out, false)
     }
