@@ -261,15 +261,21 @@ with base and large-v3-turbo, 22 with large-v3; whisper.cpp 19 to 23).
   same pass makes every decoder layer's cross-attention keys and values and keeps them on the
   device (half precision); the host copy of the encoder output is read only for word
   timestamps. A large-v3-turbo window takes about 76 ms of GPU time (whisper.cpp: 101-107 ms).
-- A decoder step is one command buffer: few-row matvecs of the decoder's weights (bf16, q8 or
-  q4), self-attention over a per-sequence device cache (the attention kernel stores the row's
-  new key and value itself), cross-attention over the window's keys and values in chunks of 128
+- A decoder step is a dozen dependent GPU stages per layer, each as short as it can be: a
+  LayerNorm kernel (one threadgroup a row), few-row matvecs of the decoder's weights (bf16, q8
+  or q4; two output rows a threadgroup, each lane's weight chunks loaded before it reads the
+  input) whose epilogue adds the residual and the bias or applies the bias and the exact GELU,
+  self-attention over a per-sequence device cache (the attention kernel stores the row's new key
+  and value itself), cross-attention over the window's keys and values in chunks of 128
   positions merged per head, the logits of the rows asked for.
-- Greedy decoding (temperature 0, one sequence per window) chains 8 steps per command buffer: the
-  token choice runs on the GPU after each step (`whc_select`: the suppressed tokens, the
-  timestamp rules of `process`, the argmax and its log-probability) and the next step's input is
-  gathered from the chosen token there, so a step costs no round trip to the host. The host keeps
-  the tokens up to where the window ends (the rest of the 8 steps is discarded). Beam search and
+- Greedy decoding (temperature 0, one sequence per window) chains 8 steps per submission, one
+  command buffer per step committed as soon as it is encoded (the GPU runs a step while the next
+  ones are encoded): the token choice runs on the GPU after each step (`whc_select`: the
+  suppressed tokens, the timestamp rules of `process`, the argmax and its log-probability) and
+  the next step's input is gathered from the chosen token there, so a step costs no round trip
+  to the host. The steps after the first dispatch indirectly, with sizes that a gate kernel at
+  the start of the step zeroes once every row of the chain has chosen the end token: the steps
+  past the end of a window cost a few microseconds instead of a whole step. Beam search and
   sampling choose on the host, one step per submission.
 - Batches stay exact: every window and every row gets the bits it gets alone (each kernel
   computes a row from that row alone, a window's attention from its own rows). Checked on three

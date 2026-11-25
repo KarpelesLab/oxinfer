@@ -277,16 +277,6 @@ kernel void wh_flash64_f32(device const float* q [[buffer(0)]], device const flo
 }
 
 // ---- Decoder steps ----
-// gelu(y + bias) in place over rows of n.
-struct WDG { uint n; uint _p0; uint _p1; uint _p2; };
-kernel void whd_gelu(device float* y [[buffer(0)]], device const float* bias [[buffer(1)]], constant WDG& p [[buffer(2)]],
-                     uint2 g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-    uint c = g.x * 256 + tid, n4 = p.n / 4;
-    if (c >= n4) return;
-    device float4* r = (device float4*)(y + (ulong)g.y * p.n);
-    r[c] = wh_gelu4(r[c] + ((device const float4*)bias)[c]);
-}
-
 // One query row's attention over n cached positions in chunks of 128, one threadgroup (128
 // threads) per chunk and 64-wide head: q = (q + bias) * scale, keys and values of type T in rows
 // d apart. Each writes its chunk's max score, exponential sum and weighted values (68 floats at
@@ -383,30 +373,6 @@ kernel void whd_part_h(device const float* q [[buffer(0)]], device const float* 
     threadgroup float qs[64], S[128], red[8], kn[64], vn[64];
     threadgroup float4 acc[128];
     whd_part_body<half>(q, qb, k, v, part, p, g, tid, sg, lane, qs, S, red, acc, q, q, q, q, o, kn, vn);
-}
-// x += bias over rows of d (the residual step), then each row's LayerNorm (weight w, bias lb)
-// into f32 rows of `out`: one SIMD-group per row.
-struct WDL { uint d; float eps; uint _p0; uint _p1; };
-kernel void whd_ln(device float* x [[buffer(0)]], device const float* bias [[buffer(1)]], device const float* w [[buffer(2)]],
-                   device const float* lb [[buffer(3)]], device float* out [[buffer(4)]], constant WDL& p [[buffer(5)]],
-                   uint r [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {
-    uint d4 = p.d / 4;
-    device float4* xr = (device float4*)(x + (ulong)r * p.d);
-    device const float4* b4 = (device const float4*)bias;
-    float sum = 0.f;
-    for (uint c = lane; c < d4; c += 32) {
-        float4 v = xr[c] + b4[c];
-        xr[c] = v;
-        sum += v.x + v.y + v.z + v.w;
-    }
-    float mean = simd_sum(sum) / float(p.d);
-    float sq = 0.f;
-    for (uint c = lane; c < d4; c += 32) { float4 v = xr[c] - mean; sq += dot(v, v); }
-    float inv = 1.0f / sqrt(simd_sum(sq) / float(p.d) + p.eps);
-    device const float4* w4 = (device const float4*)w;
-    device const float4* l4 = (device const float4*)lb;
-    device float4* o = (device float4*)(out + (ulong)r * p.d);
-    for (uint c = lane; c < d4; c += 32) o[c] = (xr[c] - mean) * inv * w4[c] + l4[c];
 }
 // The chunks of `whd_part_*` of one head (threadgroup, 64 threads: one per value) into o.
 kernel void whd_attn_merge(device const float* part [[buffer(0)]], device float* o [[buffer(1)]], constant WDP& p [[buffer(2)]],
@@ -540,5 +506,163 @@ kernel void whc_select(device const float* logits [[buffer(0)]], device const uc
         n.n = s.n + 1;
         st[r] = n;
     }
+}
+// ---- Decoder matvecs ----
+// y = W x for up to 4 rows of x (`nt`; x rows n_in apart, y rows n_out apart), `nthr` threads a
+// threadgroup: each output row by KS SIMD-groups (`ks`), which split its chunks as `mvt_*` does
+// (lane l of SIMD-group s takes chunks s * 32 + l, then KS * 32 further), nthr / 32 KS rows a
+// threadgroup. A lane loads its weight chunks first (at most WDM_MAXC), then dots them with each
+// row of x. Modes: 0 y = W x, 1 y = (y + W x) + b (the residual), 2 y = gelu(W x + b).
+struct WDM { uint n_out; uint n_in; uint mode; uint ks; uint nt; uint nthr; uint _p0; uint _p1; };
+#define WDM_MAXC 4u
+// A chunk of a weight row, loaded (`wld`) then dotted (`wdot`, mdot's arithmetic).
+struct RBf { packed_ushort4 p[4]; };
+inline void wld(MBf f, uint row, uint c, thread RBf& r) {
+    device const packed_ushort4* p = (device const packed_ushort4*)(f.w + (ulong)row * f.rb + c * 32);
+    for (int i = 0; i < 4; i++) r.p[i] = p[i];
+}
+inline float wdot(MBf f, thread const RBf& r, uint c, thread const X16& xr) {
+    float4 a = bf4(r.p[0]) * xr.v[0];
+    a = fma(bf4(r.p[1]), xr.v[1], a);
+    a = fma(bf4(r.p[2]), xr.v[2], a);
+    a = fma(bf4(r.p[3]), xr.v[3], a);
+    return hsum(a);
+}
+struct RQ8 { uint4 u; float d; };
+inline void wld(MQ8 f, uint row, uint c, thread RQ8& r) {
+    r.u = *(device const uint4*)(f.q + (ulong)row * f.n_in + c * 16);
+    r.d = f.s[(ulong)row * (f.n_in / 32) + c / 2];
+}
+inline float wdot(MQ8 f, thread const RQ8& r, uint c, thread const X16& xr) {
+    float4 a = float4(as_type<char4>(r.u.x)) * xr.v[0];
+    a = fma(float4(as_type<char4>(r.u.y)), xr.v[1], a);
+    a = fma(float4(as_type<char4>(r.u.z)), xr.v[2], a);
+    a = fma(float4(as_type<char4>(r.u.w)), xr.v[3], a);
+    return r.d * hsum(a);
+}
+struct RQ4 { uint4 u; float d; float o; };
+inline void wld(MQ4 f, uint row, uint c, thread RQ4& r) {
+    r.u = *(device const uint4*)(f.q + (ulong)row * (f.n_in / 2) + c * 16);
+    r.d = float(f.s[(ulong)row * (f.n_in / 32) + c]);
+    r.o = f.gk == 0 ? 0.f : as_type<float>(uint(f.o[(ulong)row * f.gpr + c / f.gk]) << 16);
+}
+inline float wdot(MQ4 f, thread const RQ4& r, uint c, thread const X32& xr) {
+    if (f.gk == 0) return r.d * (q4_block(r.u, xr) - 8.f * xsum32(xr));
+    return q4_affine(r.d, q4_block(r.u, xr), xsum32(xr), r.o);
+}
+inline float whd_tg_sum(float v, uint sg, uint nsg, uint lane, threadgroup float* red) {
+    v = simd_sum(v);
+    if (lane == 0) red[sg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float s = 0.f;
+    for (uint i = 0; i < nsg; i++) s += red[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return s;
+}
+template <typename F, typename R, typename X, uint CH>
+inline void whd_mv_body(F f, device const float* x, device float* y, constant WDM& p, device const float* bias,
+                        threadgroup float* red, uint tg, uint sg, uint lane) {
+    const uint KS = p.ks, rpt = p.nthr / 32 / KS, nt = min(p.nt, 4u);
+    const uint row = tg * rpt + sg / KS, ks = sg % KS;
+    const uint rr = min(row, p.n_out - 1), nch = p.n_in / CH;
+    R w[WDM_MAXC];
+    for (uint k = 0; k < WDM_MAXC; k++) {
+        uint c = ks * 32 + lane + k * KS * 32;
+        if (c < nch) wld(f, rr, c, w[k]);
+    }
+    float a[4] = { 0.f, 0.f, 0.f, 0.f };
+    for (uint k = 0; k < WDM_MAXC; k++) {
+        uint c = ks * 32 + lane + k * KS * 32;
+        if (c >= nch) break;
+        for (uint t = 0; t < 4; t++) {
+            if (t >= nt) break;
+            X xr;
+            xload(x + (ulong)t * p.n_in, c, xr);
+            a[t] += wdot(f, w[k], c, xr);
+        }
+    }
+    for (uint t = 0; t < 4; t++) a[t] = simd_sum(a[t]);
+    if (KS > 1) {
+        if (lane == 0)
+            for (uint t = 0; t < 4; t++) red[sg * 4 + t] = a[t];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (ks != 0) return;
+        for (uint t = 0; t < 4; t++) {
+            float s = 0.f;
+            for (uint j = 0; j < KS; j++) s += red[(sg + j) * 4 + t];
+            a[t] = s;
+        }
+    }
+    if (lane < nt && row < p.n_out) {
+        float v = a[0];
+        for (uint t = 1; t < 4; t++) if (lane == t) v = a[t];
+        device float* o = y + (ulong)lane * p.n_out + row;
+        if (p.mode == 0) *o = v;
+        else if (p.mode == 1) *o = (*o + v) + bias[row];
+        else *o = wh_gelu(v + bias[row]);
+    }
+}
+#define WHD_MV_SIG(NAME) \
+kernel void NAME(device const uchar* wb [[buffer(0)]], device const uchar* sb [[buffer(1)]], device const float* x [[buffer(2)]], \
+                 device float* y [[buffer(3)]], constant MV& m [[buffer(4)]], constant WDM& p [[buffer(5)]], \
+                 device const uchar* ob [[buffer(6)]], device const float* bias [[buffer(7)]], \
+                 uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
+                 uint lane [[thread_index_in_simdgroup]])
+WHD_MV_SIG(whd_mv_bf) {
+    threadgroup float red[128];
+    MBf f = { wb + m.w_off, m.gpr };
+    whd_mv_body<MBf, RBf, X16, 16>(f, x, y, p, bias, red, tg, sg, lane);
+}
+WHD_MV_SIG(whd_mv_q8) {
+    threadgroup float red[128];
+    MQ8 f = { (device const char*)(wb + m.w_off), (device const float*)(sb + m.s_off), m.n_in };
+    whd_mv_body<MQ8, RQ8, X16, 16>(f, x, y, p, bias, red, tg, sg, lane);
+}
+WHD_MV_SIG(whd_mv_q4) {
+    threadgroup float red[128];
+    MQ4 f = { wb + m.w_off, (device const half*)(sb + m.s_off), m.n_in, (device const ushort*)(ob + m.o_off), m.gpr, m.gk };
+    whd_mv_body<MQ4, RQ4, X32, 32>(f, x, y, p, bias, red, tg, sg, lane);
+}
+
+// Rows' LayerNorms (weight w, bias b) into `out`, one threadgroup of 256 threads a row, the
+// row's values in registers (at most 2048).
+struct WDL { uint d; float eps; uint _p0; uint _p1; };
+kernel void whd_ln(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]], device const float* b [[buffer(2)]],
+                   device float* out [[buffer(3)]], constant WDL& p [[buffer(4)]],
+                   uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                   uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    const uint d4 = p.d / 4;
+    device const float4* xr = (device const float4*)(x + (ulong)r * p.d);
+    device float4* o = (device float4*)(out + (ulong)r * p.d);
+    float4 xv[2], wv[2], bv[2];
+    float s = 0.f;
+    for (uint j = 0; j < 2; j++) {
+        uint c = tid + j * 256;
+        if (c < d4) {
+            xv[j] = xr[c]; wv[j] = ((device const float4*)w)[c]; bv[j] = ((device const float4*)b)[c];
+            s += xv[j].x + xv[j].y + xv[j].z + xv[j].w;
+        }
+    }
+    float mean = whd_tg_sum(s, sg, 8, lane, red) / float(p.d);
+    float sq = 0.f;
+    for (uint j = 0; j < 2; j++)
+        if (tid + j * 256 < d4) { float4 v = xv[j] - mean; sq += dot(v, v); }
+    float inv = 1.0f / sqrt(whd_tg_sum(sq, sg, 8, lane, red) / float(p.d) + p.eps);
+    for (uint j = 0; j < 2; j++) {
+        uint c = tid + j * 256;
+        if (c < d4) o[c] = (xv[j] - mean) * inv * wv[j] + bv[j];
+    }
+}
+
+// Greedy chains end early: at the start of a chain's later steps, the step's indirect dispatch
+// sizes (`n` u32s at args[tmpl], written by the host) go to their live copy (args[tmpl + n]) the
+// dispatches read, or zeros once every row has chosen the end token (the step then does nothing).
+struct WCG { uint rows; uint eot; uint tmpl; uint n; };
+kernel void whc_gate(device const WCS* st [[buffer(0)]], device uint* args [[buffer(1)]], constant WCG& p [[buffer(2)]],
+                     uint tid [[thread_index_in_threadgroup]]) {
+    bool dead = true;
+    for (uint r = 0; r < p.rows; r++) dead = dead && st[r].last == p.eot;
+    for (uint i = tid; i < p.n; i += 256) args[p.tmpl + p.n + i] = dead ? 0u : args[p.tmpl + i];
 }
 #endif

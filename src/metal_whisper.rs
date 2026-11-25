@@ -9,7 +9,7 @@
 //! 1536), and every kernel computes a row from that row alone (attention from its own window), so
 //! a window gets the same bits stacked with others as alone.
 
-use super::decode::{FastEnc, Fns, MvParams, MvWeight, run_concurrent};
+use super::decode::{FastEnc, Fns, MvFmt, MvParams, MvWeight, run_concurrent};
 use super::*;
 use crate::gpu::whisper::{ChainRow, CrossLin, Decoder, DevMem, Encoder, Greedy, Lin, Row, Session};
 
@@ -26,6 +26,91 @@ fn skip_op(op: &str) -> bool {
         .any(|x| x == op)
 }
 
+/// Profiling (`OXINFER_WHISPER_REP=op:n`): op `op` of the decoder layers (qkv, self, o, cq,
+/// cross, merge, co, fc1, fc2) encoded n times (its marginal cost).
+fn reps(op: &str) -> usize {
+    static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let s = S.get_or_init(|| std::env::var("OXINFER_WHISPER_REP").unwrap_or_default());
+    s.split_once(':')
+        .filter(|(o, _)| *o == op)
+        .and_then(|(_, n)| n.parse().ok())
+        .unwrap_or(1)
+}
+
+/// Profiling (`OXINFER_WHISPER_PROF`): decoder submissions, steps, GPU and wall nanoseconds.
+static PROF: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+fn prof_on() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var_os("OXINFER_WHISPER_PROF").is_some())
+}
+
+/// The encoder of a decoder pass: barriers left out with `OXINFER_WHISPER_SKIP=dbar`
+/// (profiling); with `ind`, dispatches read their sizes from a chain's indirect arguments: the
+/// arguments buffer, the host's copy of this step's sizes (`end` u32s at most, `next` used) and
+/// the u32 index of the live copy the dispatches read.
+struct DEnc<'a, 'f> {
+    e: &'a FastEnc<'f>,
+    nobar: bool,
+    ind: Option<(Id, *mut u32, usize)>,
+    next: std::cell::Cell<usize>,
+    end: usize,
+}
+impl<'f> std::ops::Deref for DEnc<'_, 'f> {
+    type Target = FastEnc<'f>;
+    fn deref(&self) -> &FastEnc<'f> {
+        self.e
+    }
+}
+impl DEnc<'_, '_> {
+    fn barrier(&self) {
+        if !self.nobar {
+            self.e.barrier();
+        }
+    }
+    fn dispatch(&self, groups: (usize, usize), threads: usize) {
+        if let Some((buf, host, live)) = self.ind {
+            let i = self.next.get();
+            if i + 3 <= self.end {
+                // SAFETY: the host copy holds `end` u32s.
+                unsafe { std::ptr::copy_nonoverlapping([groups.0 as u32, groups.1 as u32, 1].as_ptr(), host.add(i), 3) };
+                self.next.set(i + 3);
+                self.e.dispatch_indirect(buf, (live + i) * 4, threads);
+                return;
+            }
+        }
+        self.e.dispatch(groups, threads);
+    }
+}
+
+/// Threads a threadgroup of the decoder matvecs (two rows with one SIMD-group a row: fastest
+/// on an M5 Max, against 1 to 16 rows a threadgroup).
+fn mv_threads(ks: usize) -> usize {
+    64.max(32 * ks)
+}
+
+/// u32s of a chain step's indirect dispatch sizes, for `t` rows of `nl` layers (three per
+/// dispatch: matvecs by groups of 4 rows, every row's attention parts and merges, the key and
+/// value stores, the LayerNorms, the logits, the input and the choice). A step with more
+/// dispatches than that dispatches the rest directly.
+fn step_cap(nl: usize, t: usize) -> usize {
+    3 * (nl * (8 * t.div_ceil(4) + 6 * t + 3) + t + 8)
+}
+
+/// A decoder matvec: the weight, its format's index in `Pipes::mv` and its SIMD-groups per row
+/// (as `mvt_pipe` splits the row's chunks), when each lane takes at most `WDM_MAXC` chunks.
+fn dec_mv(l: &Lin) -> Option<(MvWeight, usize, usize)> {
+    let w = MvWeight::new(&l.w, l.dev, l.n_out, l.n_in)?;
+    let (fi, chunk) = match w.fmt {
+        MvFmt::Bf16 => (0, 16),
+        MvFmt::Q8 => (1, 16),
+        MvFmt::Q4 => (2, 32),
+        MvFmt::Gguf(_) => return None,
+    };
+    let nch = l.n_in / chunk;
+    let ks = (nch / 64).clamp(1, 4).next_power_of_two().min(4);
+    (nch.div_ceil(ks * 32) <= WDM_MAXC).then_some((w, fi, ks))
+}
+
 /// A device buffer that grows on demand (released with the session).
 struct DBuf {
     id: Id,
@@ -40,7 +125,9 @@ struct Pipes {
     bias: Id,
     flash: Id,
     flash_f32: Id,
-    gelu: Id,
+    /// `whd_mv_{bf,q8,q4}`.
+    mv: [Id; 3],
+    gate: Id,
     part_f32: Id,
     part_h: Id,
     merge: Id,
@@ -62,10 +149,10 @@ pub(crate) struct MetalWhisper {
     chain_consts: Option<(Vec<u8>, usize)>,
 }
 
-/// Byte offsets in `B::DConsts`: zeros, then per layer the biases (q, k, v, o, cross q, cross
-/// o, fc1, fc2) and norms (ln1, ln_cross, ln2: weight then bias), then the final norm.
+/// Byte offsets in `B::DConsts` (after zeros, the biases a layer lacks): per layer the biases
+/// (q, k, v, o, cross q, cross o, fc1, fc2) and norms (ln1, ln_cross, ln2: weight then bias),
+/// then the final norm.
 struct DecConsts {
-    zeros: usize,
     layers: Vec<([usize; 8], [usize; 6])>,
     ln: [usize; 2],
 }
@@ -110,8 +197,14 @@ enum B {
     Cpos,
     Cstate,
     Cout,
+    Cargs,
 }
-const NBUF: usize = 31;
+const NBUF: usize = 32;
+
+/// Weight chunks per lane of the decoder matvecs (`whd_mv_*`) at most, and values of a row of
+/// the decoder's LayerNorm kernel (`whd_ln`, 256 threads of 2 float4s).
+const WDM_MAXC: usize = 4;
+const WDM_MAXD: usize = 2048;
 
 /// Positions per threadgroup of the decoder's attention (`whd_part_*`), and chunks at most.
 const DEC_CHUNK: usize = 128;
@@ -142,7 +235,8 @@ impl MetalBackend {
             bias: pipe("wh_bias")?,
             flash: pipe("wh_flash64")?,
             flash_f32: pipe("wh_flash64_f32")?,
-            gelu: pipe("whd_gelu")?,
+            mv: [pipe("whd_mv_bf")?, pipe("whd_mv_q8")?, pipe("whd_mv_q4")?],
+            gate: pipe("whc_gate")?,
             part_f32: pipe("whd_part_f32")?,
             part_h: pipe("whd_part_h")?,
             merge: pipe("whd_attn_merge")?,
@@ -269,6 +363,17 @@ impl DevMem for WhMem {
 
 impl Drop for MetalWhisper {
     fn drop(&mut self) {
+        if prof_on() {
+            let v: Vec<u64> = PROF.iter().map(|x| x.load(std::sync::atomic::Ordering::Relaxed)).collect();
+            let st = v[1].max(1) as f64;
+            eprintln!(
+                "whisper decoder: {} submissions, {} steps, GPU {:.3} ms/step, wall {:.3} ms/step",
+                v[0],
+                v[1],
+                v[2] as f64 / st / 1e6,
+                v[3] as f64 / st / 1e6
+            );
+        }
         let void: MsgVoid = self.be.o.msg_send();
         for b in &self.bufs {
             if !b.id.is_null() {
@@ -598,9 +703,14 @@ impl Session for MetalWhisper {
     }
 
     fn decodes(&self, dec: &Decoder) -> bool {
-        let be = self.be;
         let d = dec.d;
-        if dec.heads == 0 || d != dec.heads * 64 || dec.max_pos > 1536 || !dec.ffn.is_multiple_of(4) || dec.head.n_out != dec.vocab {
+        if dec.heads == 0
+            || d != dec.heads * 64
+            || d > WDM_MAXD
+            || dec.max_pos > 1536
+            || !dec.ffn.is_multiple_of(4)
+            || dec.head.n_out != dec.vocab
+        {
             return false;
         }
         let lins = dec
@@ -608,13 +718,8 @@ impl Session for MetalWhisper {
             .iter()
             .flat_map(|l| [&l.q, &l.k, &l.v, &l.o, &l.cq, &l.co, &l.fc1, &l.fc2])
             .chain([&dec.head]);
-        for l in lins {
-            let Some(w) = MvWeight::new(&l.w, l.dev, l.n_out, l.n_in) else {
-                return false;
-            };
-            if be.mvt_pipe(w.fmt, l.n_in).is_none() {
-                return false;
-            }
+        if lins.into_iter().any(|l| dec_mv(l).is_none()) {
+            return false;
         }
         dec.layers.iter().all(|l| {
             [&l.q, &l.k, &l.v, &l.o, &l.cq, &l.co].iter().all(|x| x.n_out == d && x.n_in == d)
@@ -702,7 +807,8 @@ impl Session for MetalWhisper {
         let ok = self.ensure(B::Cmask, v)
             && self.ensure(B::Cpos, dec.max_pos * d * 4)
             && self.ensure(B::Cstate, t * 32)
-            && self.ensure(B::Cout, t * steps * 8);
+            && self.ensure(B::Cout, t * steps * 8)
+            && self.ensure(B::Cargs, 2 * steps * step_cap(dec.layers.len(), t) * 4);
         if !ok {
             return false;
         }
@@ -850,7 +956,7 @@ impl MetalWhisper {
             }
             // SAFETY: sized above; the device is idle.
             unsafe { par_copy(self.host(B::DConsts), consts.as_ptr(), consts.len()) };
-            self.dconsts = Some((key, DecConsts { zeros, layers, ln }));
+            self.dconsts = Some((key, DecConsts { layers, ln }));
         }
         true
     }
@@ -876,7 +982,7 @@ impl MetalWhisper {
         chain: Option<&ChainSpec>,
     ) -> bool {
         let be = self.be;
-        let (d, ffn, nh, v, nl) = (dec.d, dec.ffn, dec.heads, dec.vocab, dec.layers.len());
+        let (d, nh, v, nl) = (dec.d, dec.heads, dec.vocab, dec.layers.len());
         let t = pos.len();
         // The rows' sequences: runs of rows sharing a cache, at consecutive positions.
         let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
@@ -893,16 +999,13 @@ impl MetalWhisper {
             .flat_map(|l| [&l.q, &l.k, &l.v, &l.o, &l.cq, &l.co, &l.fc1, &l.fc2])
             .chain([&dec.head])
         {
-            let Some(w) = MvWeight::new(&l.w, l.dev, l.n_out, l.n_in) else {
-                return false;
-            };
-            let Some((pipe, nr, ks)) = be.mvt_pipe(w.fmt, l.n_in) else {
+            let Some((w, fi, ks)) = dec_mv(l) else {
                 return false;
             };
             if let Some(mw) = l.dev.downcast_ref::<MetalWeight>() {
                 mw.keep_resident(&be.residency);
             }
-            ws.push((w, pipe, nr, ks));
+            ws.push((w, fi, ks));
         }
         let ids: [Id; NBUF] = std::array::from_fn(|i| self.bufs[i].id);
         let id = |b: B| ids[b as usize];
@@ -912,54 +1015,62 @@ impl MetalWhisper {
         let scale = (64f32).powf(-0.5);
         let cross_ids: Vec<(Id, usize)> = mems.iter().map(|(_, c)| c.get()).collect();
         let kv_ids: Vec<(Id, usize)> = mems.iter().map(|(k, _)| k.get()).collect();
-        // Rows `r0..r0 + n` of x (`n_in` apart) through matvec `wi` into y (`n_out` apart).
-        let mv = |e: &FastEnc, wi: usize, x: Id, r0: usize, n: usize, y: Id, y0: usize, add: bool| {
+        // Rows `r0..r0 + n` of x (`n_in` apart) through matvec `wi` into y (`n_out` apart), by
+        // `mode`: 0 store, 1 residual add then bias `bias`, 2 GELU of the sum with the bias.
+        let mv = |e: &DEnc, wi: usize, x: Id, r0: usize, n: usize, y: Id, y0: usize, mode: u32, bias: usize| {
             if (wi == nl * 8 && skip_op("dhead")) || (wi < nl * 8 && skip_op("dmv")) {
                 return;
             }
-            let (w, pipe, nr, ks) = &ws[wi];
-            e.pipe(*pipe);
-            e.buf(w.data, 0, 0);
-            e.buf(w.scales, 0, 1);
-            e.buf(w.data, 0, 5);
-            e.buf(w.scales, 0, 6);
-            e.buf(w.offs, 0, 7);
-            e.buf(w.offs, 0, 8);
+            let (w, fi, ks) = &ws[wi];
+            let thr = mv_threads(*ks);
+            let rpt = thr / 32 / ks;
             for g in (0..n).step_by(4) {
                 let k = (n - g).min(4);
-                let pr = MvParams {
-                    n_out: w.n_out as u32,
-                    n_in: w.n_in as u32,
-                    mode: add as u32,
-                    rows_per_tg: *nr as u32,
-                    w_off: w.data_off,
-                    s_off: w.scales_off,
-                    w2_off: w.data_off,
-                    s2_off: w.scales_off,
-                    o_off: w.offs_off,
-                    o2_off: w.offs_off,
-                    gpr: w.gpr,
-                    gk: w.gk,
-                    ldy: k as u32,
-                    _p: 0,
-                };
+                e.pipe(p.mv[*fi]);
+                e.buf(w.data, 0, 0);
+                e.buf(w.scales, 0, 1);
                 e.buf(x, (r0 + g) * w.n_in * 4, 2);
                 e.buf(y, (y0 + g) * w.n_out * 4, 3);
-                e.bytes(&pr, 4);
-                e.buf(x, (r0 + g) * w.n_in * 4, 9);
-                e.dispatch((w.n_out.div_ceil(*nr), 1), 32 * ks);
+                e.bytes(
+                    &MvParams {
+                        n_out: w.n_out as u32,
+                        n_in: w.n_in as u32,
+                        mode,
+                        rows_per_tg: rpt as u32,
+                        w_off: w.data_off,
+                        s_off: w.scales_off,
+                        w2_off: w.data_off,
+                        s2_off: w.scales_off,
+                        o_off: w.offs_off,
+                        o2_off: w.offs_off,
+                        gpr: w.gpr,
+                        gk: w.gk,
+                        ldy: k as u32,
+                        _p: 0,
+                    },
+                    4,
+                );
+                e.bytes(
+                    &U8([w.n_out as u32, w.n_in as u32, mode, *ks as u32, k as u32, thr as u32, 0, 0]),
+                    5,
+                );
+                e.buf(w.offs, 0, 6);
+                e.buf(cst, bias, 7);
+                e.dispatch((w.n_out.div_ceil(rpt), 1), thr);
             }
         };
-        // Dx += bias, then its LayerNorm into Dh.
-        let res_ln = |e: &FastEnc, bias: usize, norm: [usize; 2]| {
+        // The LayerNorms of Dx's rows into Dh.
+        let norm = |e: &DEnc, ln: [usize; 2]| {
+            if skip_op("dln") {
+                return;
+            }
             e.pipe(p.ln);
             e.buf(id(B::Dx), 0, 0);
-            e.buf(cst, bias, 1);
-            e.buf(cst, norm[0], 2);
-            e.buf(cst, norm[1], 3);
-            e.buf(id(B::Dh), 0, 4);
-            e.bytes(&U4([d as u32, dec.eps.to_bits(), 0, 0]), 5);
-            e.dispatch((t, 1), 32);
+            e.buf(cst, ln[0], 1);
+            e.buf(cst, ln[1], 2);
+            e.buf(id(B::Dh), 0, 3);
+            e.bytes(&U4([d as u32, dec.eps.to_bits(), 0, 0]), 4);
+            e.dispatch((t, 1), 256);
             e.barrier();
         };
         // Attention of row i's query (Dq + bias) over `n` rows of keys and values: straight into
@@ -967,7 +1078,10 @@ impl MetalWhisper {
         // Datt. With `fuse` (key and value biases), the row's own key and value (position n - 1)
         // come from Dk / Dv and go to the cache there.
         let part =
-            |e: &FastEnc, pipe: Id, i: usize, qb: usize, kv: (Id, usize, usize), n: usize, elem: usize, fuse: Option<(usize, usize)>| {
+            |e: &DEnc, pipe: Id, i: usize, qb: usize, kv: (Id, usize, usize), n: usize, elem: usize, fuse: Option<(usize, usize)>| {
+                if skip_op(if elem == 4 { "dself" } else { "dcross" }) {
+                    return;
+                }
                 let (buf, k_off, v_off) = kv;
                 e.pipe(pipe);
                 e.buf(id(B::Dq), i * d * 4, 0);
@@ -993,7 +1107,10 @@ impl MetalWhisper {
                 e.buf(id(B::Datt), i * d * 4, 10);
                 e.dispatch((chunks, nh), DEC_CHUNK);
             };
-        let merge = |e: &FastEnc, i: usize, n: usize| {
+        let merge = |e: &DEnc, i: usize, n: usize| {
+            if skip_op("dmerge") {
+                return;
+            }
             e.pipe(p.merge);
             e.buf(id(B::Dpart), i * nh * DEC_CHUNKS * 68 * 4, 0);
             e.buf(id(B::Datt), i * d * 4, 1);
@@ -1001,9 +1118,43 @@ impl MetalWhisper {
             e.dispatch((nh, 1), 64);
         };
         let all: Vec<usize> = (0..t).collect();
-        let (ok, _) = run_concurrent(be, &self.f, std::slice::from_ref(&(0..1)), |e, _| {
-            for step in 0..steps {
+        // A chain's steps after the first dispatch indirectly, from sizes a gate at the start of
+        // the step copies from the ones written here, or zeros once every row has ended.
+        let step_cap = step_cap(nl, t);
+        let args = chain
+            .filter(|_| !skip_op("dstop"))
+            .map(|_| (id(B::Cargs), self.host(B::Cargs) as *mut u32));
+        // One command buffer per step of a chain (the GPU starts on a step while the next ones
+        // are encoded).
+        let parts: Vec<std::ops::Range<usize>> = match chain {
+            Some(_) => (0..steps).map(|s| s..s + 1).collect(),
+            None => std::iter::once(0..steps).collect(),
+        };
+        let t0 = std::time::Instant::now();
+        let (ok, gpu) = run_concurrent(be, &self.f, &parts, |e0, r| {
+            let mut e = DEnc {
+                e: e0,
+                nobar: skip_op("dbar"),
+                ind: None,
+                next: std::cell::Cell::new(0),
+                end: 0,
+            };
+            for step in r {
                 if let Some(c) = chain {
+                    if let Some((abuf, host)) = args.filter(|_| step > 0) {
+                        // The gate: this step's sizes into their live copies.
+                        let tmpl = 2 * step * step_cap;
+                        e.pipe(p.gate);
+                        e.buf(id(B::Cstate), 0, 0);
+                        e.buf(abuf, 0, 1);
+                        e.bytes(&U4([t as u32, c.g.eot, tmpl as u32, step_cap as u32]), 2);
+                        e.e.dispatch((1, 1), 256);
+                        e.barrier();
+                        // SAFETY: Cargs holds 2 * steps * step_cap u32s.
+                        e.ind = Some((abuf, unsafe { host.add(tmpl) }, tmpl + step_cap));
+                        e.next.set(0);
+                        e.end = step_cap;
+                    }
                     // The rows' inputs from their last tokens.
                     let rp: Vec<f32> = pos.iter().map(|&x| f32::from_bits((x + step) as u32)).collect();
                     e.pipe(p.embed);
@@ -1017,15 +1168,17 @@ impl MetalWhisper {
                     e.barrier();
                 }
                 let at = |i: usize| pos[i] + step;
-                let mut prev_bias = dcs.zeros;
                 for (li, (lb, ln)) in dcs.layers.iter().enumerate() {
                     let w0 = li * 8;
                     // Self-attention.
-                    res_ln(e, prev_bias, [ln[0], ln[1]]);
-                    mv(e, w0, id(B::Dh), 0, t, id(B::Dq), 0, false);
-                    mv(e, w0 + 1, id(B::Dh), 0, t, id(B::Dk), 0, false);
-                    mv(e, w0 + 2, id(B::Dh), 0, t, id(B::Dv), 0, false);
-                    e.barrier();
+                    let ln1 = [ln[0], ln[1]];
+                    for _ in 0..reps("qkv") {
+                        norm(&e, ln1);
+                        mv(&e, w0, id(B::Dh), 0, t, id(B::Dq), 0, 0, 0);
+                        mv(&e, w0 + 1, id(B::Dh), 0, t, id(B::Dk), 0, 0, 0);
+                        mv(&e, w0 + 2, id(B::Dh), 0, t, id(B::Dv), 0, 0, 0);
+                        e.barrier();
+                    }
                     // A row alone in its sequence stores its key and value in the attention.
                     let fused = runs.iter().all(|r| r.len() == 1);
                     if !fused {
@@ -1043,51 +1196,60 @@ impl MetalWhisper {
                         }
                         e.barrier();
                     }
-                    for i in 0..t {
-                        let (kid, cap) = kv_ids[i];
-                        let kv = (kid, 2 * li * cap * d, (2 * li + 1) * cap * d);
-                        part(e, p.part_f32, i, lb[0], kv, at(i) + 1, 4, fused.then_some((lb[1], lb[2])));
-                    }
-                    e.barrier();
-                    if (0..t).any(|i| at(i) + 1 > DEC_CHUNK) {
-                        for i in (0..t).filter(|&i| at(i) + 1 > DEC_CHUNK) {
-                            merge(e, i, at(i) + 1);
+                    for _ in 0..reps("self") {
+                        for i in 0..t {
+                            let (kid, cap) = kv_ids[i];
+                            let kv = (kid, 2 * li * cap * d, (2 * li + 1) * cap * d);
+                            part(&e, p.part_f32, i, lb[0], kv, at(i) + 1, 4, fused.then_some((lb[1], lb[2])));
                         }
                         e.barrier();
                     }
-                    mv(e, w0 + 3, id(B::Datt), 0, t, id(B::Dx), 0, true);
-                    e.barrier();
+                    if (0..t).any(|i| at(i) + 1 > DEC_CHUNK) {
+                        for i in (0..t).filter(|&i| at(i) + 1 > DEC_CHUNK) {
+                            merge(&e, i, at(i) + 1);
+                        }
+                        e.barrier();
+                    }
+                    for _ in 0..reps("o") {
+                        mv(&e, w0 + 3, id(B::Datt), 0, t, id(B::Dx), 0, 1, lb[3]);
+                        e.barrier();
+                    }
                     // Cross-attention.
-                    res_ln(e, lb[3], [ln[2], ln[3]]);
-                    mv(e, w0 + 4, id(B::Dh), 0, t, id(B::Dq), 0, false);
-                    e.barrier();
-                    for (i, &(cid, n)) in cross_ids.iter().enumerate() {
-                        part(e, p.part_h, i, lb[4], (cid, 2 * li * n * d, (2 * li + 1) * n * d), n, 2, None);
+                    for _ in 0..reps("cq") {
+                        norm(&e, [ln[2], ln[3]]);
+                        mv(&e, w0 + 4, id(B::Dh), 0, t, id(B::Dq), 0, 0, 0);
+                        e.barrier();
                     }
-                    e.barrier();
-                    for (i, &(_, n)) in cross_ids.iter().enumerate() {
-                        merge(e, i, n);
+                    for _ in 0..reps("cross") {
+                        for (i, &(cid, n)) in cross_ids.iter().enumerate() {
+                            part(&e, p.part_h, i, lb[4], (cid, 2 * li * n * d, (2 * li + 1) * n * d), n, 2, None);
+                        }
+                        e.barrier();
                     }
-                    e.barrier();
-                    mv(e, w0 + 5, id(B::Datt), 0, t, id(B::Dx), 0, true);
-                    e.barrier();
+                    for _ in 0..reps("merge") {
+                        for (i, &(_, n)) in cross_ids.iter().enumerate() {
+                            merge(&e, i, n);
+                        }
+                        e.barrier();
+                    }
+                    for _ in 0..reps("co") {
+                        mv(&e, w0 + 5, id(B::Datt), 0, t, id(B::Dx), 0, 1, lb[5]);
+                        e.barrier();
+                    }
                     // Feed-forward.
-                    res_ln(e, lb[5], [ln[4], ln[5]]);
-                    mv(e, w0 + 6, id(B::Dh), 0, t, id(B::Df), 0, false);
-                    e.barrier();
-                    e.pipe(p.gelu);
-                    e.buf(id(B::Df), 0, 0);
-                    e.buf(cst, lb[6], 1);
-                    e.bytes(&U4([ffn as u32, 0, 0, 0]), 2);
-                    e.dispatch(((ffn / 4).div_ceil(256), t), 256);
-                    e.barrier();
-                    mv(e, w0 + 7, id(B::Df), 0, t, id(B::Dx), 0, true);
-                    e.barrier();
-                    prev_bias = lb[7];
+                    for _ in 0..reps("fc1") {
+                        norm(&e, [ln[4], ln[5]]);
+                        mv(&e, w0 + 6, id(B::Dh), 0, t, id(B::Df), 0, 2, lb[6]);
+                        e.barrier();
+                    }
+                    for _ in 0..reps("fc2") {
+                        mv(&e, w0 + 7, id(B::Df), 0, t, id(B::Dx), 0, 1, lb[7]);
+                        e.barrier();
+                    }
                 }
-                res_ln(e, prev_bias, dcs.ln);
                 // The logits of the rows asked for (every row in a chain), consecutive ones
-                // together.
+                // together, after the final LayerNorm.
+                norm(&e, dcs.ln);
                 let want = want.unwrap_or(&all[..]);
                 let mut k = 0;
                 while k < want.len() {
@@ -1095,7 +1257,7 @@ impl MetalWhisper {
                     while k + n < want.len() && want[k + n] == want[k] + n {
                         n += 1;
                     }
-                    mv(e, nl * 8, id(B::Dh), want[k], n, id(B::Dlog), k, false);
+                    mv(&e, nl * 8, id(B::Dh), want[k], n, id(B::Dlog), k, 0, 0);
                     k += n;
                 }
                 if let Some(c) = chain {
@@ -1124,6 +1286,13 @@ impl MetalWhisper {
                 }
             }
         });
+        if prof_on() {
+            use std::sync::atomic::Ordering::Relaxed;
+            PROF[0].fetch_add(1, Relaxed);
+            PROF[1].fetch_add(steps as u64, Relaxed);
+            PROF[2].fetch_add((gpu * 1e9) as u64, Relaxed);
+            PROF[3].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        }
         ok
     }
 }
