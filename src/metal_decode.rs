@@ -786,6 +786,11 @@ fn pf_glu_half() -> bool {
     // (Read as each plan is built, so that `pf_ab` can compare.)
     std::env::var("OXINFER_PF_GLU_HALF").map_or(true, |v| v != "0")
 }
+/// Whether prefill plans run a gate / up pair and its SwiGLU as one GEMM (`mmap_*`, the same
+/// values); `OXINFER_PF_PAIR=0`: two GEMMs and `pf_glu_half`. Read as each plan is built.
+fn pf_pair() -> bool {
+    std::env::var("OXINFER_PF_PAIR").map_or(true, |v| v != "0")
+}
 /// Whether prefill plans make the GEMMs' half rows in the RMSNorm before them (`pf_norm_half`,
 /// which sums in another order than `dec_rms_norm`; `OXINFER_PF_NORM_HALF=0`: `dec_rms_norm`
 /// and a separate `x_half`).
@@ -2268,6 +2273,9 @@ enum MOp {
         y: usize,
         ldy: u32,
         add: bool,
+        /// A gate / up pair with its SwiGLU in the stores (`mmap_*`, `pipes` theirs; `n_out` the
+        /// GLU's width): the up weight's data and scales, and its w_off and s_off.
+        pair: Option<(Id, Id, [u32; 4])>,
     },
     /// Prefill plans: `y = W x` with f32 weights in the constants (`gemm_f32`, 64 x 64 tiles; the
     /// MoE routers), x rows `n_in` apart, y rows `n_out` apart.
@@ -2640,14 +2648,10 @@ impl KvMirror {
 
 impl Drop for KvMirror {
     fn drop(&mut self) {
-        if let Some(r) = &self.res
-            && !self.k.is_null()
-            && !self.v.is_null()
-        {
-            r.update(&[self.k, self.v], false);
-        }
+        // Pooled buffers stay in the residency set (taken again, they need no new residency
+        // request; they leave it when the pool releases them).
         if !self.k.is_null() && !self.v.is_null() {
-            kv_pool_put(self.bytes, self.k, self.v, self.release);
+            kv_pool_put(self.bytes, self.k, self.v, self.release, self.res.clone());
             return;
         }
         for b in [self.k, self.v] {
@@ -2660,19 +2664,26 @@ impl Drop for KvMirror {
 
 /// Device KV copies of dropped sessions kept for the next ones (a new session would otherwise
 /// allocate fresh buffers, which the GPU then faults in on first write): (bytes, key buffer,
-/// value buffer), at most [`KV_POOL_BYTES`] in all, the oldest released first.
-struct KvPool(Vec<(usize, usize, usize)>);
+/// value buffer, the residency set they are still in), at most [`KV_POOL_BYTES`] in all, the
+/// oldest released first. Taking them back out of a residency set and adding them again cost
+/// ~20 us a buffer (a commit and a residency request each): 0.6-0.8 ms before every prompt of
+/// Llama-3.2-1B.
+type PoolRes = Option<std::sync::Arc<crate::metal::Residency>>;
+struct KvPool(Vec<(usize, usize, usize, PoolRes)>);
 static KV_POOL: std::sync::Mutex<KvPool> = std::sync::Mutex::new(KvPool(Vec::new()));
 /// Bytes of device KV buffers [`KV_POOL`] keeps at most (less on phones).
 const KV_POOL_BYTES: usize = if cfg!(target_os = "ios") { 1 << 28 } else { 1 << 30 };
 
-fn kv_pool_put(cap_bytes: usize, k: Id, v: Id, release: (MsgVoid, Sel)) {
+fn kv_pool_put(cap_bytes: usize, k: Id, v: Id, release: (MsgVoid, Sel), res: PoolRes) {
     let mut p = KV_POOL.lock().unwrap_or_else(|e| e.into_inner());
-    p.0.push((cap_bytes, k as usize, v as usize));
+    p.0.push((cap_bytes, k as usize, v as usize, res));
     let mut total: usize = p.0.iter().map(|e| 2 * e.0).sum();
     while total > KV_POOL_BYTES && !p.0.is_empty() {
-        let (b, k, v) = p.0.remove(0);
+        let (b, k, v, res) = p.0.remove(0);
         total -= 2 * b;
+        if let Some(r) = res {
+            r.update(&[k as Id, v as Id], false);
+        }
         unsafe {
             (release.0)(k as Id, release.1);
             (release.0)(v as Id, release.1);
@@ -2680,12 +2691,21 @@ fn kv_pool_put(cap_bytes: usize, k: Id, v: Id, release: (MsgVoid, Sel)) {
     }
 }
 
-/// A pair of pooled KV buffers of exactly `bytes` each.
-fn kv_pool_take(bytes: usize) -> Option<(Id, Id)> {
+/// A pair of pooled KV buffers of exactly `bytes` each, and whether they are in `res` already.
+fn kv_pool_take(bytes: usize, res: Option<&std::sync::Arc<crate::metal::Residency>>) -> Option<(Id, Id, bool)> {
     let mut p = KV_POOL.lock().unwrap_or_else(|e| e.into_inner());
     let i = p.0.iter().rposition(|e| e.0 == bytes)?;
-    let (_, k, v) = p.0.remove(i);
-    Some((k as Id, v as Id))
+    let (_, k, v, had) = p.0.remove(i);
+    let resident = match (had, res) {
+        (Some(a), Some(b)) if std::sync::Arc::ptr_eq(&a, b) => true,
+        (Some(a), _) => {
+            // (Another residency set's: they leave it.)
+            a.update(&[k as Id, v as Id], false);
+            false
+        }
+        (None, _) => false,
+    };
+    Some((k as Id, v as Id, resident))
 }
 
 /// `EmP` of the shader (`dec_embed`): a token table the device reads.
@@ -2817,6 +2837,23 @@ impl MetalBackend {
     /// as in a multi-token plan. Results differ from one-token steps in rounding.
     pub(crate) fn build_plan_pf(&self, g: &Graph, tokens: usize) -> Option<MetalPlan<'_>> {
         self.build_plan_mode(g, tokens, false, true)
+    }
+
+    /// The pair GEMM pipelines (`mma_pair_pipes`) of a gate / up pair stored in one format,
+    /// neither affine.
+    fn pair_gemm(
+        &self,
+        w: &WeightRef,
+        dev: &DeviceWeight,
+        w2: &(WeightRef, &DeviceWeight),
+        n_out: usize,
+        n_in: usize,
+    ) -> Option<[(Id, usize); 3]> {
+        let (m1, m2) = (dev.downcast_ref::<MetalWeight>()?, w2.1.downcast_ref::<MetalWeight>()?);
+        if m1.offsets.is_some() || m2.offsets.is_some() || MvFmt::of(w)? != MvFmt::of(&w2.0)? {
+            return None;
+        }
+        self.mma_pair_pipes(w, n_out, n_in)
     }
 
     fn build_plan_mode(&self, g: &Graph, tokens: usize, fast: bool, pf: bool) -> Option<MetalPlan<'_>> {
@@ -3191,6 +3228,7 @@ impl MetalBackend {
                             y: 0,
                             ldy: 0,
                             add: false,
+                            pair: None,
                         })
                     };
                     let mmas = if !pf || is_streamed(dev) || w2.as_ref().is_some_and(|(_, d)| is_streamed(d)) {
@@ -3259,6 +3297,32 @@ impl MetalBackend {
                                 r.push(rng(y, n_out));
                                 r.push((PF_RES + 1, 0, usize::MAX));
                                 wv.push((PF_RES + 1, 0, usize::MAX));
+                            }
+                            // (SwiGLU only: GeGLU's tanh in the stores gave other roundings of
+                            // the same values, and no gain on Gemma 4 12B.)
+                            (LinMode::SiluPair, Some(g2))
+                                if let Some(pp) = pf_pair().then(|| self.pair_gemm(w, dev, w2.as_ref()?, n_out, n_in)).flatten() =>
+                            {
+                                // Gate, up and their GLU in one GEMM: the f32 rows, whose half
+                                // rows the down projection's `XHalf` makes.
+                                if let (
+                                    MOp::Gemm {
+                                        pipes, y: gy, ldy, pair, ..
+                                    },
+                                    MOp::Gemm {
+                                        data,
+                                        scales,
+                                        w_off,
+                                        s_off,
+                                        ..
+                                    },
+                                ) = (&mut g1, &g2)
+                                {
+                                    *pipes = pp;
+                                    (*gy, *ldy) = (byte(y), ts(y) as u32);
+                                    *pair = Some((*data, *scales, [*w_off, *s_off, 0, 0]));
+                                }
+                                emit.push(g1);
                             }
                             (LinMode::SiluPair | LinMode::GeluPair, Some(mut g2)) => {
                                 set_y(&mut g1, pf_tmp, 0);
@@ -5326,10 +5390,11 @@ impl MetalPlan<'_> {
         // decoding after a prompt (not the next power of two: GBs unused at long contexts).
         let cap = (need + 1 + need / 8).next_multiple_of(256);
         let bytes = cap * row * if half { 2 } else { 4 };
-        let (k, v) = kv_pool_take(bytes).unwrap_or_else(|| unsafe {
+        let (k, v, resident) = kv_pool_take(bytes, m.res.as_ref()).unwrap_or_else(|| unsafe {
             (
                 new_len(be.device, be.sels.new_buffer_len, bytes, 0),
                 new_len(be.device, be.sels.new_buffer_len, bytes, 0),
+                false,
             )
         });
         if k.is_null() || v.is_null() {
@@ -5349,7 +5414,9 @@ impl MetalPlan<'_> {
             }
         }
         if let Some(r) = &m.res {
-            r.update(&[k, v], true);
+            if !resident {
+                r.update(&[k, v], true);
+            }
             if !m.k.is_null() && !m.v.is_null() {
                 r.update(&[m.k, m.v], false);
             }
@@ -6305,6 +6372,7 @@ impl MetalPlan<'_> {
                 y,
                 ldy,
                 add,
+                pair,
             } => {
                 // Few 128-row tiles (narrow outputs): 64-row ones, or 32-row ones if those are
                 // still few, keep more of the GPU busy. Without matrix units always 64-row ones
@@ -6348,6 +6416,11 @@ impl MetalPlan<'_> {
                     if let Some((ob, op)) = offs {
                         e.buf(*ob, 0, 6);
                         e.bytes(op, 7);
+                    }
+                    if let Some((d2, s2, pq)) = pair {
+                        e.buf(*d2, 0, 6);
+                        e.buf(*s2, 0, 7);
+                        e.bytes(pq, 8);
                     }
                     e.dispatch((n_out / tn, n), 128);
                 }
@@ -7688,6 +7761,7 @@ impl DecodePlan for MetalPlan<'_> {
     fn step(&self, slot: &mut Slot, s: Step) -> bool {
         let t_start = Instant::now();
         let _g = self.lock.lock().unwrap();
+        let t_locked = Instant::now();
         let t = s.t;
         if t == 0
             || t > self.tokens
@@ -7707,7 +7781,11 @@ impl DecodePlan for MetalPlan<'_> {
         }
         let ms = self.slot_of(slot);
         let pos = s.pos;
-        if !self.sync_kv(ms, s.kv, pos, t) || !self.wrap_states(ms, s.states) {
+        if !self.sync_kv(ms, s.kv, pos, t) {
+            return false;
+        }
+        let t_kv = Instant::now();
+        if !self.wrap_states(ms, s.states) {
             return false;
         }
         let stb: Vec<(Id, usize)> = ms
@@ -8050,8 +8128,10 @@ impl DecodePlan for MetalPlan<'_> {
         sync_kv(usize::MAX);
         if trace() {
             eprintln!(
-                "[metal decode step: sync {:.0} us, run {:.0} us, read back {:.0} us]",
+                "[metal decode step: sync {:.0} us (lock {:.0}, kv {:.0}), run {:.0} us, read back {:.0} us]",
                 (t_synced - t_start).as_secs_f64() * 1e6,
+                (t_locked - t_start).as_secs_f64() * 1e6,
+                (t_kv - t_locked).as_secs_f64() * 1e6,
                 (t_ran - t_synced).as_secs_f64() * 1e6,
                 t_ran.elapsed().as_secs_f64() * 1e6
             );

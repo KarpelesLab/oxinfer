@@ -1148,6 +1148,84 @@ MMAG_BF(mmag_bf, GTM) MMAG_BF(mmag_bf_l, 128) MMAG_BF(mmag_bf_s, 16)
 GGM(F16) GGM(Q4_1) GGM(Q5_0) GGM(Q5_1)
 GGM(Q4_0) GGM(IQ4_NL) GGM(Q8_0) GGM(Q4_K) GGM(Q5_K) GGM(Q6_K) GGM(Q3_K) GGM(Q2_K) GGM(IQ4_XS)
 GGM(IQ2_XXS) GGM(IQ2_XS) GGM(IQ2_S) GGM(IQ3_XXS) GGM(IQ3_S) GGM(IQ1_S) GGM(IQ1_M) GGM(MXFP4)
+#if MMA_UNITS
+// Prefill plans: a gate / up pair and its SwiGLU in one GEMM (`mmap_*`). A threadgroup's 64
+// weight rows are 32 gate rows and the 32 matching up rows, so the products run as one dense GEMM
+// tile; the up half of the results goes through threadgroup memory to the threads holding the
+// gate half, which store silu(g) * u for 32 outputs. g and u are rounded to f32 with the token
+// rows' scales first, as the two GEMMs' stores are, and silu as `dec_glu_t`'s: the same values
+// bit for bit, without the gate and up rows' f32 stores and the GLU pass that read them. The
+// plans pass gelu = 0 only (GeGLU's tanh in these stores rounded otherwise), but the branch stays:
+// it keeps the expression in `pf_glu_half`'s shape, which fast math otherwise rearranges (other
+// bits). pq: the up weight's w_off and s_off, gelu.
+template <typename W, int TM>
+inline void mma_pair_tile(W wg, W wu, device const half* xh, device const float* rs, device float* y, uint n_in, uint rows,
+                          uint ob, uint t0, uint tid, threadgroup half* Ws, threadgroup float* U, uint ldy, uint gelu) {
+    XT X((device half*)xh, dextents<int32_t, 2>(n_in, rows));
+    constexpr auto desc = matmul2d_descriptor(TM, 64, MKB, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    typedef tensor<threadgroup half, extents<int32_t, MKB, 64>, tensor_inline> WT;
+    WT Wt(Ws, extents<int32_t, MKB, 64>());
+    auto a0 = X.template slice<MKB, TM>(0, t0);
+    auto c = op.template get_destination_cooperative_tensor<decltype(a0), WT, float>();
+    zero(c);
+    uint row = tid / 2, blk = tid % 2;   // each thread dequantizes one 32-block of one row
+    W w = row < 32 ? wg : wu;
+    uint wrow = ob + row % 32;
+    threadgroup half4* wd = (threadgroup half4*)(Ws + row * MKB + blk * 32);
+    for (uint k0 = 0; k0 < n_in; k0 += MKB) {
+        half4 wv[8];
+        loadh(w, wrow, k0 / 32 + blk, wv);
+        for (uint i = 0; i < 8; i++) wd[i] = wv[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto a = X.template slice<MKB, TM>(k0, t0);
+        op.run(a, Wt, c);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+#pragma unroll
+    for (uint16_t i = 0; i < c.get_capacity(); ++i)
+        if (c.is_valid_element(i)) {
+            auto idx = c.get_multidimensional_index(i);
+            if (idx[0] >= 32) U[idx[1] * 33 + idx[0] - 32] = c[i] * rs[t0 + idx[1]];
+        }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+    for (uint16_t i = 0; i < c.get_capacity(); ++i)
+        if (c.is_valid_element(i)) {
+            auto idx = c.get_multidimensional_index(i);
+            if (idx[0] < 32) {
+                uint r = t0 + idx[1];
+                float a = c[i] * rs[r];
+                float act;
+                if (gelu != 0) {
+                    float tt = 0.7978845608f * (a + 0.044715f * a * a * a);
+                    act = 0.5f * a * (1.0f + precise::tanh(tt));
+                } else {
+                    act = a / (1.0f + exp(-a));
+                }
+                y[(ulong)r * ldy + ob + idx[0]] = act * U[idx[1] * 33 + idx[0]];
+            }
+        }
+}
+#define MMAP_SIG(NAME) \
+kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]], device const half* xh [[buffer(2)]], \
+                 device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
+                 device const void* qb2 [[buffer(6)]], device const void* sb2 [[buffer(7)]], constant uint4& pq [[buffer(8)]], \
+                 uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
+#define MMAP_K(NAME, WT, TM, MK) \
+MMAP_SIG(NAME) { threadgroup half Ws[64 * MKB]; threadgroup float U[TM * 33]; \
+    MP p2 = p; p2.w_off = pq.x; p2.s_off = pq.y; \
+    mma_pair_tile<WT, TM>(MK(qb, sb, p), MK(qb2, sb2, p2), xh, rs, y, p.n_in, p.rows, tg.x * 32, p._p1 + tg.y * TM, tid, Ws, U, p._p0, pq.z); }
+// (MAKE is used directly in the helper's body: forwarded to another macro, its commas would
+// split it.)
+#define MMAP(NAME, WT, MAKE) \
+inline WT NAME##_w(device const void* qb, device const void* sb, MP p) { return MAKE; } \
+MMAP_K(NAME, WT, 128, NAME##_w) MMAP_K(NAME##_s, WT, 32, NAME##_w) MMAP_K(NAME##_m, WT, 64, NAME##_w)
+MMAP(mmap_q8, Q8W, MK_Q8) MMAP(mmap_q4, Q4W, MK_Q4)
+#define GGP(T) MMAP(mmap_##T, T##W, MK_GG(T##W))
+GGP(Q4_0) GGP(Q4_1) GGP(Q5_0) GGP(Q5_1) GGP(Q8_0) GGP(IQ4_NL) GGP(IQ4_XS) GGP(MXFP4)
+GGP(Q2_K) GGP(Q3_K) GGP(Q4_K) GGP(Q5_K) GGP(Q6_K)
+#endif
 
 // Input rows (optionally gathered: row r is source row src[r], zeros for ~0) to half with a
 // power-of-two scale per row (see above); rs gets the inverse scale. Source rows are `stride`
@@ -2741,6 +2819,27 @@ impl MetalBackend {
             (WeightRef::Gguf(g), Tile::Grouped) => (find(&m.g_gguf, g.kind)?, 64),
             (WeightRef::Gguf(g), _) => (pick(find(&m.gguf, g.kind)?, find(&m.gguf_s, g.kind)?), 64),
         })
+    }
+
+    /// The gate / up pair GEMM pipelines with the GLU in their stores (`mmap_*`, matrix units
+    /// only) for 128-, 32- and 64-token tiles, and the outputs per threadgroup (32); built on
+    /// first use.
+    pub(crate) fn mma_pair_pipes(&self, w: &WeightRef, n_out: usize, n_in: usize) -> Option<[(Id, usize); 3]> {
+        let m = self.mma()?;
+        if !m.units || !n_in.is_multiple_of(MMA_KB) || !n_out.is_multiple_of(32) {
+            return None;
+        }
+        let base = match w {
+            WeightRef::Q8(_) => "mmap_q8".to_string(),
+            WeightRef::Q4(_) => "mmap_q4".to_string(),
+            WeightRef::Gguf(g) if fp8_ok(g) => format!("mmap_{}", g.kind.name()),
+            _ => return None,
+        };
+        Some([
+            (self.named_pipeline(&base)?, 32),
+            (self.named_pipeline(&format!("{base}_s"))?, 32),
+            (self.named_pipeline(&format!("{base}_m"))?, 32),
+        ])
     }
 
     /// The grouped (MoE) pipelines of a weight for tiles of `MMA_GTM`, 128 and 16 rows (see
