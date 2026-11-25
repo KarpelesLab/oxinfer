@@ -196,7 +196,10 @@ stays). For small machines the GGUF files are the way: a Q4_0 transformer with a
 (`--text-encoder city96/t5-v1_1-xxl-encoder-gguf:Q4_K_M`) is 9.7 GB on disk, all of it mapped.
 On Metal, every matmul runs on the GPU (M5's matrix units: half-precision operands) and
 attention uses a fused kernel on the matrix units (`flash_attn128_mma`: 7.2 -> 3.6 s per 1024^2
-step against the f32 kernel). `OXINFER_METAL_MMA=0` gives the f32 kernels (the exact rows of the
+step against the f32 kernel; since November 2026 with the scores and probabilities in each
+SIMD-group's matrix registers over key blocks of 32, 1.7x the speed of the threadgroup-memory
+version over 4608 tokens, see [Performance](performance.md): 1.83-1.97 -> 1.70-1.73 s per Q4_0
+1024^2 step). `OXINFER_METAL_MMA=0` gives the f32 kernels (the exact rows of the
 agreement table, 2-2.5x slower).
 
 **Whole passes on the GPU** (the default with matrix units; `--no-device-passes`, the

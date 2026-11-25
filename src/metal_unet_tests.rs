@@ -397,7 +397,8 @@ fn un_gemm_bench() {
         let mut bz = DBuf::empty();
         let a_rows = rows + 256;
         assert!(ensure(be, &mut bx, a_rows * cin * 2));
-        assert!(ensure(be, &mut bw, nout * cin * taps * 2 + 4096));
+        // Twice the outputs: GEMMs with a gate (GEGLU) read the rows past n_out.
+        assert!(ensure(be, &mut bw, 2 * nout * cin * taps * 2 + 4096));
         assert!(ensure(be, &mut by, rows * nout * 4));
         assert!(ensure(be, &mut bz, 4096));
         let mut off = [0i32; 9];
@@ -469,6 +470,266 @@ fn un_gemm_bench() {
                 best * 1e3,
                 flop / best / 1e12
             );
+        }
+    }
+}
+
+/// Softmax attention of `q` (rows x dh) over `k` / `v` (keys x dh) in f64.
+fn attn_ref(q: &[f64], k: &[f64], v: &[f64], dh: usize, scale: f64) -> Vec<f64> {
+    let tk = k.len() / dh;
+    let mut o = vec![0f64; q.len()];
+    for (qr, orow) in q.chunks(dh).zip(o.chunks_mut(dh)) {
+        let s: Vec<f64> = k
+            .chunks(dh)
+            .map(|kr| qr.iter().zip(kr).map(|(a, b)| a * b).sum::<f64>() * scale)
+            .collect();
+        let m = s.iter().cloned().fold(f64::MIN, f64::max);
+        let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
+        let l: f64 = e.iter().sum();
+        for j in 0..tk {
+            for c in 0..dh {
+                orow[c] += e[j] / l * v[j * dh + c];
+            }
+        }
+    }
+    o
+}
+
+/// Relative L2 distance of `y` from `r`.
+fn rel64(y: &[f64], r: &[f64]) -> f64 {
+    let n: f64 = y.iter().zip(r).map(|(a, b)| (a - b).powi(2)).sum();
+    let d: f64 = r.iter().map(|b| b * b).sum();
+    (n / d.max(1e-300)).sqrt()
+}
+
+/// Flash attention kernel timings over UNet shapes, each kernel's output against the first's
+/// (`cargo test --release --lib un_flash_bench -- --ignored --nocapture`; UN_FLASH_KERNELS=a,b
+/// names kernels of one head width, `_m32` ones (and un_flash48 / 64) taking 128 queries a
+/// threadgroup, others 64;
+/// UN_FLASH_SHAPES=images:queries:keys:heads:dh,...).
+#[test]
+#[ignore]
+fn un_flash_bench() {
+    let Ok(b) = MetalBackend::new() else { return };
+    if b.mma().is_none_or(|m| !m.units) {
+        return;
+    }
+    let be: &'static MetalBackend = Box::leak(Box::new(b));
+    let f = Fns::new(be);
+    let names = std::env::var("UN_FLASH_KERNELS").unwrap_or("un_flash48".into());
+    let shapes: Vec<[usize; 5]> = match std::env::var("UN_FLASH_SHAPES") {
+        Ok(v) => v
+            .split(',')
+            .map(|s| {
+                let n: Vec<usize> = s.split(':').map(|x| x.parse().unwrap()).collect();
+                [n[0], n[1], n[2], n[3], n[4]]
+            })
+            .collect(),
+        Err(_) => vec![[2, 4096, 4096, 8, 40], [2, 4096, 77, 8, 40]],
+    };
+    let mut seed = 7u64;
+    for &[nb, tq, tk, heads, dh] in &shapes {
+        let d = head_pad(dh).unwrap();
+        let ks = tk.next_multiple_of(64);
+        let qrows = nb * tq + 512;
+        let krows = nb * ks + 512;
+        let ld = heads * d;
+        let mut bq = DBuf::empty();
+        let mut bk = DBuf::empty();
+        let mut bv = DBuf::empty();
+        let mut bo = DBuf::empty();
+        assert!(ensure(be, &mut bq, qrows * ld * 2));
+        assert!(ensure(be, &mut bk, krows * ld * 2));
+        assert!(ensure(be, &mut bv, krows * ld * 2));
+        assert!(ensure(be, &mut bo, nb * tq * heads * dh * 2));
+        for (buf, rows, amp) in [(&bq, qrows, 2.0f32), (&bk, krows, 2.0), (&bv, krows, 1.0)] {
+            let p = f.contents(buf.id) as *mut u16;
+            for r in 0..rows {
+                for c in 0..ld {
+                    let v = if c % d < dh { rnd(&mut seed) * amp } else { 0.0 };
+                    // SAFETY: rows x ld halves were allocated above.
+                    unsafe { *p.add(r * ld + c) = half::f16::from_f32(v).to_bits() };
+                }
+            }
+        }
+        let p = Ufa {
+            tq: tq as u32,
+            tk: tk as u32,
+            qs: tq as u32,
+            ks: ks as u32,
+            heads: heads as u32,
+            dh: dh as u32,
+            o_ld: (heads * dh) as u32,
+            scale: 1.0 / (dh as f32).sqrt(),
+        };
+        let n_out = nb * tq * heads * dh;
+        let mut first: Option<Vec<f32>> = None;
+        // The first 64 queries of image 0's last head in f64.
+        let hh = heads - 1;
+        let get = |b: &DBuf, r: usize, c: usize| -> f64 {
+            let p = f.contents(b.id) as *const u16;
+            // SAFETY: r < rows, c < dh <= d.
+            half::f16::from_bits(unsafe { *p.add(r * ld + hh * d + c) }).to_f64()
+        };
+        let rq = 64.min(tq);
+        let qr: Vec<f64> = (0..rq * dh).map(|i| get(&bq, i / dh, i % dh)).collect();
+        let kr: Vec<f64> = (0..tk * dh).map(|i| get(&bk, i / dh, i % dh)).collect();
+        let vr: Vec<f64> = (0..tk * dh).map(|i| get(&bv, i / dh, i % dh)).collect();
+        let want = attn_ref(&qr, &kr, &vr, dh, 1.0 / (dh as f64).sqrt());
+        for name in names.split(',') {
+            let pp = be.named_pipeline(name).unwrap();
+            let qtg = if name.contains("_m32") || name == "un_flash48" || name == "un_flash64" {
+                128
+            } else {
+                64
+            };
+            let reps = 20;
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let parts = [std::ops::Range { start: 0, end: reps }];
+                let (ok, _) = run_concurrent(be, &f, &parts, |e, r| {
+                    for _ in r {
+                        e.pipe(pp);
+                        e.buf(bq.id, 0, 0);
+                        e.buf(bk.id, 0, 1);
+                        e.buf(bv.id, 0, 2);
+                        e.buf(bo.id, 0, 3);
+                        e.bytes(&p, 4);
+                        e.dispatch3((tq.div_ceil(qtg), heads * (d / value_chunk(d)), nb), 128);
+                        e.barrier();
+                    }
+                });
+                assert!(ok);
+                best = best.min(t.elapsed().as_secs_f64() / reps as f64);
+            }
+            let op = f.contents(bo.id) as *const u16;
+            // SAFETY: the output holds n_out halves.
+            let out: Vec<f32> = (0..n_out).map(|i| half::f16::from_bits(unsafe { *op.add(i) }).to_f32()).collect();
+            let err = first.as_ref().map_or(0.0, |r| rel(&out, r));
+            let got: Vec<f64> = (0..rq * dh).map(|i| out[(i / dh) * heads * dh + hh * dh + i % dh] as f64).collect();
+            let eref = rel64(&got, &want);
+            eprintln!(
+                "{nb} x {tq:5} q x {tk:5} k x {heads} heads of {dh:3}: {name:14} {:7.3} ms {:6.1} G scores/s, rel {err:.2e}, f64 {eref:.2e}",
+                best * 1e3,
+                (nb * tq * tk * heads) as f64 / best / 1e9
+            );
+            if first.is_none() {
+                first = Some(out);
+            }
+        }
+    }
+}
+
+/// Timings of the DiT attention kernels over 128-wide heads, each kernel's output against the
+/// first's (`cargo test --release --lib fa128_bench -- --ignored --nocapture`;
+/// FA_KERNELS=flash_attn128_mma,dit_flash128_hilo (`hilo` ones read the low halves too),
+/// FA_SHAPES=tokens:heads,...).
+#[test]
+#[ignore]
+fn fa128_bench() {
+    let Ok(b) = MetalBackend::new() else { return };
+    if b.mma().is_none_or(|m| !m.units) {
+        return;
+    }
+    let be: &'static MetalBackend = Box::leak(Box::new(b));
+    let f = Fns::new(be);
+    let names = std::env::var("FA_KERNELS").unwrap_or("flash_attn128_mma".into());
+    let shapes: Vec<[usize; 2]> = match std::env::var("FA_SHAPES") {
+        Ok(v) => v
+            .split(',')
+            .map(|s| {
+                let n: Vec<usize> = s.split(':').map(|x| x.parse().unwrap()).collect();
+                [n[0], n[1]]
+            })
+            .collect(),
+        Err(_) => vec![[4608, 24]],
+    };
+    let mut seed = 11u64;
+    for &[n, heads] in &shapes {
+        let d = heads * 128;
+        let rows = n.next_multiple_of(64);
+        let bufs: Vec<DBuf> = (0..5)
+            .map(|i| {
+                let mut b = DBuf::empty();
+                assert!(ensure(be, &mut b, rows * d * 2));
+                let p = f.contents(b.id) as *mut u16;
+                for j in 0..rows * d {
+                    let v = if j < n * d {
+                        rnd(&mut seed) * if i >= 3 { 1e-3 } else { 3.0 }
+                    } else {
+                        0.0
+                    };
+                    // SAFETY: rows x d halves were allocated above.
+                    unsafe { *p.add(j) = half::f16::from_f32(v).to_bits() };
+                }
+                b
+            })
+            .collect();
+        let mut bo = DBuf::empty();
+        assert!(ensure(be, &mut bo, n * d * 4));
+        let p = U4([n as u32, n as u32, d as u32, (1.0f32 / (128f32).sqrt()).to_bits()]);
+        let mut first: Option<Vec<f32>> = None;
+        // The first 32 queries of head 0 in f64, from the high halves and from hi + lo.
+        let get = |b: &DBuf, i: usize| -> f64 {
+            let p = f.contents(b.id) as *const u16;
+            // SAFETY: i < rows x d.
+            half::f16::from_bits(unsafe { *p.add(i) }).to_f64()
+        };
+        let at = |i: usize| (i / 128) * d + i % 128;
+        let refs: Vec<Vec<f64>> = [false, true]
+            .iter()
+            .map(|&lo| {
+                let qv: Vec<f64> = (0..32 * 128)
+                    .map(|i| get(&bufs[0], at(i)) + if lo { get(&bufs[3], at(i)) } else { 0.0 })
+                    .collect();
+                let kv: Vec<f64> = (0..n * 128)
+                    .map(|i| get(&bufs[1], at(i)) + if lo { get(&bufs[4], at(i)) } else { 0.0 })
+                    .collect();
+                let vv: Vec<f64> = (0..n * 128).map(|i| get(&bufs[2], at(i))).collect();
+                attn_ref(&qv, &kv, &vv, 128, 1.0 / (128f64).sqrt())
+            })
+            .collect();
+        for name in names.split(',') {
+            let pp = be.named_pipeline(name).unwrap();
+            let reps = 10;
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let parts = [std::ops::Range { start: 0, end: reps }];
+                let (ok, _) = run_concurrent(be, &f, &parts, |e, r| {
+                    for _ in r {
+                        e.pipe(pp);
+                        for i in 0..3 {
+                            e.buf(bufs[i].id, 0, i);
+                        }
+                        e.buf(bo.id, 0, 3);
+                        e.bytes(&p, 4);
+                        if name.contains("hilo") {
+                            e.buf(bufs[3].id, 0, 5);
+                            e.buf(bufs[4].id, 0, 6);
+                        }
+                        e.dispatch((n.div_ceil(64), heads), 128);
+                        e.barrier();
+                    }
+                });
+                assert!(ok);
+                best = best.min(t.elapsed().as_secs_f64() / reps as f64);
+            }
+            let op = f.contents(bo.id) as *const f32;
+            // SAFETY: the output holds n x d floats.
+            let out: Vec<f32> = unsafe { std::slice::from_raw_parts(op, n * d) }.to_vec();
+            let err = first.as_ref().map_or(0.0, |r| rel(&out, r));
+            let got: Vec<f64> = (0..32 * 128).map(|i| out[at(i)] as f64).collect();
+            let eref = rel64(&got, &refs[name.contains("hilo") as usize]);
+            eprintln!(
+                "{n:5} tokens x {heads} heads of 128: {name:20} {:7.3} ms {:6.1} G scores/s, rel {err:.2e}, f64 {eref:.2e}",
+                best * 1e3,
+                (n * n * heads) as f64 / best / 1e9
+            );
+            if first.is_none() {
+                first = Some(out);
+            }
         }
     }
 }

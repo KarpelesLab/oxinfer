@@ -272,7 +272,9 @@ half(x) and lo = half(x - hi) (22 bits of x), and `dit_flash128_hilo` (`src/meta
 computes the scores as Qh Kh^T + Qh Kl^T + Ql Kh^T with f32 accumulation (the dropped Ql Kl^T is
 2^-22 of a score), the probabilities and values in half precision as in the fast kernel: three
 half-precision score products and one value product instead of two f32 ones, attention about a
-quarter faster. Against f32 operands: first velocity 7.1e-4, final latents 2.7e-3, 55.7 dB
+quarter faster (and since November 2026 with the scores and probabilities in each SIMD-group's
+matrix registers, `flash_attn128_reg` in `src/metal.rs`: 15.4 -> 13.5 ms over 4608 tokens x 24
+heads; the 1024^2 image 48 dB from the previous kernel's). Against f32 operands: first velocity 7.1e-4, final latents 2.7e-3, 55.7 dB
 (2512 Q4_0, 3 steps CFG 4); Edit-2511 + Lightning 1.8e-3, 9.8e-3, 45.9 dB, both below the
 device-pass-against-per-operation differences above.
 

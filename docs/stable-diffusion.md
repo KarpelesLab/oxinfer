@@ -50,10 +50,14 @@ strided convolutions and narrow inputs (the 4 latent channels) go through an unf
 The GEMM tiles are 128 rows x 64 outputs (64 x 64 where 128-row tiles would leave the GPU's
 cores with fewer than 128 threadgroups). Attention is a fused flash kernel over heads padded to a
 multiple of 16 (48 for SD 1.5's 40, 64, 80, 128, 160; a VAE's single head of 512 in value chunks
-of 128), with an online softmax in base 2 whose running row maximum moves only when a block's
-scores pass it by more than 5 (in log2 units), so most key blocks skip rescaling the output; the
-probabilities, at most 2^5, go to half scaled by 2^10, so that the thousands of tiny ones of a
-long row keep their precision. The text's cross-attention keys and values depend on the prompt
+of 128) in which each SIMD-group owns 16 or 32 queries and keeps the scores, their exponentials,
+the probabilities (fed straight back as the left operand of the second product) and the output
+in its matrix-unit registers, with the row maxima and sums in row-reduction tensors; an online
+softmax in base 2 whose running row maximum moves only when a block's scores pass it by more
+than 5 (in log2 units), so most key blocks skip rescaling the output; the probabilities, at most
+2^5, go to half scaled by 2^10, so that the thousands of tiny ones of a long row keep their
+precision. The feed-forward's first GEMM computes the value and gate outputs of a tile side by
+side and stores the GEGLU's half product directly. The text's cross-attention keys and values depend on the prompt
 only: the first pass of a generation computes them into buffers the session keeps, the other
 steps read them (the session compares the half-precision contexts of the batch with the ones
 they were computed from, so a new prompt recomputes them); the op-by-op path below keeps them
@@ -159,13 +163,55 @@ s with the text encoders' plan (`src/metal_t5.rs`), the VAE decode unchanged.
 - **Text keys and values once per generation:** 94.8 -> 94.6 ms. They were 32 small GEMMs per
   step, already encoded without barriers beside the query; the op-by-op path saves the same 1%.
 
-Left (min of interleaved runs, GPU shared): convolutions 21 ms (0.93 TFLOP per step at 45
+Left after it (min of interleaved runs, GPU shared): convolutions 21 ms (0.93 TFLOP per step at 45
 TFLOP/s), attention 17-19 ms (0.3 TFLOP with the heads padded to 48: score bound, about 80 G scores
-a second, faster than FLUX.1's 128-wide heads per score), the transformer projections and
-feed-forward 11 ms (0.34 TFLOP at 31 TFLOP/s: K of 320-1280), the group norms 4.6 ms, the
-attention's q / k / v projections 4 ms. A softmax on the score tiles in registers (no threadgroup round
-trip) is what attention would need next; the 8x8 level (200 rows) would gain 0.3 ms from 32-wide
-tiles.
+a second), the transformer projections and feed-forward 11 ms (0.34 TFLOP at 31 TFLOP/s: K of
+320-1280), the group norms 4.6 ms, the attention's q / k / v projections 4 ms.
+
+A fourth round (November 2026, same measure): **65.5 -> 47.7 ms** per guided SD 1.5 512x512 step,
+SDXL at 1024x1024 353-372 -> 289-304 ms (min / median of interleaved runs on a shared GPU). End to
+end, 20 guided steps of SD 1.5 sample in 1.1-1.2 s (1.3-1.6 s before on the same runs), SDXL base
+in 5.9 s (7.4-7.6 s).
+
+- **Flash attention in registers** (`un_flash_body`): the scores of a key block came out of the
+  matrix units into threadgroup memory, two lanes per row read them back for the softmax and wrote
+  the half probabilities over them for the second product, with three threadgroup barriers per
+  block. Now each of the 4 SIMD-groups of a threadgroup runs alone over its own queries
+  (`execution_simdgroup` matmuls): `reduce_rows` gives the block's row maxima and sums from the
+  score tensor, the exponentials are taken in place (`map_iterator` reads each element's row
+  maximum), the probabilities are converted to a half destination tensor and handed to the
+  second product with `get_left_input_cooperative_tensor`, and only the rescaling factors of a
+  block where a maximum moved (and the final 1 / sum) pass through threadgroup memory, MQ floats
+  inside the SIMD-group. Measured kernels (`metal::unet::tests::un_flash_bench`, ignored; 2
+  images): SD 1.5's 4096 x 4096 x 8 heads of 40 2.56 -> 1.15 ms (105 -> 233 G scores/s), its
+  77-key cross-attention 0.14 -> 0.05 ms, 1024 x 1024 x 8 heads of 80 0.29 -> 0.14 ms, SDXL's
+  4096 x 4096 x 10 heads of 64 3.4 -> 1.55 ms, the VAE's single head of 512 over 4096 pixels 2.17
+  -> 1.8 ms. Queries per SIMD-group and keys per block are chosen per width (32 and 64 for heads
+  of 48 over many keys, 32 and 32 for 64, 16 and 64 for the others and for the text's 77 keys;
+  32-query tiles at 80 wide, 64-key blocks at 64 wide or 32-key blocks at 80 and 160 were
+  slower). Against the softmax in float64 on the same half operands every variant is 2.6-3.1e-4
+  apart (the half output's rounding), the old kernel as well. Keeping the queries in a left-input
+  cooperative tensor loaded once instead of reading them each block was slower (spills).
+  54.4 ms per step.
+- **GEGLU in the GEMM** (`un_gemm_geglu`): the feed-forward's first GEMM wrote f32 rows of
+  [value | gate] (8192 x 2560 floats at the top level, 84 MB) that a row kernel read back for the
+  half GEGLU. One 64 x 64 tile now accumulates its value outputs and the matching gate outputs
+  side by side and stores `value * gelu(gate)` as half: 0.42 -> 0.29 ms (8192 x 320 -> 2 x 1280),
+  0.32 -> 0.27 ms (2048 x 640 -> 2 x 2560), and the 84 MB scratch buffer is gone.
+- **Group-norm statistics** spread over channels: a threadgroup per chunk of 32 pixels (more for
+  a VAE's full-size tensors, at most 256 chunks an image), image and block of 256 channels, a
+  thread per channel, the partial sums per channel; the second stage sums a group's channels and
+  chunks with 64 threads. Before, a chunk of 64 pixels was one threadgroup for all channels, which
+  left the 8x8 and 16x16 levels with 2-8 threadgroups: the norms 4.3 -> 1.3 ms a step.
+
+The SD 1.5 image after these against diffusers in float32 (`tools/ref_sd.py`, same noise, 20
+Euler steps at guidance 7.5): 37.0 dB before, 36.8 after the attention, 36.7 after all three (the
+op-by-op path: 36.9 dB), the first guided UNet output 6.77e-4 -> 6.72e-4 from the reference, i.e.
+the differences are the trajectory's; SDXL base against diffusers' float32 image 45.2 -> 44.8 dB
+(44.5-45.2 over the earlier rounds). Left: convolutions 21 ms (now 40% of the step; 52-59
+TFLOP/s on the shapes above 8x8, 29 TFLOP/s at 8x8, where 1280-channel 3x3 convolutions over 200
+padded rows give 80 threadgroups), the projections and feed-forward 9 ms, attention 7.6 ms, the
+q / k / v projections 3.5 ms, group norms 1.3 ms.
 
 Op by op (other GPUs, or `gpu_pass=0`), convolutions, attention and the group and layer norms run on the GPU: each norm is fused
 into the convolution or projection that consumes it (a statistics kernel, then normalization and

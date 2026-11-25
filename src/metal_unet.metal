@@ -21,47 +21,48 @@ inline bool un_interior(UGEO g, uint nimg, uint r, thread uint& b, thread uint& 
     return true;
 }
 
-// Group-norm statistics, first stage: per image and chunk of `chunk` pixels, the sum and sum of
-// squares of each group. Grid (chunks, images), 256 threads.
+// Group-norm statistics, first stage: per image, chunk of `chunk` pixels and channel, the sum
+// and sum of squares (of the values minus the group's first value: no cancellation when the
+// mean is large against the spread). Grid (chunks, images, channel blocks of 256), 256 threads,
+// a thread per channel (SIMD-groups read consecutive channels of a pixel).
 struct UGS { UGEO g; uint c; uint groups; uint chunk; uint nchunk; };
 kernel void un_gn_stats(device const float* x [[buffer(0)]], device float2* part [[buffer(1)]], constant UGS& p [[buffer(2)]],
-                        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup float2 cs[2560];
-    uint b = tg.y, n = p.g.h * p.g.w;
+                        uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    uint b = tg.y, ch = tg.z * 256 + tid, n = p.g.h * p.g.w;
+    if (ch >= p.c) return;
     uint p0 = tg.x * p.chunk, p1 = min(p0 + p.chunk, n);
     uint cpg = p.c / p.groups;
-    device const float* x0 = x + (ulong)un_prow(p.g, b, 0, 0) * p.c;
-    for (uint ch = tid; ch < p.c; ch += 256) {
-        // Sums of the values minus the group's first value (no cancellation when the mean is
-        // large against the spread).
-        float s = 0.f, s2 = 0.f, k = x0[(ch / cpg) * cpg];
-        uint y = p0 / p.g.w, xx = p0 - y * p.g.w;
-        for (uint q = p0; q < p1; q++) {
-            float v = x[(ulong)un_prow(p.g, b, y, xx) * p.c + ch] - k;
-            s += v; s2 += v * v;
-            if (++xx == p.g.w) { xx = 0; y++; }
-        }
-        cs[ch] = float2(s, s2);
+    float s = 0.f, s2 = 0.f, k = x[(ulong)un_prow(p.g, b, 0, 0) * p.c + (ch / cpg) * cpg];
+    uint y = p0 / p.g.w, xx = p0 - y * p.g.w;
+    for (uint q = p0; q < p1; q++) {
+        float v = x[(ulong)un_prow(p.g, b, y, xx) * p.c + ch] - k;
+        s += v; s2 += v * v;
+        if (++xx == p.g.w) { xx = 0; y++; }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint gi = tid; gi < p.groups; gi += 256) {
-        float2 a = float2(0.f);
-        for (uint j = 0; j < cpg; j++) a += cs[gi * cpg + j];
-        part[((ulong)b * p.nchunk + tg.x) * p.groups + gi] = a;
-    }
+    part[((ulong)b * p.nchunk + tg.x) * p.c + ch] = float2(s, s2);
 }
-// Second stage: (mean, 1 / std) per image and group. One thread per (group, image).
+// Second stage: (mean, 1 / std) per image and group. A threadgroup (64 threads) per (group, image).
 kernel void un_gn_fin(device const float2* part [[buffer(0)]], device float2* st [[buffer(1)]], constant UGS& p [[buffer(2)]],
                       constant float& eps [[buffer(3)]], device const float* x [[buffer(4)]],
-                      uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-    uint gi = tg.x * 64 + tid, b = tg.y;
-    if (gi >= p.groups) return;
+                      uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float2 red[2];
+    uint gi = tg.x, b = tg.y, cpg = p.c / p.groups, items = p.nchunk * cpg;
     float s = 0.f, s2 = 0.f;
-    for (uint k = 0; k < p.nchunk; k++) { float2 a = part[((ulong)b * p.nchunk + k) * p.groups + gi]; s += a.x; s2 += a.y; }
-    float cnt = float(p.g.h * p.g.w * (p.c / p.groups));
+    for (uint i = tid; i < items; i += 64) {
+        uint kc = i / cpg, j = i - kc * cpg;
+        float2 a = part[((ulong)b * p.nchunk + kc) * p.c + gi * cpg + j];
+        s += a.x; s2 += a.y;
+    }
+    s = simd_sum(s); s2 = simd_sum(s2);
+    if (lane == 0) red[sg] = float2(s, s2);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0) return;
+    s = red[0].x + red[1].x; s2 = red[0].y + red[1].y;
+    float cnt = float(p.g.h * p.g.w * cpg);
     float m = s / cnt;
     float var = max(s2 / cnt - m * m, 0.f);
-    float k = x[(ulong)un_prow(p.g, b, 0, 0) * p.c + gi * (p.c / p.groups)];
+    float k = x[(ulong)un_prow(p.g, b, 0, 0) * p.c + gi * cpg];
     st[b * p.groups + gi] = float2(k + m, 1.0f / sqrt(var + eps));
 }
 
@@ -256,23 +257,48 @@ kernel void un_ln(device const float* x [[buffer(0)]], device half* out [[buffer
     }
 }
 
-// GEGLU: rows of [value | gate] (inner each, f32) into half rows of value * gelu(gate) (erf).
+// erf, for the GEGLU (un_gemm_geglu).
 inline float un_erf(float x) {
     // Abramowitz and Stegun 7.1.26 (|error| < 1.5e-7).
     float t = 1.0f / (1.0f + 0.3275911f * abs(x));
     float y = 1.0f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t * exp(-x * x);
     return copysign(y, x);
 }
-struct UGG { uint inner; uint rows; uint _p0; uint _p1; };
-kernel void un_geglu(device const float* g [[buffer(0)]], device half* out [[buffer(1)]], constant UGG& p [[buffer(2)]],
-                     uint i [[thread_position_in_grid]]) {
-    uint n4 = p.inner / 4, row = i / n4, j = i - row * n4;
-    if (row >= p.rows) return;
-    device const float4* r = (device const float4*)(g + (ulong)row * 2 * p.inner);
-    float4 v = r[j], ga = r[n4 + j];
-    float4 ge = 0.5f * ga * (1.0f + float4(un_erf(ga.x * M_SQRT1_2_F), un_erf(ga.y * M_SQRT1_2_F), un_erf(ga.z * M_SQRT1_2_F),
-                                           un_erf(ga.w * M_SQRT1_2_F)));
-    ((device half4*)(out + (ulong)row * p.inner))[j] = half4(v * ge);
+// The feed-forward's first GEMM with its GEGLU (rows of `ldw` halves, weights of 2 n_out
+// outputs: values then gates, as un_gemm_body's): a tile's value outputs o and gate outputs
+// n_out + o accumulate side by side, and value * gelu(gate) goes out as half rows of n_out (ldy
+// wide), the f32 [value | gate] rows never stored. Bias: bias[o], bias[n_out + o]. 64 rows x 64
+// outputs per threadgroup (faster than 128-row tiles on every UNet shape measured).
+kernel void un_gemm_geglu(device const bfloat* w [[buffer(0)]], device const half* xh [[buffer(1)]], device half* y [[buffer(2)]],
+                          device const float* bias [[buffer(3)]], constant UG& p [[buffer(4)]],
+                          uint2 tg [[threadgroup_position_in_grid]]) {
+    constexpr int TMR = 64, TN = 64;
+    uint o0 = tg.x * TN, t0 = p.r0 + tg.y * TMR;
+    XT X((device half*)xh, dextents<int32_t, 2>(p.cin, p.a_rows));
+    constexpr auto desc = matmul2d_descriptor(TMR, TN, static_cast<int>(dynamic_extent), false, true, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    array<int32_t, 2> ws = { 1, int32_t(p.ldw) };
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> W0((device bfloat*)w, dextents<int32_t, 2>(p.cin, int(2 * p.n_out)), ws);
+    auto a0 = X.slice(0, int(t0));
+    auto bv = W0.slice(0, o0);
+    auto bg = W0.slice(0, o0 + p.n_out);
+    auto cv = op.template get_destination_cooperative_tensor<decltype(a0), decltype(bv), float>();
+    auto cg = op.template get_destination_cooperative_tensor<decltype(a0), decltype(bv), float>();
+    zero(cv);
+    zero(cg);
+    op.run(a0, bv, cv);
+    op.run(a0, bg, cg);
+#pragma unroll
+    for (uint16_t i = 0; i < cv.get_capacity(); ++i) {
+        if (!cv.is_valid_element(i)) continue;
+        auto idx = cv.get_multidimensional_index(i);
+        uint o = o0 + idx[0], r = t0 + idx[1];
+        if (o >= p.n_out || r >= p.r_end) continue;
+        float v = cv[i], g = cg[i];
+        if (p.has_bias != 0) { v += bias[o]; g += bias[p.n_out + o]; }
+        y[(ulong)r * p.ldy + o] = half(v * (0.5f * g * (1.0f + un_erf(g * M_SQRT1_2_F))));
+    }
 }
 
 // Concatenation of the channels of two padded f32 tensors of one geometry.
@@ -289,104 +315,120 @@ kernel void un_concat(device const float* a [[buffer(0)]], device const float* b
 // Fused attention over heads padded to D (half q / k / v rows of heads * D, zeros past the
 // real head width), into half rows of heads * dh (o_ld wide). Image z's queries are rows
 // z qs .. z qs + tq, its keys rows z ks .. z ks + tk (key rows up to the next multiple of 64
-// must be finite: they are masked). One threadgroup (4 SIMD-groups) per 64 queries of one head
-// of one image; keys stream in blocks of 64 with an online softmax (flash_attn128_body's).
+// must be finite: they are masked). Each SIMD-group of a threadgroup (4 of them) owns MQ
+// queries of one head of one image and runs alone: the scores of a key block, their
+// exponentials, the probabilities (as the second product's left operand) and the output stay in
+// its matrix-unit registers (cooperative tensors), the row maxima and sums in row-reduction
+// tensors; only a block's rescaling factors and the final 1 / sum pass through threadgroup
+// memory (MQ floats, within the SIMD-group). Keys stream in blocks of KB (32 or 64) with an online softmax.
 // Heads wider than 160 (a VAE's single head of 512) split their values and outputs into DV-wide
 // chunks, a threadgroup each (the scores computed once per chunk): grid y is heads x D / DV.
-#define UN_SLD 68
-#define UN_PLD (2 * UN_SLD)
+//
 // Scores are in base 2 (the scale times log2(e), exp2). The running row maximum moves only
 // when a block's scores pass it by more than UN_LAZY (probabilities then stay below 2^UN_LAZY),
-// and the output's rescaling is skipped for key blocks where no row of the threadgroup moved.
+// and the output's rescaling is skipped for key blocks where no row of the SIMD-group moved.
 // Probabilities go to half scaled by 2^10: with thousands of keys most are far below half's
 // smallest normal (6e-5), where they would lose their precision; the sums divide it out
 // (2^UN_LAZY * UN_PSCALE stays inside half's range).
 #define UN_LAZY 5.0f
 #define UN_PSCALE 1024.0f
 struct UFA { uint tq; uint tk; uint qs; uint ks; uint heads; uint dh; uint o_ld; float scale; };
-template <int D, int DV>
+template <int D, int DV, int MQ, int KB>
 inline void un_flash_body(device const half* q, device const half* k, device const half* v, device half* o, constant UFA& p,
-                          threadgroup float* S, threadgroup half* P, threadgroup float* A, threadgroup float* L,
-                          threadgroup uint* RS, uint3 tg, uint tid) {
-    uint q0 = tg.x * 64, h = tg.y / (D / DV), vc = (tg.y % (D / DV)) * DV, z = tg.z;
+                          threadgroup float* T, uint3 tg, uint sg) {
+    constexpr int NSG = 4;
+    uint qt0 = tg.x * (NSG * MQ), q0 = qt0 + sg * MQ, h = tg.y / (D / DV), vc = (tg.y % (D / DV)) * DV, z = tg.z;
     int ld = int(p.heads) * D;
-    int qrows = int(p.qs) * int(z) + int(q0) + 64, krows = int(p.ks) * int(z) + int(p.tk + 63) / 64 * 64;
+    int qrows = int(p.qs) * int(z) + int(qt0) + NSG * MQ, krows = int(p.ks) * int(z) + int(p.tk + 63) / 64 * 64;
     tensor<device half, dextents<int32_t, 2>, tensor_inline> Qt((device half*)q, dextents<int32_t, 2>(ld, qrows));
     tensor<device half, dextents<int32_t, 2>, tensor_inline> Kt((device half*)k, dextents<int32_t, 2>(ld, krows));
     tensor<device half, dextents<int32_t, 2>, tensor_inline> Vt((device half*)v, dextents<int32_t, 2>(ld, krows));
-    // Score and probability rows padded (UN_SLD floats, UN_PLD halves) against bank conflicts:
-    // each thread reads half a row.
-    tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline> St(S, dextents<int32_t, 2>(64, 64), array<int32_t, 2>{1, UN_SLD});
-    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> Pt(P, dextents<int32_t, 2>(64, 64), array<int32_t, 2>{1, UN_PLD});
-    constexpr auto ds = matmul2d_descriptor(64, 64, D, false, true, false);
-    constexpr auto dov = matmul2d_descriptor(64, DV, 64, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
-    matmul2d<ds, execution_simdgroups<4>> ops;
-    matmul2d<dov, execution_simdgroups<4>> opo;
+    constexpr auto ds = matmul2d_descriptor(MQ, KB, D, false, true, false);
+    constexpr auto dov = matmul2d_descriptor(MQ, DV, KB, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    using OPS = matmul2d<ds, execution_simdgroup>;
+    using OPO = matmul2d<dov, execution_simdgroup>;
+    OPS ops;
+    OPO opo;
     uint qr0 = p.qs * z + q0, kr0 = p.ks * z;
-    auto qa = Qt.template slice<D, 64>(h * D, qr0);
-    auto vb0 = Vt.template slice<DV, 64>(h * D + vc, kr0);
-    auto co = opo.template get_destination_cooperative_tensor<decltype(Pt), decltype(vb0), float>();
+    auto qa = Qt.template slice<D, MQ>(h * D, qr0);
+    auto kb0 = Kt.template slice<D, KB>(h * D, kr0);
+    auto vb0 = Vt.template slice<DV, KB>(h * D + vc, kr0);
+    using PL = typename OPO::template cooperative_tensor_left_input_t<half, half, float>;
+    auto co = opo.template get_destination_cooperative_tensor<PL, decltype(vb0), float>();
     zero(co);
-    uint r = tid / 2, part = tid % 2;
-    float m = -INFINITY, l = 0.0f;
+    // Per row: the running maximum and sum, a block's maxima (then sums), its rescaling factors.
+    auto mrun = ops.template get_row_reduction_destination_cooperative_tensor<decltype(qa), decltype(kb0), float>();
+    auto lrun = ops.template get_row_reduction_destination_cooperative_tensor<decltype(qa), decltype(kb0), float>();
+    auto rm = ops.template get_row_reduction_destination_cooperative_tensor<decltype(qa), decltype(kb0), float>();
+    auto alpha = ops.template get_row_reduction_destination_cooperative_tensor<decltype(qa), decltype(kb0), float>();
+    for (uint16_t i = 0; i < mrun.get_capacity(); ++i) { mrun[i] = -INFINITY; lrun[i] = 0.f; }
+    threadgroup float* A = T + sg * MQ;
     float sl2 = p.scale * 1.44269504f;
-    threadgroup uint& rescale = RS[0];
-    if (tid == 0) rescale = 0;
-    for (uint kb = 0; kb < p.tk; kb += 64) {
-        auto kt = Kt.template slice<D, 64>(h * D, kr0 + kb);
-        auto cs = ops.template get_destination_cooperative_tensor<decltype(qa), decltype(kt), float>();
-        zero(cs);
+    for (uint kb = 0; kb < p.tk; kb += KB) {
+        auto kt = Kt.template slice<D, KB>(h * D, kr0 + kb);
+        auto cs = ops.template get_destination_cooperative_tensor<decltype(qa), decltype(kb0), float>();
         ops.run(qa, kt, cs);
-        cs.store(St);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float x[32];
-        float bm = -INFINITY;
-        for (uint j = 0; j < 32; j++) {
-            uint col = part * 32 + j;
-            x[j] = kb + col < p.tk ? S[r * UN_SLD + col] * sl2 : -INFINITY;
-            bm = max(bm, x[j]);
-        }
-        bm = max(bm, simd_shuffle_xor(bm, 1));
-        bool grow = bm > m + UN_LAZY;
-        float mn = grow ? bm : m;
-        float alpha = grow ? exp2(m - mn) : 1.0f;
-        if (grow) rescale = 1;
-        float ps = 0.0f;
-        for (uint j = 0; j < 32; j++) { float e = exp2(x[j] - mn); P[r * UN_PLD + part * 32 + j] = half(e * UN_PSCALE); ps += e; }
-        ps += simd_shuffle_xor(ps, 1);
-        l = l * alpha + ps;
-        m = mn;
-        if (part == 0) A[r] = alpha;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (rescale != 0) {
+        bool tail = kb + KB > p.tk;
 #pragma unroll
+        for (uint16_t i = 0; i < cs.get_capacity(); ++i) {
+            float x = cs[i] * sl2;
+            if (tail && kb + cs.get_multidimensional_index(i)[0] >= p.tk) x = -INFINITY;
+            cs[i] = x;
+        }
+        reduce_rows(cs, rm, reduction_operation::max, -INFINITY);
+        bool grew = false;
+        for (uint16_t i = 0; i < rm.get_capacity(); ++i) {
+            float bm = rm[i], mo = mrun[i];
+            bool grow = bm > mo + UN_LAZY;
+            float mn = grow ? bm : mo;
+            alpha[i] = grow ? exp2(mo - mn) : 1.0f;
+            mrun[i] = mn;
+            grew = grew || grow;
+        }
+        for (auto it = cs.begin(); it != cs.end(); it++) {
+            auto mi = mrun.map_iterator(it);
+            *it = exp2(*it - *mi);
+        }
+        reduce_rows(cs, rm, reduction_operation::sum, 0.0f);
+        for (uint16_t i = 0; i < rm.get_capacity(); ++i) lrun[i] = lrun[i] * alpha[i] + rm[i];
+        auto ph = ops.template get_destination_cooperative_tensor<decltype(qa), decltype(kb0), half>();
+#pragma unroll
+        for (uint16_t i = 0; i < cs.get_capacity(); ++i) ph[i] = half(cs[i] * UN_PSCALE);
+        auto pl = opo.template get_left_input_cooperative_tensor<half, half, float>(ph);
+        if (simd_any(grew)) {
+            for (uint16_t i = 0; i < alpha.get_capacity(); ++i)
+                if (alpha.is_valid_element(i)) A[alpha.get_multidimensional_index(i)[0]] = alpha[i];
+            simdgroup_barrier(mem_flags::mem_threadgroup);
             for (uint16_t i = 0; i < co.get_capacity(); ++i)
-                if (co.is_valid_element(i)) { auto idx = co.get_multidimensional_index(i); co[i] *= A[idx[1]]; }
+                if (co.is_valid_element(i)) co[i] *= A[co.get_multidimensional_index(i)[1]];
+            simdgroup_barrier(mem_flags::mem_threadgroup);
         }
-        auto vt = Vt.template slice<DV, 64>(h * D + vc, kr0 + kb);
-        opo.run(Pt, vt, co);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0) rescale = 0;
+        auto vt = Vt.template slice<DV, KB>(h * D + vc, kr0 + kb);
+        opo.run(pl, vt, co);
     }
-    if (part == 0) L[r] = 1.0f / (l * UN_PSCALE);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-#pragma unroll
+    for (uint16_t i = 0; i < lrun.get_capacity(); ++i)
+        if (lrun.is_valid_element(i)) A[lrun.get_multidimensional_index(i)[0]] = 1.0f / (lrun[i] * UN_PSCALE);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
     for (uint16_t i = 0; i < co.get_capacity(); ++i)
         if (co.is_valid_element(i)) {
             auto idx = co.get_multidimensional_index(i);
             uint row = q0 + idx[1], d = vc + idx[0];
-            if (row < p.tq && d < p.dh) o[(ulong)(p.qs * z + row) * p.o_ld + h * p.dh + d] = half(co[i] * L[idx[1]]);
+            if (row < p.tq && d < p.dh) o[(ulong)(p.qs * z + row) * p.o_ld + h * p.dh + d] = half(co[i] * A[idx[1]]);
         }
 }
-#define UN_FLASH(NAME, D, DV) \
+// Queries per SIMD-group MQ and keys per block KB: over many keys 32 and 64 for heads of 48
+// (SD 1.5's 40), 32 and 32 for heads of 64 (SDXL's); 16 and 64 otherwise (the wider heads, and a
+// text's few keys: the _m16 kernels). A threadgroup takes 4 MQ queries (metal_unet.rs:
+// flash_wide). Measured on M5 (metal::unet::tests::un_flash_bench).
+#define UN_FLASH(NAME, D, DV, MQ, KB) \
 kernel void NAME(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]], device const half* v [[buffer(2)]], \
-                        device half* o [[buffer(3)]], constant UFA& p [[buffer(4)]], \
-                        uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
-    threadgroup float S[64 * UN_SLD]; threadgroup half* P = (threadgroup half*)S; threadgroup float A[64]; threadgroup float L[64]; \
-    threadgroup uint RS[1]; \
-    un_flash_body<D, DV>(q, k, v, o, p, S, P, A, L, RS, tg, tid); }
-UN_FLASH(un_flash48, 48, 48) UN_FLASH(un_flash64, 64, 64) UN_FLASH(un_flash80, 80, 80) UN_FLASH(un_flash96, 96, 96) UN_FLASH(un_flash128, 128, 128) UN_FLASH(un_flash160, 160, 160)
-UN_FLASH(un_flash512, 512, 128)
+                 device half* o [[buffer(3)]], constant UFA& p [[buffer(4)]], \
+                 uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float T[4 * MQ]; \
+    un_flash_body<D, DV, MQ, KB>(q, k, v, o, p, T, tg, sg); }
+UN_FLASH(un_flash48, 48, 48, 32, 64) UN_FLASH(un_flash48_m16, 48, 48, 16, 64) UN_FLASH(un_flash64, 64, 64, 32, 32)
+UN_FLASH(un_flash64_m16, 64, 64, 16, 64) UN_FLASH(un_flash80, 80, 80, 16, 64) UN_FLASH(un_flash96, 96, 96, 16, 64)
+UN_FLASH(un_flash128, 128, 128, 16, 64) UN_FLASH(un_flash160, 160, 160, 16, 64) UN_FLASH(un_flash512, 512, 128, 16, 32)
 
 // f32 rows to half rows (n4 float4s each).
 kernel void un_half(device const float* x [[buffer(0)]], device half* out [[buffer(1)]], constant uint& n [[buffer(2)]],

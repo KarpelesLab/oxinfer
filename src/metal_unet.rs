@@ -15,12 +15,20 @@ pub(crate) const SRC: &str = include_str!("metal_unet.metal");
 
 /// Ops per command buffer (the GPU starts on the first while the rest is encoded).
 const OPS_PER_CB: usize = 12;
-/// Pixels per group-norm statistics chunk.
-const GN_CHUNK: usize = 64;
+/// Pixels per group-norm statistics chunk for images of `n` pixels: 32, or more to keep to
+/// 256 chunks an image (a VAE's full-size tensors).
+fn gn_chunk(n: usize) -> usize {
+    n.div_ceil(256).max(32)
+}
+
+/// Bytes of the group-norm partial sums of `nb` images of `n` pixels and `c` channels.
+fn gn_part_bytes(nb: usize, n: usize, c: usize) -> usize {
+    nb * n.div_ceil(gn_chunk(n)) * c * 8
+}
 /// GEMM rows per threadgroup.
 const TM: usize = 128;
 
-/// Profiling (`OXINFER_UNET_SKIP=conv3,conv1,unfold,qkv,lin,flash,gn,prep,ln,geglu,concat`): kinds
+/// Profiling (`OXINFER_UNET_SKIP=conv3,conv1,unfold,qkv,lin,flash,gn,prep,ln,concat`): kinds
 /// of dispatches left out of the passes (the results are then wrong; the time saved is theirs).
 fn skip(kind: &str) -> bool {
     static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -52,12 +60,14 @@ struct Pipes {
     gemm: Id,
     gemm_m64: Id,
     ln: Id,
-    geglu: Id,
+    /// The feed-forward's first GEMM with its GEGLU.
+    gemm_geglu: Id,
     concat: Id,
     half: Id,
     amax: Id,
     amax_clear: Id,
-    flash: [(usize, Id); 7],
+    /// Flash attention per head width: (width, the kernel over many keys, over few).
+    flash: [(usize, Id, Id); 7],
 }
 
 /// Scratch buffers of a session.
@@ -71,21 +81,20 @@ enum S {
     Stats,
     Consts,
     /// Transformer: hidden states (f32 rows), their normalized half copy, q / k / v heads,
-    /// attention output, feed-forward rows and their GEGLU.
+    /// attention output, the feed-forward's GEGLU.
     H,
     Hn,
     Q,
     K,
     V,
     Ah,
-    F,
     Gh,
     /// Text contexts as half rows (each padded to a multiple of 64 with zeros).
     Ctx,
     /// The largest magnitude of a convolution's raw input (float bits).
     Amax,
 }
-const NS: usize = 15;
+const NS: usize = 14;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -213,19 +222,19 @@ impl MetalBackend {
             gemm: pipe("un_gemm")?,
             gemm_m64: pipe("un_gemm_m64")?,
             ln: pipe("un_ln")?,
-            geglu: pipe("un_geglu")?,
+            gemm_geglu: pipe("un_gemm_geglu")?,
             concat: pipe("un_concat")?,
             half: pipe("un_half")?,
             amax: pipe("un_amax")?,
             amax_clear: pipe("un_amax_clear")?,
             flash: [
-                (48, pipe("un_flash48")?),
-                (64, pipe("un_flash64")?),
-                (80, pipe("un_flash80")?),
-                (96, pipe("un_flash96")?),
-                (128, pipe("un_flash128")?),
-                (160, pipe("un_flash160")?),
-                (512, pipe("un_flash512")?),
+                (48, pipe("un_flash48")?, pipe("un_flash48_m16")?),
+                (64, pipe("un_flash64")?, pipe("un_flash64_m16")?),
+                (80, pipe("un_flash80")?, pipe("un_flash80")?),
+                (96, pipe("un_flash96")?, pipe("un_flash96")?),
+                (128, pipe("un_flash128")?, pipe("un_flash128")?),
+                (160, pipe("un_flash160")?, pipe("un_flash160")?),
+                (512, pipe("un_flash512")?, pipe("un_flash512")?),
             ],
         };
         Some(Box::new(MetalUnet {
@@ -305,9 +314,16 @@ impl Lay {
     }
 }
 
-/// Rows of a compact buffer of `n` rows (the last GEMM tile, and flash query blocks, read past).
+/// Rows of a compact buffer of `n` rows (the last GEMM tile, and flash query blocks, read past:
+/// the last image's last block of 128 queries ends up to 127 rows past `n`).
 fn compact_rows(n: usize) -> usize {
-    n.next_multiple_of(TM) + 64
+    n.next_multiple_of(TM) + 128
+}
+
+/// Whether the flash kernel for heads padded to `d` over `tk` keys takes 4 SIMD-groups of 32
+/// queries (heads of 48 or 64 over more than 256 keys), else of 16.
+fn flash_wide(d: usize, tk: usize) -> bool {
+    d <= 64 && tk > 256
 }
 
 /// The flash kernel width for heads of `dh`.
@@ -443,7 +459,7 @@ impl Session for MetalUnet {
                             return false;
                         }
                         consts.norm(n);
-                        need.at_least(S::Part, nb * (sh * sw).div_ceil(GN_CHUNK) * n.groups * 8);
+                        need.at_least(S::Part, gn_part_bytes(nb, h * wd, c));
                         need.at_least(S::Stats, nb * n.groups * 8);
                     }
                     if let Some(b) = bias {
@@ -490,7 +506,7 @@ impl Session for MetalUnet {
                     }
                     let n = h * wd;
                     let rows = compact_rows(nb * n);
-                    need.at_least(S::Part, nb * n.div_ceil(GN_CHUNK) * norm.groups * 8);
+                    need.at_least(S::Part, gn_part_bytes(nb, n, c));
                     need.at_least(S::Stats, nb * norm.groups * 8);
                     need.at_least(S::Xh, rows * c * 2);
                     need.at_least(S::Ah, rows * c * 2);
@@ -512,7 +528,7 @@ impl Session for MetalUnet {
                     consts.norm(&t.norm);
                     let n = h * wd;
                     let rows = compact_rows(nb * n);
-                    need.at_least(S::Part, nb * n.div_ceil(GN_CHUNK) * t.norm.groups * 8);
+                    need.at_least(S::Part, gn_part_bytes(nb, n, c));
                     need.at_least(S::Stats, nb * t.norm.groups * 8);
                     need.at_least(S::Xh, rows * c * 2);
                     need.at_least(S::H, rows * c * 4);
@@ -555,7 +571,6 @@ impl Session for MetalUnet {
                         if !lin_ok(&b.ff1, &mut consts) || !lin_ok(&b.ff2, &mut consts) {
                             return false;
                         }
-                        need.at_least(S::F, rows * 2 * inner * 4);
                         need.at_least(S::Gh, rows * inner * 2);
                     }
                 }
@@ -880,24 +895,65 @@ impl Cx<'_, '_> {
         }
     }
 
+    /// `S::Gh = value * gelu(gate)` (half rows of `inner`) of `[value | gate] = A W^T + bias`
+    /// over `rows` compact half rows of `cin` in `a` (`a_rows` allocated).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_geglu(&self, e: &FastEnc, w: &Lin, a: Id, a_rows: usize, cin: usize, rows: usize, inner: usize) {
+        if skip("lin") {
+            return;
+        }
+        let mw = metal_w(w).unwrap();
+        let bias = w.bias.map(|b| self.consts.get(b.as_ptr()));
+        let p = Ug {
+            n_out: inner as u32,
+            ldw: w.n_in as u32,
+            cin: cin as u32,
+            taps: 1,
+            off: [0; 9],
+            a_rows: a_rows as u32,
+            r0: 0,
+            r_end: rows as u32,
+            omode: 0,
+            ldy: inner as u32,
+            has_bias: bias.is_some() as u32,
+            bstride: 0,
+            add: 0,
+            nimg: 0,
+            dh: 0,
+            dhp: 0,
+            g: Geo::default(),
+            scaled: 0,
+            _p: [0; 3],
+        };
+        e.pipe(self.p.gemm_geglu);
+        e.buf(mw.data.id, mw.data.offset_bytes, 0);
+        e.buf(a, 0, 1);
+        e.buf(self.sc(S::Gh), 0, 2);
+        e.buf(self.cst(), bias.unwrap_or(0), 3);
+        e.bytes(&p, 4);
+        e.dispatch((inner.div_ceil(64), rows.div_ceil(64)), 128);
+        e.barrier();
+    }
+
     /// Group-norm statistics of tensor buffer `x` (layout `l`, `c` channels) into `S::Stats`.
     fn gn_stats(&self, e: &FastEnc, x: Id, l: Lay, c: usize, n: &Norm) {
         if skip("gn") {
             return;
         }
-        let nchunk = (l.h * l.w).div_ceil(GN_CHUNK);
+        let chunk = gn_chunk(l.h * l.w);
+        let nchunk = (l.h * l.w).div_ceil(chunk);
         let p = Ugs {
             g: l.geo(),
             c: c as u32,
             groups: n.groups as u32,
-            chunk: GN_CHUNK as u32,
+            chunk: chunk as u32,
             nchunk: nchunk as u32,
         };
         e.pipe(self.p.stats);
         e.buf(x, 0, 0);
         e.buf(self.sc(S::Part), 0, 1);
         e.bytes(&p, 2);
-        e.dispatch((nchunk, self.nb), 256);
+        e.dispatch3((nchunk, self.nb, c.div_ceil(256)), 256);
         e.barrier();
         e.pipe(self.p.fin);
         e.buf(self.sc(S::Part), 0, 0);
@@ -905,7 +961,7 @@ impl Cx<'_, '_> {
         e.bytes(&p, 2);
         e.bytes(&n.eps, 3);
         e.buf(x, 0, 4);
-        e.dispatch((n.groups.div_ceil(64), self.nb), 64);
+        e.dispatch((n.groups, self.nb), 64);
         e.barrier();
     }
 
@@ -1023,7 +1079,9 @@ impl Cx<'_, '_> {
         }
         let dh = c / a.heads;
         let d = head_pad(dh).unwrap();
-        let pipe = self.p.flash.iter().find(|f| f.0 == d).unwrap().1;
+        let wide = flash_wide(d, tk);
+        let f = self.p.flash.iter().find(|f| f.0 == d).unwrap();
+        let pipe = if wide { f.1 } else { f.2 };
         e.pipe(pipe);
         e.buf(q, 0, 0);
         e.buf(k, 0, 1);
@@ -1042,7 +1100,10 @@ impl Cx<'_, '_> {
             },
             4,
         );
-        e.dispatch3((tq.div_ceil(64), a.heads * (d / value_chunk(d)), self.nb), 128);
+        e.dispatch3(
+            (tq.div_ceil(if wide { 128 } else { 64 }), a.heads * (d / value_chunk(d)), self.nb),
+            128,
+        );
         e.barrier();
     }
 
@@ -1255,19 +1316,7 @@ impl Cx<'_, '_> {
             // GEGLU feed-forward.
             self.ln(e, rows, c, &b.n3);
             let inner = b.ff2.n_in;
-            let fb = self.sc(S::F);
-            let frows = Out::Rows {
-                y: fb,
-                ld: 2 * inner,
-                nimg: n,
-            };
-            self.gemm(e, &b.ff1, hn, crow, c, &[0], (0, rows), frows, None, None, b.ff1.n_out, false);
-            e.pipe(self.p.geglu);
-            e.buf(fb, 0, 0);
-            e.buf(self.sc(S::Gh), 0, 1);
-            e.bytes(&U4([inner as u32, rows as u32, 0, 0]), 2);
-            e.dispatch(((rows * inner / 4).div_ceil(256), 1), 256);
-            e.barrier();
+            self.gemm_geglu(e, &b.ff1, hn, crow, c, rows, inner);
             self.gemm(
                 e,
                 &b.ff2,

@@ -4346,11 +4346,13 @@ attention auto), mflux 0.24 on MLX 0.32.5.
 | | oxinfer, whole-pass UNet plan (batched CFG) | 0.10-0.15 s | 0.06 s | 0.10 s |
 | | oxinfer, CLIP as one GPU pass | | 0.01 s | |
 | | oxinfer, 64-wide GEMM tiles, lazy softmax (interleaved) | 0.067-0.095 s (GPU 65.5 ms, was 94.8) | 0.02 s | 0.09-0.13 s |
+| | oxinfer, attention in registers, fused GEGLU, spread group-norm sums (interleaved) | 0.055-0.06 s (GPU 47.7 ms, was 65.5) | 0.02 s | 0.09-0.13 s |
 | | stable-diffusion.cpp (batched CFG) | 0.24-0.30 s | 0.43 s | 1.23 s |
 | SD-Turbo, 512^2, 1 step | oxinfer before / after | 0.30 / 0.08-0.09 s | 0.09-0.13 s | 0.57 / 0.10 s |
 | | stable-diffusion.cpp | 0.15-0.23 s | 0.24 s | 1.17-1.19 s |
 | SDXL base 1.0 fp16, 1024^2, CFG 5, 20 Euler steps | oxinfer, whole-pass UNet plan | 0.47-0.62 s | 0.18 s | 0.45-0.50 s |
 | | oxinfer, 64-wide GEMM tiles, lazy softmax, text plan (interleaved) | 0.36-0.39 s (was 0.47-0.50 on the same runs) | 0.04-0.05 s | 0.39-0.41 s |
+| | oxinfer, attention in registers, fused GEGLU, spread group-norm sums (interleaved) | 0.30 s (GPU 289-304 ms a step, was 353-372) | 0.04-0.05 s | 0.39-0.41 s |
 | | stable-diffusion.cpp (`--force-sdxl-vae-conv-scale`) | 0.83-1.04 s | 0.78-1.0 s | 4.1-4.3 s |
 
 FLUX.1: the transformer now runs as one GPU plan per pass (see [FLUX.1](flux.md), "Whole passes
@@ -4392,6 +4394,23 @@ had the same 128-wide tiles on the matrix units: FLUX.1 [schnell] from its bf16 
 tok/s, the same outputs. The text's cross-attention keys and values are now computed once per
 generation (SD, SDXL: the session keeps them; SD 3's `context_embedder` and pooled projection
 too), bit-identical and about 0.3% of a step.
+
+Attention in registers (see [Stable Diffusion](stable-diffusion.md#image-generation), "A fourth
+round"): the UNet's flash kernels and FLUX.1's `flash_attn128_mma` / Qwen-Image's
+`dit_flash128_hilo` no longer pass the scores and probabilities of a key block through
+threadgroup memory. Each SIMD-group runs its own queries (`execution_simdgroup` matmuls); the
+row maxima and sums come from `reduce_rows` over the score tensor, the exponentials are taken in
+place, and the probabilities go to the second product as a left-input cooperative tensor
+(`get_left_input_cooperative_tensor`). SD 1.5's 4096-token self-attention 2.56 -> 1.15 ms,
+SDXL's 3.4 -> 1.55 ms; over 128-wide heads (`metal::unet::tests::fa128_bench`, 4608 tokens x 24
+heads) the half kernel 10.3 -> 5.9-6.2 ms and the split-precision one 15.4-15.7 -> 13.5 ms, both
+with key blocks of 32 (with 64-key blocks the register kernels were no faster than the old ones,
+the split-precision one half as fast), every variant 2.0e-4 from a float64 softmax as before. FLUX.1 [schnell] Q4_0 1024^2: 1.83-1.97 -> 1.70-1.73 s
+per step (interleaved), 39.3 dB against the CPU after one step at 512^2 (38.8 dB before);
+Qwen-Image-2512 Q4_0 1024^2 CFG 4: 2.23-2.39 -> 2.18-2.26 s per pass (noise level on the shared
+GPU; its images 48 dB from the previous ones). With the GEGLU fused into the feed-forward GEMM and
+the group-norm statistics spread over channels, a guided SD 1.5 step takes 65.5 -> 47.7 ms of
+GPU time and an SDXL one 353-372 -> 289-304 ms.
 
 SDXL base (the public fp16 files, 1024^2, 20 steps): oxinfer samples in 9.6-12.9 s against
 18.0-20.4 s; on the same torch CPU noise and the same ("trailing") timesteps the images are

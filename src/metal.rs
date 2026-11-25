@@ -1372,7 +1372,8 @@ kernel void silu_half(device const float* gu [[buffer(0)]], device half* ah [[bu
 // output. One threadgroup (4 SIMD-groups) per 64 queries of one head; keys stream in blocks of 64.
 // Scores S = Q K^T (f32) go through threadgroup memory for the online softmax, probabilities come
 // back as T in P for O += P V; O stays in a cooperative tensor, rescaled per query row as the max
-// moves. T = half is the fast kernel; T = float runs at f32 precision. P reuses S's memory (each
+// moves. T = float runs at f32 precision (flash_attn128_mma_f32; the half kernel is
+// flash_attn128_reg below, which keeps S and P in registers). P reuses S's memory (each
 // row of halves in the first half of its row of floats): each pair of lanes reads its row's
 // scores into registers before either writes probabilities over them, and the pair is in one
 // SIMD-group, so the reads complete first; the threadgroup holds 16 KB instead of 24.
@@ -1451,14 +1452,103 @@ inline void flash_attn128_body(device const T* q, device const T* k, device cons
             if (row < p.tq) o[(ulong)row * p.d + h0 + idx[0]] = co[i] * L[idx[1]];
         }
 }
+// The fast kernel's arithmetic with the scores, probabilities and output in the matrix-unit
+// registers of each SIMD-group (flash_attn128_mma, and dit_flash128_hilo with HILO: queries and
+// keys as hi + lo half pairs, scores Qh Kh^T + Qh Kl^T + Ql Kh^T): each of the 4 SIMD-groups owns
+// MQ = 16 of the threadgroup's 64 queries and runs alone over key blocks of KB = 32 (the row
+// maxima and sums in row-reduction tensors, the rescaling factors through MQ floats of
+// threadgroup memory), as un_flash_body in metal_unet.metal: 1.7x the speed of
+// flash_attn128_body over FLUX.1's 4608 tokens (`metal::unet::tests::fa128_bench`).
+template <bool HILO, int MQ = 16, int KB = 32>
+inline void flash_attn128_reg(device const half* q, device const half* k, device const half* v, device float* o, constant FAM& p,
+                                  device const half* ql, device const half* kl, threadgroup float* T, uint2 tg, uint sg) {
+    uint q0 = tg.x * 64 + sg * MQ, h0 = tg.y * 128;
+    uint tqp = (p.tq + 63) / 64 * 64, tkp = (p.tk + 63) / 64 * 64;
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> Qt((device half*)q, dextents<int32_t, 2>(p.d, tqp));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> Qlt((device half*)ql, dextents<int32_t, 2>(p.d, tqp));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> Kt((device half*)k, dextents<int32_t, 2>(p.d, tkp));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> Klt((device half*)kl, dextents<int32_t, 2>(p.d, tkp));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> Vt((device half*)v, dextents<int32_t, 2>(p.d, tkp));
+    using OPS = matmul2d<matmul2d_descriptor(MQ, KB, 128, false, true, false, matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroup>;
+    using OPO = matmul2d<matmul2d_descriptor(MQ, 128, KB, false, false, false, matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroup>;
+    OPS ops;
+    OPO opo;
+    auto qa = Qt.template slice<128, MQ>(h0, q0);
+    auto qla = Qlt.template slice<128, MQ>(h0, q0);
+    auto kb0 = Kt.template slice<128, KB>(h0, 0);
+    auto vb0 = Vt.template slice<128, KB>(h0, 0);
+    using PL = typename OPO::template cooperative_tensor_left_input_t<half, half, float>;
+    auto co = opo.template get_destination_cooperative_tensor<PL, decltype(vb0), float>();
+    zero(co);
+    auto mrun = ops.template get_row_reduction_destination_cooperative_tensor<decltype(qa), decltype(kb0), float>();
+    auto lrun = ops.template get_row_reduction_destination_cooperative_tensor<decltype(qa), decltype(kb0), float>();
+    auto rm = ops.template get_row_reduction_destination_cooperative_tensor<decltype(qa), decltype(kb0), float>();
+    auto alpha = ops.template get_row_reduction_destination_cooperative_tensor<decltype(qa), decltype(kb0), float>();
+    for (uint16_t i = 0; i < mrun.get_capacity(); ++i) { mrun[i] = -INFINITY; lrun[i] = 0.f; }
+    threadgroup float* A = T + sg * MQ;
+    for (uint kb = 0; kb < p.tk; kb += KB) {
+        auto kt = Kt.template slice<128, KB>(h0, kb);
+        auto cs = ops.template get_destination_cooperative_tensor<decltype(qa), decltype(kb0), float>();
+        zero(cs);
+        if (HILO) {
+            auto klt = Klt.template slice<128, KB>(h0, kb);
+            ops.run(qla, kt, cs);
+            ops.run(qa, klt, cs);
+        }
+        ops.run(qa, kt, cs);
+        bool tail = kb + KB > p.tk;
+#pragma unroll
+        for (uint16_t i = 0; i < cs.get_capacity(); ++i) {
+            float x = cs[i] * p.scale;
+            if (tail && kb + cs.get_multidimensional_index(i)[0] >= p.tk) x = -INFINITY;
+            cs[i] = x;
+        }
+        reduce_rows(cs, rm, reduction_operation::max, -INFINITY);
+        bool grew = false;
+        for (uint16_t i = 0; i < rm.get_capacity(); ++i) {
+            float bm = rm[i], mo = mrun[i];
+            bool grow = bm > mo + 8.0f;
+            float mn = grow ? bm : mo;
+            alpha[i] = grow ? exp(mo - mn) : 1.0f;
+            mrun[i] = mn;
+            grew = grew || grow;
+        }
+        for (auto it = cs.begin(); it != cs.end(); it++) {
+            auto mi = mrun.map_iterator(it);
+            *it = exp(*it - *mi);
+        }
+        reduce_rows(cs, rm, reduction_operation::sum, 0.0f);
+        for (uint16_t i = 0; i < rm.get_capacity(); ++i) lrun[i] = lrun[i] * alpha[i] + rm[i];
+        auto ph = ops.template get_destination_cooperative_tensor<decltype(qa), decltype(kb0), half>();
+#pragma unroll
+        for (uint16_t i = 0; i < cs.get_capacity(); ++i) ph[i] = half(cs[i]);
+        auto pl = opo.template get_left_input_cooperative_tensor<half, half, float>(ph);
+        if (simd_any(grew)) {
+            for (uint16_t i = 0; i < alpha.get_capacity(); ++i)
+                if (alpha.is_valid_element(i)) A[alpha.get_multidimensional_index(i)[0]] = alpha[i];
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint16_t i = 0; i < co.get_capacity(); ++i)
+                if (co.is_valid_element(i)) co[i] *= A[co.get_multidimensional_index(i)[1]];
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        auto vt = Vt.template slice<128, KB>(h0, kb);
+        opo.run(pl, vt, co);
+    }
+    for (uint16_t i = 0; i < lrun.get_capacity(); ++i)
+        if (lrun.is_valid_element(i)) A[lrun.get_multidimensional_index(i)[0]] = 1.0f / lrun[i];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint16_t i = 0; i < co.get_capacity(); ++i)
+        if (co.is_valid_element(i)) {
+            auto idx = co.get_multidimensional_index(i);
+            uint row = q0 + idx[1];
+            if (row < p.tq) o[(ulong)row * p.d + h0 + idx[0]] = co[i] * A[idx[1]];
+        }
+}
 kernel void flash_attn128_mma(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],
                               device const half* v [[buffer(2)]], device float* o [[buffer(3)]], constant FAM& p [[buffer(4)]],
-                              uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup float S[64 * 64];
-    threadgroup float A[64];
-    threadgroup float L[64];
-    threadgroup uint RS[1];
-    flash_attn128_body<half>(q, k, v, o, p, S, (threadgroup half*)S, A, L, RS, tg, tid);
+                              uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float T[64];
+    flash_attn128_reg<false>(q, k, v, o, p, q, k, T, tg, sg);
 }
 kernel void flash_attn128_mma_f32(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]],
                                   device const float* v [[buffer(2)]], device float* o [[buffer(3)]], constant FAM& p [[buffer(4)]],
