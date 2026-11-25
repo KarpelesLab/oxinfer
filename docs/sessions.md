@@ -43,9 +43,7 @@ and the next conversation goes back to the latest one within its common prefix w
 a next turn reuses the whole previous prompt, a regenerated reply all of its prompt but the
 last token. `prompt_checkpoints` (engine / C API / per-model server key; default 2, 0 off)
 caps them (each about 650 MB for Inkling-2-Mini with f32 caches, 180 MB with q8; see
-[inkling.md](inkling.md)). Qwen3.5 / 3.6 / 3.8 do not have them yet (their recurrent states can
-live on the GPU between passes); with `--prompt-cache` they restore the stored prompt but its
-last token from disk.
+[inkling.md](inkling.md)). Qwen3.5 / 3.6 / 3.8 take them too (below).
 
 **DeepSeek V4 / V4.1: the same checkpoints.** Every layer keeps a sliding window of raw keys and
 the compressors keep the rows of the windows still pooling, both trimmed as the session goes on
@@ -97,6 +95,48 @@ after). The prompt cache held 2.7 GB (f32 caches: four snapshots of 0.71-0.73 GB
 first turn takes its checkpoints as without a draft (its prompt fed in three parts: 4.7-5.7 s
 against 3.5-5.4 s in one, within the machine's noise). No DeepSeek V4 DSpark draft was at hand
 (V4.1's is not supported yet); V4's is covered by the tiny models' tests.
+
+**Qwen3.5 / 3.6 / 3.8: the same checkpoints.** The Gated DeltaNet layers' recurrent and
+convolution states cannot be cut back at all (a speculative round rewinds within its own pass
+only), so before, any mismatch started the conversation over. A checkpoint
+(`QwenSession::checkpoint`, `reachable`, `cut_to`) holds every recurrent layer's two states as
+they were at its position; the attention layers' KV caches keep every position and are cut
+back. Qwen3.5-4B: 50 MB each (24 layers of 32 heads of 128 x 128), Qwen3.8-27B about 150 MB.
+On Metal the states live in the session's own page-aligned buffers, which the decode plans (one
+token, verification passes, the device-chained greedy decode with its two alternating copies)
+read and update in place and leave up to date after every call; a checkpoint copies them from
+there, a cut back copies them back into the same buffers (and tells the plans they changed,
+`gpu_states_kept`), and the KV caches' device copies sync from the cut back length at the next
+pass. With MTP (`MtpDecoder::checkpoint`) a checkpoint also holds the MTP layer's cache length
+(cut back) and pending rows. Dense, MoE and the VL checkpoints (prompts with images in the
+reused part start over, as for the other models), on the CPU and on Metal; not Qwen4-Exp
+(Qwen3.8-Flash-Next). With a DSpark draft too, as above (`DsparkDecoder::checkpoint` over the
+session's own; `engine` `drafts_reuse_the_previous_prompt`'s "Qwen3.5 DSpark" case, on a tiny
+random draft from `qwen::tiny::write_draft`). `Engine::chat` takes them as for Inkling-2
+(`prompt_checkpoints`, default 2, 0 off). Tests on a tiny random Qwen3.5
+(`src/qwen35_tiny.rs`, dense or MoE, with or without MTP): `qwen::tiny` tests
+`checkpoint_cut_back_matches_fresh`, `mtp_checkpoint_cut_back_matches_fresh` (the CPU, bit for
+bit against a fresh session's same passes), `tests/gpu_chain.rs`
+`qwen35_checkpoints_on_the_device` (Metal: one-token steps, a chain and MTP verification
+passes after the cut back, bit for bit), `engine` `qwen35_chat_reuses_the_previous_prompt`
+(turn 2, a regenerated reply, an edited message) and `tests/server.rs`
+`qwen35_chat_reuses_the_cache_after_thinking`.
+
+Measured with `examples/chat_turns.rs` (M5 Max, Metal, warm page cache, load 1-5; best and
+worst of two interleaved runs): a first turn of about 3000 tokens in thinking mode (128 reply
+tokens, all thinking, so the reply sent back is empty and its tokens differ from the cache's),
+then a second turn 20 tokens longer:
+
+| turn 2 | cached | prefill | wall (128 tokens) |
+|---|---|---|---|
+| Qwen3.8-27B (oxinfer q4), before (master, or `prompt_checkpoints=0`) | 0 | 7.9-8.6 s | 15.7-17.3 s |
+| Qwen3.8-27B, after (back to the previous prompt but its last token) | 3046 | 0.56-0.62 s | 8.4-8.9 s |
+| Qwen3.5-4B (bf16), before | 0 | 0.68 s | 2.17 s |
+| Qwen3.5-4B, after | 3008 | 0.17 s | 1.64 s |
+
+The first turn costs the same within the noise (its prompt is fed in three passes: the system
+prefix, the rest but its last token, the last token). The replies are the same tokens before and
+after on both models.
 
 Measured on DeepSeek-V4.1-Flash-1017 (ISTA-DASLab GSQ-RCO IQ1_M, M5 Max, Metal decode, warm page
 cache, other jobs on the machine at load 4-10) with `examples/chat_turns.rs`: a 2131-token

@@ -1280,6 +1280,74 @@ fn deepseek_chat_reuses_the_cache_after_thinking() {
     }
 }
 
+/// The same on tiny random Qwen3.5 models (dense, and MoE with MTP), thinking on, with a prompt
+/// cache: the second and third turns reuse the cache up to the previous prompt (in-memory
+/// checkpoints of the recurrent states), and after a restart the conversation comes back from
+/// the disk snapshots with the same reply.
+#[test]
+fn qwen35_chat_reuses_the_cache_after_thinking() {
+    for (moe, mtp) in [(false, false), (true, true)] {
+        let tag = format!("{moe}-{mtp}");
+        let dir = std::env::temp_dir().join(format!("oxinfer-q35-server-{tag}-{}", std::process::id()));
+        let cache = std::env::temp_dir().join(format!("oxinfer-q35-server-pc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+        oxinfer::qwen::tiny::write(&dir, moe, mtp).unwrap();
+        let spec = format!(
+            "model=q={},device=cpu,mtp={},prompt_cache={},prompt_cache_min_tokens=8",
+            dir.display(),
+            mtp as u8,
+            cache.display()
+        );
+        let ask = |addr: SocketAddr, messages: &[Value]| {
+            let req = json!({"model": "q", "messages": messages, "temperature": 0, "max_tokens": 40, "think": true});
+            let (st, body) = request(addr, "POST", "/v1/chat/completions", &req.to_string());
+            assert_eq!(st, 200, "{body}");
+            serde_json::from_str::<Value>(&body).unwrap()
+        };
+        let s = serve(&spec);
+        let mut convo = vec![
+            json!({"role": "system", "content": "You are a careful assistant. ".repeat(8)}),
+            json!({"role": "user", "content": "What is the tallest mountain?"}),
+        ];
+        let mut prompt = 0;
+        let mut last = Value::Null;
+        for (turn, next) in ["And the second tallest?", "Thanks. Which one is harder to climb?"]
+            .into_iter()
+            .enumerate()
+        {
+            let v = ask(s.addr(), &convo);
+            let usage = &v["usage"];
+            let cached = usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0) as usize;
+            if turn > 0 {
+                assert!(
+                    cached + 1 >= prompt,
+                    "{tag}, turn {turn}: {cached} cached tokens of the previous prompt's {prompt}: {v}"
+                );
+            }
+            prompt = usage["prompt_tokens"].as_u64().unwrap() as usize;
+            let m = &v["choices"][0]["message"];
+            convo.push(json!({
+                "role": "assistant",
+                "content": m["content"].as_str().unwrap_or_default(),
+                "reasoning_content": m["reasoning_content"].as_str().unwrap_or("Let me think about mountains."),
+            }));
+            convo.push(json!({"role": "user", "content": next}));
+            last = v;
+        }
+        s.stop().unwrap();
+        // After a restart: the last request again, from the disk.
+        convo.truncate(convo.len() - 2);
+        let s = serve(&spec);
+        let v = ask(s.addr(), &convo);
+        let cached = v["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0) as usize;
+        assert!(cached + 1 >= prompt, "{tag}: {cached} of {prompt} restored: {v}");
+        assert_eq!(v["choices"][0]["message"], last["choices"][0]["message"], "{tag}");
+        s.stop().unwrap();
+        std::fs::remove_dir_all(&cache).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn b64_decode(s: &str) -> Option<Vec<u8>> {

@@ -46,6 +46,9 @@ fn write_safetensors(path: &Path, tensors: &[(String, Vec<usize>, Vec<f32>)]) {
     std::fs::write(path, out).unwrap();
 }
 
+/// One test at a time: `check` turns the chains off for a moment.
+static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const H: usize = 256;
 /// Not a multiple of the argmax's 1024-value blocks.
 const VOCAB: usize = 1500;
@@ -305,6 +308,7 @@ where
 
 #[test]
 fn chained_greedy_matches_host_steps() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
     let plat = oxinfer::platform::detect();
     let Ok(Some(_)) = oxinfer::gpu::init(&plat, oxinfer::platform::DevicePref::Auto) else {
         eprintln!("no GPU: skipped");
@@ -335,4 +339,99 @@ fn chained_greedy_matches_host_steps() {
     let model = oxinfer::qwen::QwenModel::load(cfg, &files, Quant::Bf16).unwrap();
     check("qwen3.5", &model, 40);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Qwen3.5 prompt checkpoints on the device: a session goes back to a checkpoint after a reply
+/// decoded on the GPU (one-token steps and a chain, whose recurrent states are updated in place
+/// and whose KV caches have device copies) and from there gives the logits of a fresh session
+/// that ran the same passes, bit for bit (dense and MoE); the MTP decoder (verification passes
+/// on the GPU) the same logits and greedy reply.
+#[test]
+fn qwen35_checkpoints_on_the_device() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+    use oxinfer::qwen::{QwenModel, QwenSession};
+    let plat = oxinfer::platform::detect();
+    let Ok(Some(_)) = oxinfer::gpu::init(&plat, oxinfer::platform::DevicePref::Auto) else {
+        eprintln!("no GPU: skipped");
+        return;
+    };
+    let toks = |n: u32, seed: u32| -> Vec<u32> { (0..n).map(|i| (i * 37 + seed * 11 + 5) % 256).collect() };
+    // Prefill, then one-token steps and a chain from the last logits: the logits after each.
+    let run = |m: &QwenModel, s: &mut QwenSession, ids: &[u32]| -> Vec<Vec<u32>> {
+        let l = m.forward(s, ids);
+        let mut t = oxinfer::sampler::argmax(&l);
+        let mut out = vec![bits(&l)];
+        for _ in 0..3 {
+            let l = m.forward(s, &[t]);
+            t = oxinfer::sampler::argmax(&l);
+            out.push(bits(&l));
+        }
+        let mut last = t;
+        let n = m.decode_greedy(s, t, 12, &mut |x| {
+            last = x;
+            Chain::Go
+        });
+        assert_eq!(n, Some(12), "no chain");
+        out.push(bits(&m.forward(s, &[last])));
+        out
+    };
+    for moe in [false, true] {
+        let dir = std::env::temp_dir().join(format!("oxinfer-gpu-chain-q35cp-{moe}-{}", std::process::id()));
+        oxinfer::qwen::tiny::write(&dir, moe, true).unwrap();
+        let files = ModelFiles::open(&dir, true).unwrap();
+        let cfg = oxinfer::config::QwenConfig::load(&dir).unwrap();
+        let m = QwenModel::load(cfg, &files, Quant::Bf16).unwrap();
+        let (a, b, c) = (toks(40, 1), toks(9, 2), toks(7, 3));
+        let mut s = m.new_session();
+        m.forward(&mut s, &a[..20]);
+        s.checkpoint(2);
+        m.forward(&mut s, &a[20..39]);
+        s.checkpoint(2);
+        run(&m, &mut s, &a[39..]);
+        s.cut_to(39).unwrap();
+        let got = run(&m, &mut s, &b);
+        let mut f = m.new_session();
+        m.forward(&mut f, &a[..20]);
+        m.forward(&mut f, &a[20..39]);
+        assert_eq!(got, run(&m, &mut f, &b), "moe {moe}: back to the prompt");
+        s.cut_to(20).unwrap();
+        let got = run(&m, &mut s, &c);
+        let mut f = m.new_session();
+        m.forward(&mut f, &a[..20]);
+        assert_eq!(got, run(&m, &mut f, &c), "moe {moe}: back to the prefix");
+
+        // MTP.
+        let mtp_layer = m.load_mtp(&files).unwrap();
+        let opts = oxinfer::qwen_mtp::MtpOptions {
+            draft_tokens: 3,
+            stop: Vec::new(),
+            ..Default::default()
+        };
+        let reply = |d: &mut oxinfer::qwen_mtp::MtpDecoder, l: &[f32], n: usize| {
+            let mut g = oxinfer::sampler::Sampler::new(0.0, 0, 1.0, 1);
+            let mut out = vec![oxinfer::sampler::argmax(l)];
+            d.push(out[0]);
+            while out.len() < n {
+                out.extend(d.step(&mut g, n - out.len()));
+            }
+            out
+        };
+        let mut d = oxinfer::qwen_mtp::MtpDecoder::new(&m, &mtp_layer, opts.clone());
+        d.prefill(&a[..20], 512);
+        d.checkpoint(2);
+        d.prefill(&a[20..39], 512);
+        d.checkpoint(2);
+        let l = d.prefill(&a[39..], 512);
+        reply(&mut d, &l, 30);
+        d.cut_to(39).unwrap();
+        let got = d.prefill(&b, 512);
+        let got_reply = reply(&mut d, &got, 20);
+        let mut f = oxinfer::qwen_mtp::MtpDecoder::new(&m, &mtp_layer, opts.clone());
+        f.prefill(&a[..20], 512);
+        f.prefill(&a[20..39], 512);
+        let want = f.prefill(&b, 512);
+        assert_eq!(bits(&got), bits(&want), "moe {moe}: MTP");
+        assert_eq!(got_reply, reply(&mut f, &want, 20), "moe {moe}: MTP reply");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -347,16 +347,18 @@ pub struct EngineOptions {
     /// Shortest conversation (in tokens) the prompt cache stores (default 64). Key
     /// `prompt_cache_min_tokens`.
     pub prompt_cache_min_tokens: Option<usize>,
-    /// Inkling-2 and DeepSeek V4 / V4.1: in-memory checkpoints [`Engine::chat`] keeps of a
-    /// conversation's prompt (the prefix shared by every conversation with the same system
-    /// prompt and tools, and each prompt but its last token), so that the next conversation can
-    /// reuse the cache up to one of them after a mismatch (a past reply rendered without its
-    /// thinking, an edited message) instead of starting over: the models' convolutions, sliding
-    /// windows and compressors' rows cannot be cut back further than 64 positions otherwise.
-    /// Each holds the sliding layers' last window of keys and values (Inkling-2-Mini: about 650
-    /// MB with f32 caches, 180 MB with q8; DeepSeek-V4.1-Flash: about 22 MB, the window's raw keys
-    /// and the compressors' pending rows, the compressed keys being shared; a draft's state
-    /// beside it: a few MB, see [`crate::dspark::DsparkDecoder::checkpoint`]). Past
+    /// Inkling-2, DeepSeek V4 / V4.1 and Qwen3.5 / 3.6 / 3.8 (dense, MoE, with MTP): in-memory
+    /// checkpoints [`Engine::chat`] keeps of a conversation's prompt (the prefix shared by every
+    /// conversation with the same system prompt and tools, and each prompt but its last token),
+    /// so that the next conversation can reuse the cache up to one of them after a mismatch (a
+    /// past reply rendered without its thinking, an edited message) instead of starting over:
+    /// the models' convolutions, sliding windows, compressors' rows and recurrent states cannot
+    /// be cut back further than 64 positions otherwise (Qwen3.5's not at all). Each holds the
+    /// sliding layers' last window of keys and values (Inkling-2-Mini: about 650 MB with f32
+    /// caches, 180 MB with q8; DeepSeek-V4.1-Flash: about 22 MB, the window's raw keys and the
+    /// compressors' pending rows, the compressed keys being shared), or the recurrent layers'
+    /// states (Qwen3.5-4B: about 50 MB, Qwen3.8-27B 150 MB); a draft's state beside it: a
+    /// few MB, see [`crate::dspark::DsparkDecoder::checkpoint`]. Past
     /// the cap the lowest one and the newest stay. Default [`DEFAULT_PROMPT_CHECKPOINTS`], 0
     /// turns them off. Key `prompt_checkpoints`.
     pub prompt_checkpoints: Option<usize>,
@@ -1375,12 +1377,16 @@ impl Lm {
     /// Whether the cache can go back to positions it took a checkpoint of (Inkling-2, whose
     /// convolutions and sliding windows cannot be cut back further than a few positions;
     /// DeepSeek V4 / V4.1, whose sliding windows and compressors' rows cannot either; with their
-    /// drafts, whose state goes back with them).
+    /// drafts, whose state goes back with them; Qwen3.5 / 3.6 / 3.8 and the other models with
+    /// Gated DeltaNet layers, with or without MTP, whose recurrent states cannot at all).
     fn checkpoints(&self) -> bool {
-        matches!(
-            self,
-            Lm::Inkling2 { .. } | Lm::DeepSeek4 { .. } | Lm::Inkling2Dspark { .. } | Lm::DeepSeek4Dspark { .. }
-        )
+        match self {
+            Lm::Inkling2 { .. } | Lm::DeepSeek4 { .. } | Lm::Inkling2Dspark { .. } | Lm::DeepSeek4Dspark { .. } => true,
+            Lm::Qwen { sess, .. } => sess.checkpointable(),
+            Lm::QwenMtp { dec } => dec.sess.checkpointable(),
+            Lm::QwenDspark { dec } => dec.sess.checkpointable(),
+            _ => false,
+        }
     }
     /// Takes a checkpoint of the current position, keeping at most `max` ([`Lm::checkpoints`]).
     fn checkpoint(&mut self, max: usize) {
@@ -1389,6 +1395,9 @@ impl Lm {
             Lm::DeepSeek4 { sess, .. } => sess.checkpoint(max),
             Lm::Inkling2Dspark { dec } => dec.checkpoint(max),
             Lm::DeepSeek4Dspark { dec } => dec.checkpoint(max),
+            Lm::Qwen { sess, .. } => sess.checkpoint(max),
+            Lm::QwenMtp { dec } => dec.checkpoint(max),
+            Lm::QwenDspark { dec } if dec.sess.checkpointable() => dec.checkpoint(max),
             _ => {}
         }
     }
@@ -1399,6 +1408,9 @@ impl Lm {
             Lm::DeepSeek4 { sess, .. } => sess.has_checkpoint(pos),
             Lm::Inkling2Dspark { dec } => dec.has_checkpoint(pos),
             Lm::DeepSeek4Dspark { dec } => dec.has_checkpoint(pos),
+            Lm::Qwen { sess, .. } => sess.has_checkpoint(pos),
+            Lm::QwenMtp { dec } => dec.has_checkpoint(pos),
+            Lm::QwenDspark { dec } if dec.sess.checkpointable() => dec.has_checkpoint(pos),
             _ => false,
         }
     }
@@ -1410,6 +1422,9 @@ impl Lm {
             Lm::DeepSeek4 { sess, .. } => sess.reachable(len),
             Lm::Inkling2Dspark { dec } => dec.reachable(len),
             Lm::DeepSeek4Dspark { dec } => dec.reachable(len),
+            Lm::Qwen { sess, .. } if sess.checkpointable() => sess.reachable(len),
+            Lm::QwenMtp { dec } if dec.sess.checkpointable() => dec.reachable(len),
+            Lm::QwenDspark { dec } if dec.sess.checkpointable() => dec.reachable(len),
             _ if self.truncatable() => len,
             _ => 0,
         }
@@ -1422,6 +1437,9 @@ impl Lm {
             Lm::DeepSeek4 { sess, .. } => Some(sess.cut_to(len)),
             Lm::Inkling2Dspark { dec } => Some(dec.cut_to(len)),
             Lm::DeepSeek4Dspark { dec } => Some(dec.cut_to(len)),
+            Lm::Qwen { sess, .. } if sess.checkpointable() => Some(sess.cut_to(len)),
+            Lm::QwenMtp { dec } if dec.sess.checkpointable() => Some(dec.cut_to(len)),
+            Lm::QwenDspark { dec } if dec.sess.checkpointable() => Some(dec.cut_to(len)),
             _ => None,
         };
         if let Some(r) = r {
@@ -4692,9 +4710,10 @@ mod tests {
     /// A model folder with the engine options that attach its draft.
     type DraftCase = (&'static str, PathBuf, Vec<(&'static str, String)>);
 
-    /// Speculative decoding's models with checkpoints: the tiny Inkling-2 with its MTP drafter
-    /// and the tiny DeepSeek V4 with a DSpark draft (each case: the folder, the options with the
-    /// draft).
+    /// Speculative decoding's models with checkpoints: the tiny Inkling-2 with its MTP drafter,
+    /// the tiny DeepSeek V4 with a DSpark draft and the tiny Qwen3.5 with a DSpark draft (fixed
+    /// draft lengths: the random draft is never accepted, so the cost-aware policy would not
+    /// draft) (each case: the folder, the options with the draft).
     fn draft_cases(tag: &str) -> Vec<DraftCase> {
         let ink = tiny_inkling(&format!("d{tag}"));
         crate::inkling::tiny::write_tiny_mtp(&ink, 9, &[0, 2]).unwrap();
@@ -4702,9 +4721,18 @@ mod tests {
         let cfg = crate::deepseek4::tiny::write_chat(&ds, false, serde_json::json!({})).unwrap();
         let draft = ds.join("dspark-draft.gguf");
         crate::deepseek4::tiny::write_draft(&draft, &cfg, 7, 5).unwrap();
+        let q = std::env::temp_dir().join(format!("oxinfer-q35-engine-d{tag}-{}", std::process::id()));
+        crate::qwen::tiny::write(&q, false, false).unwrap();
+        let qdraft = q.join("dspark-draft");
+        crate::qwen::tiny::write_draft(&qdraft, 11).unwrap();
         vec![
             ("Inkling-2 MTP", ink, vec![("mtp", "on".into())]),
             ("DeepSeek V4 DSpark", ds, vec![("draft", draft.display().to_string())]),
+            (
+                "Qwen3.5 DSpark",
+                q,
+                vec![("draft", qdraft.display().to_string()), ("draft_fixed", "on".into())],
+            ),
         ]
     }
 
@@ -4797,6 +4825,60 @@ mod tests {
             assert!(other.stats.restored_tokens > 0, "{name}");
             assert_eq!(other.tokens, next.tokens, "{name}: the next turn");
             std::fs::remove_dir_all(&cache).ok();
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Qwen3.5 (dense and MoE, plain and with MTP): a next turn whose past reply is rendered
+    /// otherwise than the model wrote it (its thinking goes; here the tiny model's reply is just
+    /// other tokens) reuses the cache up to the previous prompt's checkpoint, where the
+    /// recurrent states could not be cut back at all before; a regenerated reply all of its
+    /// prompt but the last token, and the same reply (the same passes from the same state).
+    #[test]
+    fn qwen35_chat_reuses_the_previous_prompt() {
+        for (moe, mtp) in [(false, false), (true, false), (false, true), (true, true)] {
+            let dir = std::env::temp_dir().join(format!("oxinfer-q35-engine-{moe}-{mtp}-{}", std::process::id()));
+            crate::qwen::tiny::write(&dir, moe, mtp).unwrap();
+            let tag = format!("moe {moe}, mtp {mtp}");
+            let mut o = cpu_options();
+            o.set("mtp", if mtp { "1" } else { "0" }).unwrap();
+            let mut e = Engine::load(dir.to_str().unwrap(), &o).unwrap();
+            assert_eq!(matches!(e.lm, Lm::QwenMtp { .. }), mtp, "{tag}");
+            e.config_mut().max_tokens = 40;
+            e.config_mut().think = true;
+            let mut convo = vec![
+                Message::system("You answer briefly. ".repeat(6)),
+                Message::user("Hello there, what is the weather like today?"),
+            ];
+            let r1 = e.chat(&convo, &mut quiet).unwrap();
+            assert_eq!(r1.stats.cached_tokens, 0);
+            let len1 = r1.stats.prompt_tokens;
+            convo.push(Message::assistant(format!("{}!", r1.text)));
+            convo.push(Message::user("And tomorrow?"));
+            let r2 = e.chat(&convo, &mut quiet).unwrap();
+            assert_eq!(r2.stats.cached_tokens, len1 - 1, "{tag}");
+            let len2 = r2.stats.cached_tokens + r2.stats.prompt_tokens;
+            // Regenerated.
+            let r3 = e.chat(&convo, &mut quiet).unwrap();
+            assert_eq!(r3.stats.cached_tokens, len2 - 1, "{tag}");
+            assert_eq!(r3.tokens, r2.tokens, "{tag}: the regenerated reply");
+            // An edited last message: back to the shared system prefix.
+            let mut edited = convo.clone();
+            edited.last_mut().unwrap().content = "Or the day after?".into();
+            let r4 = e.chat(&edited, &mut quiet).unwrap();
+            assert!(
+                r4.stats.cached_tokens > 0 && r4.stats.cached_tokens < len1,
+                "{tag}: {} cached",
+                r4.stats.cached_tokens
+            );
+            // With checkpoints off, the conversation starts over.
+            o.set("prompt_checkpoints", "0").unwrap();
+            let mut e = Engine::load(dir.to_str().unwrap(), &o).unwrap();
+            e.config_mut().max_tokens = 40;
+            e.config_mut().think = true;
+            e.chat(&convo[..2], &mut quiet).unwrap();
+            let r2 = e.chat(&convo, &mut quiet).unwrap();
+            assert_eq!(r2.stats.cached_tokens, 0, "{tag}");
             std::fs::remove_dir_all(&dir).ok();
         }
     }

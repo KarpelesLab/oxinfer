@@ -735,6 +735,17 @@ pub struct MtpDecoder<'m> {
     /// of the MTP layer when it promises more tokens per second (as for
     /// [`crate::dspark::DsparkDecoder::lookup`]).
     pub lookup: Option<crate::lookup::Lookup>,
+    /// The MTP layer's side of the main session's checkpoints ([`MtpDecoder::checkpoint`]).
+    marks: Vec<MtpMark>,
+}
+
+/// What the MTP layer had at a checkpoint of the main session: its cache's length (the cache
+/// keeps every position, so it is cut back) and its pending rows.
+struct MtpMark {
+    pos: usize,
+    len: usize,
+    pend_h: Vec<f32>,
+    pend_t: Vec<u32>,
 }
 
 impl<'m> MtpDecoder<'m> {
@@ -774,6 +785,7 @@ impl<'m> MtpDecoder<'m> {
                 ..MtpStats::default()
             },
             lookup: None,
+            marks: Vec::new(),
         }
     }
 
@@ -1030,6 +1042,73 @@ impl<'m> MtpDecoder<'m> {
     }
 }
 
+/// In-memory prompt checkpoints: the main session's ([`QwenSession::checkpoint`]) with the MTP
+/// layer's cache length and pending rows (without the committed token not yet run: a decoder
+/// gone back to one continues with a prefill).
+impl MtpDecoder<'_> {
+    /// Takes a checkpoint of the current position, keeping at most `max`.
+    pub fn checkpoint(&mut self, max: usize) {
+        let pos = self.sess.pos;
+        self.sess.checkpoint(max);
+        if self.sess.has_checkpoint(pos) && !self.marks.iter().any(|m| m.pos == pos) {
+            let pend_t = if self.next.is_some() {
+                &self.pend_t[..self.pend_t.len().saturating_sub(1)]
+            } else {
+                &self.pend_t[..]
+            };
+            self.marks.push(MtpMark {
+                pos,
+                len: self.msess.len(),
+                pend_h: self.pend_h.clone(),
+                pend_t: pend_t.to_vec(),
+            });
+        }
+        let sess = &self.sess;
+        self.marks.retain(|m| sess.has_checkpoint(m.pos));
+    }
+
+    /// Whether there is a checkpoint of position `pos`.
+    pub fn has_checkpoint(&self, pos: usize) -> bool {
+        self.sess.has_checkpoint(pos) && self.marks.iter().any(|m| m.pos == pos)
+    }
+
+    /// The latest position up to `len` the decoder can go back to ([`Self::cut_to`]): the
+    /// current one when `len` is not below it, else its latest checkpoint up to `len`, else 0.
+    pub fn reachable(&self, len: usize) -> usize {
+        if len >= self.sess.pos {
+            return self.sess.pos;
+        }
+        self.marks
+            .iter()
+            .map(|m| m.pos)
+            .filter(|&p| p <= len && self.sess.has_checkpoint(p))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Goes back to the checkpoint of position `len` (main session and MTP layer).
+    pub fn cut_to(&mut self, len: usize) -> Result<()> {
+        if len >= self.sess.pos {
+            return Ok(());
+        }
+        let Some(i) = self.marks.iter().position(|m| m.pos == len) else {
+            bail!("Qwen MTP: no checkpoint of position {len} to go back to (at {})", self.sess.pos);
+        };
+        if self.marks[i].len > self.msess.len() {
+            bail!("Qwen MTP: the layer's cache is shorter than its checkpoint");
+        }
+        self.sess.cut_to(len)?;
+        let m = &self.marks[i];
+        self.msess.truncate(m.len);
+        self.msess.spans = self.sess.spans.clone();
+        self.pend_h.clone_from(&m.pend_h);
+        self.pend_t.clone_from(&m.pend_t);
+        self.next = None;
+        self.marks.retain(|m| m.pos <= len);
+        Ok(())
+    }
+}
+
 /// Snapshots ([`crate::snapshot`]): the main session, the MTP layer's cache and its pending rows
 /// (without the committed token not yet run: a restored decoder starts with a prefill).
 impl MtpDecoder<'_> {
@@ -1069,6 +1148,7 @@ impl MtpDecoder<'_> {
         self.pend_t = pt;
         self.msess.spans = self.sess.spans.clone();
         self.next = None;
+        self.marks.clear();
         Ok(())
     }
 }

@@ -17,6 +17,9 @@ use crate::prof::{self, Cat};
 use crate::safetensors::ModelFiles;
 use anyhow::{Context, Result, bail};
 
+#[path = "qwen35_tiny.rs"]
+pub mod tiny;
+
 pub(crate) struct Gdn<'a> {
     pub(crate) qkv: Lin<'a>,         // [2*key_dim + value_dim, H]
     pub(crate) z: Lin<'a>,           // [value_dim, H]
@@ -575,6 +578,19 @@ pub struct QwenSession {
     pub deepstack: Option<Box<DeepStack>>,
     /// Qwen4-Exp state (n-gram contexts and conv, indexer keys; see `crate::qwen4exp`).
     pub(crate) exp: Option<Box<crate::qwen4exp::ExpSession>>,
+    /// Checkpoints of earlier positions, lowest first ([`QwenSession::checkpoint`]; shared by
+    /// the session's copies).
+    pub(crate) checkpoints: Vec<std::sync::Arc<Checkpoint>>,
+}
+
+/// What a session with recurrent layers cannot rebuild of an earlier position once it has gone
+/// further: every Gated DeltaNet (or conv, lightning) layer's recurrent and convolution states
+/// as they were there. The attention layers' KV caches keep every position, so they are cut
+/// back. See [`QwenSession::checkpoint`].
+pub(crate) struct Checkpoint {
+    pos: usize,
+    /// `(recurrent, conv)` of each recurrent layer, in layer order.
+    states: Vec<(Vec<f32>, Vec<f32>)>,
 }
 
 /// The DeepStack rows of a session (see [`QwenSession::deepstack`]).
@@ -605,6 +621,7 @@ impl QwenSession {
             return Ok(());
         }
         self.gpu_states_kept = false;
+        self.checkpoints.retain(|c| c.pos <= pos);
         if let Some(e) = &mut self.exp {
             // After a GPU pass the n-gram conv state is replayed with the recurrent states below.
             if self.gpu_rec.is_some() {
@@ -670,6 +687,92 @@ impl QwenSession {
         }
         self.spans.retain(|s| s.start < pos);
         self.pos = pos;
+        Ok(())
+    }
+}
+
+impl QwenSession {
+    /// Whether the session takes [checkpoints](QwenSession::checkpoint): it has recurrent layers
+    /// (whose state cannot be cut back otherwise), and is not Qwen4-Exp's (n-gram and indexer
+    /// state) nor fed explicit positions.
+    pub fn checkpointable(&self) -> bool {
+        self.exp.is_none() && self.positions.is_none() && self.gdn.iter().any(Option::is_some)
+    }
+
+    /// Takes a [`Checkpoint`] of the current position (none when there is one already, `max` is
+    /// 0 or the session is not [checkpointable](QwenSession::checkpointable)), keeping at most
+    /// `max`: past that the lowest one (a shared prefix, say) and the newest stay, the second
+    /// lowest goes. Each holds the recurrent layers' states, read from the host's buffers, which
+    /// GPU decoding (one step or a chain of them) leaves up to date after every call: Qwen3.5-4B
+    /// about 50 MB, Qwen3.8-27B about 150 MB.
+    pub fn checkpoint(&mut self, max: usize) {
+        let pos = self.pos;
+        if max == 0 || pos == 0 || !self.checkpointable() || self.has_checkpoint(pos) {
+            return;
+        }
+        let states: Vec<(Vec<f32>, Vec<f32>)> = self.gdn.iter().flatten().map(|g| (g.s.to_vec(), g.conv.to_vec())).collect();
+        if std::env::var_os("OXINFER_DEBUG").is_some() {
+            let floats: usize = states.iter().map(|(s, c)| s.len() + c.len()).sum();
+            eprintln!("[Qwen: checkpoint of position {pos}, {:.1} MB]", floats as f64 * 4e-6);
+        }
+        let at = self.checkpoints.partition_point(|c| c.pos < pos);
+        self.checkpoints.insert(at, std::sync::Arc::new(Checkpoint { pos, states }));
+        while self.checkpoints.len() > max {
+            self.checkpoints.remove(if max > 1 { 1 } else { 0 });
+        }
+    }
+
+    /// Whether there is a checkpoint of position `pos`.
+    pub fn has_checkpoint(&self, pos: usize) -> bool {
+        self.checkpoints.iter().any(|c| c.pos == pos)
+    }
+
+    /// The positions of the checkpoints, lowest first.
+    pub fn checkpoint_positions(&self) -> Vec<usize> {
+        self.checkpoints.iter().map(|c| c.pos).collect()
+    }
+
+    /// The latest position up to `len` that the session can go back to ([`Self::cut_to`]):
+    /// the current one when `len` is not below it, any one without recurrent layers, else the
+    /// latest checkpoint up to `len` (0 when none).
+    pub fn reachable(&self, len: usize) -> usize {
+        if len >= self.pos {
+            return self.pos;
+        }
+        if self.gdn.iter().all(Option::is_none) && self.exp.is_none() {
+            return len;
+        }
+        self.checkpoints.iter().map(|c| c.pos).filter(|&p| p <= len).max().unwrap_or(0)
+    }
+
+    /// Goes back to position `len`, a checkpoint's (any position without recurrent layers): the
+    /// recurrent states are copied back into the session's own buffers (those GPU decoding reads
+    /// in place; the device is told they changed) and the KV caches cut back (their device
+    /// copies sync from there at the next pass). The logits from there are those of a session
+    /// that ran the same tokens up to `len` in the same passes and nothing after, bit for bit.
+    pub fn cut_to(&mut self, len: usize) -> Result<()> {
+        if len >= self.pos {
+            return Ok(());
+        }
+        if self.gdn.iter().all(Option::is_none) && self.exp.is_none() {
+            return self.rewind(len);
+        }
+        let Some(cp) = self.checkpoints.iter().find(|c| c.pos == len).cloned() else {
+            bail!("Qwen: no checkpoint of position {len} to go back to (at {})", self.pos);
+        };
+        for (g, (s, conv)) in self.gdn.iter_mut().flatten().zip(&cp.states) {
+            g.s.copy_from_slice(s);
+            g.conv.copy_from_slice(conv);
+        }
+        for c in self.kv.iter_mut().flatten() {
+            c.truncate(len);
+        }
+        self.spans.retain(|s| s.start < len);
+        self.pos = len;
+        self.rec_span = None;
+        self.gpu_rec = None;
+        self.gpu_states_kept = false;
+        self.checkpoints.retain(|c| c.pos <= len);
         Ok(())
     }
 }
@@ -1268,6 +1371,7 @@ impl<'a> QwenModel<'a> {
             positions: None,
             deepstack: None,
             exp: self.exp.as_ref().map(|e| Box::new(e.new_session(cfg))),
+            checkpoints: Vec::new(),
         }
     }
 
@@ -3074,6 +3178,23 @@ impl crate::dspark::Target for QwenModel<'_> {
     }
 }
 
+/// A speculative decoder's checkpoints ([`crate::dspark::DsparkDecoder::checkpoint`]): the
+/// session's own ([`QwenSession::checkpoint`]).
+impl crate::dspark::CheckpointTarget for QwenModel<'_> {
+    fn checkpoint(&self, sess: &mut QwenSession, max: usize) {
+        sess.checkpoint(max)
+    }
+    fn has_checkpoint(&self, sess: &QwenSession, pos: usize) -> bool {
+        sess.has_checkpoint(pos)
+    }
+    fn reachable(&self, sess: &QwenSession, len: usize) -> usize {
+        sess.reachable(len)
+    }
+    fn cut_to(&self, sess: &mut QwenSession, len: usize) -> Result<()> {
+        sess.cut_to(len)
+    }
+}
+
 /// Snapshots ([`crate::snapshot`]): the position, the vision spans, the attention layers' KV
 /// caches and the Gated DeltaNet layers' recurrent and convolution states (copied into the
 /// session's own page-aligned buffers, which GPU decoding uses in place). A restored session
@@ -3134,6 +3255,7 @@ impl crate::snapshot::SessionState for QwenSession {
         self.rec_span = None;
         self.gpu_rec = None;
         self.gpu_states_kept = false;
+        self.checkpoints.clear();
         self.pos = pos;
         Ok(())
     }
