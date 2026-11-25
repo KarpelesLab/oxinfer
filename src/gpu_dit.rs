@@ -107,13 +107,17 @@ pub struct FluxSingle<'a> {
 
 /// A FLUX.1 transformer (`crate::flux::transformer::FluxTransformer`) as the device runs it:
 /// layer norms without weights (eps 1e-6) under the modulations, QK RMS norms (eps 1e-6),
-/// interleaved rotary pairs, GELU-tanh MLPs, a bias on every linear layer.
+/// interleaved rotary pairs, GELU-tanh MLPs, a bias on every linear layer. Qwen-Image's MMDiT
+/// (`crate::qwen_image::transformer`) is the same with double blocks only, its text already
+/// embedded (no `ctx_emb`), any text length, LoRA side paths, and with Edit-2511's
+/// `zero_cond_t` a second image modulation for the reference tokens.
 pub struct FluxModel<'a> {
     pub dim: usize,
     pub heads: usize,
     pub head_dim: usize,
     pub x_emb: Lin<'a>,
-    pub ctx_emb: Lin<'a>,
+    /// The text embedder; None: the text tokens come in at `dim` wide.
+    pub ctx_emb: Option<Lin<'a>>,
     pub doubles: Vec<FluxDouble<'a>>,
     pub singles: Vec<FluxSingle<'a>>,
     pub proj_out: Lin<'a>,
@@ -127,7 +131,8 @@ pub struct FluxInput<'a> {
     /// `[n_img, x_emb.n_in]`.
     pub img: &'a [f32],
     pub n_img: usize,
-    /// `[n_txt, ctx_emb.n_in]`.
+    /// `[n_txt, ctx_emb.n_in]` (`[n_txt, dim]` without a text embedder). Without single blocks
+    /// any count; FLUX.1's single blocks need a multiple of 128.
     pub txt: &'a [f32],
     pub n_txt: usize,
     /// Per token of `[text; image]`: `head_dim / 2` angles' cosines (pair `i` = dims `2i, 2i + 1`),
@@ -138,11 +143,19 @@ pub struct FluxInput<'a> {
     /// (`12 dim`), then per single block `[shift, scale, gate]` (`3 dim`), then the head's
     /// `[scale, shift]`.
     pub mods: &'a [f32],
+    /// Image tokens from this one on take the image modulation of `mods2` instead (`n_img`:
+    /// none do).
+    pub img_split: usize,
+    /// Per double block the second image modulation (`6 dim`, the order of `mods`' image part);
+    /// empty when `img_split == n_img`.
+    pub mods2: &'a [f32],
+    /// The leading image tokens the head predicts (`n_img`: all).
+    pub n_out: usize,
 }
 
 /// FLUX.1 passes on the device, activations kept in device buffers between blocks.
 pub trait FluxSession: Send {
-    /// The prediction `[n_img, proj_out.n_out]` (bias included) into `out`; false when the
+    /// The prediction `[n_out, proj_out.n_out]` (bias included) into `out`; false when the
     /// device declined or failed (the caller then runs the CPU path).
     fn forward(&mut self, m: &FluxModel, inp: &FluxInput, out: &mut Vec<f32>) -> bool;
 }

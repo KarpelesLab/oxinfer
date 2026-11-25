@@ -55,6 +55,7 @@ editing, have [their own section](#qwen-image-21-and-qwen-image-21-turbo).
 | `--transformer FILE` | the transformer from a GGUF file (unsloth / QuantStack conversions; BF16 outer layers kept) or a single safetensors file (FP8 scaled checkpoints, bf16) |
 | `--quant q8\|q4` | transformer and text-encoder precision (the text encoder stays Q8 with `q4`) |
 | `--mmap`, `--stream` | map the weights; stream the transformer's 60 blocks from storage (`--cache-budget-gb`) |
+| `--no-device-passes` | run the transformer op by op instead of whole passes on the GPU (library: `Options::device_passes`, C API / server: `device_passes=0`) |
 
 What runs: the instruction goes through the pipeline's chat template with Qwen2.5-VL-7B
 (`crate::qwen_vl`, below): a system turn, `Picture N: <|vision_start|>...<|vision_end|>` per input
@@ -245,8 +246,44 @@ Not supported: batches (one image per call), ComfyUI's mixed-precision (`comfy_q
 single-file checkpoints, ControlNets with the edit models, several different ControlNets at once,
 `padding_mask_crop` of the inpainting pipelines, layers through the C API and the server (the
 command line and the library return them), the browser build (the weights exceed its 4 GB).
-The transformer's activations go between CPU and GPU at every
-matmul (about 1 s per pass at 1024x1024), the next lever for speed.
+
+**Whole passes on the GPU** (the default with matrix units; `--no-device-passes`, the
+`device_passes=0` load option or `OXINFER_QWEN_IMAGE_DEVICE_PASS=0` turn them off). The
+transformer runs as FLUX.1's device plan (`gpu::dit::FluxSession`, `src/metal_dit.rs`, see
+[FLUX.1](flux.md)) with double blocks only: the joint `[text; image]` sequence stays in device
+buffers for all 60 blocks, ten command buffers per pass, the layer norms under the modulations,
+biases, QK RMS norms with the interleaved MSRoPE, GELU-tanh and the gated residuals as row
+kernels that write the next GEMM's half-precision input. The text rows are padded to the GEMMs'
+128-row tile, and the attention operands are written compact (the padding never reaches the
+attention, which keeps f32 operands); Edit-2511's reference tokens take their own modulation
+rows; a run-time LoRA (Lightning on bf16 or GGUF weights) runs as side GEMMs beside each layer
+(the rank padded to 64 with zeros). The modulations (120 matrix-vector products of
+`silu(temb)`, and of `silu(temb(0))` for the reference tokens) are one f32 submission per step,
+shared by the guided and unguided passes; the exact input channels of load-time quantized
+modulation layers, LoRA updates and biases are added on the CPU. ControlNet residuals and
+streamed weights take the per-operation path, and the plan's buffers (1-2 GB) are released
+before the VAE decode.
+
+Against the per-operation path (same GEMMs and attention kernel; the row work in f32 on the GPU
+instead of f64 / f32 on the CPU), Qwen-Image-2512 Q4_0, 1024x1024, 3 steps, CFG 4: first
+velocity 1.6e-3 (relative L2), final latents 6.5e-3, image 51.9 dB; Edit-2511 bf16 + Lightning
+(1024x1024, 4096 target + 4096 reference tokens): 2.6e-3, 1.6e-2, 42.0 dB (four large Lightning
+steps amplify the difference, as above).
+
+M5 Max (shared with other jobs; runs alternated), against stable-diffusion.cpp (master 82c19c8,
+Metal, the same GGUF, `qwen_2.5_vl_7b.safetensors`, the ComfyUI VAE, Euler):
+
+| run | engine | per step (per pass) | text | VAE decode |
+|---|---|---|---|---|
+| Qwen-Image-2512 GGUF Q4_0, 1024x1024, true CFG 4 (two passes a step) | oxinfer per-operation (before) | 10.1-10.4 s (5.0-5.2 s) | 3.3 s | 2.2 s |
+| | oxinfer, whole passes | 5.4 s (2.7 s) | 3.4 s | 2.4 s |
+| | stable-diffusion.cpp | 12.4 s | 12.8 s | 46 s (untiled) |
+| Edit-2511 bf16 + Lightning, 1024x1024 edit of a 1024x1024 image (8192 + ~100 tokens, 4 steps) | oxinfer per-operation (before) | 16.5 s | 3.3 s | 1.9 s |
+| | oxinfer, whole passes | 10-11 s (first 11.4 s with the uploads) | 2.6 s | 2.1 s |
+
+Per text-to-image pass about 1.15 s is attention (f32 operands, ~12 TFLOP/s), 1.4 s the GEMMs,
+0.14 s the row kernels and 12 ms the modulations; the edit's 8.3k-token attention is most of its
+pass.
 
 ## Qwen-Image-2.1 and Qwen-Image-2.1-Turbo
 

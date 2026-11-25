@@ -675,7 +675,7 @@ impl FluxTransformer {
             heads: c.heads,
             head_dim: c.head_dim,
             x_emb: dit_lin(&self.x_emb)?,
-            ctx_emb: dit_lin(&self.ctx_emb)?,
+            ctx_emb: Some(dit_lin(&self.ctx_emb)?),
             doubles,
             singles,
             proj_out: dit_lin(&self.proj_out)?,
@@ -695,6 +695,9 @@ impl FluxTransformer {
             cos: &cos,
             sin: &sin,
             mods: &mods,
+            img_split: n_img,
+            mods2: &[],
+            n_out: n_img,
         };
         let mut sess = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
         if sess.is_none() {

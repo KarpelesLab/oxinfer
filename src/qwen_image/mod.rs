@@ -121,12 +121,16 @@ pub struct Options {
     pub keep_text_encoder: bool,
     /// Accelerator choice, when the process has not initialized one yet.
     pub device: crate::platform::DevicePref,
+    /// Whole transformer passes on the accelerator (default on; off: op by op, see
+    /// [`transformer::Transformer::set_device_passes`]).
+    pub device_passes: bool,
 }
 
 impl Options {
     /// Sets an option by name (the C API's `key=value` options): `quant` and `text_quant` (bf16,
     /// q8, q4), `mmap`, `transformer` (a GGUF or safetensors file, or a folder), `controlnet`
-    /// (a folder or repo id), `lora` (`FILE[:SCALE]`, repeatable), `keep_text_encoder`, `stream`.
+    /// (a folder or repo id), `lora` (`FILE[:SCALE]`, repeatable), `keep_text_encoder`, `stream`,
+    /// `device`, `device_passes`.
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         let flag = || match value.to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => Ok(true),
@@ -143,12 +147,15 @@ impl Options {
             "lora" => self.loras.push(LoraSpec::parse(value)?),
             "keep_text_encoder" => self.keep_text_encoder = flag()?,
             "stream" => self.stream = flag()?.then(crate::stream::StreamOptions::default),
+            "device_passes" => self.device_passes = flag()?,
             "device" => {
                 self.device = crate::platform::DevicePref::parse(value)
                     .with_context(|| format!("device: unknown device {value:?} (auto|cpu|cuda|metal|vulkan)"))?
             }
             _ => {
-                bail!("unknown option {key:?} (quant, text_quant, mmap, transformer, controlnet, lora, keep_text_encoder, stream, device)")
+                bail!(
+                    "unknown option {key:?} (quant, text_quant, mmap, transformer, controlnet, lora, keep_text_encoder, stream, device, device_passes)"
+                )
             }
         }
         Ok(())
@@ -231,6 +238,7 @@ impl Default for Options {
             stream: None,
             keep_text_encoder: false,
             device: crate::platform::DevicePref::Auto,
+            device_passes: transformer::device_passes_default(),
         }
     }
 }
@@ -801,6 +809,7 @@ impl Pipeline {
             prefix,
         };
         let mut t = Transformer::load(self.tcfg.clone(), &ld)?;
+        t.set_device_passes(self.opts.device_passes);
         self.lora_report.clear();
         if let Some(l) = &lora {
             for (f, n) in &l.files {
@@ -1286,6 +1295,9 @@ impl Pipeline {
         }
         dump("latents_out.bin", &x);
         tm.denoise = t2.elapsed().as_secs_f64();
+        tr.release_device();
+        // The device pass buffers (1-2 GB) go before the VAE runs.
+        tr.release_device();
 
         let t3 = Instant::now();
         let lat = unpack(&x, lh, lw, z);

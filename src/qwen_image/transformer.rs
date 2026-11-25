@@ -186,7 +186,19 @@ pub struct Transformer<'a> {
     inv_freq: [Vec<f32>; 3],
     /// Weight streaming: unit `i` is block `i`.
     pub(crate) stream: Option<crate::stream::StreamHook>,
+    /// Whole passes on the device ([`Transformer::set_device_passes`]).
+    device_passes: std::sync::atomic::AtomicBool,
+    gpu: std::sync::Mutex<Option<Box<dyn crate::gpu::dit::FluxSession>>>,
+    /// The modulations of the last noise level (shared by a step's guided and unguided passes).
+    mods: std::sync::Mutex<Option<(ModKey, Mods)>>,
 }
+
+/// What the modulations depend on: the noise level, `additional_t_cond`, whether the reference
+/// tokens take their own (`zero_cond_t`).
+type ModKey = (u32, Option<usize>, bool);
+/// Per block `[image: shift, scale, gate, shift, scale, gate | text: the same]` then the head's
+/// `[scale, shift]`; per block the reference tokens' image modulation (with `zero_cond_t`).
+type Mods = (Vec<f32>, Vec<f32>);
 
 /// LayerNorm without affine parameters (eps 1e-6) of each `n`-row, then `x * (1 + scale) +
 /// shift` with the modulation of each row's group.
@@ -286,6 +298,9 @@ impl<'a> Transformer<'a> {
             },
             inv_freq: [inv(ax[0]), inv(ax[1]), inv(ax[2])],
             stream: None,
+            device_passes: std::sync::atomic::AtomicBool::new(device_passes_default()),
+            gpu: std::sync::Mutex::new(None),
+            mods: std::sync::Mutex::new(None),
             cfg,
         })
     }
@@ -409,6 +424,9 @@ impl<'a> Transformer<'a> {
         let n_out: usize = shapes[..extra.targets.clamp(1, shapes.len())].iter().map(|s| s.tokens()).sum();
         assert_eq!(img.len(), ni * cfg.in_channels, "image tokens do not match the shapes");
         let (norm_out, proj_out) = self.head.as_ref().expect("a ControlNet has no output head");
+        if let Some(v) = self.forward_device(img, shapes, txt, sigma, extra) {
+            return v;
+        }
         let mut x = self.img_in.forward(img, ni);
         let nb = self.blocks.len();
         let temb = self.run_blocks(&mut x, shapes, txt, sigma, extra.t_cond, &mut |li, x| {
@@ -524,6 +542,176 @@ impl<'a> Transformer<'a> {
     pub fn num_blocks(&self) -> usize {
         self.blocks.len()
     }
+
+    /// Runs whole transformer passes on the accelerator when it has them (the default; also
+    /// `OXINFER_QWEN_IMAGE_DEVICE_PASS=0`): every block in a few command buffers with the
+    /// activations kept on the device (FLUX.1's plan, `crate::gpu::dit::FluxSession`). Off,
+    /// each matmul and attention goes to the device on its own and the rest runs on the CPU.
+    /// Same arithmetic either way (matrix-unit GEMMs on half operands, the same attention
+    /// kernel); the row work runs in f32 on the device instead of the CPU. ControlNet residuals
+    /// and streamed weights take the per-op path.
+    pub fn set_device_passes(&self, on: bool) {
+        self.device_passes.store(on, std::sync::atomic::Ordering::Relaxed);
+        if !on {
+            self.release_device();
+        }
+    }
+
+    /// Drops the device session's buffers (made again on the next device pass).
+    pub fn release_device(&self) {
+        *self.gpu.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.mods.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// [`Self::forward_with`] as one device pass; None when the device has no plan for it or
+    /// declines this call.
+    fn forward_device(&self, img: &[f32], shapes: &[ImageShape], txt: &[f32], sigma: f32, extra: &Extra) -> Option<Vec<f32>> {
+        use crate::gpu::dit::{FluxDouble, FluxInput, FluxModel};
+        if !self.device_passes.load(std::sync::atomic::Ordering::Relaxed)
+            || self.stream.is_some()
+            || extra.control.is_some_and(|c| !c.is_empty())
+        {
+            return None;
+        }
+        let be = crate::gpu::active()?;
+        let cfg = &self.cfg;
+        let d = cfg.inner();
+        let (norm_out, proj_out) = self.head.as_ref()?;
+        let nt = txt.len() / d;
+        if cfg.attention_head_dim != 128 || nt == 0 {
+            return None;
+        }
+        let ni: usize = shapes.iter().map(|s| s.tokens()).sum();
+        let n0 = shapes[0].tokens();
+        let n_out: usize = shapes[..extra.targets.clamp(1, shapes.len())].iter().map(|s| s.tokens()).sum();
+        let zero = cfg.zero_cond_t && ni > n0;
+        let _t = crate::prof::start(crate::prof::Cat::Matmul);
+        let mut doubles = Vec::with_capacity(self.blocks.len());
+        for b in &self.blocks {
+            doubles.push(FluxDouble {
+                img_qkv: [dit_lin(&b.to_q)?, dit_lin(&b.to_k)?, dit_lin(&b.to_v)?],
+                txt_qkv: [dit_lin(&b.add_q)?, dit_lin(&b.add_k)?, dit_lin(&b.add_v)?],
+                norms: [&b.norm_q, &b.norm_k, &b.norm_added_q, &b.norm_added_k],
+                img_out: dit_lin(&b.to_out)?,
+                txt_out: dit_lin(&b.to_add_out)?,
+                img_mlp: [dit_lin(&b.img_fc1)?, dit_lin(&b.img_fc2)?],
+                txt_mlp: [dit_lin(&b.txt_fc1)?, dit_lin(&b.txt_fc2)?],
+            });
+        }
+        let model = FluxModel {
+            dim: d,
+            heads: cfg.num_attention_heads,
+            head_dim: cfg.attention_head_dim,
+            x_emb: dit_lin(&self.img_in)?,
+            ctx_emb: None,
+            doubles,
+            singles: Vec::new(),
+            proj_out: dit_lin(proj_out)?,
+            half_attention: !crate::gpu::exact_attention(),
+        };
+        let t0 = std::time::Instant::now();
+        let key = (sigma.to_bits(), extra.t_cond, zero);
+        let mut cache = self.mods.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.as_ref().is_none_or(|(k, _)| *k != key) {
+            *cache = Some((key, self.modulations(be, norm_out, sigma, extra.t_cond, zero)));
+        }
+        let (mods, mods2) = &cache.as_ref().unwrap().1;
+        // Rotary angles of [text; image].
+        let ((ic, is), (tc, ts)) = self.rope(shapes, nt);
+        let cos = [tc, ic].concat();
+        let sin = [ts, is].concat();
+        let inp = FluxInput {
+            img,
+            n_img: ni,
+            txt,
+            n_txt: nt,
+            cos: &cos,
+            sin: &sin,
+            mods,
+            img_split: if zero { n0 } else { ni },
+            mods2,
+            n_out,
+        };
+        let mut sess = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if sess.is_none() {
+            *sess = Some(be.flux_session()?);
+        }
+        let mut out = Vec::new();
+        let t1 = std::time::Instant::now();
+        let ok = sess.as_mut()?.forward(&model, &inp, &mut out);
+        if std::env::var_os("OXINFER_QWEN_IMAGE_TRACE").is_some() {
+            eprintln!(
+                "[qwen-image pass ({}): mods {:.0} ms, device {:.0} ms]",
+                if ok { "device" } else { "declined" },
+                (t1 - t0).as_secs_f64() * 1e3,
+                t1.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        ok.then_some(out)
+    }
+
+    /// Every block's modulations and the head's at noise level `sigma` (the layout of
+    /// [`crate::gpu::dit::FluxInput::mods`] / `mods2`, the second the reference tokens' at
+    /// timestep 0 with `zero`): one device submission of matrix-vector products with float32
+    /// activations when the device takes the weights (the exact channels, LoRA updates and
+    /// biases added on the CPU), else on the CPU.
+    fn modulations(&self, be: &dyn crate::gpu::Backend, norm_out: &Dense, sigma: f32, t_cond: Option<usize>, zero: bool) -> Mods {
+        let d = self.cfg.inner();
+        let mut st = self.temb(sigma, t_cond);
+        if zero {
+            st.extend(self.temb(0.0, t_cond));
+        }
+        st.iter_mut().for_each(|v| *v = crate::sd::ops::silu(*v));
+        let rows = st.len() / d;
+        let mut layers: Vec<&Dense> = Vec::with_capacity(2 * self.blocks.len() + 1);
+        for b in &self.blocks {
+            layers.extend([&b.img_mod, &b.txt_mod]);
+        }
+        layers.push(norm_out);
+        let mut ys: Vec<Vec<f32>> = layers.iter().map(|l| vec![0f32; rows * l.n_out]).collect();
+        let devs: Option<Vec<_>> = layers
+            .iter()
+            .map(|l| {
+                (!l.w.has_lora() && l.w.fold.is_none())
+                    .then(|| l.w.device_weight(l.n_out, l.n_in))
+                    .flatten()
+            })
+            .collect();
+        let on_device = devs.is_some_and(|devs| {
+            let mut jobs: Vec<crate::gpu::RowsJob> = layers
+                .iter()
+                .zip(devs)
+                .zip(ys.iter_mut())
+                .map(|((l, dev), y)| crate::gpu::RowsJob {
+                    w: l.w.as_ref(),
+                    dev,
+                    up: None,
+                    n_out: l.n_out,
+                    y,
+                })
+                .collect();
+            be.matvec_rows(&st, rows, d, &mut jobs)
+        });
+        for (l, y) in layers.iter().zip(ys.iter_mut()) {
+            if on_device {
+                l.finish(&st, rows, y);
+            } else {
+                *y = l.forward_small(&st, rows);
+            }
+        }
+        let mut mods = Vec::with_capacity(self.blocks.len() * 12 * d + 2 * d);
+        let mut mods2 = Vec::with_capacity(if zero { self.blocks.len() * 6 * d } else { 0 });
+        for b in ys[..2 * self.blocks.len()].chunks(2) {
+            let (im, tm) = (&b[0], &b[1]);
+            mods.extend_from_slice(&im[..6 * d]);
+            mods.extend_from_slice(&tm[..6 * d]);
+            if zero {
+                mods2.extend_from_slice(&im[6 * d..12 * d]);
+            }
+        }
+        mods.extend_from_slice(&ys[2 * self.blocks.len()][..2 * d]);
+        (mods, mods2)
+    }
 }
 
 /// The timestep embedding of `sigma` through the embedder's two layers: `[inner]`.
@@ -585,4 +773,41 @@ fn mlp(fc1: &Dense, fc2: &Dense, x: &[f32], rows: usize) -> Vec<f32> {
 pub(super) fn gelu_tanh_exact(x: f32) -> f32 {
     const K: f32 = 0.797_884_6;
     0.5 * x * (1.0 + (K * (x + 0.044_715 * x * x * x)).tanh())
+}
+
+/// Whether Qwen-Image transformers run whole device passes unless told otherwise
+/// (`OXINFER_QWEN_IMAGE_DEVICE_PASS=0` turns them off).
+pub(crate) fn device_passes_default() -> bool {
+    std::env::var("OXINFER_QWEN_IMAGE_DEVICE_PASS").map_or(true, |v| v != "0")
+}
+
+/// A layer as the device's whole-pass plan sees it, its run-time LoRA update as a side path;
+/// None for a weight the device has no state for (or with exact input channels, which only the
+/// modulation layers have).
+fn dit_lin<'s>(d: &'s Dense) -> Option<crate::gpu::dit::Lin<'s>> {
+    let lin = |w: &'s crate::model::Lin, n_out: usize, n_in: usize, bias: Option<&'s [f32]>| {
+        if w.has_lora() || w.fold.is_some() {
+            return None;
+        }
+        Some(crate::gpu::dit::Lin {
+            w: w.as_ref(),
+            dev: w.device_weight(n_out, n_in)?,
+            n_out,
+            n_in,
+            bias,
+            side: None,
+            rot: None,
+        })
+    };
+    if d.exact.is_some() {
+        return None;
+    }
+    let mut l = lin(&d.w, d.n_out, d.n_in, d.b.as_deref())?;
+    if let Some(r) = &d.lora {
+        l.side = Some((
+            Box::new(lin(&r.down, r.r, d.n_in, None)?),
+            Box::new(lin(&r.up, d.n_out, r.r, None)?),
+        ));
+    }
+    Some(l)
 }

@@ -437,6 +437,7 @@ fn usage() -> ! {
          \x20                      -o out.png writes out_0.png ...)\n\
          \x20 --resolution N       Qwen-Image-Layered: 640 (default) or 1024\n\
          \x20 --quant q8|q4        transformer and text encoder precision; --mmap, --stream as above\n\
+         \x20 --no-device-passes   run the transformer op by op instead of whole passes on the GPU\n\
          \n\
          MOSS-Image (lodestones/Kromoss, OpenMOSS-Team/MOSS-Image-*; see docs/moss-image.md): text to\n\
          image (-o, --steps, --guidance, --negative, --size, --seed, --lora as above):\n\

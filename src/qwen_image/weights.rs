@@ -230,26 +230,34 @@ impl LoraSet {
 }
 
 /// A LoRA update applied at run time: `y += up (down x)`, both small matmuls through the shared
-/// matmul (so on the GPU when the base one is).
+/// matmul (so on the GPU when the base one is). The rank is padded to a multiple of 64 with
+/// zeros (the matrix-unit GEMMs' tile, for the device passes' side paths).
 pub struct RuntimeLora {
-    down: Lin<'static>,
-    up: Lin<'static>,
-    r: usize,
+    pub(super) down: Lin<'static>,
+    pub(super) up: Lin<'static>,
+    /// The padded rank.
+    pub(super) r: usize,
 }
 
 impl RuntimeLora {
     fn new(down: &[f32], up: &[f32], r: usize) -> Self {
-        let bf = |v: &[f32]| {
-            let mut p = PageVec::<u16>::zeroed(v.len());
-            for (o, &x) in p.iter_mut().zip(v) {
-                *o = crate::sd::ops::f32_to_bf16(x);
+        let n_in = down.len() / r;
+        let n_out = up.len() / r;
+        let rp = r.next_multiple_of(64);
+        let mut dp = PageVec::<u16>::zeroed(rp * n_in);
+        for (o, &x) in dp.iter_mut().zip(down) {
+            *o = crate::sd::ops::f32_to_bf16(x);
+        }
+        let mut upp = PageVec::<u16>::zeroed(n_out * rp);
+        for (o, row) in upp.chunks_mut(rp).zip(up.chunks(r)) {
+            for (a, &x) in o.iter_mut().zip(row) {
+                *a = crate::sd::ops::f32_to_bf16(x);
             }
-            Lin::bf16_owned(p)
-        };
+        }
         Self {
-            down: bf(down),
-            up: bf(up),
-            r,
+            down: Lin::bf16_owned(dp),
+            up: Lin::bf16_owned(upp),
+            r: rp,
         }
     }
 }
@@ -316,28 +324,46 @@ impl Dense<'_> {
             linear_multi(&mut dj, n_in, x, rows);
         }
         for ((d, y), h) in jobs.iter_mut().zip(&hs) {
-            if let Some(e) = &d.exact {
-                let k = e.idx.len();
-                for_chunks(y, d.n_out, rows > 1, |t, yr| {
-                    let xs: Vec<f32> = e.idx.iter().map(|&c| x[t * n_in + c]).collect();
-                    for (v, wr) in yr.iter_mut().zip(e.w.chunks_exact(k)) {
-                        *v += wr.iter().zip(&xs).map(|(a, b)| a * b).sum::<f32>();
-                    }
-                });
-            }
-            if let Some(l) = &d.lora {
-                let mut u = vec![0f32; rows * d.n_out];
-                linear(&l.up, d.n_out, l.r, h, rows, &mut u);
-                crate::kernels::add_inplace(y, &u);
-            }
-            if let Some(b) = &d.b {
-                for_chunks(y, d.n_out, rows > 1, |_, r| {
-                    for (v, &bb) in r.iter_mut().zip(b) {
-                        *v += bb;
-                    }
-                });
-            }
+            d.add_rest(x, rows, h, y);
         }
+    }
+
+    /// What [`Dense::forward`] adds to the base matmul `y` (`[rows, n_out]`, of the quantized
+    /// matrix alone): the exact input channels, the LoRA update (its down projection `h`,
+    /// `[rows, r]`) and the bias.
+    fn add_rest(&self, x: &[f32], rows: usize, h: &[f32], y: &mut [f32]) {
+        let n_in = self.n_in;
+        if let Some(e) = &self.exact {
+            let k = e.idx.len();
+            for_chunks(y, self.n_out, rows > 1, |t, yr| {
+                let xs: Vec<f32> = e.idx.iter().map(|&c| x[t * n_in + c]).collect();
+                for (v, wr) in yr.iter_mut().zip(e.w.chunks_exact(k)) {
+                    *v += wr.iter().zip(&xs).map(|(a, b)| a * b).sum::<f32>();
+                }
+            });
+        }
+        if let Some(l) = &self.lora {
+            let mut u = vec![0f32; rows * self.n_out];
+            linear(&l.up, self.n_out, l.r, h, rows, &mut u);
+            crate::kernels::add_inplace(y, &u);
+        }
+        if let Some(b) = &self.b {
+            for_chunks(y, self.n_out, rows > 1, |_, r| {
+                for (v, &bb) in r.iter_mut().zip(b) {
+                    *v += bb;
+                }
+            });
+        }
+    }
+
+    /// [`Dense::add_rest`] after a base matmul computed elsewhere (the device's
+    /// matrix-vector products), the LoRA down projection on the CPU.
+    pub fn finish(&self, x: &[f32], rows: usize, y: &mut [f32]) {
+        let mut h = vec![0f32; self.lora.as_ref().map_or(0, |l| rows * l.r)];
+        if let Some(l) = &self.lora {
+            linear(&l.down, l.r, self.n_in, x, rows, &mut h);
+        }
+        self.add_rest(x, rows, &h, y);
     }
 }
 

@@ -618,7 +618,8 @@ typedef struct OxiQwenImage OxiQwenImage;
  *                          defaults to its settings
  *   keep_text_encoder=0|1  keep the 16 GB text encoder loaded between calls (default 0)
  *   stream=0|1             stream the transformer's blocks from storage
- *   device=auto|cpu|metal|cuda|vulkan */
+ *   device=auto|cpu|metal|cuda|vulkan
+ *   device_passes=0|1      whole transformer passes on the GPU (default 1); 0: op by op */
 OxiQwenImage *oxi_qwen_image_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
 
 /* Frees a pipeline (NULL is ignored); no other call on it may be running. */
