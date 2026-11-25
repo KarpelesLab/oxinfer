@@ -280,7 +280,19 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   Qwen3-8B pass spends 1.5 ms there instead of 18.1 on the decode kernel in batches of 32
   (`gpu_exact=1` keeps that), so its prompts run at 6165 tok/s at 512 tokens and 5432 at 2048,
   Llama-3.2-1B's at 26871 and 21460, with the same greedy tokens as before on the four
-  `pf_check` runs. Host time of a step: the new keys and values go into the host caches in one
+  `pf_check` runs. Longer steps take `dfattn2_*` (from 1024 positions at head dimension 128,
+  always at 64; `OXINFER_CUDA_FATTN2=0` / `1` forces one): a 256-thread block holds the heads of
+  a GQA group (up to 8) times 128 / heads queries, so a key / value tile serves 128 query rows,
+  the tiles come in by cp.async while the previous one is in the MMAs, and the longest blocks go
+  first. Per layer on an RTX PRO 6000 (32 / 8 heads): Qwen3-8B 512 tokens after 512 cached 56 ->
+  46 us, after 1536 110 -> 91, after 3584 218 -> 164, one 2048-token step 226 -> 182;
+  Llama-3.2-1B 512 after 1536 58 -> 49, one 2048-token step 121 -> 100 (a 512-token step after
+  none at 128: 30 vs 32 us, so `dfattn` stays there). Its outputs are `dfattn`'s bit for bit
+  (the same f16 values and tile order; a warp skips only tiles masked out for all its rows):
+  `pf_check` over 2048 tokens identical. Qwen3-8B Q4_K_M prompts of 4096 tokens 11773 -> 12038
+  tok/s, 2048 12516 -> 12669 (idle GPU). The tiles are still read as f32: with every SM busy a
+  tile of 128 rows takes 4.7 us against 3.2 alone, the L2 bandwidth of the f32 keys and values.
+  Host time of a step: the new keys and values go into the host caches in one
   parallel copy for every layer (a parallel region per layer and cache took 11-19 ms of a
   512-token Qwen3-8B step, now 3.4), reserved for the whole prompt and the decode steps after it
   (a power of two of positions, on transparent huge pages where Linux gives them on request; the

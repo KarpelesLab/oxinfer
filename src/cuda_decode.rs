@@ -270,6 +270,10 @@ enum COp {
         /// The tensor-core kernel over the whole step (`dfattn_D`: fast prefill plans, head
         /// dimensions 64 and 128; else null).
         fa: F,
+        /// Its variant with the group's heads in one block and streamed tiles (`dfattn2_D`;
+        /// null with `fa`), taken for steps over at least `fa2_from` positions.
+        fa2: F,
+        fa2_from: usize,
         combine: F,
         q: P,
         out: P,
@@ -718,6 +722,19 @@ fn op_name(op: &Op) -> &'static str {
         Op::AttendSel { .. } => "qsa-attention",
         Op::LoraDown { .. } => "lora-down",
         Op::LoraUp { .. } => "lora-up",
+    }
+}
+
+/// From how many positions (its own and the cached ones) a prefill step's attention takes
+/// `dfattn2` rather than `dfattn`: at head dimension 64, and from 1024 positions at 128, where
+/// its 128-row blocks still fill the GPU (Qwen3-8B, 512 tokens after none: dfattn 30 us, dfattn2
+/// 32). `OXINFER_CUDA_FATTN2=0` / `1` takes one kernel always.
+fn fattn2_from(hd: usize) -> usize {
+    match std::env::var("OXINFER_CUDA_FATTN2").as_deref() {
+        Ok("0") => usize::MAX,
+        Ok(_) => 0,
+        Err(_) if hd == 64 => 0,
+        Err(_) => 1024,
     }
 }
 
@@ -1194,6 +1211,16 @@ impl CudaBackend {
                             },
                             fa: if fast_attn && matches!(hd, 64 | 128) {
                                 self.func(&format!("dfattn_{hd}"))?
+                            } else {
+                                std::ptr::null_mut()
+                            },
+                            fa2_from: fattn2_from(hd),
+                            fa2: if fast_attn && matches!(hd, 64 | 128) {
+                                let f = self.func(&format!("dfattn2_{hd}"))?;
+                                // Its tiles take more than the 48 KB of shared memory a block
+                                // gets by default.
+                                let shm = crate::cuda::dfattn2_shmem(hd) as std::ffi::c_int;
+                                (unsafe { self.cu.cuFuncSetAttribute(f, 8, shm) } == 0).then_some(f)?
                             } else {
                                 std::ptr::null_mut()
                             },
@@ -2112,17 +2139,40 @@ impl CudaPlan<'_> {
                 )
             }
             COp::Attn {
-                fa, q, out, kv, gate, p, ..
+                fa,
+                fa2,
+                fa2_from,
+                q,
+                out,
+                kv,
+                gate,
+                p,
+                hd,
+                ..
             } if !fa.is_null() && p.block == 0 => {
-                // The whole step: 64 queries of a head per block.
                 let m = &slot.kv[kv];
                 let (qa, oa, ga, sp, qs, os, gs) = (q.a, out.a, gate.a, self.sp, st(q), st(out), st(gate));
-                be.launch(
-                    fa,
-                    (tt.div_ceil(64), p.nh),
-                    128,
-                    &mut args![qa, m.k, m.v, oa, ga, sp, p, tt, qs, os, gs],
-                )
+                // During a step the device cache holds the positions before it (`synced`).
+                if m.synced + t >= fa2_from {
+                    // The group's heads per block, 128 query rows: longer steps and head
+                    // dimension 64 (measured: Qwen3-8B 512 tokens after 1536 110 -> 91 us).
+                    let hb = crate::cuda::dfattn2_heads(p.nh as usize, p.nkv as usize);
+                    be.launch_shm(
+                        fa2,
+                        (tt.div_ceil(128 / hb), p.nh / hb, 1),
+                        256,
+                        crate::cuda::dfattn2_shmem(hd as usize),
+                        &mut args![qa, m.k, m.v, oa, ga, sp, p, tt, qs, os, gs, hb],
+                    )
+                } else {
+                    // 64 queries of a head per block.
+                    be.launch(
+                        fa,
+                        (tt.div_ceil(64), p.nh),
+                        128,
+                        &mut args![qa, m.k, m.v, oa, ga, sp, p, tt, qs, os, gs],
+                    )
+                }
             }
             COp::Attn {
                 ft,

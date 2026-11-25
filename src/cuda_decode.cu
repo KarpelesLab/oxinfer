@@ -1137,3 +1137,193 @@ extern "C" __global__ void __launch_bounds__(128) dfattn_##D(const float* q, con
                                                              const unsigned int* sp, DAP p, unsigned int t, unsigned int qs, unsigned int os, \
                                                              unsigned int gs) { dfattn_body<D>(q, kc, vc, out, gate, sp, p, t, qs, os, gs); }
 DFATTN(64) DFATTN(128)
+
+// ---- `dfattn2_D`: dfattn with the heads of a GQA group packed into one block and the key /
+// value tiles streamed. A 256-thread block (8 warps of 16 query rows) takes `hb` heads that
+// share a key / value head (hb in 1, 2, 4, 8, dividing the group) times 128 / hb consecutive
+// queries, so one tile of 64 keys serves 128 query rows (twice dfattn's). Each tile arrives in
+// f32 by cp.async into a staging buffer while the previous one is in the MMAs, then is rounded
+// to f16 shared to shared (the same f16 values as dfattn). Blocks are taken longest first
+// (last query tile first) so the causal tail does not run alone at the end. A warp skips the
+// MMAs of tiles wholly past its last query. Dynamic shared memory: DFA2_SHM(D) bytes.
+#define DFA2_SHM(D) (2 * FA_K * (D) * 4 + 2 * FA_K * ((D) + 8) * 2)
+__device__ __forceinline__ void fa_cpa16(void* dst, const void* src, unsigned int n) {
+    unsigned int a = (unsigned int)__cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(a), "l"(src), "r"(n));
+}
+template <int D>
+__device__ __forceinline__ void dfattn2_body(const float* q, const float* kc, const float* vc, float* out, const float* gate,
+                                             const unsigned int* sp, DAP p, unsigned int t, unsigned int qs, unsigned int os,
+                                             unsigned int gs, unsigned int hb) {
+    constexpr unsigned int LD = D + 8;
+    extern __shared__ __align__(16) unsigned char fa2_smem[];
+    float* Kf = (float*)fa2_smem;
+    float* Vf = Kf + FA_K * D;
+    unsigned short* Ks = (unsigned short*)(Vf + FA_K * D);
+    unsigned short* Vs = Ks + FA_K * LD;
+    unsigned int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, c4 = lane & 3;
+    unsigned int tq = 128 / hb, wph = 8 / hb; // queries per block, warps per head
+    unsigned int h = blockIdx.y * hb + warp / wph, kvh = (blockIdx.y * hb) / (p.nh / p.nkv);
+    unsigned int j0 = (gridDim.x - 1 - blockIdx.x) * tq;
+    if (j0 >= t) return;
+    unsigned int pos0 = sp[0];
+    size_t rs = (size_t)p.nkv * D;
+    unsigned int qr0 = j0 + 16 * (warp % wph) + g, qr1 = qr0 + 8;
+    unsigned int qa[D / 16][4];
+    {
+        const float* q0 = q + (size_t)min(qr0, t - 1) * qs + h * D;
+        const float* q1 = q + (size_t)min(qr1, t - 1) * qs + h * D;
+#pragma unroll
+        for (int kk = 0; kk < D / 16; kk++) {
+            unsigned int c = 16 * kk + 2 * c4;
+            qa[kk][0] = fa_pack(q0[c] * p.scale, q0[c + 1] * p.scale);
+            qa[kk][1] = fa_pack(q1[c] * p.scale, q1[c + 1] * p.scale);
+            qa[kk][2] = fa_pack(q0[c + 8] * p.scale, q0[c + 9] * p.scale);
+            qa[kk][3] = fa_pack(q1[c + 8] * p.scale, q1[c + 9] * p.scale);
+        }
+    }
+    unsigned int P0 = pos0 + qr0, P1 = pos0 + qr1;
+    unsigned int lo0 = p.window != 0 && P0 + 1 > p.window ? P0 + 1 - p.window : 0;
+    unsigned int lo1 = p.window != 0 && P1 + 1 > p.window ? P1 + 1 - p.window : 0;
+    // The warp's last query position, and the first key any of its rows sees.
+    unsigned int wlast = pos0 + min(j0 + 16 * (warp % wph) + 15, t - 1);
+    unsigned int wfirst = pos0 + j0 + 16 * (warp % wph);
+    unsigned int wlo = p.window != 0 && wfirst + 1 > p.window ? wfirst + 1 - p.window : 0;
+    unsigned int plast = pos0 + min(j0 + tq, t) - 1, pfirst = pos0 + j0;
+    unsigned int klo = p.window != 0 && pfirst + 1 > p.window ? pfirst + 1 - p.window : 0;
+    klo = klo / FA_K * FA_K;
+    // Tile k0's f32 keys and values into the staging buffers (rows past plast as zeros).
+    auto fetch = [&](unsigned int k0) {
+        for (unsigned int i = tid; i < FA_K * D / 4; i += 256) {
+            unsigned int r = i / (D / 4), c = 4 * (i % (D / 4));
+            bool in = k0 + r <= plast;
+            size_t off = in ? (size_t)(k0 + r) * rs + kvh * D + c : 0;
+            fa_cpa16(Kf + r * D + c, kc + off, in ? 16u : 0u);
+            fa_cpa16(Vf + r * D + c, vc + off, in ? 16u : 0u);
+        }
+        asm volatile("cp.async.commit_group;");
+    };
+    auto convert = [&]() {
+        for (unsigned int i = tid; i < FA_K * D / 4; i += 256) {
+            unsigned int r = i / (D / 4), c = 4 * (i % (D / 4));
+            float4 kv = *(const float4*)(Kf + r * D + c), vv = *(const float4*)(Vf + r * D + c);
+            *(uint2*)&Ks[r * LD + c] = make_uint2(fa_pack(kv.x, kv.y), fa_pack(kv.z, kv.w));
+            *(uint2*)&Vs[r * LD + c] = make_uint2(fa_pack(vv.x, vv.y), fa_pack(vv.z, vv.w));
+        }
+    };
+    const float NEG = -__uint_as_float(0x7f800000u);
+    float m0 = NEG, m1 = NEG, l0 = 0.f, l1 = 0.f;
+    float o[D / 8][4];
+#pragma unroll
+    for (int i = 0; i < D / 8; i++) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
+    fetch(klo);
+    asm volatile("cp.async.wait_group 0;");
+    __syncthreads();
+    convert();
+    __syncthreads();
+    if (klo + FA_K <= plast) fetch(klo + FA_K);
+    for (unsigned int k0 = klo; k0 <= plast; k0 += FA_K) {
+        if (k0 <= wlast && k0 + FA_K > wlo) {
+            float s[FA_K / 8][4];
+#pragma unroll
+            for (int nt = 0; nt < FA_K / 8; nt++) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.f;
+#pragma unroll
+            for (int kk = 0; kk < D / 16; kk++)
+#pragma unroll
+                for (int np = 0; np < FA_K / 16; np++) {
+                    unsigned int r = 16 * np + (lane & 7) + 8 * (lane >> 4), c = 16 * kk + 8 * ((lane >> 3) & 1);
+                    unsigned int b4[4];
+                    fa_ldsm4(b4, &Ks[r * LD + c]);
+                    fa_mma(s[2 * np], qa[kk], b4);
+                    fa_mma(s[2 * np + 1], qa[kk], b4 + 2);
+                }
+            float mx0 = m0, mx1 = m1;
+#pragma unroll
+            for (int nt = 0; nt < FA_K / 8; nt++)
+#pragma unroll
+                for (int e = 0; e < 2; e++) {
+                    unsigned int kp = k0 + 8 * nt + 2 * c4 + e;
+                    if (kp > P0 || kp < lo0) s[nt][e] = NEG;
+                    if (kp > P1 || kp < lo1) s[nt][2 + e] = NEG;
+                    mx0 = fmaxf(mx0, s[nt][e]);
+                    mx1 = fmaxf(mx1, s[nt][2 + e]);
+                }
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+            float a0 = mx0 == NEG ? 1.f : expf(m0 - mx0), a1 = mx1 == NEG ? 1.f : expf(m1 - mx1);
+            float rs0 = 0.f, rs1 = 0.f;
+            unsigned int pa[FA_K / 16][4];
+#pragma unroll
+            for (int nt = 0; nt < FA_K / 8; nt++) {
+                float e0 = mx0 == NEG ? 0.f : expf(s[nt][0] - mx0), e1 = mx0 == NEG ? 0.f : expf(s[nt][1] - mx0);
+                float e2 = mx1 == NEG ? 0.f : expf(s[nt][2] - mx1), e3 = mx1 == NEG ? 0.f : expf(s[nt][3] - mx1);
+                rs0 += e0 + e1;
+                rs1 += e2 + e3;
+                unsigned int kk = nt >> 1;
+                if ((nt & 1) == 0) {
+                    pa[kk][0] = fa_pack(e0, e1);
+                    pa[kk][1] = fa_pack(e2, e3);
+                } else {
+                    pa[kk][2] = fa_pack(e0, e1);
+                    pa[kk][3] = fa_pack(e2, e3);
+                }
+            }
+            rs0 += __shfl_xor_sync(0xffffffffu, rs0, 1);
+            rs0 += __shfl_xor_sync(0xffffffffu, rs0, 2);
+            rs1 += __shfl_xor_sync(0xffffffffu, rs1, 1);
+            rs1 += __shfl_xor_sync(0xffffffffu, rs1, 2);
+            l0 = l0 * a0 + rs0;
+            l1 = l1 * a1 + rs1;
+            m0 = mx0;
+            m1 = mx1;
+#pragma unroll
+            for (int i = 0; i < D / 8; i++) {
+                o[i][0] *= a0;
+                o[i][1] *= a0;
+                o[i][2] *= a1;
+                o[i][3] *= a1;
+            }
+#pragma unroll
+            for (int kk = 0; kk < FA_K / 16; kk++)
+#pragma unroll
+                for (int dp = 0; dp < D / 16; dp++) {
+                    unsigned int r = 16 * kk + (lane & 7) + 8 * ((lane >> 3) & 1), c = 16 * dp + 8 * (lane >> 4);
+                    unsigned int b4[4];
+                    fa_ldsm4t(b4, &Vs[r * LD + c]);
+                    fa_mma(o[2 * dp], pa[kk], b4);
+                    fa_mma(o[2 * dp + 1], pa[kk], b4 + 2);
+                }
+        }
+        if (k0 + FA_K <= plast) {
+            asm volatile("cp.async.wait_group 0;");
+            __syncthreads(); // the staged tile is in, and every warp is done with the f16 one
+            convert();
+            __syncthreads();
+            if (k0 + 2 * FA_K <= plast) fetch(k0 + 2 * FA_K);
+        }
+    }
+    float il0 = l0 > 0.f ? 1.f / l0 : 0.f, il1 = l1 > 0.f ? 1.f / l1 : 0.f;
+#pragma unroll
+    for (int i = 0; i < D / 8; i++)
+#pragma unroll
+        for (int e = 0; e < 2; e++) {
+            unsigned int d = 8 * i + 2 * c4 + e;
+            if (qr0 < t) {
+                float v = o[i][e] * il0;
+                if (p.has_gate) v *= dsig(gate[(size_t)qr0 * gs + h * p.g_stride + d]);
+                out[(size_t)qr0 * os + h * D + d] = v;
+            }
+            if (qr1 < t) {
+                float v = o[i][2 + e] * il1;
+                if (p.has_gate) v *= dsig(gate[(size_t)qr1 * gs + h * p.g_stride + d]);
+                out[(size_t)qr1 * os + h * D + d] = v;
+            }
+        }
+}
+#define DFATTN2(D) \
+extern "C" __global__ void __launch_bounds__(256) dfattn2_##D(const float* q, const float* kc, const float* vc, float* out, const float* gate, \
+                                                              const unsigned int* sp, DAP p, unsigned int t, unsigned int qs, unsigned int os, \
+                                                              unsigned int gs, unsigned int hb) { dfattn2_body<D>(q, kc, vc, out, gate, sp, p, t, qs, os, gs, hb); }
+DFATTN2(64) DFATTN2(128)

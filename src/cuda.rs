@@ -1688,6 +1688,18 @@ impl CudaBackend {
     }
 }
 
+/// Dynamic shared memory of `dfattn2_D` (`DFA2_SHM` in `cuda_decode.cu`): f32 staging and f16
+/// tiles of 64 keys and values.
+pub(crate) const fn dfattn2_shmem(d: usize) -> u32 {
+    (2 * 64 * d * 4 + 2 * 64 * (d + 8) * 2) as u32
+}
+
+/// `dfattn2`'s heads per block: the largest of 8, 4, 2, 1 dividing the GQA group (`nh / nkv`).
+pub(crate) fn dfattn2_heads(nh: usize, nkv: usize) -> u32 {
+    let g = nh / nkv.max(1);
+    [8, 4, 2, 1].into_iter().find(|&b| g.is_multiple_of(b)).unwrap_or(1) as u32
+}
+
 fn weight_key(w: &WeightRef) -> Option<(usize, usize, u64)> {
     fn sample(b: &[u8], h: &mut u64) {
         let n = b.len();
@@ -3054,6 +3066,97 @@ mod tests {
         }
     }
 
+    /// Timing of the prefill attention kernels (`FATTN_SHAPES=d:nh:nkv:t:pos0,...`, default
+    /// Qwen3-8B's heads at 512 tokens after 0 and 1536 cached; `FATTN_KERNELS=dfattn,...`):
+    /// best of 15 rounds of 20 launches each.
+    /// `cargo test --release --lib cuda::tests::fattn_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn fattn_bench() {
+        let Some(be) = backend() else { return };
+        assert!(be.bind());
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Dap {
+            nh: u32,
+            nkv: u32,
+            window: u32,
+            has_gate: u32,
+            g_stride: u32,
+            block: u32,
+            scale: f32,
+            _q: u32,
+        }
+        let shapes = std::env::var("FATTN_SHAPES").unwrap_or("128:32:8:512:0,128:32:8:512:1536,128:32:8:64:448".into());
+        let kernels = std::env::var("FATTN_KERNELS").unwrap_or("dfattn".into());
+        let mut seed = 9;
+        for sh in shapes.split(',') {
+            let v: Vec<usize> = sh.split(':').map(|x| x.parse().unwrap()).collect();
+            let (d, nh, nkv, t, pos0) = (v[0], v[1], v[2], v[3], v[4]);
+            let len = pos0 + t;
+            let k: Vec<f32> = (0..len * nkv * d).map(|_| rnd(&mut seed)).collect();
+            let q: Vec<f32> = (0..t * nh * d).map(|_| rnd(&mut seed)).collect();
+            let sp: Vec<u32> = (0..t).flat_map(|j| [(pos0 + j) as u32, pos0 as u32, t as u32, j as u32]).collect();
+            let up = |v: &[f32]| be.upload_bytes(v.as_ptr() as *const u8, v.len() * 4).unwrap();
+            let (dk, dv, dq) = (up(&k), up(&k), up(&q));
+            let dsp = be.upload_bytes(sp.as_ptr() as *const u8, sp.len() * 4).unwrap();
+            let mut dout = 0u64;
+            assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut dout, t * nh * d * 4) }, 0);
+            let p = Dap {
+                nh: nh as u32,
+                nkv: nkv as u32,
+                window: 0,
+                has_gate: 0,
+                g_stride: 0,
+                block: 0,
+                scale: 1.0 / (d as f32).sqrt(),
+                _q: 0,
+            };
+            let (tt, qs, os, gs) = (t as u32, (nh * d) as u32, (nh * d) as u32, 0u32);
+            for kn in kernels.split(',') {
+                let f = be.func(&format!("{kn}_{d}")).unwrap();
+                let two = kn == "dfattn2";
+                let hb = dfattn2_heads(nh, nkv);
+                if two {
+                    assert_eq!(unsafe { be.cu.cuFuncSetAttribute(f, 8, dfattn2_shmem(d) as c_int) }, 0);
+                }
+                let mut args = [
+                    &dq as *const _ as *mut c_void,
+                    &dk as *const _ as *mut c_void,
+                    &dv as *const _ as *mut c_void,
+                    &dout as *const _ as *mut c_void,
+                    &dq as *const _ as *mut c_void,
+                    &dsp as *const _ as *mut c_void,
+                    &p as *const _ as *mut c_void,
+                    &tt as *const _ as *mut c_void,
+                    &qs as *const _ as *mut c_void,
+                    &os as *const _ as *mut c_void,
+                    &gs as *const _ as *mut c_void,
+                    &hb as *const _ as *mut c_void,
+                ];
+                let mut best = f64::MAX;
+                for _ in 0..15 {
+                    unsafe { be.cu.cuCtxSynchronize() };
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..20 {
+                        assert!(if two {
+                            let grid = ((t as u32).div_ceil(128 / hb), nh as u32 / hb, 1);
+                            be.launch_shm(f, grid, 256, dfattn2_shmem(d), &mut args)
+                        } else {
+                            be.launch(f, ((t as u32).div_ceil(64), nh as u32), 128, &mut args[..11])
+                        });
+                    }
+                    unsafe { be.cu.cuCtxSynchronize() };
+                    best = best.min(t0.elapsed().as_secs_f64() / 20.0);
+                }
+                println!("{kn:>10} d {d} heads {nh}/{nkv} t {t} after {pos0}: {:8.1} us", best * 1e6);
+            }
+            for ptr in [dk, dv, dq, dsp, dout] {
+                unsafe { be.cu.cuMemFree_v2(ptr) };
+            }
+        }
+    }
+
     /// The prefill plans' tensor-core attention (`dfattn_D`): queries of a step after cached
     /// positions, causal, with and without a window and an output gate, grouped heads, a partial
     /// last tile of queries, against the f64 definition (to f16's rounding of the operands).
@@ -3074,8 +3177,16 @@ mod tests {
             _q: u32,
         }
         let mut seed = 5;
-        for d in [64usize, 128] {
-            let (nh, nkv, t, pos0) = (4usize, 2usize, 100usize, 37usize);
+        for (kn, d, nh, nkv) in [
+            ("dfattn", 64usize, 4usize, 2usize),
+            ("dfattn", 128, 4, 2),
+            ("dfattn2", 64, 4, 2),
+            ("dfattn2", 128, 4, 2),
+            ("dfattn2", 128, 4, 1),
+            ("dfattn2", 64, 3, 3),
+            ("dfattn2", 128, 16, 2),
+        ] {
+            let (t, pos0) = (300usize, 37usize);
             let len = pos0 + t;
             let (qs, gs) = (nh * d + 16, nh * d);
             let k: Vec<f32> = (0..len * nkv * d).map(|_| rnd(&mut seed) * 2.0).collect();
@@ -3088,7 +3199,12 @@ mod tests {
             let dsp = be.upload_bytes(sp.as_ptr() as *const u8, sp.len() * 4).unwrap();
             let mut dout = 0u64;
             assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut dout, t * nh * d * 4) }, 0);
-            let f = be.func(&format!("dfattn_{d}")).unwrap();
+            let f = be.func(&format!("{kn}_{d}")).unwrap();
+            let two = kn == "dfattn2";
+            let hb = dfattn2_heads(nh, nkv);
+            if two {
+                assert_eq!(unsafe { be.cu.cuFuncSetAttribute(f, 8, dfattn2_shmem(d) as c_int) }, 0);
+            }
             let scale = 1.0 / (d as f32).sqrt();
             for (window, has_gate) in [(0u32, 0u32), (50, 0), (0, 1), (130, 1)] {
                 let p = Dap {
@@ -3114,8 +3230,14 @@ mod tests {
                     &qsu as *const _ as *mut c_void,
                     &os as *const _ as *mut c_void,
                     &gsu as *const _ as *mut c_void,
+                    &hb as *const _ as *mut c_void,
                 ];
-                assert!(be.launch(f, ((t as u32).div_ceil(64), nh as u32), 128, &mut args));
+                assert!(if two {
+                    let grid = ((t as u32).div_ceil(128 / hb), nh as u32 / hb, 1);
+                    be.launch_shm(f, grid, 256, dfattn2_shmem(d), &mut args)
+                } else {
+                    be.launch(f, ((t as u32).div_ceil(64), nh as u32), 128, &mut args[..11])
+                });
                 let mut out = vec![0f32; t * nh * d];
                 assert_eq!(
                     unsafe { be.cu.cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut c_void, dout, out.len() * 4) },
@@ -3155,7 +3277,10 @@ mod tests {
                     }
                 }
                 // f16 operands: ~1e-4 measured, values up to 1 in magnitude.
-                assert!(worst < 1e-3, "dfattn_{d} window {window} gate {has_gate}: error {worst:.2e}");
+                assert!(
+                    worst < 1e-3,
+                    "{kn}_{d} heads {nh}/{nkv} window {window} gate {has_gate}: error {worst:.2e}"
+                );
             }
             for ptr in [dk, dv, dq, dg, dsp, dout] {
                 unsafe { be.cu.cuMemFree_v2(ptr) };
