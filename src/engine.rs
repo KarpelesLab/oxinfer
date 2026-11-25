@@ -4288,7 +4288,7 @@ pub fn trained_context(model: &Path) -> Option<usize> {
     }
     let dir = if model.is_dir() { model } else { model.parent()? };
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).ok()?).ok()?;
-    ["max_position_embeddings", "max_sequence_length", "seq_length"]
+    ["max_position_embeddings", "max_sequence_length", "seq_length", "model_max_length"]
         .iter()
         .find_map(|k| {
             [&v, &v["text_config"], &v["llm_config"]]
@@ -4488,6 +4488,24 @@ pub fn save_quantized(src: &Path, out: &Path, files: &ModelFiles, quant: Quant) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trained_context_reads_the_config_keys() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-trained-ctx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        for (json, want) in [
+            (r#"{"max_position_embeddings": 40960}"#, Some(40960)),
+            (r#"{"text_config": {"max_position_embeddings": 131072}}"#, Some(131072)),
+            // Inkling-2's safetensors releases.
+            (r#"{"text_config": {"model_max_length": 1048576}}"#, Some(1048576)),
+            (r#"{"hidden_size": 8}"#, None),
+        ] {
+            std::fs::write(&cfg, json).unwrap();
+            assert_eq!(trained_context(&dir), want, "{json}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn assert_send<T: Send>() {}
 
