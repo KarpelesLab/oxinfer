@@ -29,6 +29,7 @@ pub struct FluxArgs {
     pub vae: Option<String>,
     pub redux: Option<String>,
     pub no_device_passes: bool,
+    pub no_text_device_passes: bool,
 }
 
 impl FluxArgs {
@@ -51,6 +52,7 @@ impl FluxArgs {
             "--vae" => self.vae = Some(val()?),
             "--redux" => self.redux = Some(val()?),
             "--no-device-passes" => self.no_device_passes = true,
+            "--no-text-device-passes" => self.no_text_device_passes = true,
             "--text-quant" => {
                 let v = val()?;
                 self.text_quant = Some(Quant::parse(&v).with_context(|| format!("--text-quant expects bf16|q8|q4, got {v}"))?);
@@ -93,7 +95,8 @@ or a BFL single-file checkpoint such as flux1-dev.safetensors):\n\
 \x20                      (default unsloth/FLUX.1-Kontext-dev)\n\
 \x20 --seed N             noise seed (default 42)\n\
 \x20 --no-device-passes   run the transformer op by op (matmuls and attention on the GPU, the\n\
-\x20                      rest on the CPU) instead of whole passes on the GPU\n";
+\x20                      rest on the CPU) instead of whole passes on the GPU (T5 too)\n\
+\x20 --no-text-device-passes  encode T5 block by block instead of in one GPU pass\n";
 
 fn load_image(p: &std::path::Path) -> Result<oxinfer::video::RgbImage> {
     #[cfg(feature = "media")]
@@ -120,6 +123,7 @@ pub fn run(args: &Args) -> Result<()> {
         quant: args.quant,
         text_quant: f.text_quant,
         device_passes: !f.no_device_passes && oxinfer::flux::LoadOptions::default().device_passes,
+        text_device_passes: !f.no_text_device_passes && oxinfer::flux::LoadOptions::default().text_device_passes,
         transformer: f.transformer.clone(),
         text_encoder: f.text_encoder.clone(),
         base: f.base.clone(),

@@ -39,6 +39,9 @@ pub struct T5Encoder {
     embed: &'static str,
     embed_dtype: String,
     pub weight_bytes: usize,
+    /// Whole encoder passes on the device (see [`Self::set_device_passes`]).
+    device_passes: std::sync::atomic::AtomicBool,
+    gpu: std::sync::Mutex<Option<Box<dyn crate::gpu::dit::T5Session>>>,
     // Declared last: dropped after every layer borrowing it.
     files: Box<ModelFiles>,
 }
@@ -109,6 +112,8 @@ impl T5Encoder {
             embed,
             embed_dtype,
             weight_bytes,
+            device_passes: std::sync::atomic::AtomicBool::new(device_passes_default()),
+            gpu: std::sync::Mutex::new(None),
             files,
         })
     }
@@ -164,12 +169,79 @@ impl T5Encoder {
         relative_bucket(rel, self.num_buckets, self.max_distance)
     }
 
+    /// Whether encodes run as one device pass where the device has a T5 plan (Metal with
+    /// matrix units; the default unless `OXINFER_T5_DEVICE_PASS=0`), else block by block with
+    /// the matmuls on the device and the rest on the CPU.
+    pub fn set_device_passes(&self, on: bool) {
+        self.device_passes.store(on, std::sync::atomic::Ordering::Relaxed);
+        if !on {
+            self.release_device();
+        }
+    }
+
+    /// Drops the device session's buffers (made again on the next device pass).
+    pub fn release_device(&self) {
+        *self.gpu.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// [`Self::forward`] as one device pass over the embeddings `h`; None when the device has no
+    /// T5 plan or declines (an unsupported shape or weight format).
+    fn forward_device(&self, h: &[f32], t: usize) -> Option<Vec<f32>> {
+        use crate::gpu::dit::{T5Block, T5Model};
+        if !self.device_passes.load(std::sync::atomic::Ordering::Relaxed) || self.d_kv != 64 {
+            return None;
+        }
+        let be = crate::gpu::active()?;
+        let lin = crate::flux::transformer::dit_lin;
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        for b in &self.blocks {
+            blocks.push(T5Block {
+                ln1: &b.ln1,
+                q: lin(&b.qkv[0])?,
+                k: lin(&b.qkv[1])?,
+                v: lin(&b.qkv[2])?,
+                o: lin(&b.o)?,
+                ln2: &b.ln2,
+                wi: [lin(&b.wi[0])?, lin(&b.wi[1])?],
+                wo: lin(&b.wo)?,
+            });
+        }
+        let m = T5Model {
+            dim: self.d_model,
+            heads: self.heads,
+            d_kv: self.d_kv,
+            eps: self.eps,
+            blocks,
+            final_ln: &self.final_ln,
+        };
+        // The bias per head over key - query in -(t-1)..t.
+        let nh = self.heads;
+        let tb = 2 * t - 1;
+        let mut bias = vec![0f32; nh * tb];
+        for r in 0..tb {
+            let bk = self.bucket(r as i64 - (t as i64 - 1));
+            for hh in 0..nh {
+                bias[hh * tb + r] = self.rel_bias[bk * nh + hh];
+            }
+        }
+        let _t = crate::prof::start(crate::prof::Cat::Matmul);
+        let mut sess = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if sess.is_none() {
+            *sess = Some(be.t5_session()?);
+        }
+        let mut out = Vec::new();
+        sess.as_mut()?.forward(&m, h, t, &bias, &mut out).then_some(out)
+    }
+
     /// The last hidden state (after the final norm) for `ids`: `[ids.len(), d_model]`.
     pub fn forward(&self, ids: &[u32]) -> Result<Vec<f32>> {
         let (t, d) = (ids.len(), self.d_model);
         let mut h = vec![0f32; t * d];
         for (i, &id) in ids.iter().enumerate() {
             self.embed_row(id, &mut h[i * d..(i + 1) * d])?;
+        }
+        if let Some(y) = self.forward_device(&h, t) {
+            return Ok(y);
         }
         // bias[head][q][k].
         let (nh, dk) = (self.heads, self.d_kv);
@@ -204,6 +276,12 @@ impl T5Encoder {
         let ids = self.tokenize(text, len)?;
         self.forward(&ids)
     }
+}
+
+/// Whether T5 encoders run whole device passes unless told otherwise
+/// (`OXINFER_T5_DEVICE_PASS=0` turns them off).
+pub(crate) fn device_passes_default() -> bool {
+    std::env::var("OXINFER_T5_DEVICE_PASS").map_or(true, |v| v != "0")
 }
 
 /// The `config.json` equivalent of a llama.cpp `t5encoder` GGUF file's metadata.

@@ -327,3 +327,80 @@ kernel void flux_gated_add(device float* h [[buffer(0)]], device const float* y 
     if (p.has_bias != 0) v += *(device const float4*)(b + c);
     *hp += *(device const float4*)(g + c) * v;
 }
+
+// ---- CLIP text encoders (metal_t5.rs, crate::gpu::dit::ClipSession) ----
+// Layer norm with weight and bias of rows of n, into scaled half rows (or with out_f32 f32 rows).
+// 256 threads per row.
+struct CLN { uint n; float eps; uint out_f32; uint _p0; };
+kernel void clip_ln(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]], device const float* b [[buffer(2)]],
+                    device void* out [[buffer(3)]], device float* rs [[buffer(4)]], constant CLN& p [[buffer(5)]],
+                    uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    threadgroup float red2[8];
+    threadgroup float red3[8];
+    device const float4* row = (device const float4*)(x + (ulong)r * p.n);
+    device const float4* w4 = (device const float4*)w;
+    device const float4* b4 = (device const float4*)b;
+    uint n4 = p.n / 4;
+    float s = 0.f;
+    for (uint i = tid; i < n4; i += 256) { float4 v = row[i]; s += v.x + v.y + v.z + v.w; }
+    float mean = dit_tg_sum(s, sg, lane, red) / float(p.n);
+    float ss = 0.f;
+    for (uint i = tid; i < n4; i += 256) { float4 v = row[i] - mean; ss += dot(v, v); }
+    float inv = 1.0f / sqrt(dit_tg_sum(ss, sg, lane, red2) / float(p.n) + p.eps);
+#define CLIP_LN(i) ((row[i] - mean) * inv * w4[i] + b4[i])
+    if (p.out_f32 != 0) {
+        device float4* o = (device float4*)((device float*)out + (ulong)r * p.n);
+        for (uint i = tid; i < n4; i += 256) o[i] = CLIP_LN(i);
+        return;
+    }
+    float m = 0.f;
+    for (uint i = tid; i < n4; i += 256) { float4 v = abs(CLIP_LN(i)); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
+    m = dit_tg_max(m, sg, lane, red3);
+    float sinv, sc = dit_row_scale(m, sinv);
+    device half4* o = (device half4*)((device half*)out + (ulong)r * p.n);
+    for (uint i = tid; i < n4; i += 256) o[i] = half4(CLIP_LN(i) * sc);
+    if (tid == 0) rs[r] = sinv;
+#undef CLIP_LN
+}
+
+// act(x + bias) of rows of n into scaled half rows: act 0 none, 1 quick_gelu (x sigmoid(1.702 x)),
+// 2 GELU with erf (Abramowitz and Stegun 7.1.26, as the CPU's). 256 threads per row.
+inline float clip_erf(float x) {
+    float t = 1.0f / (1.0f + 0.3275911f * abs(x));
+    float y = 1.0f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t * exp(-x * x);
+    return copysign(y, x);
+}
+inline float4 clip_act4(float4 x, uint act) {
+    if (act == 1) return x / (1.0f + exp(-1.702f * x));
+    if (act == 2) return 0.5f * x * (1.0f + float4(clip_erf(x.x * M_SQRT1_2_F), clip_erf(x.y * M_SQRT1_2_F), clip_erf(x.z * M_SQRT1_2_F), clip_erf(x.w * M_SQRT1_2_F)));
+    return x;
+}
+struct CAC { uint n; uint act; uint _p0; uint _p1; };
+kernel void clip_act_half(device const float* x [[buffer(0)]], device const float* b [[buffer(1)]], device half* out [[buffer(2)]],
+                          device float* rs [[buffer(3)]], constant CAC& p [[buffer(4)]],
+                          uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    device const float4* row = (device const float4*)(x + (ulong)r * p.n);
+    device const float4* b4 = (device const float4*)b;
+    uint n4 = p.n / 4;
+    float m = 0.f;
+    for (uint i = tid; i < n4; i += 256) { float4 v = abs(clip_act4(row[i] + b4[i], p.act)); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
+    m = dit_tg_max(m, sg, lane, red);
+    float sinv, s = dit_row_scale(m, sinv);
+    device half4* o = (device half4*)(out + (ulong)r * p.n);
+    for (uint i = tid; i < n4; i += 256) o[i] = half4(clip_act4(row[i] + b4[i], p.act) * s);
+    if (tid == 0) rs[r] = sinv;
+}
+
+// h[r][c] += y[r][c] + bias[c] over rows of n (256 x 4 columns per threadgroup).
+struct CRA { uint n; uint _p0; uint _p1; uint _p2; };
+kernel void clip_res_add(device float* h [[buffer(0)]], device const float* y [[buffer(1)]], device const float* b [[buffer(2)]],
+                         constant CRA& p [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    uint c = (tg.x * 256 + tid) * 4, r = tg.y;
+    if (c >= p.n) return;
+    device float4* hp = (device float4*)(h + (ulong)r * p.n + c);
+    *hp += *(device const float4*)(y + (ulong)r * p.n + c) + *(device const float4*)(b + c);
+}

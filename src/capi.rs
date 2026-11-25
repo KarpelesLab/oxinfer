@@ -2107,7 +2107,7 @@ unsafe fn flux<'a>(f: *const OxiFlux) -> Result<&'a OxiFlux> {
 
 /// Loads a FLUX pipeline (diffusers folder / repo id, or a FLUX GGUF transformer with `base=`;
 /// `key=value` options: quant, text_quant, transformer, base, device, cache_dir, vae_encoder,
-/// lora, vae, redux, device_passes).
+/// lora, vae, redux, device_passes, text_device_passes).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxi_flux_load(
     model: *const c_char,

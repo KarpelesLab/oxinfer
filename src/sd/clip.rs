@@ -164,6 +164,15 @@ pub struct ClipText {
     pub hidden: usize,
     /// `text_projection` of a `CLIPTextModelWithProjection` (SDXL's second encoder).
     proj: Option<Linear>,
+    /// Whole encoder passes on the device (see [`ClipText::set_device_passes`]).
+    device_passes: std::sync::atomic::AtomicBool,
+    gpu: std::sync::Mutex<Option<Box<dyn crate::gpu::dit::ClipSession>>>,
+}
+
+/// Whether CLIP text encoders run whole device passes unless told otherwise
+/// (`OXINFER_CLIP_DEVICE_PASS=0` turns them off).
+pub(crate) fn device_passes_default() -> bool {
+    std::env::var("OXINFER_CLIP_DEVICE_PASS").map_or(true, |v| v != "0")
 }
 
 impl ClipText {
@@ -214,6 +223,8 @@ impl ClipText {
             } else {
                 None
             },
+            device_passes: std::sync::atomic::AtomicBool::new(device_passes_default()),
+            gpu: std::sync::Mutex::new(None),
         })
     }
 
@@ -221,6 +232,9 @@ impl ClipText {
     pub fn forward(&self, ids: &[u32]) -> Vec<f32> {
         let t = ids.len();
         let mut x = self.embed(ids);
+        if let Some((y, _)) = self.forward_device(&x, t, false) {
+            return y;
+        }
         for l in &self.layers {
             self.layer(l, &mut x, t);
         }
@@ -234,17 +248,22 @@ impl ClipText {
     pub fn forward_penultimate(&self, ids: &[u32]) -> (Vec<f32>, Vec<f32>) {
         let (t, h) = (ids.len(), self.hidden);
         let mut x = self.embed(ids);
-        let n = self.layers.len();
-        for l in &self.layers[..n.saturating_sub(1)] {
-            self.layer(l, &mut x, t);
-        }
-        let penultimate = x.clone();
-        if let Some(l) = self.layers.last() {
-            self.layer(l, &mut x, t);
-        }
         // The end-of-text token has the highest id: its first position (transformers' argmax).
         let eos = (0..t).rev().max_by_key(|&i| ids[i]).unwrap_or(0);
-        let pooled = self.final_ln.forward(&x[eos * h..(eos + 1) * h], 1);
+        let (penultimate, pooled) = match self.forward_device(&x, t, true) {
+            Some((y, pen)) => (pen, y[eos * h..(eos + 1) * h].to_vec()),
+            None => {
+                let n = self.layers.len();
+                for l in &self.layers[..n.saturating_sub(1)] {
+                    self.layer(l, &mut x, t);
+                }
+                let penultimate = x.clone();
+                if let Some(l) = self.layers.last() {
+                    self.layer(l, &mut x, t);
+                }
+                (penultimate, self.final_ln.forward(&x[eos * h..(eos + 1) * h], 1))
+            }
+        };
         let pooled = match &self.proj {
             Some(p) => p.forward(&pooled, 1),
             None => pooled,
@@ -255,6 +274,72 @@ impl ClipText {
     /// Width of the pooled embedding of [`ClipText::forward_penultimate`].
     pub fn pooled_dim(&self) -> usize {
         self.proj.as_ref().map_or(self.hidden, |p| p.n_out)
+    }
+
+    /// Whether encodes run as one device pass where the device has a CLIP plan (Metal with
+    /// matrix units; the default unless `OXINFER_CLIP_DEVICE_PASS=0`), else layer by layer.
+    pub fn set_device_passes(&self, on: bool) {
+        self.device_passes.store(on, std::sync::atomic::Ordering::Relaxed);
+        if !on {
+            *self.gpu.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// All layers and the final norm as one device pass over the embeddings `x`: the final
+    /// hidden state (`[t, hidden]`) and with `pen` the penultimate one; None when the device has
+    /// no CLIP plan or declines.
+    fn forward_device(&self, x: &[f32], t: usize, pen: bool) -> Option<(Vec<f32>, Vec<f32>)> {
+        use crate::gpu::dit::{ClipBlock, ClipModel};
+        if !self.device_passes.load(std::sync::atomic::Ordering::Relaxed) || self.layers.is_empty() {
+            return None;
+        }
+        let be = crate::gpu::active()?;
+        fn lin(l: &Linear) -> Option<crate::gpu::dit::Lin<'_>> {
+            let u = l.plan_lin()?;
+            Some(crate::gpu::dit::Lin {
+                w: u.w,
+                dev: u.dev,
+                n_out: u.n_out,
+                n_in: u.n_in,
+                bias: u.bias,
+                side: None,
+                rot: None,
+            })
+        }
+        let mut blocks = Vec::with_capacity(self.layers.len());
+        for l in &self.layers {
+            let (n1, n2) = (l.ln1.params(), l.ln2.params());
+            blocks.push(ClipBlock {
+                ln1: [n1.0, n1.1],
+                q: lin(&l.q)?,
+                k: lin(&l.k)?,
+                v: lin(&l.v)?,
+                o: lin(&l.o)?,
+                ln2: [n2.0, n2.1],
+                fc1: lin(&l.fc1)?,
+                fc2: lin(&l.fc2)?,
+            });
+        }
+        let fln = self.final_ln.params();
+        let m = ClipModel {
+            dim: self.hidden,
+            heads: self.heads,
+            eps: fln.2,
+            gelu: matches!(self.act, Act::Gelu),
+            blocks,
+            final_ln: [fln.0, fln.1],
+        };
+        if self.layers.iter().any(|l| l.ln1.params().2 != m.eps || l.ln2.params().2 != m.eps) {
+            return None;
+        }
+        let mut sess = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if sess.is_none() {
+            *sess = Some(be.clip_session()?);
+        }
+        let (mut out, mut p) = (Vec::new(), Vec::new());
+        sess.as_mut()?
+            .forward(&m, x, t, pen.then_some(&mut p), &mut out)
+            .then_some((out, p))
     }
 
     /// Token plus position embeddings: `[ids.len(), hidden]`.

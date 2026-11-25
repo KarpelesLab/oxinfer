@@ -387,10 +387,15 @@ impl Pipeline {
     /// Runs every UNet pass of a step (its guidance branches in one batch) as one device plan
     /// when the accelerator has one (Metal with matrix units: half-precision GEMM inputs, f32
     /// accumulation), default on; off keeps the per-op path (`OXINFER_SD_GPU_PASS=0` sets the
-    /// default off). The C API's and the server's load option `gpu_pass=0|1`.
+    /// default off). The C API's and the server's load option `gpu_pass=0|1`. It covers the CLIP
+    /// text encoders' whole passes too (`OXINFER_CLIP_DEVICE_PASS=0` turns only those off).
     pub fn set_gpu_pass(&self, on: bool) {
         self.unet.set_gpu_pass(on);
         self.vae.set_gpu_pass(on);
+        self.text.set_device_passes(on && crate::sd::clip::device_passes_default());
+        if let Some(x) = &self.xl {
+            x.text.set_device_passes(on && crate::sd::clip::device_passes_default());
+        }
     }
 
     /// A flag that stops the running generation (from any thread) when set: it then fails with

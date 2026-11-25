@@ -3743,6 +3743,14 @@ impl Backend for MetalBackend {
         self.flux_session_impl()
     }
 
+    fn t5_session(&'static self) -> Option<Box<dyn crate::gpu::dit::T5Session>> {
+        self.t5_session_impl()
+    }
+
+    fn clip_session(&'static self) -> Option<Box<dyn crate::gpu::dit::ClipSession>> {
+        self.clip_session_impl()
+    }
+
     fn unet_session(&'static self) -> Option<Box<dyn crate::gpu::unet::Session>> {
         self.unet_session_impl()
     }

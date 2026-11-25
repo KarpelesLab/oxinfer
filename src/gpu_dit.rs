@@ -163,3 +163,68 @@ pub trait FluxSession: Send {
     /// device declined or failed (the caller then runs the CPU path).
     fn forward(&mut self, m: &FluxModel, inp: &FluxInput, out: &mut Vec<f32>) -> bool;
 }
+
+/// A T5 v1.1 encoder block (`crate::flux::t5`): RMS norms with weights, unscaled attention
+/// over 64-wide heads with a relative-position bias, a gated-GELU (tanh) feed-forward; no
+/// biases.
+pub struct T5Block<'a> {
+    pub ln1: &'a [f32],
+    pub q: Lin<'a>,
+    pub k: Lin<'a>,
+    pub v: Lin<'a>,
+    pub o: Lin<'a>,
+    pub ln2: &'a [f32],
+    /// wi_0 (the GELU gate), wi_1.
+    pub wi: [Lin<'a>; 2],
+    pub wo: Lin<'a>,
+}
+
+pub struct T5Model<'a> {
+    pub dim: usize,
+    pub heads: usize,
+    pub d_kv: usize,
+    pub eps: f32,
+    pub blocks: Vec<T5Block<'a>>,
+    pub final_ln: &'a [f32],
+}
+
+/// Whole T5 encoder passes on the device.
+pub trait T5Session: Send {
+    /// The last hidden state (final norm included) `[t, dim]` into `out` from the token
+    /// embeddings `x` (`[t, dim]`); `bias` is the relative-position bias per head over
+    /// `key - query` (`[heads, 2t - 1]`, offset `t - 1` for 0). False when the device declined
+    /// or failed (the caller runs the CPU path).
+    fn forward(&mut self, m: &T5Model, x: &[f32], t: usize, bias: &[f32], out: &mut Vec<f32>) -> bool;
+}
+
+/// A CLIP text-encoder layer (`crate::sd::clip`): pre-LN, causal self-attention over 64-wide
+/// heads, an MLP with quick_gelu or GELU (erf); every linear layer with a bias.
+pub struct ClipBlock<'a> {
+    /// Layer norm weight and bias.
+    pub ln1: [&'a [f32]; 2],
+    pub q: Lin<'a>,
+    pub k: Lin<'a>,
+    pub v: Lin<'a>,
+    pub o: Lin<'a>,
+    pub ln2: [&'a [f32]; 2],
+    pub fc1: Lin<'a>,
+    pub fc2: Lin<'a>,
+}
+
+pub struct ClipModel<'a> {
+    pub dim: usize,
+    pub heads: usize,
+    pub eps: f32,
+    /// The MLP activation: false quick_gelu, true GELU with erf.
+    pub gelu: bool,
+    pub blocks: Vec<ClipBlock<'a>>,
+    pub final_ln: [&'a [f32]; 2],
+}
+
+/// Whole CLIP text-encoder passes on the device.
+pub trait ClipSession: Send {
+    /// The final hidden state after the final layer norm (`[t, dim]`) into `out`, and with
+    /// `penultimate` the hidden state before the last layer (no norm) into it, from the token +
+    /// position embeddings `x` (`[t, dim]`). False when the device declined or failed.
+    fn forward(&mut self, m: &ClipModel, x: &[f32], t: usize, penultimate: Option<&mut Vec<f32>>, out: &mut Vec<f32>) -> bool;
+}

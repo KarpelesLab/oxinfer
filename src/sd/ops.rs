@@ -889,6 +889,11 @@ pub struct LayerNorm {
 }
 
 impl LayerNorm {
+    /// Weight, bias and epsilon.
+    pub(crate) fn params(&self) -> (&[f32], &[f32], f32) {
+        (&self.w, &self.b, self.eps)
+    }
+
     pub fn load(t: &Tensors, prefix: &str, eps: f32) -> Result<Self> {
         Ok(Self {
             w: t.f32(&format!("{prefix}.weight"))?,

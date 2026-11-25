@@ -105,6 +105,11 @@ pub struct LoadOptions {
     /// kept on the device; default on, also `OXINFER_FLUX_DEVICE_PASS=0`); off, the per-operation
     /// path (see [`transformer::FluxTransformer::set_device_passes`]).
     pub device_passes: bool,
+    /// Whole text-encoder passes on the GPU, T5 and CLIP (one plan per encode; default on, also
+    /// `OXINFER_T5_DEVICE_PASS=0` / `OXINFER_CLIP_DEVICE_PASS=0`); off, or with `device_passes`
+    /// off, layer by layer with only the matmuls on the device (see
+    /// [`t5::T5Encoder::set_device_passes`]).
+    pub text_device_passes: bool,
 }
 
 impl Default for LoadOptions {
@@ -122,6 +127,7 @@ impl Default for LoadOptions {
             vae: None,
             redux: None,
             device_passes: transformer::device_passes_default(),
+            text_device_passes: t5::device_passes_default(),
         }
     }
 }
@@ -129,7 +135,7 @@ impl Default for LoadOptions {
 impl LoadOptions {
     /// Sets one `key=value` option (C API): quant, text_quant, transformer, text_encoder, base,
     /// device, cache_dir, vae_encoder, lora (`FILE[:SCALE]`, repeatable), vae, redux,
-    /// device_passes (`0` / `1`).
+    /// device_passes, text_device_passes (`0` / `1`).
     pub fn set(&mut self, k: &str, v: &str) -> Result<()> {
         let q = |v: &str| Quant::parse(v).with_context(|| format!("{k}={v}: expected bf16, q8 or q4"));
         match k {
@@ -145,6 +151,7 @@ impl LoadOptions {
             "vae" => self.vae = Some(v.to_string()),
             "redux" => self.redux = Some(v.to_string()),
             "device_passes" => self.device_passes = !matches!(v, "0" | "false" | "no" | "off"),
+            "text_device_passes" => self.text_device_passes = !matches!(v, "0" | "false" | "no" | "off"),
             _ => bail!("unknown FLUX option {k}"),
         }
         Ok(())
@@ -519,6 +526,7 @@ impl Pipeline {
         };
         let t5 = t5::T5Encoder::load(&t5_path, &dir.join("tokenizer_2"), opts.text_quant.unwrap_or(opts.quant))
             .with_context(|| format!("T5 encoder {}", t5_path.display()))?;
+        t5.set_device_passes(opts.device_passes && opts.text_device_passes);
         let te = dir.join("text_encoder");
         let te_w = ["model.safetensors", "model.fp16.safetensors"]
             .iter()
@@ -526,6 +534,7 @@ impl Pipeline {
             .find(|p| crate::fsx::exists(p))
             .context("no text_encoder/model.safetensors")?;
         let clip = crate::sd::clip::ClipText::load(&te, crate::sd::ops::Tensors::open(&te_w)?)?;
+        clip.set_device_passes(opts.device_passes && opts.text_device_passes && crate::sd::clip::device_passes_default());
         let clip_tokenizer = crate::sd::clip::ClipTokenizer::load(&dir.join("tokenizer"))?;
         let vae = match &opts.vae {
             None => vae::Vae::load(&dir.join("vae"), opts.vae_encoder)?,
@@ -586,13 +595,35 @@ impl Pipeline {
 
     /// The prompt's T5 states (`[len, 4096]`) and CLIP pooled embedding (`[768]`).
     pub fn encode_prompt(&self, prompt: &str, len: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        let t0 = Instant::now();
         let ids = self.clip_tokenizer.encode(prompt);
         let hs = self.clip.forward(&ids);
+        let t1 = Instant::now();
         // CLIPTextModel's pooler output: the final state at the first end-of-text token.
         let eos = ids.iter().position(|&i| i == self.clip_tokenizer.eos).unwrap_or(ids.len() - 1);
         let h = self.clip.hidden;
         let pooled = hs[eos * h..(eos + 1) * h].to_vec();
         let t5 = self.t5.encode(prompt, len)?;
+        if std::env::var_os("OXINFER_FLUX_TRACE").is_some() {
+            eprintln!(
+                "[flux text: CLIP {:.0} ms, T5 {:.0} ms]",
+                t1.duration_since(t0).as_secs_f64() * 1e3,
+                t1.elapsed().as_secs_f64() * 1e3
+            );
+            // Profiling: `OXINFER_FLUX_TRACE=N` (N > 1) encodes N - 1 more times (warm timings).
+            let reps: usize = std::env::var("OXINFER_FLUX_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+            for _ in 1..reps {
+                let t0 = Instant::now();
+                self.clip.forward(&ids);
+                let t1 = Instant::now();
+                self.t5.encode(prompt, len)?;
+                eprintln!(
+                    "[flux text again: CLIP {:.1} ms, T5 {:.1} ms]",
+                    t1.duration_since(t0).as_secs_f64() * 1e3,
+                    t1.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        }
         Ok((t5, pooled))
     }
 

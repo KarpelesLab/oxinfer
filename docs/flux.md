@@ -32,6 +32,7 @@ switches oxinfer to it:
 | `--quant bf16\|q8\|q4` | transformer precision when stored as float; `--text-quant` sets T5's (default: `--quant`) |
 | `--transformer SPEC` | a transformer replacing the folder's: GGUF file or `org/name:QUANT` |
 | `--text-encoder SPEC` | a T5 encoder GGUF (`city96/t5-v1_1-xxl-encoder-gguf:Q8_0`) replacing `text_encoder_2/` |
+| `--no-text-device-passes` | encode T5 and CLIP layer by layer instead of one GPU pass each (`text_device_passes=0`) |
 | `--base SPEC` | with a GGUF `--model`: where T5, CLIP, the VAE and the tokenizers come from (default `unsloth/FLUX.1-Kontext-dev`) |
 
 **What runs.** The prompt goes through CLIP-L (the pooled embedding, `sd::clip`) and the T5 v1.1
@@ -72,7 +73,8 @@ law requires it. Read `LICENSE.md` in the repository before use. FLUX.1 [schnell
 encoder are Apache 2.0.
 
 In the library (`Pipeline::load` takes the same specs as `--model`; `LoadOptions` has `quant`,
-`text_quant`, `transformer`, `text_encoder`, `base`, `device`, `cache_dir`, `vae_encoder`, `loras`, `vae`, `redux`;
+`text_quant`, `transformer`, `text_encoder`, `base`, `device`, `cache_dir`, `vae_encoder`, `loras`, `vae`, `redux`,
+`device_passes`, `text_device_passes`;
 `Options` are diffusers' call arguments, see `examples/flux_edit.rs`):
 
 ```rust
@@ -125,6 +127,51 @@ T5 at `--text-quant q8` is 1.9e-2 from bf16; city96's Q8_0 T5 GGUF is 11% off, a
 from its quantized token-embedding table (rows reach 231 in magnitude; the same weights in
 transformers give the same 11%), so the T5 GGUF files are for memory, not fidelity.
 
+**Text encoders on the GPU.** With matrix units (the default; `--no-text-device-passes`, the
+`text_device_passes=0` load option, `OXINFER_T5_DEVICE_PASS=0` / `OXINFER_CLIP_DEVICE_PASS=0`, or
+`--no-device-passes` turn it off) T5 and CLIP each run as one device plan per encode
+(`src/metal_t5.rs`): the residual stream stays in f32 device rows for all 24 (12) blocks, the
+projections are the transformer's matrix-unit GEMMs on scaled half inputs (64-token tiles at
+these row counts: 69 -> 48 ms against 128-token ones), attention runs on f32 operands with T5's
+relative-position bias (CLIP's causal mask) added to the scores in the kernel, and the RMS /
+layer norms, the gated GELU and the residual adds are row kernels. Before, only the matmuls ran
+on the GPU, one submission each, with the attention, norms and activations on the CPU. FLUX.1
+[schnell] (256 T5 tokens), M5 Max, as the CLI reports it (the first encode of a process) and
+warm (`OXINFER_FLUX_TRACE=N` encodes N times):
+
+| | T5 first / warm | CLIP-L first / warm | text in the CLI |
+|---|---|---|---|
+| layer by layer (before) | 470-560 ms / 350-400 ms (2.35 s cold from disk) | 33-35 ms / 16-24 ms | 0.50 s |
+| one device pass each | 85-104 ms / 48 ms | 11-15 ms / 2.6 ms | 0.10 s |
+| mflux `-q 4` (T5 and CLIP at 4 bits, MLX) | | | 0.20 s first, 0.08-0.09 s next |
+
+512 tokens (FLUX.1 [dev], Kontext): 95 ms warm. Accuracy, FLUX.1 [schnell] Q4_0, 1024x1024,
+4 steps, same seed; "exact" is the layer-by-layer path with `OXINFER_METAL_MMA=0` (f32 matmuls;
+2.0e-5 from transformers), the images are each run's with the exact encoders' embeddings fed to
+the same default transformer:
+
+| Encoders | T5 states vs exact | CLIP pooled vs exact | image vs the exact encoders' |
+|---|---|---|---|
+| layer by layer, half GEMM inputs (before) | 3.3e-3 | 2.4e-4 | 32.4 dB |
+| one device pass each | 3.7e-3 | 3.6e-4 | 33.6 dB |
+
+The two default paths are 2.3e-3 apart (33.9 dB between their images): the half-precision GEMM
+inputs set both errors. Quantized T5 weights run on the same plan (any GGUF block format, or
+`--text-quant q8|q4` at load) but are not faster here (the encode is compute-bound: 56-61 ms warm
+against 48 ms for bf16) and they move the picture, so the default stays at the stored bf16:
+
+| T5 weights | T5 states vs bf16 | image vs bf16 T5 (1024x1024, 4 steps) | T5 in memory |
+|---|---|---|---|
+| `--text-quant q8` | 5.3e-2 | 23.0 dB | 5.2 GB |
+| `--text-quant q4` | 0.51 | 12.4 dB | 2.6 GB |
+| city96 Q8_0 GGUF | 0.17 | 16.3 dB | 4.9 GB |
+| city96 Q4_K_M GGUF | 0.48 | 12.8 dB | 2.8 GB |
+
+All of these are clean pictures of the prompt: under 25 dB the composition moves (the dog's pose,
+the door, the wreaths), not the quality. (The block-by-block path gives the same errors for q8 and
+q4: 5.0e-2 and 0.51 from the exact states.) The same plans run SD 1.x / 2.x / XL's CLIP encoders
+(see [Stable Diffusion](stable-diffusion.md)) and SD 3's T5.
+
 **Speed and memory** on the M5 Max (18 cores, 128 GB, shared with other jobs: load average 12-27
 during these runs, so take the numbers as upper bounds). Per denoising step, steady state (the
 first step also uploads the weights); an edit at 1024x1024 has 8704 tokens per pass (512 text +
@@ -175,6 +222,7 @@ stable-diffusion.cpp (master 82c19c8, Metal, the same GGUF, T5 fp16, `ae.safeten
 |---|---|---|---|
 | oxinfer, per-operation (before) | 3.5-4.2 s | 0.6 s (2.6 s cold) | 2.4-2.9 s |
 | oxinfer, whole passes | 1.9 s | 0.6 s | 2.4-2.9 s |
+| oxinfer, whole passes, device VAE and text encoders | 1.9-2.4 s | 0.10 s | 0.42-0.58 s |
 | stable-diffusion.cpp | 5.2 s | 4.9 s | 4.2 s |
 | mflux, `-q 4` | 2.6-2.7 s | 0.1-0.2 s (T5 at 4 bits) | 0.5-0.7 s |
 

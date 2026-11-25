@@ -35,10 +35,11 @@ reference is the bf16 weight storage (47 dB).
 | CPU only (18 threads) | 0.08 s | 0.91 s | 2.87 s | 3.9 s | |
 | Metal, op by op (`gpu_pass=0`) | 0.08 s | 0.37 s | 0.66 s | 1.1 s | 16 s |
 | Metal, whole passes (default) | 0.07 s | 0.05 s (batch of 2: 0.10 s) | 0.10 s | 0.3 s | 2.8 s |
+| Metal, + CLIP as one device pass (default) | 0.01 s | | | | |
 | Browser (Chrome, WebGPU, one CPU thread) | 0.2 s | 1.1 s | 1.9 s | 3.2 s | |
 
-**Whole passes on Metal.** On a GPU with matrix units (M5, A19), every UNet pass and the VAE
-decode run as one device plan (`src/gpu_unet.rs`, `src/metal_unet.rs`): the model describes the
+**Whole passes on Metal.** On a GPU with matrix units (M5, A19), the CLIP text encoders, every
+UNet pass and the VAE decode run as one device plan (`src/gpu_unet.rs`, `src/metal_unet.rs`): the model describes the
 pass as a graph of convolutions, concatenations and transformer blocks, the activations stay in
 device buffers between ops and between steps, and the guidance branches of a step run as one batch
 (both CFG passes in one, InstructPix2Pix's three in one). Activations are f32 in a padded
@@ -52,7 +53,8 @@ on their way to half, so that the thousands of tiny ones of a long row keep thei
 upsampling are fused into row kernels or the GEMMs' stores. Inputs without a norm are scaled by
 a power of two when their largest magnitude passes half's range (the SDXL VAE's activations
 do), and the products scaled back. `gpu_pass=0` (`Pipeline::set_gpu_pass(false)`, the
-C API's and the server's load option, or `OXINFER_SD_GPU_PASS=0`) keeps the op-by-op path below;
+C API's and the server's load option, or `OXINFER_SD_GPU_PASS=0`) keeps the op-by-op path below
+(`OXINFER_CLIP_DEVICE_PASS=0` only for the text encoders);
 `OXINFER_GPU_CHECK=1` and exact mode (`OXINFER_METAL_MMA=0`) use it too. FLUX.1's VAE decoder is
 the same code, so it takes the same plan: 1024x1024 FLUX.1-schnell decodes in 0.57 s instead of 2.9 s
 (66.9 dB against the op-by-op decode of the same latents; mflux, on MLX, takes 0.5-0.7 s). The
@@ -60,6 +62,12 @@ VAE encoders (SD's for image-to-image and inpainting, FLUX's for its edits) run 
 SD 1.5 at 512x512 0.44 -> 0.10 s (posterior mean 6.6e-4 from the op-by-op one, the image after
 10 img2img steps 58.3 dB), FLUX.1 at 1024x1024 1.75 -> 0.28-0.34 s (latents 1.3e-2 apart, the
 image after a 2-step edit 52.8 dB; SD's encoder on the same 1024x1024 picture 3.5e-3).
+
+The text encoders' plan (`src/metal_t5.rs`, shared with FLUX.1's T5 and CLIP) keeps the residual
+stream in f32 on the device, runs the projections on the matrix-unit GEMMs (scaled half inputs)
+and the causal attention on f32 operands: SD 1.5's text context 0.07 -> 0.01 s (3.9e-4 from the
+layer-by-layer encoder, the 20-step image 56.4 dB), SD-Turbo's OpenCLIP-H 0.10 -> 0.02 s (6.7e-4,
+58.6 dB), SDXL-Turbo's two encoders 0.19 -> 0.05 s (context 1.2e-4, pooled 2.4e-4, image 51.5 dB).
 
 Against the op-by-op path (512x512, same seed): the first guided SD 1.5 UNet output differs by
 5.2e-4 (relative L2), the image after 20 Euler steps at guidance 7.5 by 53.4 dB (8-bit PSNR; the

@@ -235,6 +235,15 @@ pub trait Backend: Send + Sync {
     fn flux_session(&'static self) -> Option<Box<dyn dit::FluxSession>> {
         None
     }
+    /// A session running whole T5 encoder passes on the device; None when the backend has none.
+    fn t5_session(&'static self) -> Option<Box<dyn dit::T5Session>> {
+        None
+    }
+    /// A session running whole CLIP text-encoder passes on the device; None when the backend
+    /// has none.
+    fn clip_session(&'static self) -> Option<Box<dyn dit::ClipSession>> {
+        None
+    }
     /// A session running whole convolutional UNet passes on the device (see [`unet`]); None
     /// when the backend has none.
     fn unet_session(&'static self) -> Option<Box<dyn unet::Session>> {

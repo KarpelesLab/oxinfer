@@ -829,7 +829,7 @@ pub(crate) fn device_passes_default() -> bool {
 
 /// A layer as the device's whole-pass plans see it; None with a LoRA update attached or a
 /// weight the device has no state for.
-fn dit_lin<'a>(d: &'a Dense) -> Option<crate::gpu::dit::Lin<'a>> {
+pub(crate) fn dit_lin<'a>(d: &'a Dense) -> Option<crate::gpu::dit::Lin<'a>> {
     if d.w.has_lora() || d.w.fold.is_some() {
         return None;
     }

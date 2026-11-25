@@ -4335,6 +4335,7 @@ attention auto), mflux 0.24 on MLX 0.32.5.
 | | stable-diffusion.cpp | 5.2 s | 4.9 s | 4.2 s |
 | | mflux `-q 4` | 2.6-2.7 s | 0.1-0.2 s | 0.5-0.7 s |
 | same, final interleaved run on a loaded GPU | oxinfer / mflux `-q 4` | 2.45 s / 3.08 s | 0.6 s / 0.09 s | 0.54 s / 0.52 s |
+| same, T5 and CLIP as one GPU pass each (bf16 T5), interleaved | oxinfer / mflux `-q 4` | 1.9-2.4 s / 2.6-3.1 s | 0.10 s / 0.08-0.22 s | 0.42-0.58 s / 0.48-0.75 s |
 | FLUX.1 [schnell] Q8_0, 1024^2 | oxinfer before / after | 5.0 s / 2.5 s | 0.6 s | 0.56 s |
 | | stable-diffusion.cpp | 6.7-6.8 s | | 4.2 s |
 | | mflux `-q 8` | 3.2-3.8 s | 0.1-0.4 s | 0.5-1.0 s |
@@ -4343,6 +4344,7 @@ attention auto), mflux 0.24 on MLX 0.32.5.
 | | stable-diffusion.cpp | 12.4 s | 12.8 s | 46 s (untiled) |
 | SD 1.5 fp16, 512^2, CFG 7.5, Euler | oxinfer before (two UNet passes) | 0.60 s | 0.06 s | 0.56 s |
 | | oxinfer, whole-pass UNet plan (batched CFG) | 0.10-0.15 s | 0.06 s | 0.10 s |
+| | oxinfer, CLIP as one GPU pass | | 0.01 s | |
 | | stable-diffusion.cpp (batched CFG) | 0.24-0.30 s | 0.43 s | 1.23 s |
 | SD-Turbo, 512^2, 1 step | oxinfer before / after | 0.30 / 0.08-0.09 s | 0.09-0.13 s | 0.57 / 0.10 s |
 | | stable-diffusion.cpp | 0.15-0.23 s | 0.24 s | 1.17-1.19 s |
@@ -4354,7 +4356,12 @@ on the GPU"); per pass at 1024^2 the GEMMs take about 1.25 s (~83 TFLOP/s of the
 attention 0.55 s (13 TFLOP), the row kernels 0.1 s, the modulation vectors 5 ms (they took
 155 ms on the CPU). The VAE decoder and encoder run as one device plan too (see
 [Stable Diffusion](stable-diffusion.md)): FLUX.1 decode at 1024^2 2.9 -> 0.57 s, encode
-1.75 -> 0.3 s. What still trails MLX is the T5 encoder (bf16 here, 4-bit in mflux).
+1.75 -> 0.3 s. The T5 and CLIP encoders now run as one device plan each too (see
+[FLUX.1](flux.md), "Text encoders on the GPU"): 0.5-0.6 s -> 0.10 s in the CLI (T5 48 ms warm
+with bf16 weights, CLIP 2.6 ms), against mflux's 0.2 s first and 0.08-0.09 s repeated encodes
+with 4-bit weights; the downstream image is as close to the exact encoders' as before (33.6 dB
+against 32.4 dB). Quantized T5 weights are not faster on the plan (56-61 ms) and move the picture
+(q8: 23 dB), so the default stays bf16.
 
 Attention round (`flash_attn128_mma`, all its users): the running row maximum of the online
 softmax now moves only when a block's scores exceed it by more than 8 (probabilities stay below
