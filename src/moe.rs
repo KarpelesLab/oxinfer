@@ -563,8 +563,13 @@ impl<'a> Experts<'a> {
         // the extra matmul), when nothing has to see the float activations in between: the
         // same rows as below, so the same bits.
         let total: usize = toks.iter().map(|tk| tk.len()).sum();
-        if hook.is_none() && shared.is_none() && !self.interleaved && !self.lora_active() {
-            let glu: Vec<(&Lin, usize, &Lin, usize, usize)> = used
+        // (A shared expert joins them when it is as wide, with the same activation: its rows
+        // come after the routed experts', as below.)
+        let shared_fits = shared.is_none_or(|s| {
+            s.inter == mi && s.act == self.act && s.hook.is_none() && [s.gate, s.up, s.down].iter().all(|l| l.active_lora().is_none())
+        });
+        if hook.is_none() && shared_fits && !self.interleaved && !self.lora_active() {
+            let mut glu: Vec<(&Lin, usize, &Lin, usize, usize)> = used
                 .iter()
                 .zip(&input)
                 .map(|(&e, &i)| match &self.gate_up[e] {
@@ -572,13 +577,16 @@ impl<'a> Experts<'a> {
                     GateUp::Split(g, u) => (g, 0, u, 0, i),
                 })
                 .collect();
+            if let Some(s) = shared {
+                glu.push((s.gate, 0, s.up, 0, 0));
+            }
             let mut plain: Vec<(&Lin, usize, &mut [f32])> = Vec::new();
             if let Some((l, ey)) = extra.as_mut() {
                 plain.push((*l, ex_i, &mut **ey));
             }
             if let Some(aq) = crate::model::linear_glu_batch_q(&xs, &glu, mi, self.act, &mut plain, None) {
                 drop(plain);
-                return self.down_batched(&aq, &toks, &used, h, routes, y);
+                return self.down_batched(&aq, &toks, &used, h, routes, y, shared);
             }
         }
         if let Some((l, ey)) = extra {
@@ -771,7 +779,8 @@ impl<'a> Experts<'a> {
     }
 
     /// The down projections of [`Experts::forward_batched`]'s fused path: `aq` holds every
-    /// expert's activations (its tokens' rows, experts in the order of `used`), quantized.
+    /// expert's activations (its tokens' rows, experts in the order of `used`, then the shared
+    /// expert's `t` rows if there is one), quantized.
     #[allow(clippy::too_many_arguments)]
     fn down_batched(
         &self,
@@ -781,9 +790,11 @@ impl<'a> Experts<'a> {
         h: usize,
         routes: &[Vec<(usize, f32)>],
         y: &mut [f32],
+        shared: Option<&Shared>,
     ) -> bool {
+        let t = routes.len();
         let mut row = 0;
-        let xs: Vec<crate::quant::QAct> = toks
+        let mut xs: Vec<crate::quant::QAct> = toks
             .iter()
             .map(|tk| {
                 let rows: Vec<usize> = (row..row + tk.len()).collect();
@@ -791,6 +802,9 @@ impl<'a> Experts<'a> {
                 aq.gather(&rows)
             })
             .collect();
+        if shared.is_some() {
+            xs.push(aq.gather(&(row..row + t).collect::<Vec<_>>()));
+        }
         let mut outs: Vec<Vec<f32>> = toks.iter().map(|tk| vec![0f32; tk.len() * h]).collect();
         let mut jobs: Vec<(&Lin, usize, &mut [f32])> = used
             .iter()
@@ -798,8 +812,15 @@ impl<'a> Experts<'a> {
             .enumerate()
             .map(|(i, (&e, o))| (&self.down[e], i, &mut o[..]))
             .collect();
+        // The shared expert writes `y` first (the routed experts add to it).
+        if let Some(s) = shared {
+            jobs.push((s.down, used.len(), &mut *y));
+        }
         crate::model::linear_batch_q(&xs, &mut jobs);
         drop(jobs);
+        if let Some(s) = shared {
+            s.apply_scale(t, h, y);
+        }
         for (ti, r) in routes.iter().enumerate() {
             let yr = &mut y[ti * h..(ti + 1) * h];
             for &(e, w) in r {
@@ -1430,17 +1451,19 @@ mod tests {
                         })
                         .collect();
                     let scale: Vec<f32> = (0..t).map(|_| lcg(&mut seed)).collect();
-                    for si in [None, Some(0), Some(1)] {
+                    // (Shared 2: the routed experts' width and activation, so it joins their
+                    // fused region; 3: the same without a scale.)
+                    for si in [None, Some(0), Some(1), Some(2), Some(3)] {
                         let shared = si.map(|i| {
-                            let (g, u, d, n) = &sh[i];
+                            let (g, u, d, n) = &sh[i % 2];
                             Shared {
                                 gate: g,
                                 up: u,
                                 down: d,
                                 inter: *n,
-                                act: Act::SiluClamp(0.7),
+                                act: if i >= 2 { Act::Silu } else { Act::SiluClamp(0.7) },
                                 hook: None,
-                                scale: (i == 0).then(|| scale.clone()),
+                                scale: (i % 2 == 0).then(|| scale.clone()),
                             }
                         });
                         let run = |batched: bool| {

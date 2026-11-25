@@ -2671,6 +2671,14 @@ first table's way, half an hour later at load 19-24, which slowed llama.cpp's 8 
 65.8 to 62.3): 8 threads 62.3 / 70.4, 12 threads 62.6 / 72.3, 16 threads 11.1 (collapsed) /
 76.8 tok/s. The dense models' steps are unchanged by this round.
 
+Inkling-2-Mini Q8_0 (ggml-org GGUF, CPU, tg64 at 16 threads, alternated with master `e9de36f`):
+28.1 / 28.3 before, 28.1 / 29.4 after (its MoE is a smaller part of the step); llama.cpp 24.0
+(8 threads), 24.4 (12), 1.5 (16, collapsed). A shared expert as wide as the routed ones and with
+their activation (Qwen3.5 / 3.6 MoE) now joins the fused gate / up region too, its rows after the
+routed experts' as before, its down projection writing the output first (bit-identical in the
+unit test, which gained such a shared expert with and without its per-token scale; no Qwen MoE
+checkpoint was on the machine to time).
+
 #### x86-64 CPU prefill (November 2026)
 
 The same machine as above (Threadripper 9970X, 32 threads by default, AVX-512 with VNNI), still
