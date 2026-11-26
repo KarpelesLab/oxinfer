@@ -215,8 +215,11 @@ TTFT p50 / p95 in seconds):
 At one request the speculative decoding a request alone keeps (DSpark, prompt lookup, chained
 passes) sets the rate; from 4 rows on the exact batched step does (Qwen3-8B Q8_0 at 8 rows 34 ms,
 Q4_K_M 39; see below): llama-server's batched kernels scale further, its rows not being their
-one-token steps. Gemma 4 26B-A4B decode-bound at 8 rows here is below the 294.8 measured when its
-experts' batching landed (the same build family, another window: the machine is shared). The
+one-token steps. Gemma 4 26B-A4B decode-bound at 8 rows here (245.0) is below the 294.8 measured
+when its experts' batching landed (100-token prompts there): the machine's load, not a
+regression. The builds of 9384888, dde5e9b and 2739799 alternated twice on these 137-token
+prompts gave N=8 276.5 / 282.0 / 288.2 tok/s and 274.0 / 271.6 / 217.8 (8-row step 27.5 / 27.3
+/ 26.3 ms, then 27.8 / 27.5 / 34.6: the last run alone on a loaded GPU). The
 `batch_fast=1` columns of the first measurements (fast-verification kernels from 5 rows, not
 exact): Qwen3-8B Q8_0 decode-bound 8 rows 295.5, Q4_K_M 269.5, Gemma 4 316.1; mixed 8 Qwen3-8B
 Q8_0 115.8, Gemma 4 183.0.
