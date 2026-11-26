@@ -608,7 +608,8 @@ where
     let mut alone: Vec<M::Sess> = Vec::new();
     let mut toks: Vec<u32> = Vec::new();
     for (i, &n) in lens.iter().enumerate() {
-        let prompt: Vec<u32> = (0..n as u32).map(|j| (j * 97 + 13 * i as u32 + 5) % VOCAB as u32).collect();
+        // (Ids below 256: in every tiny vocabulary, the byte-level Qwen3.5 one included.)
+        let prompt: Vec<u32> = (0..n as u32).map(|j| (j * 97 + 13 * i as u32 + 5) % 256).collect();
         let mut s = model.new_session();
         let l = model.forward(&mut s, &prompt);
         toks.push(oxinfer::sampler::argmax(&l));
@@ -678,6 +679,18 @@ fn batched_rows_match_one_token_steps() {
         let cfg = oxinfer::config::QwenConfig::load(&dir).unwrap();
         let model = oxinfer::qwen::QwenModel::load(cfg, &files, quant).unwrap();
         check_rows(&format!("qwen3.5 {quant:?}"), &model, 12);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // A mixture of experts (4 experts, 2 a token, a gated shared expert) over Gated DeltaNet
+    // layers: each row's experts with the one-token kernels' arithmetic.
+    let dir = std::env::temp_dir().join(format!("oxinfer-gpu-chain-q35moe-{}", std::process::id()));
+    oxinfer::qwen::tiny::write(&dir, true, false).unwrap();
+    let files = ModelFiles::open(&dir, true).unwrap();
+    for quant in [Quant::Bf16, Quant::Q8] {
+        let cfg = oxinfer::config::QwenConfig::load(&dir).unwrap();
+        let model = oxinfer::qwen::QwenModel::load(cfg, &files, quant).unwrap();
+        check_rows(&format!("qwen3.5 moe {quant:?}"), &model, 12);
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }

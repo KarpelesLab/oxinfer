@@ -176,9 +176,6 @@ impl QwenModel<'_> {
             || self.exp.is_some()
             || self.stream.is_some()
             || crate::gpu::decode::check()
-            // (The mixture of experts' multi-token kernels round differently from the one-token
-            // ones: exact only one session after the other, unless asked for the fast kernels.)
-            || (self.layers.iter().any(|l| matches!(l.ffn, Ffn::Moe(_))) && !crate::batch::fast())
             || sess.iter().any(|s| {
                 s.iv.active()
                     || !s.capture.is_empty()

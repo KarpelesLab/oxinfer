@@ -181,6 +181,90 @@ fn worst_row(a: &[f32], b: &[f32], n: usize) -> f32 {
 /// between its reference and its device passes.
 static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Batched decode steps of several sessions (the server's concurrent requests,
+/// `TextLm::forward_batch`: one multi-token plan step, each token's experts through the
+/// several-token expert kernels) against each session's own one-token steps: the same greedy
+/// tokens, logits within rounding (bit for bit where the kernels keep the one-token arithmetic,
+/// which this prints but does not require, as that depends on the chip's compiler); and the
+/// greedy chain on the device (`decode_greedy`, what a request alone runs) against one-token
+/// steps: the same tokens, then the same logits bit for bit (the same kernels).
+#[test]
+fn batched_rows_and_chain_match_one_token_steps() {
+    use oxinfer::generate::Chain;
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+    let plat = oxinfer::platform::detect();
+    let Ok(Some(_)) = oxinfer::gpu::init(&plat, oxinfer::platform::DevicePref::Auto) else {
+        eprintln!("no GPU: skipped");
+        return;
+    };
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    let dir = tiny_gemma_moe();
+    let cfg = TextConfig::load(&dir).unwrap();
+    let files = ModelFiles::open(&dir, true).unwrap();
+    for quant in [Quant::Bf16, Quant::Q8, Quant::Q4] {
+        let model = Model::load(cfg.clone(), &files, quant).unwrap();
+        let lens = [3usize, 9, 17, 40, 250];
+        let mut alone = Vec::new();
+        let mut toks: Vec<u32> = Vec::new();
+        for (i, &n) in lens.iter().enumerate() {
+            let prompt: Vec<u32> = (0..n as u32).map(|j| (j * 97 + 13 * i as u32 + 5) % VOCAB as u32).collect();
+            let mut s = model.new_session();
+            let l = model.forward(&mut s, &prompt);
+            toks.push(oxinfer::sampler::argmax(&l));
+            alone.push(s);
+        }
+        let n = 24;
+        for (j, s0) in alone.iter().enumerate() {
+            let mut host = s0.clone();
+            let mut want = vec![toks[j]];
+            let mut after = Vec::new();
+            for i in 0..=n {
+                let l = model.forward(&mut host, &[want[i]]);
+                want.push(oxinfer::sampler::argmax(&l));
+                after.push(l);
+            }
+            let mut sess = s0.clone();
+            let mut got = Vec::new();
+            let kept = model.decode_greedy(&mut sess, toks[j], n, &mut |t| {
+                got.push(t);
+                Chain::Go
+            });
+            let Some(kept) = kept else {
+                eprintln!("{quant:?}: no chain");
+                break;
+            };
+            assert_eq!(kept, n, "{quant:?} session {j}: chained passes");
+            assert_eq!(got[..], want[1..=n], "{quant:?} session {j}: chained tokens");
+            let l = model.forward(&mut sess, &[got[n - 1]]);
+            assert_eq!(bits(&l), bits(&after[n]), "{quant:?} session {j}: logits after the chain");
+        }
+        let mut batch = alone.clone();
+        let (mut exact, mut worst) = (true, 0f32);
+        for step in 0..6 {
+            let want: Vec<Vec<f32>> = alone.iter_mut().zip(&toks).map(|(s, &t)| model.forward(s, &[t])).collect();
+            let mut refs: Vec<_> = batch.iter_mut().collect();
+            let got = model.forward_batch(&mut refs, &toks);
+            for (j, (g, w)) in got.iter().zip(&want).enumerate() {
+                exact &= bits(g) == bits(w);
+                let d = worst_row(g, w, VOCAB);
+                worst = worst.max(d);
+                assert!(d < 1e-3, "{quant:?} step {step} row {j}: logits differ by {d}");
+                assert_eq!(
+                    oxinfer::sampler::argmax(g),
+                    oxinfer::sampler::argmax(w),
+                    "{quant:?} step {step} row {j}"
+                );
+            }
+            toks = want.iter().map(|l| oxinfer::sampler::argmax(l)).collect();
+        }
+        eprintln!(
+            "{quant:?}: batched rows {} (worst relative difference {worst:e})",
+            if exact { "bit-identical" } else { "within rounding" }
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn gpu_prefill_plan_and_decode_match_cpu() {
     let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());

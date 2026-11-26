@@ -1098,9 +1098,6 @@ impl Model<'_> {
     fn gpu_step_rows(&self, sess: &mut [&mut Session], tokens: &[u32]) -> Option<Vec<Vec<f32>>> {
         let b = tokens.len();
         if b > 8
-            // (The mixture of experts' multi-token kernels round differently from the one-token
-            // ones: exact only one session after the other, unless asked for the fast kernels.)
-            || (self.layers.iter().any(|l| l.moe.is_some()) && !crate::batch::fast())
             || !self.gpu_decode_on()
             || self.stream.is_some()
             || crate::gpu::decode::check()

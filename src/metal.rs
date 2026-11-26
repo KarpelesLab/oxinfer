@@ -5039,6 +5039,36 @@ mod tests {
                     assert!(ea < 1e-5 && ey < 1e-5, "{kind:?}: tiled decode {geo:?} off by {ea} / {ey}");
                 }
             }
+            // Several tokens' experts in one dispatch (batched decode steps): each token's
+            // activations and output those of its own dispatch, within rounding (bit for bit
+            // where the compiler keeps the same arithmetic, which is printed, not required: that
+            // depends on the chip), for 1 to 8 tokens sharing some experts.
+            let mut same = true;
+            for nt in [1usize, 3, 8] {
+                let rts: Vec<Vec<(usize, f32)>> = (0..nt)
+                    .map(|i| vec![([0, 2, 3, 0, 5, 1, 3, 2][i], 0.7), ([1, 1, 5, 2, 0, 3, 2, 5][i], 0.3)])
+                    .collect();
+                let rr: Vec<&[(usize, f32)]> = rts.iter().map(|r| &r[..]).collect();
+                let xs = &x[..nt * h];
+                for geo in std::iter::once(None).chain(super::decode::XT_GEOS.map(Some)) {
+                    let Some(one) = be.decode_experts_rows(&gw, up, &dw, (h, mi), gelu, xs, &rr, geo, false) else {
+                        continue;
+                    };
+                    let all = be.decode_experts_rows(&gw, up, &dw, (h, mi), gelu, xs, &rr, geo, true).unwrap();
+                    let (ea, ey) = (row_err(&all.0, &one.0, mi), row_err(&all.1, &one.1, h));
+                    assert!(ea < 1e-5 && ey < 1e-5, "{kind:?}: {nt} tokens' experts {geo:?} off by {ea} / {ey}");
+                    same &= all
+                        .0
+                        .iter()
+                        .zip(&one.0)
+                        .chain(all.1.iter().zip(&one.1))
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
+                }
+            }
+            eprintln!(
+                "{kind:?}: several tokens' experts {}",
+                if same { "bit-identical" } else { "within rounding" }
+            );
         }
     }
 

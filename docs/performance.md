@@ -242,6 +242,43 @@ rows of unrelated text; `OXINFER_INKLING_PROFILE` at 8 tokens: 19 of 36 ms in th
 kernels against 3.3 of 9 at one token), then the dense multi-token matvecs (the LM head 0.56 ->
 2.5 ms).
 
+**Mixtures of experts** (Gemma 4 26B-A4B, Qwen3 / Qwen3.5 MoE): batched by default, exactly. A
+batched step runs each row's routed experts with the one-token expert kernels' arithmetic: the
+rows' gate / up pairs side by side, then every row's weighted down sums in one dispatch
+(`mvx_*_bsum` / `mvxt_*_bsum`: threadgroup (row, output block), the rows of a block neighbours in
+the grid, so the experts they share come from memory once). Before, their steps ran one after
+the other (the multi-token plans already ran each token's experts on the one-token kernels, so
+batching them was exact; they were held back on a wrong belief). Aggregate tok/s (per stream),
+`parallel=8`, TTFT p50 for the mixed prompts:
+
+| model | prompts | N | before (in turns) | batched (exact) | llama-server |
+|---|---|---|---|---|---|
+| Gemma 4 26B-A4B Q4_0 | decode-bound | 1 | 149.6 | 158.7 | 124.3 |
+| | | 4 | 126.3 (32.2) | 266.2 (69.7) | 254.6 (67.1) |
+| | | 8 | 127.5 (16.3) | 294.8 (37.9) | 357.8 (47.1) |
+| | mixed | 4 | 85.1, 1.41 | 146.5, 1.00 | 135.8, 2.41 |
+| | | 8 | 86.3, 2.06 | 158.3, 0.85 | 183.3, 3.49 |
+| Qwen3.5-35B-A3B Q4_K_M | decode-bound | 1 | 134.5 | 134.5 | 102.9 |
+| | | 4 | 121.8 (31.5) | 219.2 (58.3) | 195.9 (51.6) |
+| | | 8 | 121.6 (15.6) | 247.0 (32.7) | 248.6 (32.7) |
+| | mixed | 4 | 98.1, 1.26 | 155.7, 1.14 | 114.5, 2.73 |
+| | | 8 | 98.0, 1.75 | 185.4, 1.15 | 170.3, 3.90 |
+
+(Gemma's "before" from the tables above; Qwen3.5-35B-A3B's with `max_batch=1`, its steps in
+turns.) A batched step of Gemma 4 26B-A4B takes 14.1 ms at 4 rows and 26.3 at 8 (one row 6.3);
+Qwen3.5-35B-A3B 14.4 and 27.0 (one row 7.4). Of the alternatives measured at 8 rows on Gemma
+(`OXINFER_XB`, in the tree while measuring), a dispatch per row for the sums 31 ms a step, the
+pairs of every row in one dispatch 33, an expert's rows in one threadgroup (its weights read once
+for them) 35: the caches already share the experts between the rows' dispatches, and fewer,
+longer threadgroups lose more in parallelism than they save. Replies equal to alone on a fresh
+server: Gemma 4 and Qwen3.5-35B-A3B, 4 of 4 and 8 of 8 concurrent requests (Gemma once 7 of 8,
+the same request also with every step in turns, `max_batch=1`, and 8 of 8 with
+`OXINFER_GPU_CHAIN=0 lookup=0`: the request alone's chained / lookup passes, not the batching;
+see [docs/server.md](server.md#concurrent-requests)). `tests/gemma_moe_gpu.rs` (tiny Gemma 4 MoE:
+batched rows and chains against one-token steps), `tests/gpu_chain.rs` (tiny Qwen3.5 MoE) and
+`metal::tests::tiled_experts_match` (several rows' expert sums against a dispatch per row, every
+format and tile geometry) print bit-identical here.
+
 Before, the decode-bound runs gave the single-stream rate in aggregate with the TTFT growing by
 a reply per queued request (Gemma 4 26B-A4B: 127.9 tok/s at N=8, TTFT p50 8.06 s against 0.40).
 On the CPU (Qwen3-8B Q4_K_M, `device=cpu`, 64 tokens): 4 requests 34.6 tok/s, TTFT p50 1.71 s
@@ -251,17 +288,14 @@ What is measured and where the gap to llama-server comes from:
 
 - **Replies are exact.** Every batched row is its session's one-token step bit for bit (the
   exact multi-token kernels; checked on the real models: 8 concurrent Qwen3-8B Q8_0 and Q4_K_M
-  requests and 4 Inkling-2 ones give the replies each gets alone on a fresh server; Gemma 4
-  26B-A4B 3 of 4, as its greedy chain on the device, which a request alone runs, does not round
-  as its one-token steps do: 4 of 4 with `OXINFER_GPU_CHAIN=0`).
+  requests, 4 Inkling-2 ones and 8 Gemma 4 26B-A4B / Qwen3.5-35B-A3B ones give the replies each
+  gets alone on a fresh server).
   llama.cpp's batched kernels are not batch-invariant. The exact multi-token matvecs cost about
   1.4x a one-token step at 2 rows, 1.8x at 4 and 4x at 8 (Qwen3-8B Q8_0: 11.2, 15.4, 20, 45 ms a
   step), so exact batching gains up to 4 rows; `batch_fast=1` runs 5+ rows on the
   fast-verification kernels (21 ms at 8 rows), at the cost of exactness (logits within ~1e-4).
-- **Mixtures of experts are not batched by default** (Gemma 4 26B-A4B): their multi-token
-  expert kernels do not give the one-token kernels' bits and each row reads its own experts;
-  their steps run one after the other in turns. With `batch_fast=1` they are batched (183 tok/s
-  at 8 mixed requests, llama-server's 183).
+- **Mixtures of experts are batched exactly** (above); what is left of their gap at 8 rows is
+  the dense matvecs' (attention, the dense MLP, the head) on the exact multi-token kernels.
 - **Mixed prompts are prefill-bound**: 30k prompt tokens at N=8, read at ~2300 tok/s (Qwen3-8B
   on Metal) where llama.cpp reads faster, so its wall time is half ours there; TTFT p50 is lower
   than llama-server's (shortest prompts first, chunks interleaved) but p95 higher (the longest

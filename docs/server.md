@@ -314,7 +314,7 @@ exact multi-token Metal kernels (the default) the logits are bit for bit those o
 gave the tokens of its one-token steps on the four prompts of `concurrent_chats_match_alone`
 (`examples/dec_ab ... chain steps:chain=0`, with and without prompt lookup), and the test passed
 5 times out of 5 on it (also with the MoE layers in the order of before,
-`OXINFER_DEC_MOE_ORDER=0 OXINFER_DEC_TOPK=0`), so the cause was not found. Not covered: after
+`OXINFER_DEC_MOE_ORDER=0 OXINFER_DEC_TOPK=0`), so the cause was not found (with its MoE rows batched, 4 of 4 and 8 of 8 concurrent requests, once 7 of 8: the same request also with `max_batch=1`, 8 of 8 with `OXINFER_GPU_CHAIN=0 lookup=0`). Not covered: after
 a plain turn of a DSpark model, the next turn reads that reply as prompt (prefill
 kernels) where alone it would have been verified tokens, so later turns may round differently,
 as a restored snapshot does. `batch_fast=1` runs batched steps of 5 rows or more on the
@@ -324,9 +324,12 @@ throughput at 8 concurrent requests.
 
 Batched on the GPU: dense models (Qwen3, Llama, Gemma 3 / 4 dense, and Qwen3.5 / 3.6 / 3.8,
 whose Gated DeltaNet layers run each row's one-token conv and delta-rule kernels on that
-session's own recurrent states). Mixtures of experts (Gemma 4 26B-A4B, Qwen MoE) only with `batch_fast=1`: their
-multi-token expert kernels do not give the one-token kernels' bits, and each row reads its own
-experts anyway (Gemma 4 26B-A4B Q4_0: 4 batched rows decode about as fast as 4 one-token steps).
+session's own recurrent states) and mixtures of experts (Gemma 4 26B-A4B, Qwen3 / Qwen3.5 MoE).
+A batched step runs each row's routed experts with the one-token expert kernels' arithmetic: the
+rows' gate / up pairs side by side, every row's weighted down sums in one dispatch
+(`mvx*_bsum`; `OXINFER_XB=0`: a dispatch per row, the same bits), so that the experts the rows
+share come from memory once (Gemma 4 26B-A4B Q4_0, 8 rows: 26 ms a step, one row 6.3 ms; see
+[docs/performance.md](performance.md#concurrent-requests-the-server)).
 Inkling-2 on Metal batches its decode steps exactly: one pass of up to 16 rows whose matvecs,
 expert groups (tokens choosing the same expert read it once) and mixes run over all the rows,
 and whose ops on a session's state (queries, keys and values into its caches, attention, the

@@ -295,11 +295,14 @@ pub(crate) fn shader_src() -> String {
         let n = f.name();
         let _ = writeln!(s, "#define MKX_{n}(e) {mk}");
         let _ = writeln!(s, "MVX(mvx_{n}, {t}, {x}, {ch}, MKX_{n})");
+        // Several tokens' expert sums in one dispatch (multi-token steps): `mvx_<fmt>_bsum`.
+        let _ = writeln!(s, "MVXB(mvx_{n}, {t}, {x}, {ch}, MKX_{n})");
         // The same on tiled copies, of each geometry: `mvxt_<fmt>_<rows>x<groups>_pair` / `_sum`.
         if let Some((t, x, ch, mk)) = f.tiled_kernel_types() {
             let _ = writeln!(s, "#define MKXT_{n}(e) {mk}");
             for (r, k) in XT_GEOS {
                 let _ = writeln!(s, "MVXT(mvxt_{n}_{r}x{k}, {t}, {x}, {ch}, MKXT_{n}, {r}, {k})");
+                let _ = writeln!(s, "MVXTB(mvxt_{n}_{r}x{k}, {t}, {x}, {ch}, MKXT_{n}, {r}, {k})");
             }
         }
         // DeepSeek V4.1's routed experts on dots of their own: `mvxd_<fmt>_pair` / `_sum`.
@@ -950,6 +953,13 @@ fn xname(fmt: MvFmt, q: (u32, u32), part: &str) -> String {
     } else {
         format!("mvx_{}_{part}", fmt.name())
     }
+}
+
+/// Whether multi-token plans run every token's expert sums in one dispatch of the `_bsum`
+/// kernels (`OXINFER_XB=0`: a dispatch per token, the same results).
+fn xb_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OXINFER_XB").map_or(true, |v| v != "0"))
 }
 
 /// The rows and threads a threadgroup of [`xname`]'s kernel.
@@ -2180,8 +2190,11 @@ enum MOp {
         /// Neuron edits between the two kernels: (pipeline, hot offset, entries).
         edit: Option<(Id, usize, u32)>,
         /// Multi-token plans: the x, selection, activation and y strides in bytes (each token's
-        /// experts through the single-token kernels: tokens route to different experts).
+        /// experts with the single-token kernels' arithmetic: tokens route to different experts).
         t: Option<[usize; 4]>,
+        /// Multi-token plans: the sum kernel of several tokens (`_bsum`: every token's sums in
+        /// one dispatch), if any.
+        tb: Option<Id>,
         /// Runtime LoRA updates of the experts (`Experts::lora`).
         lora: Option<Box<XLora>>,
     },
@@ -4083,7 +4096,13 @@ impl MetalBackend {
                         }
                         None => None,
                     };
+                    let tb = if mt && lora.is_none() && xb_on() {
+                        self.named_pipeline(&xname(pf.1, d, "bsum"))
+                    } else {
+                        None
+                    };
                     emit.push(MOp::Experts {
+                        tb,
                         pair: self.named_pipeline(&xname(pf.0, g, "pair"))?,
                         sum: self.named_pipeline(&xname(pf.1, d, "sum"))?,
                         nr: [xrows(g, "pair"), xrows(d, "sum")],
@@ -6037,6 +6056,7 @@ impl MetalPlan<'_> {
                 k,
                 edit: None,
                 t: tk,
+                tb,
                 lora,
             } => {
                 // Every token's gate / up pairs, then every token's down projections.
@@ -6067,15 +6087,38 @@ impl MetalPlan<'_> {
                     e.dispatch((*inter / nr[0].0, *k), nr[0].1);
                 }
                 e.barrier();
-                e.pipe(*sum);
                 e.buf(tabs[2], 0, 0);
                 e.buf(tabs[2], 0, 1);
                 e.bytes(&p(*h, *inter, if *add { MvMode::Add } else { MvMode::Store }, *d, 0), 4);
-                for j in 0..t {
-                    e.buf(arena, *act + j * sact, 2);
-                    e.buf(arena, *y + j * sy, 3);
-                    e.buf(arena, *sel + j * ssel, 5);
-                    e.dispatch((*h / nr[1].0, 1), nr[1].1);
+                match tb.filter(|_| t > 1) {
+                    Some(bsum) => {
+                        // Every token's sums in one dispatch (`MVXB` in the shader).
+                        let xb = [
+                            t as u32,
+                            (sx / 4) as u32,
+                            (ssel / 4) as u32,
+                            (sact / 4) as u32,
+                            (sy / 4) as u32,
+                            0,
+                            0,
+                            0,
+                        ];
+                        e.pipe(bsum);
+                        e.buf(arena, *act, 2);
+                        e.buf(arena, *y, 3);
+                        e.buf(arena, *sel, 5);
+                        e.bytes(&xb, 6);
+                        e.dispatch((t, *h / nr[1].0), nr[1].1);
+                    }
+                    None => {
+                        e.pipe(*sum);
+                        for j in 0..t {
+                            e.buf(arena, *act + j * sact, 2);
+                            e.buf(arena, *y + j * sy, 3);
+                            e.buf(arena, *sel + j * ssel, 5);
+                            e.dispatch((*h / nr[1].0, 1), nr[1].1);
+                        }
+                    }
                 }
             }
             MOp::Mv {
@@ -9188,7 +9231,28 @@ impl MetalBackend {
         route: &[(usize, f32)],
         tiled: Option<(usize, usize)>,
     ) -> Option<(Vec<f32>, Vec<f32>)> {
+        self.decode_experts_rows(gate, up, down, (h, mi), gelu, x, &[route], tiled, false)
+    }
+
+    /// [`Self::decode_experts_once`] of several tokens (x rows of `h`, a route each, all of k
+    /// slots): a dispatch per token of the one-token kernels, the sums (`batched`) in one
+    /// dispatch of the several-token kernel (`_bsum`, multi-token plans' `MOp::Experts`). The
+    /// tokens' activations (k mi each) and outputs (h each), one after the other.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_experts_rows(
+        &self,
+        gate: &[WeightRef],
+        up: Option<&[WeightRef]>,
+        down: &[WeightRef],
+        (h, mi): (usize, usize),
+        gelu: bool,
+        x: &[f32],
+        routes: &[&[(usize, f32)]],
+        tiled: Option<(usize, usize)>,
+        batched: bool,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
         use crate::quant::PageVec;
+        let nt = routes.len();
         let (fg, fd) = (MvFmt::of(&gate[0])?, MvFmt::of(&down[0])?);
         if tiled.is_some() && (fg.tiled_kernel_types().is_none() || fd.tiled_kernel_types().is_none()) {
             return None;
@@ -9235,16 +9299,21 @@ impl MetalBackend {
             }
             tabs.push((tab, tid, q));
         }
-        let k = route.len();
-        let mut sel = PageVec::<f32>::zeroed(256);
-        for (s, &(e, wt)) in route.iter().enumerate() {
-            sel[s] = f32::from_bits(e as u32);
-            sel[k + s] = wt;
+        let k = routes[0].len();
+        // A token's selection: k ids, k weights (and room for a limit), 4 k floats apart.
+        let ssel = 4 * k;
+        let mut sel = PageVec::<f32>::zeroed((nt * ssel).next_multiple_of(256));
+        for (j, route) in routes.iter().enumerate() {
+            assert_eq!(route.len(), k);
+            for (s, &(e, wt)) in route.iter().enumerate() {
+                sel[j * ssel + s] = f32::from_bits(e as u32);
+                sel[j * ssel + k + s] = wt;
+            }
         }
-        let mut xv = PageVec::<f32>::zeroed(h.next_multiple_of(1024));
-        xv[..h].copy_from_slice(x);
-        let act = PageVec::<f32>::zeroed((k * mi).next_multiple_of(1024));
-        let y = PageVec::<f32>::zeroed(h.next_multiple_of(1024));
+        let mut xv = PageVec::<f32>::zeroed((nt * h).next_multiple_of(1024));
+        xv[..nt * h].copy_from_slice(&x[..nt * h]);
+        let act = PageVec::<f32>::zeroed((nt * k * mi).next_multiple_of(1024));
+        let y = PageVec::<f32>::zeroed((nt * h).next_multiple_of(1024));
         let (sb, _) = wrap(sel.as_ptr() as *const u8, sel.len() * 4, &mut bufs)?;
         let (xb, _) = wrap(xv.as_ptr() as *const u8, xv.len() * 4, &mut bufs)?;
         let (ab, _) = wrap(act.as_ptr() as *const u8, act.len() * 4, &mut bufs)?;
@@ -9254,8 +9323,10 @@ impl MetalBackend {
             None => format!("mvx_{}_{part}", f.name()),
         };
         let (nr, threads) = tiled.map_or((1, 32), |(r, k)| (r, 32 * k));
-        let (pair, sum) = (self.named_pipeline(&name(fg, "pair"))?, self.named_pipeline(&name(fd, "sum"))?);
+        let sn = if batched { "bsum" } else { "sum" };
+        let (pair, sum) = (self.named_pipeline(&name(fg, "pair"))?, self.named_pipeline(&name(fd, sn))?);
         let (tg, tu, td) = (&tabs[0], &tabs[if fused { 0 } else { 1 }], tabs.last().unwrap());
+        let xbp = [nt as u32, h as u32, ssel as u32, (k * mi) as u32, h as u32, 0, 0, 0];
         let p = |n_out: usize, n_in: usize, mode: MvMode, q: u32, r2: usize| MvParams {
             n_out: n_out as u32,
             n_in: n_in as u32,
@@ -9274,24 +9345,36 @@ impl MetalBackend {
             let enc = (f.enc_type)(cb, f.s_enc_type, 1);
             let e = FastEnc { enc, f: &f };
             e.use_resources(&res);
+            let am = if gelu { MvMode::GeluPair } else { MvMode::SiluPair };
             e.pipe(pair);
             e.buf(tg.1, 0, 0);
             e.buf(tu.1, 0, 1);
-            e.buf(xb, 0, 2);
-            e.buf(ab, 0, 3);
-            let am = if gelu { MvMode::GeluPair } else { MvMode::SiluPair };
             e.bytes(&p(mi, h, am, tg.2, if fused { mi } else { 0 }), 4);
-            e.buf(sb, 0, 5);
-            e.dispatch((mi / nr, k), threads);
+            for j in 0..nt {
+                e.buf(xb, j * h * 4, 2);
+                e.buf(ab, j * k * mi * 4, 3);
+                e.buf(sb, j * ssel * 4, 5);
+                e.dispatch((mi / nr, k), threads);
+            }
             e.barrier();
             e.pipe(sum);
             e.buf(td.1, 0, 0);
             e.buf(td.1, 0, 1);
-            e.buf(ab, 0, 2);
-            e.buf(yb, 0, 3);
             e.bytes(&p(h, mi, MvMode::Store, td.2, 0), 4);
-            e.buf(sb, 0, 5);
-            e.dispatch((h / nr, 1), threads);
+            if batched {
+                e.buf(ab, 0, 2);
+                e.buf(yb, 0, 3);
+                e.buf(sb, 0, 5);
+                e.bytes(&xbp, 6);
+                e.dispatch((nt, h / nr), threads);
+            } else {
+                for j in 0..nt {
+                    e.buf(ab, j * k * mi * 4, 2);
+                    e.buf(yb, j * h * 4, 3);
+                    e.buf(sb, j * ssel * 4, 5);
+                    e.dispatch((h / nr, 1), threads);
+                }
+            }
             (f.void)(enc, f.s_end);
             (f.void)(cb, f.s_commit);
             (f.void)(cb, f.s_wait);
@@ -9301,7 +9384,7 @@ impl MetalBackend {
         for b in &bufs {
             unsafe { void(b.id, self.sels.release) };
         }
-        Some((act[..k * mi].to_vec(), y[..h].to_vec()))
+        Some((act[..nt * k * mi].to_vec(), y[..nt * h].to_vec()))
     }
 }
 

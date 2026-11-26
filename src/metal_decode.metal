@@ -2045,6 +2045,42 @@ MVX_SIG(NAME##_sum) { threadgroup float red[2 * RPS * KS]; \
         a += sel[p.ldy + s] * xt_run<T, X, CH, RPS, KS>(f, row, x + (ulong)s * p.n_in, p.n_in, sg, lane); \
     } \
     if (xt_reduce<RPS, KS>(a, b, sg, lane, red)) mv_store(a, b, y, p.mode, row, p.n_out, sel); }
+// ---- MoE expert sums of several tokens in one dispatch (the rows of a batched decode step, a
+// verification pass): threadgroup (token t, row block) computes token t's weighted sum over its
+// slots with exactly the one-token sum kernel's arithmetic (the same inline bodies), so each token
+// gets the bits of its one-token step; the tokens of a row block are neighbours in the grid, so the
+// expert rows they share come from memory once, then from the caches. (Gate / up pairs of several
+// tokens in one dispatch, and an expert's tokens in one threadgroup, measured slower than a
+// dispatch per token: Gemma 4 26B-A4B, 8 rows, 31-38 ms a step against 29.) `XB`: the tokens and
+// the x, selection, activation and y strides in floats.
+struct XB { uint ntok; uint sx; uint ssel; uint sact; uint sy; uint _p0; uint _p1; uint _p2; };
+#define MVXB_SIG(NAME) \
+kernel void NAME(device const EPX* tab [[buffer(0)]], device const EPX* tab2 [[buffer(1)]], device const float* x [[buffer(2)]], \
+                 device float* y [[buffer(3)]], constant MV& p [[buffer(4)]], device const float* sel [[buffer(5)]], \
+                 constant XB& b [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
+                 uint lane [[thread_index_in_simdgroup]])
+#define MVXB(NAME, T, X, CH, MAKE) \
+MVXB_SIG(NAME##_bsum) { threadgroup float red[2]; \
+    uint t = tg.x, row = tg.y; \
+    device const float* st = sel + (ulong)t * b.ssel; \
+    device const float* xt = x + (ulong)t * b.sact; \
+    float acc[1] = { 0.f }, acc2[1] = { 0.f }; \
+    for (uint s = 0; s < p.ldy; s++) { \
+        EPX e = tab[as_type<uint>(st[s])]; T f = MAKE(e); \
+        mv_acc<T, X, CH, 1, 1>(f, f, false, 0, xt + (ulong)s * p.n_in, p.n_in, p.n_out, row, sg, lane, acc, acc2, st[p.ldy + s]); \
+    } \
+    mv_finish<1, 1>(acc, acc2, y + (ulong)t * b.sy, p.mode, row, p.n_out, sg, lane, red, st); }
+#define MVXTB(NAME, T, X, CH, MAKE, RPS, KS) \
+MVXB_SIG(NAME##_bsum) { threadgroup float red[2 * RPS * KS]; \
+    uint t = tg.x, row = tg.y * RPS + lane % RPS; \
+    device const float* st = sel + (ulong)t * b.ssel; \
+    device const float* xt = x + (ulong)t * b.sact; \
+    float a = 0.f, bb = 0.f; \
+    for (uint s = 0; s < p.ldy; s++) { \
+        EPX e = tab[as_type<uint>(st[s])]; T f = MAKE(e); \
+        a += st[p.ldy + s] * xt_run<T, X, CH, RPS, KS>(f, row, xt + (ulong)s * p.n_in, p.n_in, sg, lane); \
+    } \
+    if (xt_reduce<RPS, KS>(a, bb, sg, lane, red)) mv_store(a, bb, y + (ulong)t * b.sy, p.mode, row, p.n_out, st); }
 #define MK_RAWX(T) T{ e.q, p.gpr }
 #define MKX_Q8(e) MQ8{ (device const char*)(e).q, (device const float*)(e).s, p.n_in }
 #define MKX_Q4(e) MQ4{ (e).q, (device const half*)(e).s, p.n_in, (device const ushort*)(e).o, p.gpr, p.gk }
