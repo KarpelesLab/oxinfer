@@ -29,6 +29,10 @@ name = "membench"
 path = "src/bin/membench.rs"
 
 [[example]]
+name = "longcat_avatar_check"
+required-features = ["media"]
+
+[[example]]
 name = "whisper_enc_bench"
 required-features = ["hf", "media"]
 

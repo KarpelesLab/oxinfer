@@ -35,6 +35,7 @@ mod haru_cli;
 mod intervene_cli;
 mod janus_cli;
 mod lfm3_omni_cli;
+mod longcat_avatar_cli;
 mod minimax_h3_cli;
 mod minimax_h3_video_cli;
 mod models_cli;
@@ -240,6 +241,8 @@ struct Args {
     // FLUX.1 / Kontext.
     flux: flux_cli::FluxArgs,
     moss: moss_image_cli::MossArgs,
+    // LongCat-Video-Avatar.
+    avatar: longcat_avatar_cli::AvatarArgs,
     // Stable Diffusion 3 / 3.5.
     sd3: sd3_cli::Sd3Args,
     // BAGEL.
@@ -440,6 +443,15 @@ fn usage() -> ! {
          \x20 --resolution N       Qwen-Image-Layered: 640 (default) or 1024\n\
          \x20 --quant q8|q4        transformer and text encoder precision; --mmap, --stream as above\n\
          \x20 --no-device-passes   run the transformer op by op instead of whole passes on the GPU\n\
+         \n\
+         LongCat-Video-Avatar (meituan-longcat/LongCat-Video-Avatar-1.6 or --preset longcat-avatar-int8;\n\
+         see docs/longcat-avatar.md): a 25 fps video of a character speaking (-p, -o, --seed, --frames):\n\
+         \x20 --audio FILE         the driving speech (twice: two speakers); --init-image FILE the character\n\
+         \x20 --int8               the int8 transformer; --segments N clips chained into a long video\n\
+         \x20 --hd                 the 720p buckets; --bbox Y0,X0,Y1,X1 (twice) the two speakers' regions\n\
+         \x20 --mix-steps N, --mix-alpha F   DMD LoRA share of the first N of the 8 steps (default 4, 1)\n\
+         \x20 --no-distill         the base model alone: --steps, --guidance, --audio-guidance (default 50, 4, 4)\n\
+         \x20 --audio-mode para|add, --ref-index N, --mask-frames N, --avatar-base DIR\n\
          \n\
          MOSS-Image (lodestones/Kromoss, OpenMOSS-Team/MOSS-Image-*; see docs/moss-image.md): text to\n\
          image (-o, --steps, --guidance, --negative, --size, --seed, --lora as above):\n\
@@ -817,6 +829,7 @@ fn parse_args() -> Result<Args> {
         iv: Default::default(),
         flux: Default::default(),
         moss: Default::default(),
+        avatar: Default::default(),
         sd3: Default::default(),
         bagel: Default::default(),
         ocr: Default::default(),
@@ -1150,6 +1163,7 @@ fn parse_args() -> Result<Args> {
             "-h" | "--help" => usage(),
             _ if a.iv.parse(&k, &mut val)? => {}
             _ if a.moss.parse(&k, &mut val)? => {}
+            _ if a.avatar.parse(&k, &mut val)? => {}
             _ if a.flux.parse(&k, &mut val)? => {}
             _ if a.sd3.parse(&k, &mut val)? => {}
             _ if a.bagel.parse(&k, &mut val)? => {}
@@ -1503,6 +1517,10 @@ fn main() -> Result<()> {
         args.model.clone()
     } else if spec.ends_with(".safetensors") {
         resolve_file(&spec, args.cache_dir.as_deref())?
+    } else if !args.model.exists() && spec == oxinfer::longcat_avatar::AVATAR_REPO {
+        // LongCat-Video-Avatar: its loader fetches the parts it reads (one of two transformers,
+        // one of Whisper's five weight files) and the base repository's.
+        args.model.clone()
     } else if !args.model.exists() && oxinfer::zonos::is_zonos(&args.model) {
         // ZONOS3's repository: its loader fetches the few files it reads.
         args.model.clone()
@@ -1890,6 +1908,9 @@ fn run(mut args: Args) -> Result<()> {
         }
         // Questions about images: the model's Qwen2.5-VL as a chat model.
         args = omnigen2_cli::understanding_args(args);
+    }
+    if longcat_avatar_cli::wants(&args) {
+        return longcat_avatar_cli::run(&args);
     }
     if moss_image_cli::wants(&args) {
         return moss_image_cli::run(&args);

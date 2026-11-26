@@ -930,6 +930,42 @@ pub const PRESETS: &[Preset] = &[
                  SHA-256 at huggingface.co/Lnypuuuu/txt2image",
         note: "photographic social-media look (a LyCORIS LoKr, merged at load) at strength 1.4",
     },
+    // LongCat-Video-Avatar: the transformer and the two LoRAs are folders of the base repository
+    // (`extra_download_gb`: nothing beyond it), with the text encoder and VAE of
+    // meituan-longcat/LongCat-Video.
+    Preset {
+        id: "longcat-avatar-int8",
+        base: "meituan-longcat/LongCat-Video-Avatar-1.6",
+        pipeline: "longcat-avatar",
+        load: &[
+            ("transformer", "base_model_int8"),
+            ("lora", "loraA/lora.safetensors:1"),
+            ("lora", "loraB/lora.safetensors:1"),
+        ],
+        defaults: &[("steps", "8"), ("guidance", "1"), ("mix_steps", "4"), ("mix_alpha", "1")],
+        trigger: "",
+        extra_download_gb: 0.0,
+        source: "https://huggingface.co/meituan-longcat/LongCat-Video-Avatar-1.6 (Quick Inference: --use_distill --use_int8 \
+                 --mix_steps=4 --mix_alpha=1.0: 8 steps without guidance, the DMD LoRA (loraA) for the first four and the \
+                 OPSD LoRA (loraB) for the rest)",
+        note: "audio-driven avatar video (--audio, --init-image): the int8 transformer (15.9 GB) with the two LoRAs",
+    },
+    Preset {
+        id: "longcat-avatar",
+        base: "meituan-longcat/LongCat-Video-Avatar-1.6",
+        pipeline: "longcat-avatar",
+        load: &[
+            ("transformer", "base_model"),
+            ("lora", "loraA/lora.safetensors:1"),
+            ("lora", "loraB/lora.safetensors:1"),
+        ],
+        defaults: &[("steps", "8"), ("guidance", "1"), ("mix_steps", "4"), ("mix_alpha", "1")],
+        trigger: "",
+        extra_download_gb: 0.0,
+        source: "https://huggingface.co/meituan-longcat/LongCat-Video-Avatar-1.6 (Quick Inference: --use_distill \
+                 --mix_steps=4 --mix_alpha=1.0)",
+        note: "audio-driven avatar video (--audio, --init-image): the bf16 transformer (31.7 GB) with the two LoRAs",
+    },
 ];
 
 /// The preset of that id.

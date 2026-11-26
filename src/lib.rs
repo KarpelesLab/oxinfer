@@ -90,6 +90,7 @@ pub mod kimi;
 pub mod lfm3;
 pub mod lfm3_omni;
 pub mod longcat;
+pub mod longcat_avatar;
 pub mod longcat_chat;
 pub mod lookup;
 pub mod lora;
