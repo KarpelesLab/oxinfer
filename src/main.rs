@@ -535,8 +535,8 @@ fn usage() -> ! {
          \x20 --gpu-kv T           f16 (default) | f32: the device's copies of the attention caches\n\
          \x20                      (Metal whole-pass plans; f16 halves their traffic at long contexts)\n\
          \x20 --gpu-expert-tiles M auto (default) | on | off: tiled copies of a GGUF checkpoint's routed\n\
-         \x20                      experts for the GPU prefill GEMMs (faster MoE prefill, the experts'\n\
-         \x20                      memory again; auto: GPUs with matrix units, within a quarter of RAM)\n\
+         \x20                      experts for the GPU (faster MoE prefill; decoding reads them too, in\n\
+         \x20                      the checkpoint's place: no extra memory; auto: GPUs with matrix units)\n\
          \x20 --dump-logits FILE   write last-prompt-token logits (f32 LE) and exit\n\
          \n\
          ANEMLL Core ML models (a meta.yaml folder; macOS 15 / iOS 18, Apple Neural Engine):\n\

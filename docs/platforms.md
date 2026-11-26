@@ -56,11 +56,13 @@ experts in one submission per layer: the tokens are gathered into one segment pe
 grouped GEMM walks per-expert tiles for the gate/up projection, then SiLU, the grouped down
 projection and the weighted combination, all on the GPU (the expert weights are kept resident
 with an `MTLResidencySet`; making them resident per submission cost more than the GEMMs).
-Prefill plans run the routed experts of GGUF checkpoints on tiled copies (each band of 64 rows
-stored block column by block column, so that a tile's K step reads one run of memory: the same
-results, 3-7% faster passes on an M5 Max, for as much memory again as the experts take; on GPUs
-with matrix units while the copies stay within a quarter of the machine's memory; engine option
-`gpu_expert_tiles=0|1`, `--gpu-expert-tiles`, `OXINFER_GPU_EXPERT_TILES=0|1`).
+Prefill and decode plans run the routed experts of GGUF checkpoints on tiled copies (each band
+of 64 rows stored block column by block column, so that a tile's K step reads one run of memory:
+the same results, 3-7% faster prefill passes on an M5 Max); the checkpoint's experts are then let
+go (pages of a GGUF file read into memory mapped back from the file, of a mapped one dropped from
+the page cache; CPU paths read them from the file again), so the copies take no extra memory. On
+GPUs with matrix units, not on iOS; engine option `gpu_expert_tiles=0|1`, `--gpu-expert-tiles`,
+`OXINFER_GPU_EXPERT_TILES=0|1`.
 
 If the matrix-unit library fails to compile on such a GPU (a driver or SDK that rejects one of
 its kernels), oxinfer falls back to the SIMD-group kernels below, which still work but are 2-3x

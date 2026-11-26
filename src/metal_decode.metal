@@ -53,13 +53,31 @@ inline float mdot(MBf f, uint row, uint c, thread const X16& xr) {
 }
 // ---- f16 (GGUF): chunk of 16.
 struct MF16 { device const uchar* w; ulong rb; };
-inline float mdot(MF16 f, uint row, uint c, thread const X16& xr) {
-    device const packed_half4* p = (device const packed_half4*)(f.w + (ulong)row * f.rb + c * 32);
+// Routed experts in the grouped GEMMs' tiled layout (`gblk` / `kpart` in GGUF_SHADER_SRC,
+// `MetalBackend::tiled_experts`): the `<type>T` twins of the raw types below read the same bytes
+// at their tiled places (`rb`: the row length without `GG_TILED`) and compute the same products
+// in the same order. Block `blk` (of `bs` bytes) of row `row`, and the part of `len` bytes `off`
+// bytes into super-block `sb` (of `tsz` bytes) of a K-quant row.
+inline device const uchar* tblk(device const uchar* w, ulong rb, uint row, uint blk, uint bs) {
+    return w + (ulong)(row & ~63u) * rb + (ulong)blk * (64 * bs) + (row & 63u) * bs;
+}
+inline device const uchar* tpart(device const uchar* w, ulong rb, uint row, uint sb, uint tsz, uint off, uint len) {
+    return w + (ulong)(row & ~63u) * rb + (ulong)sb * (64 * tsz) + 64 * off + (row & 63u) * len;
+}
+inline float f16_dot(device const packed_half4* p, thread const X16& xr) {
     float4 a = float4(half4(p[0])) * xr.v[0];
     a = fma(float4(half4(p[1])), xr.v[1], a);
     a = fma(float4(half4(p[2])), xr.v[2], a);
     a = fma(float4(half4(p[3])), xr.v[3], a);
     return hsum(a);
+}
+inline float mdot(MF16 f, uint row, uint c, thread const X16& xr) {
+    return f16_dot((device const packed_half4*)(f.w + (ulong)row * f.rb + c * 32), xr);
+}
+// (Tiled F16 blocks are of 32 values: two chunks.)
+struct MF16T { device const uchar* w; ulong rb; };
+inline float mdot(MF16T f, uint row, uint c, thread const X16& xr) {
+    return f16_dot((device const packed_half4*)(tblk(f.w, f.rb, row, c / 2, 64) + (c % 2) * 32), xr);
 }
 // ---- oxinfer Q8: int8 rows plus an f32 scale per 32; chunk of 16.
 struct MQ8 { device const char* q; device const float* s; uint n_in; };
@@ -104,17 +122,18 @@ inline float mdot(MQ4 f, uint row, uint c, thread const X32& xr) {
 // ---- GGUF Q4_0: 18-byte blocks (2-byte aligned), chunk of 32.
 struct MQ4_0 { device const uchar* w; ulong rb; };
 inline uint ld32u(device const ushort* p) { return uint(p[0]) | (uint(p[1]) << 16); }
-inline float mdot(MQ4_0 f, uint row, uint c, thread const X32& xr) {
-    device const ushort* b = (device const ushort*)(f.w + (ulong)row * f.rb + c * 18);
+inline float q4_0_dot(device const ushort* b, thread const X32& xr) {
     float d = float(as_type<half>(b[0]));
     uint4 u = uint4(ld32u(b + 1), ld32u(b + 3), ld32u(b + 5), ld32u(b + 7));
     return d * (q4_block(u, xr) - 8.f * xsum32(xr));
 }
+inline float mdot(MQ4_0 f, uint row, uint c, thread const X32& xr) { return q4_0_dot((device const ushort*)(f.w + (ulong)row * f.rb + c * 18), xr); }
+struct MQ4_0T { device const uchar* w; ulong rb; };
+inline float mdot(MQ4_0T f, uint row, uint c, thread const X32& xr) { return q4_0_dot((device const ushort*)tblk(f.w, f.rb, row, c, 18), xr); }
 // ---- GGUF Q8_0: 34-byte blocks (2-byte aligned), chunk of 32.
 struct MQ8_0 { device const uchar* w; ulong rb; };
 inline float4 c4(ushort a, ushort b) { return float4(float(as_type<char2>(a).x), float(as_type<char2>(a).y), float(as_type<char2>(b).x), float(as_type<char2>(b).y)); }
-inline float mdot(MQ8_0 f, uint row, uint c, thread const X32& xr) {
-    device const ushort* b = (device const ushort*)(f.w + (ulong)row * f.rb + c * 34);
+inline float q8_0_dot(device const ushort* b, thread const X32& xr) {
     float d = float(as_type<half>(b[0]));
     float4 a = c4(b[1], b[2]) * xr.v[0];
     a = fma(c4(b[3], b[4]), xr.v[1], a);
@@ -126,6 +145,9 @@ inline float mdot(MQ8_0 f, uint row, uint c, thread const X32& xr) {
     a = fma(c4(b[15], b[16]), xr.v[7], a);
     return d * hsum(a);
 }
+inline float mdot(MQ8_0 f, uint row, uint c, thread const X32& xr) { return q8_0_dot((device const ushort*)(f.w + (ulong)row * f.rb + c * 34), xr); }
+struct MQ8_0T { device const uchar* w; ulong rb; };
+inline float mdot(MQ8_0T f, uint row, uint c, thread const X32& xr) { return q8_0_dot((device const ushort*)tblk(f.w, f.rb, row, c, 34), xr); }
 // ---- IQ1_S (50-byte blocks of 256, 2-byte aligned), chunk of 32 = one sub-block: four grid
 // entries of 8 ternary values (signed bytes) plus a shared delta, one scale. The delta is applied
 // to the sum of the x values rather than to each weight. The chunk is decoded (`iq1s_dec`) and its
@@ -166,8 +188,7 @@ inline float iq1s_fin(thread const WIQ1S& w, thread const X32& x) {
 }
 // (The one-token dot decodes each grid entry as it goes: the same operations as `iq1s_fin` on
 // `iq1s_dec`'s values, with fewer registers live.)
-inline float mdot(MIQ1_S f, uint row, uint c, thread const X32& x) {
-    device const ushort* B = (device const ushort*)(f.w + (ulong)row * f.rb + (c / 8) * 50);
+inline float iq1s_dot(device const ushort* B, uint c, thread const X32& x) {
     uint j = c % 8;
     uint qh = B[17 + j], q01 = B[1 + 2 * j], q23 = B[2 + 2 * j];
     float dl = float(as_type<half>(B[0])) * float(2 * ((qh >> 12) & 7) + 1);
@@ -181,6 +202,11 @@ inline float mdot(MIQ1_S f, uint row, uint c, thread const X32& x) {
     }
     return iq1s_end(dl, delta, s, sx);
 }
+inline float mdot(MIQ1_S f, uint row, uint c, thread const X32& x) {
+    return iq1s_dot((device const ushort*)(f.w + (ulong)row * f.rb + (c / 8) * 50), c, x);
+}
+struct MIQ1_ST { device const uchar* w; ulong rb; };
+inline float mdot(MIQ1_ST f, uint row, uint c, thread const X32& x) { return iq1s_dot((device const ushort*)tblk(f.w, f.rb, row, c / 8, 50), c, x); }
 // ---- IQ1_M (56-byte blocks of 256): per group of 8 its own scale (3 bits a half sub-block) and
 // delta sign; the f16 scale in the top nibbles of the four scale words. Decoded and summed as
 // IQ1_S (`iq1m_dec`, `iq1m_fin`).
@@ -220,8 +246,7 @@ inline float iq1m_fin(thread const WIQ1M& w, thread const X32& x) {
     return r;
 }
 // (As for IQ1_S: `iq1m_fin`'s operations on `iq1m_dec`'s values, decoded as they are used.)
-inline float mdot(MIQ1_M f, uint row, uint c, thread const X32& x) {
-    device const uchar* B = f.w + (ulong)row * f.rb + (c / 8) * 56;
+inline float iq1m_dot(device const uchar* B, uint c, thread const X32& x) {
     uint j = c % 8;
     device const ushort* S = (device const ushort*)(B + 48);
     uint s0 = S[0], s1 = S[1], s2 = S[2], s3 = S[3];
@@ -242,6 +267,9 @@ inline float mdot(MIQ1_M f, uint row, uint c, thread const X32& x) {
     }
     return r;
 }
+inline float mdot(MIQ1_M f, uint row, uint c, thread const X32& x) { return iq1m_dot(f.w + (ulong)row * f.rb + (c / 8) * 56, c, x); }
+struct MIQ1_MT { device const uchar* w; ulong rb; };
+inline float mdot(MIQ1_MT f, uint row, uint c, thread const X32& x) { return iq1m_dot(tblk(f.w, f.rb, row, c / 8, 56), c, x); }
 // ---- The routed experts' IQ1_S / IQ1_M dots (`mvxd_*`; one-token only, so free of the sharing
 // above): the grid entries from `iq1s_grid_h`, the same ternary values as halves (+-1 = 0x3c00 /
 // 0xbc00, a 16-byte row per entry, prepended by `decode_src`), which the multiply-adds take
@@ -389,19 +417,28 @@ inline float kq_fin(float2 dm, float2 s0, float2 s1, float dl, float dh, float s
     return fma(dm.x, fma(s0.x, dl, s1.x * dh), -(dm.y * fma(s0.y, sl, s1.y * sh)));
 }
 struct MQ4_K { device const uchar* w; ulong rb; };
-inline float mdot(MQ4_K f, uint row, uint c, thread const XKQ& x) {
-    uint k = c % 8, g = k / 2, h = k % 2;
-    device const uchar* B = f.w + (ulong)row * f.rb + (c / 8) * 144;
+// (B: the super-block's d, dmin and scales; Q: the chunk's 16 bytes of quants.)
+inline float q4_k_dot(device const uchar* B, device const uchar* Q, uint g, thread const XKQ& x) {
     float2 dm = float2(*(device const half2*)B);
     float4 sc = kscale2(B + 4, g);
     float2 s0 = sc.xy, s1 = sc.zw;
-    uint4 u = *(device const uint4*)(B + 16 + 32 * g + 16 * h);
+    uint4 u = *(device const uint4*)Q;
     float4 lo = 0.f, hi = 0.f;
     nib_acc(u.x, x.k.l[0], x.k.h[0], lo, hi);
     nib_acc(u.y, x.k.l[1], x.k.h[1], lo, hi);
     nib_acc(u.z, x.k.l[2], x.k.h[2], lo, hi);
     nib_acc(u.w, x.k.l[3], x.k.h[3], lo, hi);
     return kq_fin(dm, s0, s1, dot(lo, NIB_LO), dot(hi, NIB_HI), x.k.sl, x.k.sh);
+}
+inline float mdot(MQ4_K f, uint row, uint c, thread const XKQ& x) {
+    uint k = c % 8, g = k / 2, h = k % 2;
+    device const uchar* B = f.w + (ulong)row * f.rb + (c / 8) * 144;
+    return q4_k_dot(B, B + 16 + 32 * g + 16 * h, g, x);
+}
+struct MQ4_KT { device const uchar* w; ulong rb; };
+inline float mdot(MQ4_KT f, uint row, uint c, thread const XKQ& x) {
+    uint k = c % 8, g = k / 2, h = k % 2;
+    return q4_k_dot(tpart(f.w, f.rb, row, c / 8, 144, 0, 16), tpart(f.w, f.rb, row, c / 8, 144, 16 + 32 * g, 32) + 16 * h, g, x);
 }
 // Q5_K: the fifth bit of value 64g + 16h + i (and of 64g + 32 + 16h + i) is bit 2g (2g + 1) of
 // qh[16h + i]. Merged into each value's byte before the float conversion (one conversion and
@@ -413,13 +450,12 @@ inline void nib5_acc(uint w, uint q, uint sh, float4 xa, float4 xb, thread float
     lo += xa * float4(as_type<uchar4>(a));
     hi += xb * float4(as_type<uchar4>(b));
 }
-inline float mdot(MQ5_K f, uint row, uint c, thread const XKQ& x) {
-    uint k = c % 8, g = k / 2, h = k % 2;
-    device const uchar* B = f.w + (ulong)row * f.rb + (c / 8) * 176;
+// (B: the super-block's d, dmin, scales and high bits; Q: the chunk's 16 bytes of quants.)
+inline float q5_k_dot(device const uchar* B, device const uchar* Q, uint g, uint h, thread const XKQ& x) {
     float2 dm = float2(*(device const half2*)B);
     float4 sc = kscale2(B + 4, g);
     float2 s0 = sc.xy, s1 = sc.zw;
-    uint4 u = *(device const uint4*)(B + 48 + 32 * g + 16 * h);
+    uint4 u = *(device const uint4*)Q;
     uint4 q = *(device const uint4*)(B + 16 + 16 * h);
     float4 lo = 0.f, hi = 0.f;
     nib5_acc(u.x, q.x, 2 * g, x.k.l[0], x.k.h[0], lo, hi);
@@ -427,6 +463,16 @@ inline float mdot(MQ5_K f, uint row, uint c, thread const XKQ& x) {
     nib5_acc(u.z, q.z, 2 * g, x.k.l[2], x.k.h[2], lo, hi);
     nib5_acc(u.w, q.w, 2 * g, x.k.l[3], x.k.h[3], lo, hi);
     return kq_fin(dm, s0, s1, dot(lo, NIB_LO), dot(hi, NIB_HI), x.k.sl, x.k.sh);
+}
+inline float mdot(MQ5_K f, uint row, uint c, thread const XKQ& x) {
+    uint k = c % 8, g = k / 2, h = k % 2;
+    device const uchar* B = f.w + (ulong)row * f.rb + (c / 8) * 176;
+    return q5_k_dot(B, B + 48 + 32 * g + 16 * h, g, h, x);
+}
+struct MQ5_KT { device const uchar* w; ulong rb; };
+inline float mdot(MQ5_KT f, uint row, uint c, thread const XKQ& x) {
+    uint k = c % 8, g = k / 2, h = k % 2;
+    return q5_k_dot(tpart(f.w, f.rb, row, c / 8, 176, 0, 48), tpart(f.w, f.rb, row, c / 8, 176, 48 + 32 * g, 32) + 16 * h, g, h, x);
 }
 // Q6_K (210-byte super-blocks, 2-byte aligned): chunk k covers half n = k / 4 and positions
 // l = 8 (k % 4) + i of it; its values are 128n + l + {0, 32, 64, 96} (sub-blocks of 16 with
@@ -457,20 +503,30 @@ inline float4 q6v(uint ql, uint qh) {
     uint q = (ql & 0x0F0F0F0Fu) | ((qh & 0x03030303u) << 4);
     return float4(as_type<uchar4>(q)) - 32.f;
 }
-inline float mdot(MQ6_K f, uint row, uint c, thread const X6& x) {
-    uint n = (c % 8) / 4, l0 = 8 * (c % 4);
-    device const uchar* B = f.w + (ulong)row * f.rb + (c / 8) * 210;
-    device const ushort* q1 = (device const ushort*)(B + 64 * n + l0);
-    device const ushort* q2 = (device const ushort*)(B + 64 * n + 32 + l0);
-    device const ushort* qh = (device const ushort*)(B + 128 + 32 * n + l0);
+// (L: the half's 64 low quant bytes, H: its 32 high ones, S: the 16 scales and d.)
+inline float q6_k_dot(device const uchar* L, device const uchar* H, device const uchar* S, uint n, uint l0, thread const X6& x) {
+    device const ushort* q1 = (device const ushort*)(L + l0);
+    device const ushort* q2 = (device const ushort*)(L + 32 + l0);
+    device const ushort* qh = (device const ushort*)(H + l0);
     uint a0 = ld32u(q1), a1 = ld32u(q1 + 2), b0 = ld32u(q2), b1 = ld32u(q2 + 2), h0 = ld32u(qh), h1 = ld32u(qh + 2);
-    device const char* sc = (device const char*)(B + 192 + 8 * n + l0 / 16);
-    float d = float(*(device const half*)(B + 208));
+    device const char* sc = (device const char*)(S + 8 * n + l0 / 16);
+    float d = float(*(device const half*)(S + 16));
     float s0 = q6_pair(q6v(a0, h0), x.v[0], q6v(a1, h1), x.v[1]);
     float s1 = q6_pair(q6v(b0, h0 >> 2), x.v[2], q6v(b1, h1 >> 2), x.v[3]);
     float s2 = q6_pair(q6v(a0 >> 4, h0 >> 4), x.v[4], q6v(a1 >> 4, h1 >> 4), x.v[5]);
     float s3 = q6_pair(q6v(b0 >> 4, h0 >> 6), x.v[6], q6v(b1 >> 4, h1 >> 6), x.v[7]);
     return d * q6_sum(s0, s1, s2, s3, float(sc[0]), float(sc[2]), float(sc[4]), float(sc[6]));
+}
+inline float mdot(MQ6_K f, uint row, uint c, thread const X6& x) {
+    uint n = (c % 8) / 4, l0 = 8 * (c % 4);
+    device const uchar* B = f.w + (ulong)row * f.rb + (c / 8) * 210;
+    return q6_k_dot(B + 64 * n, B + 128 + 32 * n, B + 192, n, l0, x);
+}
+struct MQ6_KT { device const uchar* w; ulong rb; };
+inline float mdot(MQ6_KT f, uint row, uint c, thread const X6& x) {
+    uint n = (c % 8) / 4, l0 = 8 * (c % 4);
+    device const uchar* P = tpart(f.w, f.rb, row, c / 8, 210, 18 + 96 * n, 96);
+    return q6_k_dot(P, P + 64, tpart(f.w, f.rb, row, c / 8, 210, 0, 18), n, l0, x);
 }
 // ---- IQ4_XS (136-byte super-blocks of 256, 8-byte aligned): chunk k is sub-block k % 8, its 16
 // bytes of nibbles (low = value i, high = value i + 16) looked up in the kernel's threadgroup copy
@@ -532,6 +588,25 @@ inline void mv_acc(F f, F f2, bool pair, uint r2off, device const float* x, uint
 // Reduces the lane sums over the threadgroup and writes rows r0 .. of y by `mode`: 0 store, 1 add,
 // 2 silu(acc) * acc2, 3 gelu(acc) * acc2, 4 add acc * sigmoid(*gate), 5 raw pair, 6 clamped SwiGLU
 // pair (limit *gate; the expert pair kernels read it after the k ids and weights of `sel`).
+// Row o's sums a (and b, of a pair) written to y by `mode` (see `mv_finish`).
+inline void mv_store(float a, float b, device float* y, uint mode, uint o, uint n_out, device const float* gate) {
+    if (mode == 0) y[o] = a;
+    else if (mode == 1) y[o] += a;
+    else if (mode == 2) y[o] = a / (1.0f + exp(-a)) * b;
+    else if (mode == 3) {
+        float t = 0.7978845608f * (a + 0.044715f * a * a * a);
+        y[o] = 0.5f * a * (1.0f + precise::tanh(t)) * b;
+    } else if (mode == 5) {
+        // Raw pair (experts with LoRA updates): gate then up outputs, 2 n_out per slot.
+        y[o] = a;
+        y[n_out + o] = b;
+    } else if (mode == 6) {
+        // DeepSeek's clamped SwiGLU, the limit at *gate: silu(min(a, l)) * clamp(b, -l, l).
+        float l = gate[0];
+        float g = min(a, l);
+        y[o] = g / (1.0f + precise::exp(-g)) * clamp(b, -l, l);
+    } else y[o] += a / (1.0f + exp(-gate[0]));
+}
 template <int NR, int KS>
 inline void mv_finish(thread float* acc, thread float* acc2, device float* y, uint mode, uint r0, uint n_out, uint sg, uint lane,
                       threadgroup float* red, device const float* gate) {
@@ -550,23 +625,7 @@ inline void mv_finish(thread float* acc, thread float* acc2, device float* y, ui
     if (lane < NR && r0 + lane < n_out) {
         float a = acc[0], b = acc2[0];
         for (int r = 1; r < NR; r++) if (lane == uint(r)) { a = acc[r]; b = acc2[r]; }
-        uint o = r0 + lane;
-        if (mode == 0) y[o] = a;
-        else if (mode == 1) y[o] += a;
-        else if (mode == 2) y[o] = a / (1.0f + exp(-a)) * b;
-        else if (mode == 3) {
-            float t = 0.7978845608f * (a + 0.044715f * a * a * a);
-            y[o] = 0.5f * a * (1.0f + precise::tanh(t)) * b;
-        } else if (mode == 5) {
-            // Raw pair (experts with LoRA updates): gate then up outputs, 2 n_out per slot.
-            y[o] = a;
-            y[n_out + o] = b;
-        } else if (mode == 6) {
-            // DeepSeek's clamped SwiGLU, the limit at *gate: silu(min(a, l)) * clamp(b, -l, l).
-            float l = gate[0];
-            float g = min(a, l);
-            y[o] = g / (1.0f + precise::exp(-g)) * clamp(b, -l, l);
-        } else y[o] += a / (1.0f + exp(-gate[0]));
+        mv_store(a, b, y, mode, r0 + lane, n_out, gate);
     }
 }
 template <typename F, typename X, uint CH, int NR, int KS>
@@ -1903,6 +1962,70 @@ MVX_SIG(NAME##_sum) { threadgroup float red[2]; \
         while (c >= nch) { c -= nch; s++; } \
     } \
     mv_finish<NRS, 1>(a, b, y, p.mode, row, p.n_out, 0, lane, red, sel); }
+// Experts in the tiled layout (`<type>T` weights, `p.gpr` with `GG_TILED`, see `gblk`): a lane a
+// row. Consecutive lanes take consecutive rows of a band (a threadgroup RPS of them, 32 / RPS
+// lanes a row), so that each read of the SIMD-group is one run of memory (the rows' copies of a
+// block, one after another), where a lane a chunk (`MVX`) would read RPS pieces a band's column
+// apart. The row's chunks are cut into 32 / RPS x KS runs, one per lane of the row in each of the
+// KS SIMD-groups, summed in order, then the runs' sums over the lanes (shuffles) and the
+// SIMD-groups (threadgroup memory). Other sums than `MVX`'s (the same products), the same in every
+// kernel of a plan (multi-token steps run these per token).
+template <typename T, typename X, uint CH, uint RPS, uint KS>
+inline float xt_run(T f, uint row, device const float* x, uint n_in, uint sg, uint lane) {
+    uint nch = n_in / CH, np = KS * (32 / RPS), q = sg * (32 / RPS) + lane / RPS;
+    uint c0 = nch * q / np, c1 = nch * (q + 1) / np;
+    float a = 0.f;
+    for (uint c = c0; c < c1; c++) {
+        X xr;
+        xload(x, c, xr);
+        a += mdot(f, row, c, xr);
+    }
+    return a;
+}
+template <typename T, typename X, uint CH, uint RPS, uint KS>
+inline void xt_run2(T f, T f2, uint row, uint r2, device const float* x, uint n_in, uint sg, uint lane, thread float& a, thread float& b) {
+    uint nch = n_in / CH, np = KS * (32 / RPS), q = sg * (32 / RPS) + lane / RPS;
+    uint c0 = nch * q / np, c1 = nch * (q + 1) / np;
+    for (uint c = c0; c < c1; c++) {
+        X xr;
+        xload(x, c, xr);
+        a += mdot(f, row, c, xr);
+        b += mdot(f2, row + r2, c, xr);
+    }
+}
+// The sums of a row's runs into lanes 0 .. RPS - 1 of SIMD-group 0; false for the other lanes.
+template <uint RPS, uint KS>
+inline bool xt_reduce(thread float& a, thread float& b, uint sg, uint lane, threadgroup float* red) {
+    for (uint o = 16; o >= RPS; o /= 2) {
+        a += simd_shuffle_down(a, o);
+        b += simd_shuffle_down(b, o);
+    }
+    if (KS > 1) {
+        if (lane < RPS) { red[sg * 2 * RPS + lane] = a; red[sg * 2 * RPS + RPS + lane] = b; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg != 0 || lane >= RPS) return false;
+        a = red[lane]; b = red[RPS + lane];
+        for (uint k = 1; k < KS; k++) { a += red[k * 2 * RPS + lane]; b += red[k * 2 * RPS + RPS + lane]; }
+        return true;
+    }
+    return lane < RPS;
+}
+#define MVXT(NAME, T, X, CH, MAKE, RPS, KS) \
+MVX_SIG(NAME##_pair) { threadgroup float red[2 * RPS * KS]; \
+    uint s = tg.y, row = tg.x * RPS + lane % RPS; EPX e = tab[as_type<uint>(sel[s])], e2 = tab2[as_type<uint>(sel[s])]; \
+    T f = MAKE(e); T f2 = MAKE(e2); \
+    float a = 0.f, b = 0.f; \
+    xt_run2<T, X, CH, RPS, KS>(f, f2, row, p._p, x, p.n_in, sg, lane, a, b); \
+    if (xt_reduce<RPS, KS>(a, b, sg, lane, red)) \
+        mv_store(a, b, y + (ulong)s * p.n_out * (p.mode == 5u ? 2u : 1u), p.mode, row, p.n_out, sel + 2 * p.ldy); } \
+MVX_SIG(NAME##_sum) { threadgroup float red[2 * RPS * KS]; \
+    uint row = tg.x * RPS + lane % RPS; \
+    float a = 0.f, b = 0.f; \
+    for (uint s = 0; s < p.ldy; s++) { \
+        EPX e = tab[as_type<uint>(sel[s])]; T f = MAKE(e); \
+        a += sel[p.ldy + s] * xt_run<T, X, CH, RPS, KS>(f, row, x + (ulong)s * p.n_in, p.n_in, sg, lane); \
+    } \
+    if (xt_reduce<RPS, KS>(a, b, sg, lane, red)) mv_store(a, b, y, p.mode, row, p.n_out, sel); }
 #define MK_RAWX(T) T{ e.q, p.gpr }
 #define MKX_Q8(e) MQ8{ (device const char*)(e).q, (device const float*)(e).s, p.n_in }
 #define MKX_Q4(e) MQ4{ (e).q, (device const half*)(e).s, p.n_in, (device const ushort*)(e).o, p.gpr, p.gk }

@@ -239,6 +239,24 @@ impl MvFmt {
             },
         }
     }
+    /// [`Self::kernel_types`] of the expert kernels on tiled copies (`mvxt_<fmt>_<rows>`, see
+    /// `MetalBackend::tiled_experts`): the raw types' `<type>T` twins, the dequantizer of the
+    /// others (which reads the layout from `GG_TILED` in `p.gpr` itself). None: no such kernels
+    /// (formats the copies do not take).
+    pub(crate) fn tiled_kernel_types(self) -> Option<(String, &'static str, usize, String)> {
+        use GgmlType::*;
+        let MvFmt::Gguf(k) = self else { return None };
+        if !super::GGUF_MMA_TYPES.contains(&k) || k == F8E4M3 {
+            return None;
+        }
+        let (t, x, ch, mk) = self.kernel_types();
+        Some(match k {
+            F16 | Q4_0 | Q8_0 | Q4_K | Q5_K | Q6_K | IQ1_S | IQ1_M => {
+                (format!("{t}T"), x, ch, format!("{t}T{{ (e).q, p.gpr & ~GG_TILED }}"))
+            }
+            _ => (t, x, ch, mk),
+        })
+    }
     /// Values per chunk (one lane's unit of work).
     fn chunk(self) -> usize {
         match self {
@@ -277,6 +295,13 @@ pub(crate) fn shader_src() -> String {
         let n = f.name();
         let _ = writeln!(s, "#define MKX_{n}(e) {mk}");
         let _ = writeln!(s, "MVX(mvx_{n}, {t}, {x}, {ch}, MKX_{n})");
+        // The same on tiled copies, of each geometry: `mvxt_<fmt>_<rows>x<groups>_pair` / `_sum`.
+        if let Some((t, x, ch, mk)) = f.tiled_kernel_types() {
+            let _ = writeln!(s, "#define MKXT_{n}(e) {mk}");
+            for (r, k) in XT_GEOS {
+                let _ = writeln!(s, "MVXT(mvxt_{n}_{r}x{k}, {t}, {x}, {ch}, MKXT_{n}, {r}, {k})");
+            }
+        }
         // DeepSeek V4.1's routed experts on dots of their own: `mvxd_<fmt>_pair` / `_sum`.
         if let Some((nrp, nrs)) = mvxd_rows(f) {
             let _ = writeln!(s, "#define MKD_{n}(e) MX{n}{{ (e).q, p.gpr }}");
@@ -860,6 +885,48 @@ pub(crate) struct MvParams {
     pub gk: u32,
     pub ldy: u32,
     pub _p: u32,
+}
+
+/// The geometries of the expert kernels on tiled copies (`mvxt_<fmt>_<rows>x<groups>`): rows a
+/// threadgroup (a lane a row, 32 / rows lanes each) and SIMD-groups a threadgroup.
+/// (Gemma 4 26B-A4B Q4_0, `dec_ab`: the pair kernel at 16 x 8 or 8 x 8 and the sum at 16 x 4
+/// decode as fast as the checkpoint's layout on `mvx_*`; 16 x 2: -2%, 32 x 4: -4%, 32 x 1: -24%.)
+pub(crate) const XT_GEOS: [(usize, usize); 4] = [(16, 4), (16, 8), (8, 8), (32, 4)];
+
+/// The geometry of the tiled expert kernels of `part` ("pair" or "sum"):
+/// `OXINFER_XT_GEO_PAIR` / `_SUM` or `OXINFER_XT_GEO` (`<rows>x<groups>`), else 16 x 8 for the
+/// pairs, 16 x 4 for the sums.
+fn xt_geo(part: &str) -> (usize, usize) {
+    let parse = |k: &str| {
+        let v = std::env::var(k).ok()?;
+        let (r, g) = v.split_once('x')?;
+        Some((r.parse().ok()?, g.parse().ok()?)).filter(|g| XT_GEOS.contains(g))
+    };
+    parse(&format!("OXINFER_XT_GEO_{}", part.to_uppercase()))
+        .or_else(|| parse("OXINFER_XT_GEO"))
+        .unwrap_or(if part == "pair" { (16, 8) } else { (16, 4) })
+}
+
+/// The expert kernel of `fmt` (`part`: "pair" or "sum") for weights of row parameters `q`
+/// (`expert_tables`): on tiled copies (`GG_TILED` in the row bytes) `mvxt_<fmt>_<geometry>`,
+/// else `mvx_<fmt>`.
+fn xname(fmt: MvFmt, q: (u32, u32), part: &str) -> String {
+    if q.0 & super::GG_TILED != 0 {
+        let (r, k) = xt_geo(part);
+        format!("mvxt_{}_{r}x{k}_{part}", fmt.name())
+    } else {
+        format!("mvx_{}_{part}", fmt.name())
+    }
+}
+
+/// The rows and threads a threadgroup of [`xname`]'s kernel.
+fn xrows(q: (u32, u32), part: &str) -> (usize, usize) {
+    if q.0 & super::GG_TILED != 0 {
+        let (r, k) = xt_geo(part);
+        (r, 32 * k)
+    } else {
+        (1, 32)
+    }
 }
 
 /// The formats with routed-expert kernels of their own (`mvxd_<fmt>_pair` / `_sum`, DeepSeek
@@ -2056,6 +2123,9 @@ enum MOp {
         /// (row bytes or offset groups, blocks per group) of gate / up and of down.
         g: (u32, u32),
         d: (u32, u32),
+        /// The rows and the threads a threadgroup of the pair and of the sum kernel (one row of
+        /// 32 threads but on tiled copies: `mvxt_*`).
+        nr: [(usize, usize); 2],
         x: usize,
         sel: usize,
         act: usize,
@@ -3755,8 +3825,7 @@ impl MetalBackend {
                         }
                         None => None,
                     };
-                    let wrapped = indirect.len();
-                    let (tabs, fused, _, _, _) = self.expert_tables(ex, &mut owned, &mut shared, &mut indirect, None)?;
+                    let fused = ex.up.is_none();
                     let n = ex.gate.len();
                     let g_rows = if fused { 2 * ex.inter } else { ex.inter };
                     let affine = |w: &WeightRef| matches!(w, WeightRef::Q4(m) if m.offsets.is_some());
@@ -3790,35 +3859,20 @@ impl MetalBackend {
                     if !ex.h.is_multiple_of(64) || !ex.inter.is_multiple_of(64) {
                         return None;
                     }
-                    // Grouped GEMM tables: (data, scales) per expert, from the decode tables, or
-                    // the experts' tiled copies (`tiled_experts`; their row lengths flagged for
-                    // the kernels).
+                    // Grouped GEMM tables: (data, scales) per expert, from the decode tables (the
+                    // experts' tiled copies where they have them: `expert_tables`; their row
+                    // lengths flagged for the kernels).
+                    let (tabs, _, gq, dq, _) = self.expert_tables(ex, &mut owned, &mut shared, &mut indirect, None, true)?;
+                    let flag = |q: (u32, u32)| q.0 & super::GG_TILED;
+                    let tiled = [flag(gq), flag(gq), flag(dq)];
                     let copy: MsgNewBufBytes = self.o.msg_send();
                     let mut t16 = [std::ptr::null_mut(); 3];
-                    let mut tiled = [0u32; 3];
-                    let projs: [(&[WeightRef], usize, usize); 3] = [
-                        (&ex.gate, g_rows, ex.h),
-                        (ex.up.as_deref().unwrap_or(&[]), ex.inter, ex.h),
-                        (&ex.down, ex.h, ex.inter),
-                    ];
                     for (j, (&src, dst)) in tabs.iter().zip(t16.iter_mut()).enumerate() {
                         if j == 1 && fused {
                             continue;
                         }
-                        let (ws, n_out, n_in) = projs[j];
-                        let tab: Vec<[u64; 2]> =
-                            match self.tiled_experts(ws, n_out, n_in, src, 4, &indirect[wrapped..], true, crate::gpu::expert_tiles()) {
-                                Some((id, addr, mb)) => {
-                                    shared.push(id);
-                                    indirect.push(id);
-                                    tiled[j] = super::GG_TILED;
-                                    (0..n).map(|e| [addr + (e * mb) as u64, 0]).collect()
-                                }
-                                None => {
-                                    let rows = unsafe { std::slice::from_raw_parts(f.contents(src) as *const [u64; 4], n) };
-                                    rows.iter().map(|r| [r[0], r[1]]).collect()
-                                }
-                            };
+                        let rows = unsafe { std::slice::from_raw_parts(f.contents(src) as *const [u64; 4], n) };
+                        let tab: Vec<[u64; 2]> = rows.iter().map(|r| [r[0], r[1]]).collect();
                         *dst = unsafe { copy(self.device, self.sels.new_buffer_bytes, tab.as_ptr() as *const c_void, n * 16, 0) };
                         if dst.is_null() {
                             return None;
@@ -3826,7 +3880,6 @@ impl MetalBackend {
                     }
                     if fused {
                         t16[1] = t16[0];
-                        tiled[1] = tiled[0];
                     }
                     // `P::s_off` of projection j's GGUF kernels.
                     let rb_of = |w: &WeightRef, j: usize| plain_rb(w) | tiled[j];
@@ -3917,12 +3970,14 @@ impl MetalBackend {
                         _ => None,
                     };
                     let mut addrs = Vec::new();
+                    let tiles = g.gate.is_none();
                     let (tabs, fused, g, d, pf) = self.expert_tables(
                         ex,
                         &mut owned,
                         &mut shared,
                         &mut indirect,
                         streamed_unit.is_some().then_some(&mut addrs),
+                        tiles,
                     )?;
                     if let Some(u) = streamed_unit {
                         sxp = Some(StreamedExperts {
@@ -3967,8 +4022,9 @@ impl MetalBackend {
                         None => None,
                     };
                     emit.push(MOp::Experts {
-                        pair: self.named_pipeline(&format!("mvx_{}_pair", pf.0.name()))?,
-                        sum: self.named_pipeline(&format!("mvx_{}_sum", pf.1.name()))?,
+                        pair: self.named_pipeline(&xname(pf.0, g, "pair"))?,
+                        sum: self.named_pipeline(&xname(pf.1, d, "sum"))?,
+                        nr: [xrows(g, "pair"), xrows(d, "sum")],
                         tabs,
                         fused,
                         gelu: ex.gelu,
@@ -5408,7 +5464,14 @@ impl MetalBackend {
     /// regions merged: experts are usually slices of one tensor), added to `owned` and `indirect`.
     /// Returns the tables (gate or fused gate/up, up, down), whether gate/up are fused, the
     /// (row bytes or groups, blocks per group) parameters of gate/up and of down, and their formats.
-    #[allow(clippy::type_complexity)]
+    ///
+    /// `tiles`: GGUF experts may be read from tiled copies instead (`tiled_experts`, shared by the
+    /// plans of a model, as decided by [`crate::gpu::expert_tiles`]): the tables then point at
+    /// the copies and the row bytes carry [`super::GG_TILED`]. When every projection has its
+    /// copy, the checkpoint's experts are let go: their wraps are released (unless another plan
+    /// still reads them) and their pages, if mapped from the file, dropped from memory, so that
+    /// the experts take their memory once.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn expert_tables(
         &self,
         ex: &crate::gpu::decode::Experts,
@@ -5416,6 +5479,7 @@ impl MetalBackend {
         shared: &mut Vec<Id>,
         indirect: &mut Vec<Id>,
         stream: Option<&mut Vec<ExpertAddrs>>,
+        tiles: bool,
     ) -> Option<([Id; 3], bool, (u32, u32), (u32, u32), (MvFmt, MvFmt))> {
         let n = ex.gate.len();
         if n == 0 || ex.down.len() != n || ex.up.as_ref().is_some_and(|u| u.len() != n) || ex.k > 64 {
@@ -5502,6 +5566,63 @@ impl MetalBackend {
             }
             return Some((tabs, fused, infos[0][0].1, infos[2][0].1, (infos[0][0].0, infos[2][0].0)));
         }
+        // Tiled copies another plan of the model made already: the tables point at them, and the
+        // checkpoint's experts (given back by then) are not wrapped again.
+        let tileable = |j: usize| infos[j].first().is_some_and(|i| i.0.tiled_kernel_types().is_some());
+        if tiles && (0..3).all(|j| infos[j].is_empty() || tileable(j)) {
+            let mode = crate::gpu::expert_tiles();
+            let hits: Vec<Option<(Id, u64, usize)>> = lists
+                .iter()
+                .map(|&(ws, n_out, n_in)| {
+                    if ws.is_empty() {
+                        None
+                    } else {
+                        self.tiled_shared(ws, n_out, n_in, mode)
+                    }
+                })
+                .collect();
+            if lists.iter().zip(&hits).all(|(l, h)| l.0.is_empty() || h.is_some()) {
+                let copy: MsgNewBufBytes = self.o.msg_send();
+                let mut tabs = [std::ptr::null_mut(); 3];
+                for (t, h) in tabs.iter_mut().zip(&hits) {
+                    let Some((id, base, mb)) = *h else { continue };
+                    shared.push(id);
+                    indirect.push(id);
+                    let tab: Vec<[u64; 4]> = (0..n)
+                        .map(|e| {
+                            let a = base + (e * mb) as u64;
+                            [a, a, a, 0]
+                        })
+                        .collect();
+                    *t = unsafe {
+                        copy(
+                            self.device,
+                            self.sels.new_buffer_bytes,
+                            tab.as_ptr() as *const c_void,
+                            tab.len() * 32,
+                            0,
+                        )
+                    };
+                    if t.is_null() {
+                        return None;
+                    }
+                    owned.push(*t);
+                }
+                if fused {
+                    tabs[1] = tabs[0];
+                }
+                let (mut g, mut d) = (infos[0][0].1, infos[2][0].1);
+                g.0 |= super::GG_TILED;
+                d.0 |= super::GG_TILED;
+                return Some((tabs, fused, g, d, (infos[0][0].0, infos[2][0].0)));
+            }
+            for (id, _, _) in hits.into_iter().flatten() {
+                if self.unwrap_shared(id) {
+                    let void: MsgVoid = self.o.msg_send();
+                    unsafe { void(id, self.sels.release) };
+                }
+            }
+        }
         let mut all: Vec<(usize, usize)> = infos.iter().flatten().flat_map(|i| i.2.iter().flatten().copied()).collect();
         all.sort_unstable();
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -5512,6 +5633,7 @@ impl MetalBackend {
             }
         }
         let mut addr = Vec::with_capacity(spans.len());
+        let wrapped = (shared.len(), indirect.len());
         for &(s, e) in &spans {
             let (id, a) = self.wrap_shared(s as *const u8, e - s)?;
             addr.push(a);
@@ -5549,10 +5671,68 @@ impl MetalBackend {
             }
             owned.push(*t);
         }
+        let (mut g, mut d) = (infos[0][0].1, infos[2][0].1);
+        if tiles {
+            // Tiled copies of each projection (gate and up both or neither: one pair kernel).
+            let src: Vec<Id> = indirect[wrapped.1..].to_vec();
+            let mode = crate::gpu::expert_tiles();
+            let mut copies: [Option<(Id, u64, usize)>; 3] = [None; 3];
+            for (j, &(ws, n_out, n_in)) in lists.iter().enumerate() {
+                if ws.is_empty() || infos[j][0].0.tiled_kernel_types().is_none() {
+                    continue;
+                }
+                copies[j] = self.tiled_experts(ws, n_out, n_in, tabs[j], 4, &src, true, mode);
+            }
+            if !fused && copies[0].is_some() != copies[1].is_some() {
+                for c in copies[..2].iter_mut() {
+                    if let Some((id, _, _)) = c.take()
+                        && self.unwrap_shared(id)
+                    {
+                        let void: MsgVoid = self.o.msg_send();
+                        unsafe { void(id, self.sels.release) };
+                    }
+                }
+            }
+            for (j, c) in copies.iter().enumerate() {
+                let Some((id, base, mb)) = *c else { continue };
+                shared.push(id);
+                indirect.push(id);
+                // SAFETY: the table (shared storage, not yet in use) holds a [data, scales,
+                // offsets, unused] row of u64s per expert.
+                let rows = unsafe { std::slice::from_raw_parts_mut(self.contents(tabs[j]) as *mut [u64; 4], n) };
+                for (e, r) in rows.iter_mut().enumerate() {
+                    let a = base + (e * mb) as u64;
+                    *r = [a, a, a, 0];
+                }
+                if j == 2 {
+                    d.0 |= super::GG_TILED;
+                } else {
+                    g.0 |= super::GG_TILED;
+                }
+            }
+            // Every projection on its copy: the checkpoint's experts go.
+            if lists.iter().zip(&copies).all(|(l, c)| l.0.is_empty() || c.is_some()) {
+                let ids: Vec<Id> = shared.drain(wrapped.0..wrapped.0 + spans.len()).collect();
+                indirect.drain(wrapped.1..wrapped.1 + spans.len());
+                for id in ids {
+                    if self.unwrap_shared(id) {
+                        let void: MsgVoid = self.o.msg_send();
+                        unsafe { void(id, self.sels.release) };
+                    }
+                }
+                // (Off the plan's path: giving back gigabytes of pages takes the system ~0.1 s
+                // a GB, and the bytes stay readable meanwhile.)
+                std::thread::spawn(move || {
+                    for (s, e) in spans {
+                        crate::safetensors::release_copied(s, e - s);
+                    }
+                });
+            }
+        }
         if fused {
             tabs[1] = tabs[0];
         }
-        Some((tabs, fused, infos[0][0].1, infos[2][0].1, (infos[0][0].0, infos[2][0].0)))
+        Some((tabs, fused, g, d, (infos[0][0].0, infos[2][0].0)))
     }
 }
 
@@ -5777,6 +5957,7 @@ impl MetalPlan<'_> {
             }
             MOp::Experts {
                 pair,
+                nr,
                 sum,
                 tabs,
                 fused,
@@ -5820,7 +6001,7 @@ impl MetalPlan<'_> {
                     e.buf(arena, *x + j * sx, 2);
                     e.buf(arena, *act + j * sact, 3);
                     e.buf(arena, *sel + j * ssel, 5);
-                    e.dispatch((*inter, *k), 32);
+                    e.dispatch((*inter / nr[0].0, *k), nr[0].1);
                 }
                 e.barrier();
                 e.pipe(*sum);
@@ -5831,7 +6012,7 @@ impl MetalPlan<'_> {
                     e.buf(arena, *act + j * sact, 2);
                     e.buf(arena, *y + j * sy, 3);
                     e.buf(arena, *sel + j * ssel, 5);
-                    e.dispatch((*h, 1), 32);
+                    e.dispatch((*h / nr[1].0, 1), nr[1].1);
                 }
             }
             MOp::Mv {
@@ -6253,6 +6434,7 @@ impl MetalPlan<'_> {
     fn encode_xlora(&self, e: &FastEnc, op: &MOp, arena: Id, consts: Id, t: usize, ts: [usize; 4]) {
         let MOp::Experts {
             pair,
+            nr,
             sum,
             tabs,
             fused,
@@ -6311,7 +6493,7 @@ impl MetalPlan<'_> {
             e.buf(arena, *x + j * sx, 2);
             e.buf(arena, out.0 + j * out.1, 3);
             e.buf(arena, *sel + j * ssel, 5);
-            e.dispatch((mi, k), 32);
+            e.dispatch((mi / nr[0].0, k), nr[0].1);
         }
         e.barrier();
         if let Some(gu) = &l.gate_up {
@@ -6356,7 +6538,7 @@ impl MetalPlan<'_> {
             e.buf(arena, *act + j * sact, 2);
             e.buf(arena, *y + j * sy, 3);
             e.buf(arena, *sel + j * ssel, 5);
-            e.dispatch((h, 1), 32);
+            e.dispatch((h / nr[1].0, 1), nr[1].1);
         }
         if let Some(dn) = &l.dn {
             e.barrier();
@@ -7657,6 +7839,7 @@ impl MetalPlan<'_> {
             }
             MOp::Experts {
                 pair,
+                nr,
                 sum,
                 tabs,
                 fused,
@@ -7698,7 +7881,7 @@ impl MetalPlan<'_> {
                 let am = if *gelu { MvMode::GeluPair } else { MvMode::SiluPair };
                 e.bytes(&p(*inter, *h, am, *g, if *fused { *inter } else { 0 }), 4);
                 e.buf(arena, *sel, 5);
-                e.dispatch((*inter, *k), 32);
+                e.dispatch((*inter / nr[0].0, *k), nr[0].1);
                 e.barrier();
                 if let Some((pipe, hot, n)) = edit {
                     e.pipe(*pipe);
@@ -7716,7 +7899,7 @@ impl MetalPlan<'_> {
                 e.buf(arena, *y, 3);
                 e.bytes(&p(*h, *inter, if *add { MvMode::Add } else { MvMode::Store }, *d, 0), 4);
                 e.buf(arena, *sel, 5);
-                e.dispatch((*h, 1), 32);
+                e.dispatch((*h / nr[1].0, 1), nr[1].1);
             }
             MOp::QkRope {
                 pipe,
@@ -8611,6 +8794,141 @@ impl MetalPlan<'_> {
             );
         }
         Some(kept)
+    }
+}
+
+#[cfg(test)]
+impl MetalBackend {
+    /// One token's routed experts through the decode kernels of `MOp::Experts`, on the
+    /// checkpoint's layout (`mvx_*`, `tiled` None) or on tiled copies (`tiled_experts`,
+    /// `mvxt_*` of that geometry, see [`XT_GEOS`]): the activations of the `route`'s slots and
+    /// the output. None where the format has no such kernels.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_experts_once(
+        &self,
+        gate: &[WeightRef],
+        up: Option<&[WeightRef]>,
+        down: &[WeightRef],
+        (h, mi): (usize, usize),
+        gelu: bool,
+        x: &[f32],
+        route: &[(usize, f32)],
+        tiled: Option<(usize, usize)>,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        use crate::quant::PageVec;
+        let (fg, fd) = (MvFmt::of(&gate[0])?, MvFmt::of(&down[0])?);
+        if tiled.is_some() && (fg.tiled_kernel_types().is_none() || fd.tiled_kernel_types().is_none()) {
+            return None;
+        }
+        let fused = up.is_none();
+        let g_rows = if fused { 2 * mi } else { mi };
+        let rb = |w: &WeightRef| match w {
+            WeightRef::Gguf(g) => g.row_bytes() as u32,
+            _ => 0,
+        };
+        let mut bufs: Vec<Buf> = Vec::new();
+        let wrap = |p: *const u8, n: usize, bufs: &mut Vec<Buf>| -> Option<(Id, u64)> {
+            let b = self.wrap(p, n)?;
+            let a = self.gpu_address(&b);
+            let id = b.id;
+            bufs.push(b);
+            Some((id, a))
+        };
+        // Per projection: its table (EPX rows) and row bytes, flagged when tiled.
+        let projs: Vec<(&[WeightRef], usize, usize)> = [Some((gate, g_rows, h)), up.map(|u| (u, mi, h)), Some((down, h, mi))]
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut tabs: Vec<(PageVec<u64>, Id, u32)> = Vec::new();
+        for &(ws, n_out, n_in) in &projs {
+            let mut tab = PageVec::<u64>::zeroed((4 * ws.len()).next_multiple_of(512));
+            let mut ids = Vec::new();
+            for (e, w) in ws.iter().enumerate() {
+                let WeightRef::Gguf(g) = w else { return None };
+                let (id, a) = wrap(g.data.as_ptr(), g.data.len(), &mut bufs)?;
+                ids.push(id);
+                tab[4 * e..4 * e + 4].copy_from_slice(&[a, a, a, 0]);
+            }
+            let (tid, _) = wrap(tab.as_ptr() as *const u8, tab.len() * 8, &mut bufs)?;
+            let mut q = rb(&ws[0]);
+            if tiled.is_some() {
+                let (id, base, mb) = self.tiled_experts(ws, n_out, n_in, tid, 4, &ids, false, Some(true))?;
+                bufs.push(Buf { id, offset_bytes: 0 });
+                for e in 0..ws.len() {
+                    let a = base + (e * mb) as u64;
+                    tab[4 * e..4 * e + 4].copy_from_slice(&[a, a, a, 0]);
+                }
+                q |= super::GG_TILED;
+            }
+            tabs.push((tab, tid, q));
+        }
+        let k = route.len();
+        let mut sel = PageVec::<f32>::zeroed(256);
+        for (s, &(e, wt)) in route.iter().enumerate() {
+            sel[s] = f32::from_bits(e as u32);
+            sel[k + s] = wt;
+        }
+        let mut xv = PageVec::<f32>::zeroed(h.next_multiple_of(1024));
+        xv[..h].copy_from_slice(x);
+        let act = PageVec::<f32>::zeroed((k * mi).next_multiple_of(1024));
+        let y = PageVec::<f32>::zeroed(h.next_multiple_of(1024));
+        let (sb, _) = wrap(sel.as_ptr() as *const u8, sel.len() * 4, &mut bufs)?;
+        let (xb, _) = wrap(xv.as_ptr() as *const u8, xv.len() * 4, &mut bufs)?;
+        let (ab, _) = wrap(act.as_ptr() as *const u8, act.len() * 4, &mut bufs)?;
+        let (yb, _) = wrap(y.as_ptr() as *const u8, y.len() * 4, &mut bufs)?;
+        let name = |f: MvFmt, part: &str| match tiled {
+            Some((r, k)) => format!("mvxt_{}_{r}x{k}_{part}", f.name()),
+            None => format!("mvx_{}_{part}", f.name()),
+        };
+        let (nr, threads) = tiled.map_or((1, 32), |(r, k)| (r, 32 * k));
+        let (pair, sum) = (self.named_pipeline(&name(fg, "pair"))?, self.named_pipeline(&name(fd, "sum"))?);
+        let (tg, tu, td) = (&tabs[0], &tabs[if fused { 0 } else { 1 }], tabs.last().unwrap());
+        let p = |n_out: usize, n_in: usize, mode: MvMode, q: u32, r2: usize| MvParams {
+            n_out: n_out as u32,
+            n_in: n_in as u32,
+            mode: mode as u32,
+            rows_per_tg: 1,
+            gpr: q,
+            ldy: k as u32,
+            _p: r2 as u32,
+            ..Default::default()
+        };
+        let res: Vec<Id> = bufs.iter().map(|b| b.id).collect();
+        let f = Fns::new(self);
+        unsafe {
+            let pool = (self.sels.pool_push)();
+            let cb = (f.msg0)(self.queue, f.s_cb);
+            let enc = (f.enc_type)(cb, f.s_enc_type, 1);
+            let e = FastEnc { enc, f: &f };
+            e.use_resources(&res);
+            e.pipe(pair);
+            e.buf(tg.1, 0, 0);
+            e.buf(tu.1, 0, 1);
+            e.buf(xb, 0, 2);
+            e.buf(ab, 0, 3);
+            let am = if gelu { MvMode::GeluPair } else { MvMode::SiluPair };
+            e.bytes(&p(mi, h, am, tg.2, if fused { mi } else { 0 }), 4);
+            e.buf(sb, 0, 5);
+            e.dispatch((mi / nr, k), threads);
+            e.barrier();
+            e.pipe(sum);
+            e.buf(td.1, 0, 0);
+            e.buf(td.1, 0, 1);
+            e.buf(ab, 0, 2);
+            e.buf(yb, 0, 3);
+            e.bytes(&p(h, mi, MvMode::Store, td.2, 0), 4);
+            e.buf(sb, 0, 5);
+            e.dispatch((h / nr, 1), threads);
+            (f.void)(enc, f.s_end);
+            (f.void)(cb, f.s_commit);
+            (f.void)(cb, f.s_wait);
+            (self.sels.pool_pop)(pool);
+        }
+        let void: MsgVoid = self.o.msg_send();
+        for b in &bufs {
+            unsafe { void(b.id, self.sels.release) };
+        }
+        Some((act[..k * mi].to_vec(), y[..h].to_vec()))
     }
 }
 

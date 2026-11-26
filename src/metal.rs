@@ -2125,18 +2125,33 @@ struct MoeDev {
     /// The residency set holding `bufs`, if any (else they are made resident per submission).
     residency: Option<std::sync::Arc<Residency>>,
     release: (MsgVoid, Sel),
+    /// Tiled copies shared with the model's plans (`tiled_experts`), and their keeper (the
+    /// process's backend, which outlives the state).
+    shared: Vec<Id>,
+    backend: *const MetalBackend,
 }
 
 impl Drop for MoeDev {
     fn drop(&mut self) {
+        // SAFETY: the backend outlives the states it makes (`backend`).
+        let last: Vec<Id> = self
+            .shared
+            .iter()
+            .copied()
+            .filter(|&id| unsafe { (*self.backend).unwrap_shared(id) })
+            .collect();
         if let Some(r) = &self.residency {
-            r.update(&self.bufs.iter().map(|b| b.id).collect::<Vec<_>>(), false);
+            r.update(
+                &self.bufs.iter().map(|b| b.id).chain(last.iter().copied()).collect::<Vec<_>>(),
+                false,
+            );
         }
         let (f, sel) = self.release;
         let ids = self
             .bufs
             .iter()
             .map(|b| b.id)
+            .chain(last)
             .chain([self.ep.0, self.ep.1, self.up.map_or(std::ptr::null_mut(), |u| u.2)]);
         for id in ids.filter(|id| !id.is_null()) {
             // SAFETY: each buffer was created for this state and is released once.
@@ -2743,8 +2758,9 @@ impl MetalBackend {
     /// same model (each gives it back with `unwrap_shared`), else the caller's (forced copies
     /// only). `mode`: as [`crate::gpu::expert_tiles`]. None when the mode, the format or the
     /// shape rule it out, or (automatic) where the OS limits the app's memory or the live copies
-    /// would pass a quarter of the machine's memory. Returns the buffer, its GPU address and the
-    /// bytes of one expert.
+    /// would pass a quarter of the machine's memory (copies that do not take the experts' place),
+    /// or, with a null `src`, when no shared copy exists yet ([`Self::tiled_shared`]). Returns the
+    /// buffer, its GPU address and the bytes of one expert.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn tiled_experts(
         &self,
@@ -2790,16 +2806,28 @@ impl MetalBackend {
         let (nb, mb) = (n_in / be, g0.row_bytes() * n_out);
         let total = mb * ws.len();
         let key = (g0.data.as_ptr() as usize, total | 1 << 63);
+        // (Plans build concurrently: one copy at a time, so that each is made once.)
+        static TILING: Mutex<()> = Mutex::new(());
+        let _one = TILING.lock().unwrap_or_else(|e| e.into_inner());
         if shared && let Some(e) = self.shared_wraps.lock().unwrap().get_mut(&key) {
             e.2 += 1;
             return Some((e.0 as Id, e.1, mb));
         }
-        // Automatic: not where the OS limits the app's memory (iOS), and all the live copies
-        // within a quarter of the machine's memory.
+        if src.is_null() {
+            return None;
+        }
+        // Experts in a checkpoint file's memory ([`crate::safetensors::releasable`]: mapped, or
+        // GGUF read into memory): the decode plans give their memory back once they have their
+        // copies (`expert_tables`), so the copies take its place. Others stay beside their copies.
+        let free = ws
+            .iter()
+            .all(|w| matches!(w, WeightRef::Gguf(g) if crate::safetensors::releasable(g.data.as_ptr() as usize, g.data.len())));
+        // Automatic: not where the OS limits the app's memory (iOS), and, but for copies that
+        // take the experts' place, all the live copies within a quarter of the machine's memory.
         if !forced {
             let live: usize = self.tiled.lock().unwrap().values().sum();
             let cap = crate::platform::total_memory().unwrap_or(0) as usize / 4;
-            if !shared || crate::platform::process_available_memory().is_some() || live + total > cap {
+            if !shared || crate::platform::process_available_memory().is_some() || (!free && live + total > cap) {
                 return None;
             }
         }
@@ -2871,9 +2899,17 @@ impl MetalBackend {
         let addr = self.buffer_gpu_address(id);
         if shared {
             self.shared_wraps.lock().unwrap().insert(key, (id as usize, addr, 1));
-            self.tiled.lock().unwrap().insert(id as usize, total);
+            if !free {
+                self.tiled.lock().unwrap().insert(id as usize, total);
+            }
         }
         Some((id, addr, mb))
+    }
+
+    /// The shared tiled copy of the experts `ws` ([`Self::tiled_experts`]) if another plan made
+    /// it already (the caller gives it back with `unwrap_shared`).
+    pub(crate) fn tiled_shared(&self, ws: &[WeightRef], n_out: usize, n_in: usize, mode: Option<bool>) -> Option<(Id, u64, usize)> {
+        self.tiled_experts(ws, n_out, n_in, std::ptr::null_mut(), 0, &[], true, mode)
     }
 
     /// [`Self::wrap`] for a caller that releases the buffer itself: (buffer, offset of `ptr`).
@@ -3468,7 +3504,8 @@ fn format_index(w: &WeightRef) -> (usize, usize, usize) {
 impl MetalBackend {
     /// `Backend::upload_moe`; `resident` puts the wrapped experts in the queue's residency set
     /// (else each submission makes them resident: transient state of streamed experts); `tiles`
-    /// runs the GEMMs on tiled copies of GGUF experts (`tiled_experts`).
+    /// (as [`crate::gpu::expert_tiles`]) runs the GEMMs on tiled copies of GGUF experts
+    /// (`tiled_experts`; transient experts: only when forced on).
     #[allow(clippy::too_many_arguments)]
     fn moe_state(
         &self,
@@ -3479,7 +3516,7 @@ impl MetalBackend {
         mi: usize,
         act: crate::gpu::MoeAct,
         resident: bool,
-        tiles: bool,
+        tiles: Option<bool>,
     ) -> Option<DeviceWeight> {
         self.mma()?;
         if !crate::gpu::moe_offload() || gate_up.is_empty() || gate_up.len() != down.len() || up.is_some_and(|u| u.len() != down.len()) {
@@ -3547,7 +3584,52 @@ impl MetalBackend {
             act,
             residency: None,
             release,
+            shared: Vec::new(),
+            backend: self,
         };
+        // Resident experts whose shared tiled copies the model's plans made already: the tables
+        // point at those (the checkpoint's experts, given back by then, are not wrapped again).
+        if resident && tiles != Some(false) {
+            let mut projs: Vec<(&[WeightRef], usize, usize)> = vec![(gate_up, g_rows, h), (down, h, mi)];
+            projs.extend(up.map(|u| (u, mi, h)));
+            let hits: Vec<Option<(Id, u64, usize)>> = projs.iter().map(|p| self.tiled_shared(p.0, p.1, p.2, tiles)).collect();
+            if hits.iter().all(|c| c.is_some()) {
+                let copy: MsgNewBufBytes = self.o.msg_send();
+                let mut tabs = Vec::new();
+                for &(id, base, mb) in hits.iter().flatten() {
+                    dev.shared.push(id);
+                    let tab: Vec<[u64; 2]> = (0..gate_up.len()).map(|e| [base + (e * mb) as u64, 0]).collect();
+                    let t = unsafe {
+                        copy(
+                            self.device,
+                            self.sels.new_buffer_bytes,
+                            tab.as_ptr() as *const c_void,
+                            tab.len() * 16,
+                            0,
+                        )
+                    };
+                    if t.is_null() {
+                        return None;
+                    }
+                    tabs.push(t);
+                }
+                dev.ep = (tabs[0], tabs[1]);
+                dev.row_bytes = (dev.row_bytes.0 | GG_TILED, dev.row_bytes.1 | GG_TILED);
+                if let (Some(u), Some(pu)) = (up, pu3) {
+                    dev.up = Some((pu, row_bytes(&u[0]) as u32 | GG_TILED, tabs[2]));
+                }
+                if let Some(r) = self.residency.as_ref() {
+                    r.update(&dev.shared, true);
+                    dev.residency = Some(r.clone());
+                }
+                return Some(Box::new(dev));
+            }
+            for (id, _, _) in hits.into_iter().flatten() {
+                if self.unwrap_shared(id) {
+                    unsafe { release.0(id, release.1) };
+                }
+            }
+        }
         let mut addr: Vec<u64> = Vec::with_capacity(spans.len());
         for &(s, e) in &spans {
             let b = self.wrap(s as *const u8, e - s)?;
@@ -3597,9 +3679,12 @@ impl MetalBackend {
             }
             dev.up = Some((pu, row_bytes(&u[0]) as u32, id));
         }
-        // Tiled copies of the experts (only when asked for: these copies are per layer, outside
-        // the plans' memory budget), made from the address tables, which then point at them.
-        if tiles {
+        // Tiled copies of the experts (`tiled_experts`), made from the address tables, which then
+        // point at them. Resident experts: the copies the model's plans share (made here when no
+        // plan has them yet), in the checkpoint's place as there (`expert_tables`). Transient
+        // ones (only when forced on): copies of their own, beside them.
+        let mode = if resident || tiles == Some(true) { tiles } else { Some(false) };
+        if mode != Some(false) {
             let wrapped: Vec<Id> = dev.bufs.iter().map(|b| b.id).collect();
             let mut projs = vec![
                 (gate_up, g_rows, h, dev.ep.0, &mut dev.row_bytes.0),
@@ -3608,22 +3693,48 @@ impl MetalBackend {
             if let (Some(u), Some((_, rb, tab))) = (up, dev.up.as_mut()) {
                 projs.push((u, mi, h, *tab, rb));
             }
-            let mut copies = Vec::new();
-            for (ws, n_out, n_in, tab, rb) in projs {
-                if let Some((id, addr, mb)) = self.tiled_experts(ws, n_out, n_in, tab, 2, &wrapped, false, Some(true)) {
-                    // SAFETY: the table holds a [data, scales] pair of u64s per expert.
-                    let rows = unsafe { std::slice::from_raw_parts_mut(self.contents(tab) as *mut [u64; 2], ws.len()) };
-                    for (e, r) in rows.iter_mut().enumerate() {
-                        *r = [addr + (e * mb) as u64, 0];
+            let copies: Vec<Option<(Id, u64, usize)>> = projs
+                .iter()
+                .map(|p| self.tiled_experts(p.0, p.1, p.2, p.3, 2, &wrapped, resident, mode))
+                .collect();
+            // (Resident: every projection or none, so that the checkpoint's experts can go.)
+            let all = copies.iter().all(|c| c.is_some());
+            for ((ws, _, _, tab, rb), c) in projs.into_iter().zip(&copies) {
+                let Some((id, addr, mb)) = *c else { continue };
+                if resident && !all {
+                    if self.unwrap_shared(id) {
+                        unsafe { release.0(id, release.1) };
                     }
-                    *rb |= GG_TILED;
-                    copies.push(Buf { id, offset_bytes: 0 });
+                    continue;
+                }
+                // SAFETY: the table holds a [data, scales] pair of u64s per expert.
+                let rows = unsafe { std::slice::from_raw_parts_mut(self.contents(tab) as *mut [u64; 2], ws.len()) };
+                for (e, r) in rows.iter_mut().enumerate() {
+                    *r = [addr + (e * mb) as u64, 0];
+                }
+                *rb |= GG_TILED;
+                if resident {
+                    dev.shared.push(id);
+                } else {
+                    dev.bufs.push(Buf { id, offset_bytes: 0 });
                 }
             }
-            dev.bufs.extend(copies);
+            if resident && all {
+                for b in dev.bufs.drain(..) {
+                    unsafe { release.0(b.id, release.1) };
+                }
+                std::thread::spawn(move || {
+                    for (s, e) in spans {
+                        crate::safetensors::release_copied(s, e - s);
+                    }
+                });
+            }
         }
         if let Some(r) = self.residency.as_ref().filter(|_| resident) {
-            r.update(&dev.bufs.iter().map(|b| b.id).collect::<Vec<_>>(), true);
+            r.update(
+                &dev.bufs.iter().map(|b| b.id).chain(dev.shared.iter().copied()).collect::<Vec<_>>(),
+                true,
+            );
             dev.residency = Some(r.clone());
         }
         Some(Box::new(dev))
@@ -4205,7 +4316,7 @@ impl Backend for MetalBackend {
         mi: usize,
         act: crate::gpu::MoeAct,
     ) -> Option<DeviceWeight> {
-        self.moe_state(gate_up, up, down, h, mi, act, true, crate::gpu::expert_tiles() == Some(true))
+        self.moe_state(gate_up, up, down, h, mi, act, true, crate::gpu::expert_tiles())
     }
 
     fn upload_moe_transient(
@@ -4217,7 +4328,7 @@ impl Backend for MetalBackend {
         mi: usize,
         act: crate::gpu::MoeAct,
     ) -> Option<DeviceWeight> {
-        self.moe_state(gate_up, up, down, h, mi, act, false, crate::gpu::expert_tiles() == Some(true))
+        self.moe_state(gate_up, up, down, h, mi, act, false, crate::gpu::expert_tiles())
     }
 
     fn moe(&self, x: &[f32], t: usize, h: usize, mi: usize, routes: &[Vec<(usize, f32)>], dev: &DeviceWeight, y: &mut [f32]) -> bool {
@@ -4874,7 +4985,7 @@ mod tests {
             let up = split.then_some(&uw[..]);
             let mut y = [vec![0f32; t * h], vec![0f32; t * h]];
             for (tiles, y) in [false, true].into_iter().zip(y.iter_mut()) {
-                let dev = be.moe_state(&gw, up, &dw, h, mi, act, true, tiles).unwrap();
+                let dev = be.moe_state(&gw, up, &dw, h, mi, act, true, Some(tiles)).unwrap();
                 let md = dev.downcast_ref::<MoeDev>().unwrap();
                 assert_eq!(md.row_bytes.0 & GG_TILED != 0, tiles, "{kind:?}: tiled copies");
                 assert!(be.moe(&x, t, h, mi, &routes, &dev, y));
@@ -4908,6 +5019,26 @@ mod tests {
             // (Random K-quant minimums cancel: Q5_K's half-rounded weights are ~6e-3 off.)
             let e = row_err(&y[1], &r, h);
             assert!(e < 1e-2, "{kind:?}: relative error {e} against the CPU");
+            // Decoding (`MOp::Experts`' kernels) on the tiled copies, in every geometry: the
+            // checkpoint layout's activations and outputs (the same products summed in another
+            // order, so up to f32 rounding), for tokens of one expert and of two.
+            let gelu = act == MoeAct::GeluTanh;
+            for i in [0, 1, 5] {
+                let rt = &routes[i][..if i == 5 { 1 } else { 2 }];
+                let xi = &x[i * h..(i + 1) * h];
+                let Some(plain) = be.decode_experts_once(&gw, up, &dw, (h, mi), gelu, xi, rt, None) else {
+                    continue; // (no decode kernels: MXFP4)
+                };
+                if rt.len() == 2 {
+                    let e = row_err(&plain.1, &r[i * h..(i + 1) * h], h);
+                    assert!(e < 1e-2, "{kind:?}: decode relative error {e} against the CPU");
+                }
+                for geo in super::decode::XT_GEOS {
+                    let t = be.decode_experts_once(&gw, up, &dw, (h, mi), gelu, xi, rt, Some(geo)).unwrap();
+                    let (ea, ey) = (row_err(&t.0, &plain.0, mi), row_err(&t.1, &plain.1, h));
+                    assert!(ea < 1e-5 && ey < 1e-5, "{kind:?}: tiled decode {geo:?} off by {ea} / {ey}");
+                }
+            }
         }
     }
 

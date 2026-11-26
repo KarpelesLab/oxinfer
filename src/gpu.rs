@@ -537,16 +537,20 @@ pub fn set_kv_half(on: Option<bool>) {
     );
 }
 
-/// Copies the routed experts of quantized GGUF checkpoints into a tiled layout for the prefill
-/// GEMMs (Metal: each band of 64 rows stored block column by block column, so that a grouped
-/// GEMM tile reads each K step's weights as one run of memory; the same values, so the same
-/// results). The copies are made when a model builds its prefill plans, once per model (forced
-/// on, also by the per-layer MoE uploads of models without prefill plans), and take as much
-/// memory as the experts again (decoding keeps reading the checkpoint's layout).
+/// Copies the routed experts of quantized GGUF checkpoints into a tiled layout for the GPU
+/// (Metal: each band of 64 rows stored block column by block column, so that a grouped GEMM
+/// tile reads each K step's weights as one run of memory; the same values, so the same
+/// results). The copies are made when a model builds its first decode or prefill plan, once per
+/// model, and both the prefill GEMMs and the decode kernels read them; the checkpoint's experts
+/// are then let go (their pages dropped from memory when mapped from the file, read again from
+/// it if a CPU path needs them), so the experts take their memory once. Experts read into memory
+/// (not mapped) stay: their copies take as much memory again. Forced on, the per-layer MoE
+/// uploads of models without plans make copies too (for their GEMMs, beside the experts).
 /// `Some(true)`: always (also on GPUs without matrix units); `Some(false)`: never; None (the
-/// default, or `OXINFER_GPU_EXPERT_TILES=0|1`): on GPUs with matrix units, while the copies stay
-/// within a quarter of the machine's memory, and not where the OS limits an app's memory (iOS).
-/// Process-wide, read when a model builds its plans.
+/// default, or `OXINFER_GPU_EXPERT_TILES=0|1`): on GPUs with matrix units, not where the OS
+/// limits an app's memory (iOS), and for experts read into memory while the copies stay within
+/// a quarter of the machine's memory. Not for streamed models. Process-wide, read when a model
+/// builds its plans.
 pub fn set_expert_tiles(on: Option<bool>) {
     EXPERT_TILES.store(
         match on {

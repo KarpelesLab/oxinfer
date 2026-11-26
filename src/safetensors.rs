@@ -102,6 +102,132 @@ impl Storage {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Storage {
+    fn drop(&mut self) {
+        let a = match self {
+            Storage::Mmap(m, _) => m.as_ptr() as usize,
+            Storage::Heap(v, _, pad) => v.as_ptr() as usize + *pad,
+            Storage::Host(_) => return,
+        };
+        FILES.write().unwrap().retain(|r| r.addr != a);
+    }
+}
+
+/// A checkpoint file's bytes in memory (`FILES`): mapped, or read into memory (with the file
+/// open again, to map its pages back in place: [`release_copied`]).
+#[cfg(not(target_arch = "wasm32"))]
+struct FileBytes {
+    addr: usize,
+    len: usize,
+    heap: Option<File>,
+}
+
+/// The checkpoint files in memory.
+#[cfg(not(target_arch = "wasm32"))]
+static FILES: std::sync::RwLock<Vec<FileBytes>> = std::sync::RwLock::new(Vec::new());
+
+/// The page size the system maps files in.
+#[cfg(unix)]
+fn page_size() -> usize {
+    unsafe extern "C" {
+        fn getpagesize() -> i32;
+    }
+    (unsafe { getpagesize() }).max(4096) as usize
+}
+
+/// Whether [`release_copied`] can give `[addr, addr + len)` back: it lies in a checkpoint file
+/// that is mapped, or read into memory at a page-aligned place (GGUF files: their bytes at the
+/// allocation's start).
+pub fn releasable(addr: usize, len: usize) -> bool {
+    #[cfg(unix)]
+    {
+        let page = page_size();
+        FILES
+            .read()
+            .unwrap()
+            .iter()
+            .any(|f| addr >= f.addr && addr + len <= f.addr + f.len && f.addr.is_multiple_of(page))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (addr, len);
+        false
+    }
+}
+
+/// Gives the memory of `[addr, addr + len)` (its whole pages) back to the system when the range
+/// lies in a checkpoint file ([`releasable`]) and is not read for a while: weights an accelerator
+/// keeps copies of. The bytes stay the same for any reader, who finds them in the file again: a
+/// mapped file's pages are dropped from the page cache (Darwin: `msync(MS_INVALIDATE)`, which
+/// `madvise` does not do, see `crate::stream`; elsewhere `madvise(MADV_DONTNEED)`), and the pages of
+/// a file read into memory become the file's own again (mapped over in place, copy-on-write,
+/// read on use; their memory freed). Nothing else may hold the pages (no accelerator buffer
+/// wrapping them). False when the range is not releasable.
+pub fn release_copied(addr: usize, len: usize) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut std::ffi::c_void;
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            fn msync(addr: *mut std::ffi::c_void, len: usize, flags: i32) -> i32;
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        use std::os::fd::AsRawFd;
+        let page = page_size();
+        let files = FILES.read().unwrap();
+        let Some(f) = files
+            .iter()
+            .find(|f| addr >= f.addr && addr + len <= f.addr + f.len && f.addr.is_multiple_of(page))
+        else {
+            return false;
+        };
+        let (lo, hi) = (addr.next_multiple_of(page), (addr + len) / page * page);
+        if hi <= lo {
+            return true;
+        }
+        let p = lo as *mut std::ffi::c_void;
+        match &f.heap {
+            Some(file) => {
+                const PROT_READ_WRITE: i32 = 3;
+                const MAP_PRIVATE: i32 = 2;
+                const MAP_FIXED: i32 = 0x10;
+                // SAFETY: whole pages of the file's heap copy, which holds the file's bytes from
+                // `f.addr` on, so the mapping replaces them with the same bytes (private: the
+                // allocation stays writable, as its allocator expects when it is freed).
+                let r = unsafe {
+                    mmap(
+                        p,
+                        hi - lo,
+                        PROT_READ_WRITE,
+                        MAP_PRIVATE | MAP_FIXED,
+                        file.as_raw_fd(),
+                        (lo - f.addr) as i64,
+                    )
+                };
+                r == p
+            }
+            None => {
+                // SAFETY: whole pages of a live read-only file mapping.
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                unsafe {
+                    msync(p, hi - lo, 2)
+                };
+                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                unsafe {
+                    madvise(p, hi - lo, 4)
+                };
+                true
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (addr, len);
+        false
+    }
+}
 impl std::ops::Deref for Storage {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
@@ -227,10 +353,21 @@ impl SafeTensors {
             let data_start = 8usize.saturating_add(u64::from_le_bytes(n8) as usize);
             // GGUF data is aligned within the file already (and its offsets are absolute).
             let pad = if &n8[..4] == b"GGUF" { 0 } else { (16 - data_start % 16) % 16 };
-            Storage::Heap(read_file_parallel(&file, len, pad)?, len, pad)
+            let v = read_file_parallel(&file, len, pad)?;
+            FILES.write().unwrap().push(FileBytes {
+                addr: v.as_ptr() as usize + pad,
+                len,
+                heap: Some(file),
+            });
+            Storage::Heap(v, len, pad)
         } else {
             let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
             let map = unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))?;
+            FILES.write().unwrap().push(FileBytes {
+                addr: map.as_ptr() as usize,
+                len: map.len(),
+                heap: None,
+            });
             Storage::Mmap(map, file)
         };
         #[cfg(target_arch = "wasm32")]

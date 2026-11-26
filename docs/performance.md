@@ -923,7 +923,9 @@ What changed:
   so the same results bit for bit. The plans of one model
   share the copies (`shared_wraps`, released with the last plan). Decoding keeps reading the
   checkpoint, so the copies take as much memory again as the experts: the 26B-A4B Q4_0's peak
-  footprint goes from 17.0 to 29.8 GB, and its first prompt takes 0.3 s more (the copy). By
+  footprint goes from 17.0 to 29.8 GB, and its first prompt takes 0.3 s more (the copy; since
+  [round 10](#metal-expert-tiles-round-10-one-copy-november-2026) decoding reads the copies
+  too and the checkpoint's experts are let go, so the copies cost no memory). By
   default (`gpu_expert_tiles=auto`) they are made on GPUs with matrix units while all of them
   stay within a quarter of the machine's memory, not where the OS limits an app's memory (iOS);
   `gpu_expert_tiles=0|1` (engine / server / C API), `--gpu-expert-tiles off|on`,
@@ -981,6 +983,75 @@ Measured and dropped (`moe_bench` unless noted; the matrix units' rates from the
   110.5 (pair GEMMs off in both).
 - **The next K step's blocks in registers** with the tiled layout (as in the harness): no
   better than without (above).
+
+#### Metal expert tiles round 10: one copy (November 2026)
+
+[Round 9](#metal-prefill-round-9-expert-tiles-november-2026)'s tiled copies of the routed experts
+served only the prefill GEMMs; decoding read the checkpoint's row-major experts, so a MoE model
+held its experts twice (26B-A4B Q4_0: 31 GB peak instead of 18). Now the decode kernels read the
+copies too, and the checkpoint's experts are let go once a layer has its copies:
+
+- **Decode kernels on the tiled layout** (`mvxt_<fmt>_<rows>x<groups>_pair` / `_sum`). The
+  one-token expert kernels (`mvx_*`: a row a SIMD-group, a lane a 32-value chunk) would read a
+  tiled row as 32 pieces a band's column apart (each lane a different cache line: the pair
+  kernel at 1, 2, 4, 8 rows a SIMD-group decoded 0.98, 0.95, 0.82x as fast as on the checkpoint).
+  The tiled kernels put consecutive rows on consecutive lanes instead (16 rows a SIMD-group, two
+  lanes a row, 8 SIMD-groups a threadgroup for the gate / up pairs and 4 for the down sums, each
+  taking a run of the row's chunks): every load of a SIMD-group reads the 16 rows' copies of a
+  block, one run of memory. The raw formats' dot products got `<type>T` twins that find the
+  same bytes at their tiled places (`tblk` / `tpart`, K-quants part by part), the others go
+  through the GEMM dequantizers, which read the layout from `GG_TILED` already. The products are
+  the same, summed in another order (runs, then shuffles and threadgroup memory): tiled decoding
+  is not bit-identical to the checkpoint layout's (`tiled_experts_match`: within 1e-5 of it in
+  every geometry, every format), but every kernel of a plan (one token, verification passes,
+  which run the expert kernels per token) uses the same ones, so speculative decoding still
+  gives the logits of plain decoding.
+- **One copy** (`expert_tables`, `moe_state`). The first plan (decode, verification or prefill)
+  or per-layer MoE upload of a layer makes the copies, shared by the model's other plans and
+  uploads (`tiled_shared`: later ones never wrap the checkpoint's experts again). Then the
+  checkpoint's experts' wraps are released and their pages given back
+  (`safetensors::release_copied`, on a thread of its own): pages of a GGUF file read into memory
+  (the default on Metal) are mapped over in place from the file (copy-on-write, so they read the
+  same bytes, from the file, if a CPU path ever needs them: LoRA on experts, a fallback), pages
+  of a mapped file dropped from the page cache. The copies then take the experts' place, so the
+  automatic mode no longer keeps them within a quarter of the machine's memory (it still does
+  for experts it cannot give back, not in a checkpoint file's memory), and it now applies to
+  decoding as well, on GPUs with matrix units. Streamed models (`stream_gpu`) keep the
+  checkpoint's layout.
+
+Peak footprint (`/usr/bin/time -l`, the CLI with a 2116-token prompt (Qwen: 2041) and 64 greedy
+tokens), master before (tiles automatic, i.e. on for the prefill plans) and this round:
+
+| model | before: tiles off | before: auto | after: auto | after: off |
+|---|---|---|---|---|
+| Gemma 4 26B-A4B Q4_0 | 18.17 GB | 31.03 | 18.13 | 18.17 |
+| Gemma 4 26B-A4B Q8_0 | 30.42 | 54.70 | 30.39 | 30.42 |
+| Qwen3.5-35B-A3B Q4_K_M | 24.32 | 43.82 | 24.45 | 24.32 |
+
+The greedy tokens of all four runs of each model are the same. `dec_ab` (128 tokens after a short
+prompt, tiles off and on alternated in one process, best (median) of 14-16; other agents' jobs
+on the GPU):
+
+| model | tiles off | tiles on |
+|---|---|---|
+| Gemma 4 26B-A4B Q4_0 | 155.0 (153.6) tok/s | 155.8 (154.5), +0.5% |
+| Gemma 4 26B-A4B Q8_0 | 112.0 (109.3); 112.8 (98.0) | 110.6 (107.9); 111.7 (97.0), -1% |
+| Qwen3.5-35B-A3B Q4_K_M | 145.7 (143.1); 145.0 (143.2) | 144.4 (142.0); 143.2 (141.3), -1% |
+
+Measured and dropped: the checkpoint layout's lane mapping on the tiles with more rows a
+SIMD-group (bit-identical, 1-8 rows: -2 to -18%); other geometries (pairs: 32 x 4 -1%, 4 x 8
+-1%, 32 x 1 -24%; sums: 16 x 8, 8 x 8, 32 x 8, 32 x 4, 8 x 4 -1 to -3%; the sums' SIMD-groups
+over the slots rather than the chunks: no change); a tile copy through threadgroup memory
+(reads and writes each one run: slower than one thread a block, 550 against 460 ms for the
+26B-A4B Q4_0).
+
+Prefill passes are as fast as round 9's (`pf_ab`, 512 tokens, best (median) of 12, off / on:
+26B-A4B Q4_0 114.25 (114.49) / 108.26 (108.58) ms, Qwen3.5-35B-A3B 133.57 (133.69) / 125.37
+(125.49)). The copy now comes with the first plan of any prompt (decode plans too), not only the
+first long one: the first prompt of a model (2116 tokens above) takes 1.02 s against 0.87 before
+(0.52 without tiles) for the 26B-A4B Q4_0, 1.47 against 1.29 (Q8_0), 1.58 against 1.03 (Qwen,
+whose K-quant parts copy slower); once per load. Speculative verification (prompt lookup, 88%
+accepted) and Inkling-2-Mini (its own kernels: no tiles) give the same tokens as before.
 
 #### Metal decode round (November 2026)
 

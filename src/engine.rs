@@ -268,14 +268,15 @@ pub struct EngineOptions {
     /// Process-wide, applied on load (read as a model builds its plans); None leaves the current
     /// setting ([`crate::gpu::set_kv_half`]). Key `gpu_kv` (`f16`, `f32` or `auto`).
     pub gpu_kv: Option<bool>,
-    /// Tiled copies of a GGUF checkpoint's routed experts for the GPU prefill GEMMs (Metal: each
-    /// band of 64 rows stored block column by block column, so that each K step of a grouped GEMM
-    /// tile reads one run of memory; the same results, 3-7% faster MoE prefill passes on an M5 Max, for
-    /// as much memory again as the experts take). `Some(true)`: always; `Some(false)`: never.
-    /// Process-wide, applied on load (read as a model builds its prefill plans); None leaves the
-    /// current setting (default automatic: on GPUs with matrix units, while the copies stay within
-    /// a quarter of the machine's memory; [`crate::gpu::set_expert_tiles`]). Key
-    /// `gpu_expert_tiles` (`1`, `0` or `auto`).
+    /// Tiled copies of a GGUF checkpoint's routed experts for the GPU (Metal: each band of 64
+    /// rows stored block column by block column, so that each K step of a grouped GEMM tile reads
+    /// one run of memory; the same results, 3-7% faster MoE prefill passes on an M5 Max). Decoding
+    /// reads the copies too and the checkpoint's experts are let go, so they cost no memory
+    /// (but for experts that are not in a checkpoint file's memory, whose copies take as much
+    /// again). `Some(true)`: always; `Some(false)`: never. Process-wide, applied on load (read as
+    /// a model builds its plans); None leaves the current setting (default automatic: on GPUs
+    /// with matrix units; [`crate::gpu::set_expert_tiles`]). Key `gpu_expert_tiles` (`1`, `0` or
+    /// `auto`).
     pub gpu_expert_tiles: Option<bool>,
     /// Streamed models (see [`EngineOptions::stream`]) decode on the GPU too: the resident layers
     /// stay wrapped, the others are wrapped per pass as they arrive and released after (Metal;

@@ -191,10 +191,9 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *                        run (Metal with matrix units): half-precision rows (default: half the
  *                        attention's memory traffic at long contexts) or f32; process-wide
  *   gpu_expert_tiles=0|1|auto  tiled copies of a GGUF checkpoint's routed experts for the GPU
- *                        prefill GEMMs (Metal; the same results, faster MoE prefill, as much
- *                        memory again as the experts; default auto: GPUs with matrix units,
- *                        while the copies stay within a quarter of the machine's memory;
- *                        process-wide)
+ *                        (Metal; the same results, faster MoE prefill; decoding reads them too
+ *                        and the checkpoint's experts are let go, so no extra memory; default
+ *                        auto: GPUs with matrix units; process-wide)
  *   stream_gpu=0|1|auto  streamed models decode on the GPU too (process-wide; default: dense
  *                        models on the GPU, MoE models measure both on their first tokens and
  *                        keep the faster): resident layers stay wrapped, the others are wrapped
