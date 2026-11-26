@@ -334,6 +334,7 @@ impl<'a> Model<'a> {
                     n: e.n,
                 });
             }
+            let down_at = g.ops.len();
             put(&mut g, &layer.down, h, inter, act, ob, LinMode::Store)?;
             if let Some(m) = &layer.moe {
                 // Routed experts beside the dense MLP, on the same residual x:
@@ -354,10 +355,7 @@ impl<'a> Model<'a> {
                     eps,
                     add,
                 };
-                g.ops.push(one(ob, ob, Some(&m.ln_post_dense), false));
-                g.ops.push(one(x, xr, None, false));
-                g.ops.push(one(x, hn2, Some(&m.ln_pre), false));
-                g.ops.push(Op::Route {
+                let route = Op::Route {
                     x: xr,
                     router: &m.router,
                     gate: None,
@@ -367,7 +365,25 @@ impl<'a> Model<'a> {
                     logits: rlogits,
                     sel,
                     expert_scale: Some(&m.per_expert_scale),
-                });
+                };
+                if prefill || std::env::var("OXINFER_DEC_MOE_ORDER").is_ok_and(|v| v == "0") {
+                    g.ops.push(one(ob, ob, Some(&m.ln_post_dense), false));
+                    g.ops.push(one(x, xr, None, false));
+                    g.ops.push(one(x, hn2, Some(&m.ln_pre), false));
+                    g.ops.push(route);
+                } else {
+                    // Decode plans: the routing beside the dense MLP (the router's and the
+                    // experts' input norms in its gate / up pair's stage, the top-k in its down
+                    // projection's, the experts' pairs in its post norm's), the same ops on the
+                    // same inputs, two stages fewer (`OXINFER_DEC_MOE_ORDER=0`: the order of the
+                    // prefill graph).
+                    let down: Vec<Op<'s>> = g.ops.drain(down_at..).collect();
+                    g.ops.push(one(x, xr, None, false));
+                    g.ops.push(one(x, hn2, Some(&m.ln_pre), false));
+                    g.ops.push(route);
+                    g.ops.extend(down);
+                    g.ops.push(one(ob, ob, Some(&m.ln_post_dense), false));
+                }
                 let mut gate = Vec::with_capacity(ne);
                 let mut up = Vec::with_capacity(ne);
                 for gu in &m.experts.gate_up {

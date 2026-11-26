@@ -8,8 +8,12 @@
 //! ```
 //!
 //! Prints, per configuration, the best and the median decode speed (the engine's decode tok/s,
-//! as `parity_bench`'s tg rows). Options after `--` are `EngineOptions` keys for every engine
-//! (default `draft=none lookup=0 mtp=0`).
+//! as `parity_bench`'s tg rows) and hashes of its generated tokens (one per distinct reply over
+//! the runs), so that configurations meant to decode the same tokens can be checked to. Options
+//! after `--` are `EngineOptions` keys for every engine (default `draft=none lookup=0 mtp=0`); a
+//! configuration's `opt.KEY=VALUE` pairs are `EngineOptions` keys of its engine alone, and
+//! `chain=0` / `chain=1` turns the device's greedy chain off / on for its runs (the switch is
+//! process-wide: `oxinfer::gpu::set_decode_chain` before each run), e.g. `steps:chain=0`.
 
 use anyhow::{Context, Result};
 use oxinfer::engine::{Engine, EngineOptions, Flow};
@@ -31,11 +35,16 @@ fn main() -> Result<()> {
         opts.set(k, v)?;
     }
     let corpus = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tools/bench/corpus.txt"))?;
-    let run = |e: &mut Engine, prompt: &str| -> Result<(usize, f64)> {
+    let run = |e: &mut Engine, prompt: &str| -> Result<(usize, f64, u64)> {
         e.reset();
         e.config_mut().max_tokens = n;
-        e.complete(prompt, &mut |_| Flow::Continue)?;
-        Ok((e.stats().generated_tokens, e.stats().decode_tok_s()))
+        let r = e.complete(prompt, &mut |_| Flow::Continue)?;
+        // FNV-1a of the token ids.
+        let h = r
+            .tokens
+            .iter()
+            .fold(0xcbf29ce484222325u64, |h, &t| (h ^ t as u64).wrapping_mul(0x100000001b3));
+        Ok((e.stats().generated_tokens, e.stats().decode_tok_s(), h))
     };
     let mut engines = Vec::new();
     for spec in &a[3..split] {
@@ -45,33 +54,48 @@ fn main() -> Result<()> {
             .filter(|s| !s.is_empty())
             .filter_map(|kv| kv.split_once('='))
             .collect();
+        let mut eo = opts.clone();
+        let mut chain = None;
         for (k, v) in &pairs {
-            // SAFETY: single-threaded here (no engine is running).
-            unsafe { std::env::set_var(k, v) };
+            match k.strip_prefix("opt.") {
+                Some(k) => eo.set(k, v)?,
+                None if *k == "chain" => chain = Some(*v != "0"),
+                // SAFETY: single-threaded here (no engine is running).
+                None => unsafe { std::env::set_var(k, v) },
+            }
         }
-        let mut e = Engine::load(model, &opts)?;
+        oxinfer::gpu::set_decode_chain(chain);
+        let mut e = Engine::load(model, &eo)?;
         let ids = e.tokenizer().encode(corpus.as_str(), false)?.get_ids().to_vec();
-        let prompt = e.tokenizer().decode(&ids[..15.min(ids.len())], false)?;
+        // `OXINFER_AB_PROMPT=FILE`: that raw text as the prompt instead.
+        let prompt = match std::env::var("OXINFER_AB_PROMPT") {
+            Ok(f) => std::fs::read_to_string(f)?,
+            Err(_) => e.tokenizer().decode(&ids[..15.min(ids.len())], false)?,
+        };
         // Warm-up: the plans are built (with this configuration's variables) and sized.
         run(&mut e, &prompt)?;
-        for (k, _) in &pairs {
+        for (k, _) in pairs.iter().filter(|(k, _)| !k.starts_with("opt.") && *k != "chain") {
             // SAFETY: as above.
             unsafe { std::env::remove_var(k) };
         }
-        engines.push((label.to_string(), e, prompt, Vec::new()));
+        engines.push((label.to_string(), e, prompt, chain, Vec::new()));
     }
     for _ in 0..rounds {
-        for (_, e, prompt, v) in engines.iter_mut() {
+        for (_, e, prompt, chain, v) in engines.iter_mut() {
+            oxinfer::gpu::set_decode_chain(*chain);
             v.push(run(e, prompt)?);
         }
     }
-    for (label, _, _, v) in &mut engines {
+    for (label, _, _, _, v) in &mut engines {
+        let hashes: std::collections::BTreeSet<u64> = v.iter().map(|r| r.2).collect();
+        let hashes: Vec<String> = hashes.iter().map(|h| format!("{h:016x}")).collect();
         v.sort_by(|x, y| y.1.total_cmp(&x.1));
         println!(
-            "{label:<12} {} tokens: best {:.1} tok/s, median {:.1} tok/s",
+            "{label:<12} {} tokens: best {:.1} tok/s, median {:.1} tok/s, tokens {}",
             v[0].0,
             v[0].1,
-            v[v.len() / 2].1
+            v[v.len() / 2].1,
+            hashes.join(" ")
         );
     }
     Ok(())

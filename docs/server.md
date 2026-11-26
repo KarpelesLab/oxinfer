@@ -307,11 +307,15 @@ The requests of a model share its device in turns (`src/batch.rs`):
 **Each reply equals the reply its request would get alone** (greedy, or with its own seed): a
 batched row computes exactly what a one-token step of its session would. On the CPU and with the
 exact multi-token Metal kernels (the default) the logits are bit for bit those of one-token steps
-(`qwen_batch::tests::forward_batch_logits_match_one_token_steps`, `tests/gpu_chain.rs`). Not
-covered: Gemma 4 26B-A4B, whose greedy passes chained on the device (`decode_greedy`, what a
-request alone runs) do not give the bits of its one-token steps (what it runs beside others):
-4 concurrent Q4_0 requests give 3 of 4 replies equal to their chained ones alone and all 4 equal
-with `OXINFER_GPU_CHAIN=0` (the dense models' chains are exact); and after a plain turn of a DSpark model, the next turn reads that reply as prompt (prefill
+(`qwen_batch::tests::forward_batch_logits_match_one_token_steps`, `tests/gpu_chain.rs`). Gemma 4
+26B-A4B Q4_0 once gave 3 of 4 replies equal to their chained ones alone (4 of 4 with
+`OXINFER_GPU_CHAIN=0`); on master after the
+[Metal decode round 3](performance.md#metal-decode-round-3-november-2026) its chained passes
+gave the tokens of its one-token steps on the four prompts of `concurrent_chats_match_alone`
+(`examples/dec_ab ... chain steps:chain=0`, with and without prompt lookup), and the test passed
+5 times out of 5 on it (also with the MoE layers in the order of before,
+`OXINFER_DEC_MOE_ORDER=0 OXINFER_DEC_TOPK=0`), so the cause was not found. Not covered: after
+a plain turn of a DSpark model, the next turn reads that reply as prompt (prefill
 kernels) where alone it would have been verified tokens, so later turns may round differently,
 as a restored snapshot does. `batch_fast=1` runs batched steps of 5 rows or more on the
 fast-verification kernels (as `fast_verify` does for speculative rounds: logits within ~1e-4 of

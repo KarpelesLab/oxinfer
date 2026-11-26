@@ -1932,6 +1932,114 @@ Measured and dropped:
   predict a pass; `dec_ab` does.
 - A serial (not concurrent) compute encoder without barriers for the chain: no faster.
 
+#### Metal decode round 3 (November 2026)
+
+Plain greedy decoding (tg128, the device chain on) against llama.cpp master `de30697` (Metal,
+`llama-bench -n 128 -p 0 -r 3`) and `parity_bench MODEL pp= tg=128 reps=3 lookup=0 draft=none
+mtp=0` (best of 3), the three run back to back twice per model under the bench lock ("before" is
+master `1a30a4e`; "after" this round on master `05a89fe`). M5 Max shared with other sessions' builds and benchmarks (load averages 3-12).
+tok/s, both rounds:
+
+| model | llama.cpp | before | after | after / llama.cpp |
+|---|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | 413 / 425 | 518.3 / 518.5 | 517.2 / 519.5 | 1.22-1.26 |
+| Llama-3.2-1B Q8_0 | 309 / 302 | 361.9 / 359.2 | 358.3 / 363.8 | 1.16-1.21 |
+| Qwen3-8B Q4_K_M | 77.0 / 80.4 | 105.0 / 105.5 | 105.3 / 103.2 | 1.28-1.37 |
+| Qwen3-8B Q8_0 | 58.7 / 59.0 | 66.8 / 67.4 | 67.0 / 66.5 | 1.13-1.14 |
+| Gemma 4 E4B Q8_0 | 76.0 / 75.1 | 93.4 / 93.4 | 92.7 / 93.5 | 1.22-1.24 |
+| Gemma 4 26B-A4B Q4_0 | 126.8 / 121.0 | 147.3 / 147.6 | **154.7 / 155.4** | 1.22-1.28 |
+| Gemma 4 26B-A4B Q8_0 | 82.3 / 81.6 | 108.1 / 106.6 | **112.4 / 110.3** | 1.35-1.37 |
+| Qwen3.5-35B-A3B Q4_K_M | 89.9 / 91.2 | 138.4 / 140.8 | **141.5 / 142.2** | 1.56-1.57 |
+| Qwen3.8-27B Q4_K_P (HauhauCS) | 19.3 / 22.8 | 27.4 / 29.3 | 28.8 / 29.4 | 1.29-1.49 |
+
+(llama.cpp's numbers moved by up to 15% between rounds with the machine's load, ours less: the
+ratios are each round's own. The dense rows are level with before: nothing changed for them but
+the E4B's GLU, within the noise across processes (+1.5% alternated in one process, below). A
+first 26B-A4B Q4_0 set at load average 9-12 had 152.8 / 149.0 before and 145.3 / 144.1 after;
+three alternated runs of the builds before and after the rebase on master `05a89fe` then gave
+152.2 / 149.4 / 151.4 against 156.8 / 158.2 / 160.3, and the per-pass GPU times traced the same
+6.21-6.24 ms minimum on both, so that set was the machine's.)
+
+Where the passes' GPU time goes (`OXINFER_METAL_TRACE=1`, median us per chained pass of two
+128-token runs, kinds of ops left out with `OXINFER_DEC_ONLY`; `gdnc` / `gdnr` now name the
+Gated DeltaNet conv / rule apart, `gdn` both):
+
+| | Llama-3.2-1B Q4_K_M | Qwen3-8B Q4_K_M | Gemma 4 26B-A4B Q4_0 | Qwen3.5-35B-A3B Q4_K_M | Gemma 4 E4B Q8_0 |
+|---|---|---|---|---|---|
+| matvecs alone | 1472 | 9116 | 3102 | 3602 | 8450 |
+| + barriers | 1842 | 9712 | 3515 | 3997 | 9084 |
+| + norms | 2045 | 10072 | 3981 | 4311 | 9516 |
+| whole pass, before | 1887 | 10334 | 6434 | 6953 | 10381 |
+
+(Other jobs ran on the GPU during the Qwen3-8B set.) The mixtures of experts are furthest from
+their weights' streaming time: on the 26B-A4B the routed experts (router, top-k, pairs, sums) took
+1.9 ms of the 6.4 and the attention 0.55 ms (30 layers at ~150 keys, heads of 256 / 512 on few
+threadgroups); on Qwen3.5-35B-A3B the experts 1.9-2.1 ms and the Gated DeltaNet rule 0.46 ms
+(15 us a layer for 32 heads), the conv 0.1 ms.
+
+What changed (every change gives the logits of before bit for bit: `pf_check` files of 64 greedy
+steps with their top-20 log-probabilities after a 200-token prompt, `lookup=0`, identical with
+and without the MoE order and the top-k on Gemma 4 26B-A4B Q4_0, the top-k on Qwen3.5-35B-A3B,
+the GLU on E4B Q8_0, the Gated DeltaNet loads on Qwen3.5-35B-A3B and Qwen3.8-27B; the 26B-A4B's
+chained passes give the tokens of its one-token steps, below):
+
+- **Gemma 4 MoE layers: the routing beside the dense MLP.** The decode graph had the routed
+  experts' ops after the dense MLP's (post norm, the router's and the experts' input norms, the
+  router, the top-k), each in a stage of its own. Decode plans now emit the input norms and the
+  router right after the dense gate / up pair (which reads another norm of the same residual),
+  then its down projection, then its post norm: the norms run in the pair's stage, the top-k in
+  the down projection's and the experts' gate / up pairs in the post norm's, two stages fewer per
+  layer, the same ops on the same inputs (prefill graphs keep their order, which their fused
+  tails expect; `OXINFER_DEC_MOE_ORDER=0` the order of before).
+- **Top-k of the router in one barrier** (`dec_topk`): k rounds of the whole threadgroup's
+  maximum (two threadgroup barriers each, 16 for a top 8) became each SIMD-group's own top k
+  (SIMD reductions only), then SIMD-group 0 picking the k best of those candidates: the same
+  experts in the same order (the global top k are among their SIMD-groups' top k; ties to the
+  lower index), the same softmax code, for k <= 32 and up to 64 candidates (Gemma's 128 experts,
+  Qwen's 256 at k = 8); `dec_topk_paths_agree` checks both paths against the host.
+  `OXINFER_DEC_TOPK=0` keeps the rounds.
+- **The GLU after a lone matvec in its stores** (`MvMode::GeluMul` / `SiluMul`): Gemma 4 E2B /
+  E4B's per-layer embedding gate (a matvec, then `gelu(g) * u` in place) is one dispatch,
+  `dec_glu`'s arithmetic on the matvec's row value; one-token and exact multi-token plans (not
+  fast verification). `OXINFER_DEC_GLU_MV=0` keeps the GLU.
+- Gated DeltaNet rule: the state, value and gate loaded before the q / k norms' barriers (the
+  same products): Qwen3.5-35B-A3B 147.0 -> 147.8 tok/s (three alternated runs each), Qwen3.8-27B
+  level.
+- `examples/dec_ab` prints a hash of each configuration's tokens, takes per-configuration engine
+  options (`opt.KEY=VALUE`), `chain=0|1` (the device chain, set before each of its runs) and
+  `OXINFER_AB_PROMPT=FILE`.
+
+`dec_ab` (128 tokens, alternated in one process): Gemma 4 26B-A4B Q4_0 155.6 (median 155.1) ->
+164.0 (163.3) tok/s with all of it, 157.2 (156.6) with the top-k alone; Gemma 4 E4B Q8_0 96.0
+(94.3) -> 97.5 (95.5) with the GLU; Qwen3.5-35B-A3B 144.6 (143.8) -> 147.8 (147.3) with the top-k.
+GPU time per 26B-A4B pass 6434 -> 6154 us.
+
+Measured and dropped:
+
+- **The router's and experts' input norms in the attention's AddNorm** (one kernel making the
+  residual, its next norm and two more norms of it): no faster once the norms share the dense
+  pair's stage (162.7 against 162.5 tok/s), and not bit-identical: the Metal compiler (fast math
+  on) compiled the same norm code to other bits in the new kernel at some sizes (n = 4096 in a
+  unit test), and the 26B-A4B's greedy text moved after 58 of 64 tokens.
+- A stage after an op with a barrier of its own (routing, routed experts) holding only what its
+  last kernels touch: no faster (144.7 / 144.8 tok/s), the stages it would merge already did.
+- The chain's command buffers cut at the head, at the head and 1/16 of the pass, or one command
+  buffer a pass (the lever measured at ~0.8% on Llama-3.2-1B before): 517.0 / 518.6 / 519.6 /
+  519.0 tok/s, within noise.
+- Expert kernel geometries on the tiled copies for Q8_0 and Q4_K_M (pairs 8 x 8 and 32 x 4,
+  sums 16 x 8 and 8 x 8): within 1% either way on Qwen3.5-35B-A3B, 32 x 4 pairs -3% on 26B-A4B
+  Q8_0. Tiled against the checkpoint's layout now: Qwen3.5-35B-A3B tiled +1.8% (133.1 / 130.7),
+  26B-A4B Q8_0 tiled -1.2% (115.9 / 117.3), the 1% of round 10 not recovered.
+- Fusing the Gated DeltaNet conv into the rule: the conv's state of the query / key channels is
+  shared by the value heads' threadgroups, which would read it while the first one shifts it
+  (one threadgroup per key head would halve the rule's threadgroups); not done for 0.1 ms.
+
+Gemma 4 26B-A4B Q4_0's chain against its one-token steps (the server's concurrent requests, see
+[server.md](server.md#concurrent-requests)): the four prompts of `concurrent_chats_match_alone`,
+48 tokens, `dec_ab ... chain steps:chain=0`, with and without prompt lookup: the same tokens;
+the test itself passed 5 of 5 times with `OXINFER_E2E_CHAT` on the GGUF, also with
+`OXINFER_DEC_MOE_ORDER=0 OXINFER_DEC_TOPK=0`.
+
 #### M3 Ultra (November 2026)
 
 A Mac Studio with an M3 Ultra (24 performance and 8 efficiency cores, an 80-core GPU, 96 GB,

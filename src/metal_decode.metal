@@ -605,6 +605,14 @@ inline void mv_store(float a, float b, device float* y, uint mode, uint o, uint 
         float l = gate[0];
         float g = min(a, l);
         y[o] = g / (1.0f + precise::exp(-g)) * clamp(b, -l, l);
+    } else if (mode == 7) {
+        // The GLU after a lone matvec (`dec_glu`'s arithmetic): gelu(a) * u, u at gate.
+        float t = 0.7978845608f * (a + 0.044715f * a * a * a);
+        float act = 0.5f * a * (1.0f + precise::tanh(t));
+        y[o] = act * gate[o];
+    } else if (mode == 8) {
+        float act = a / (1.0f + exp(-a));
+        y[o] = act * gate[o];
     } else y[o] += a / (1.0f + exp(-gate[0]));
 }
 template <int NR, int KS>
@@ -930,6 +938,13 @@ inline void mvk_out(device float* y, uint o, uint mode, float a, float b, device
         float l = gate[0];
         float g = min(a, l);
         y[o] = g / (1.0f + precise::exp(-g)) * clamp(b, -l, l);
+    } else if (mode == 7) {
+        float t = 0.7978845608f * (a + 0.044715f * a * a * a);
+        float act = 0.5f * a * (1.0f + precise::tanh(t));
+        y[o] = act * gate[o];
+    } else if (mode == 8) {
+        float act = a / (1.0f + exp(-a));
+        y[o] = act * gate[o];
     } else y[o] += a / (1.0f + exp(-gate[0]));
 }
 // K-quants (Q4_K, Q5_K): the chunk's 32 quants as half (exact) and its super-block scale, min and the
@@ -1708,6 +1723,15 @@ inline void gdn_rule_body(device const float* c, device const float* z, device c
     uint hdk = p.hdk, hdv = p.hdv, np = hdk / 32;
     uint hk = (p.tiled & 1u) != 0 ? hv % p.nk : hv / (p.nv / p.nk);
     uint part = tid / hdv, j = tid % hdv;
+    ulong so = (ulong)hv * hdk * hdv + part * 32 * hdv + j;
+    device const float* Si = si + so;
+    device float* S = state + so;
+    // The state, the value and the gate are loaded first, so that their latency passes during the
+    // q / k norms' barriers (the decay is applied below: the same products).
+    float s[32];
+    for (uint d = 0; d < 32; d++) s[d] = Si[d * hdv];
+    float vj = c[2 * p.key_dim + hv * hdv + j];
+    float zz = tid < hdv ? z[hv * hdv + j] : 0.f;
     float q = 0.f, k = 0.f;
     if (tid < hdk) {
         q = c[hk * hdk + tid];
@@ -1721,20 +1745,16 @@ inline void gdn_rule_body(device const float* c, device const float* z, device c
     float ga = a[hv] + cst[p.nv + hv];
     float sp = ga > 20.f ? ga : log(1.0f + exp(ga));
     float decay = exp(cst[hv] * sp);
-    ulong so = (ulong)hv * hdk * hdv + part * 32 * hdv + j;
-    device const float* Si = si + so;
-    device float* S = state + so;
-    float s[32];
     float kv = 0.f;
     for (uint d = 0; d < 32; d++) {
-        s[d] = Si[d * hdv] * decay;
+        s[d] = s[d] * decay;
         kv += s[d] * (ks[part * 32 + d] * kinv);
     }
     red[part * hdv + j] = kv;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float kvm = 0.f;
     for (uint i = 0; i < np; i++) kvm += red[i * hdv + j];
-    float delta = (c[2 * p.key_dim + hv * hdv + j] - kvm) * beta;
+    float delta = (vj - kvm) * beta;
     float o = 0.f;
     for (uint d = 0; d < 32; d++) {
         s[d] += (ks[part * 32 + d] * kinv) * delta;
@@ -1749,7 +1769,6 @@ inline void gdn_rule_body(device const float* c, device const float* z, device c
         for (uint i = 0; i < np; i++) ov += red[i * hdv + j];
     float r = rsqrt(tg_sum(ov * ov, hdv, tid, sg, lane, red2) / float(hdv) + p.eps);
     if (tid < hdv) {
-        float zz = z[hv * hdv + j];
         out[hv * hdv + j] = ov * r * cst[2 * p.nv + j] * ((p.tiled & 2u) != 0 ? 1.0f / (1.0f + precise::exp(-zz)) : zz / (1.0f + exp(-zz)));
     }
 }
@@ -2043,7 +2062,33 @@ kernel void dec_topk(device const float* logits [[buffer(0)]], device float* sel
     uint n = p.x, k = p.y;
     float v = tid < n ? logits[tid] : -INFINITY;
     uint nsg = (nt + 31) / 32;
-    for (uint j = 0; j < k; j++) {
+    if (p.w == 0 && k <= 32 && nsg * k <= 64) {
+        // Each SIMD-group's own top k (no threadgroup barrier), then SIMD-group 0 picks the k
+        // best of those candidates: the same picks in the same order (of finite logits: the
+        // global top k are among their SIMD-groups' top k), one barrier instead of 2 k.
+        threadgroup float cv[64];
+        threadgroup uint ci[64];
+        float lv = -INFINITY;
+        uint li = 0xffffffffu;
+        for (uint j = 0; j < k; j++) {
+            float m = simd_max(v);
+            uint idx = simd_min(v == m ? tid : 0xffffffffu);
+            if (tid == idx) v = -INFINITY;
+            if (lane == j) { lv = m; li = idx; }
+        }
+        if (lane < k) { cv[sg * k + lane] = lv; ci[sg * k + lane] = li; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint nc = nsg * k;
+        float a0 = lane < nc ? cv[lane] : -INFINITY, a1 = lane + 32 < nc ? cv[lane + 32] : -INFINITY;
+        uint i0 = lane < nc ? ci[lane] : 0xffffffffu, i1 = lane + 32 < nc ? ci[lane + 32] : 0xffffffffu;
+        for (uint j = 0; j < k && sg == 0; j++) {
+            float m = simd_max(max(a0, a1));
+            uint idx = simd_min(min(a0 == m ? i0 : 0xffffffffu, a1 == m ? i1 : 0xffffffffu));
+            if (i0 == idx) a0 = -INFINITY;
+            if (i1 == idx) a1 = -INFINITY;
+            if (tid == 0) { sel[j] = as_type<float>(idx); chosen[j] = m; }
+        }
+    } else for (uint j = 0; j < k; j++) {
         // max value, then the lowest index holding it
         float m = simd_max(v);
         uint idx = v == m ? tid : 0xffffffffu;

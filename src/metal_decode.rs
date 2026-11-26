@@ -746,6 +746,39 @@ fn dec_norm_pre(g: &Graph) -> Vec<Option<usize>> {
     pre
 }
 
+/// Decode plans (one-token and exact multi-token): the GLUs (`Op::Glu` in place on a lone
+/// matvec's output, the matvec right before it) that the matvec's stores take
+/// (`MvMode::GeluMul` / `SiluMul`, `dec_glu`'s arithmetic): a dispatch and a barrier fewer
+/// (Gemma 4 E2B / E4B: the per-layer embeddings' gates). `OXINFER_DEC_GLU_MV=0`: the separate
+/// GLU.
+fn dec_glu_after(g: &Graph) -> Vec<bool> {
+    let mut v = vec![false; g.ops.len()];
+    if std::env::var("OXINFER_DEC_GLU_MV").is_ok_and(|x| x == "0") {
+        return v;
+    }
+    for (i, w) in g.ops.windows(2).enumerate() {
+        if let [
+            Op::Linear {
+                w2: None,
+                n_out,
+                y,
+                mode: LinMode::Store,
+                ..
+            },
+            Op::Glu { g: gg, u, out, n, .. },
+        ] = w
+            && gg == y
+            && out == y
+            && n == n_out
+            && u.buf != y.buf
+            && i + 1 < g.head_from
+        {
+            v[i + 1] = true;
+        }
+    }
+    v
+}
+
 /// Norms a prefill plan's fused AddNorms make too (`MOp::AddNormHalf::ex`): for each AddNorm that
 /// takes `pf_add_norm_half` (its next norm feeding the next op's GEMM), up to two later RMSNorms of
 /// its new residual `x` (one row, no add, no pre-scale, the same `n` and `eps`) with only GEMMs,
@@ -1147,6 +1180,10 @@ pub(crate) enum MvMode {
     /// DeepSeek's clamped SwiGLU pair: `silu(min(a, l)) * clamp(b, -l, l)`, the limit `l` at
     /// the gate buffer (the expert pair kernels: after the k ids and weights of the selection).
     SiluClampPair = 6,
+    /// A matvec and the GLU after it (`dec_glu`'s arithmetic on the row's value),
+    /// `gelu(Wx) * u` / `silu(Wx) * u`, u at the gate buffer (see [`dec_glu_after`]).
+    GeluMul = 7,
+    SiluMul = 8,
 }
 
 impl MetalBackend {
@@ -1899,7 +1936,8 @@ fn dec_only_kind(op: &MOp) -> &'static str {
         MOp::Mv { .. } => "mv",
         MOp::Topk { .. } | MOp::Experts { .. } => "moe",
         MOp::QkRope { .. } => "qk",
-        MOp::GdnConv { .. } | MOp::GdnRule { .. } => "gdn",
+        MOp::GdnConv { .. } => "gdnc",
+        MOp::GdnRule { .. } => "gdnr",
         MOp::Glu { .. } | MOp::Ew { .. } | MOp::PleGate { .. } => "glu",
         MOp::LoraDown { .. } | MOp::LoraUp { .. } => "lora",
         MOp::Steer { .. } | MOp::NeuronEdit { .. } => "iv",
@@ -1916,12 +1954,15 @@ fn dec_only_kind(op: &MOp) -> &'static str {
 }
 
 /// `OXINFER_DEC_ONLY=barrier,norm,mv,qk,attn` (timing experiments only: wrong results): whether
-/// to encode this op.
+/// to encode this op (`gdn`: both Gated DeltaNet kernels, `gdnc` / `gdnr` the conv / the rule).
 fn dec_only(op: &MOp) -> bool {
     static ONLY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     ONLY.get_or_init(|| std::env::var("OXINFER_DEC_ONLY").ok())
         .as_ref()
-        .is_none_or(|o| o.split(',').any(|x| x == dec_only_kind(op)))
+        .is_none_or(|o| {
+            let k = dec_only_kind(op);
+            o.split(',').any(|x| x == k || (x == "gdn" && k.starts_with("gdn")))
+        })
 }
 
 fn norm_threads(n: usize) -> usize {
@@ -2111,6 +2152,9 @@ enum MOp {
         scale: Option<usize>,
         /// Multi-token plans: the logits and selection strides in bytes (one dispatch per token).
         t: Option<(usize, usize)>,
+        /// 1: the k rounds over the whole threadgroup (`OXINFER_DEC_TOPK=0`), not the SIMD-groups'
+        /// own top k first.
+        slow: u32,
     },
     Experts {
         pair: Id,
@@ -3235,14 +3279,16 @@ impl MetalBackend {
         } else {
             dec_norm_pre(g)
         };
+        // Decode plans (but fast verification's): GLUs taken by the matvec before them.
+        let glu_mv = if pf || fast { vec![false; g.ops.len()] } else { dec_glu_after(g) };
         for (i, op) in g.ops.iter().enumerate() {
             op_mop.push(ops.len());
             if tail_skip(i) {
                 // (Computed by the layer's `MOp::PfMoeTail`.)
                 continue;
             }
-            if pre_norm.contains(&Some(i)) {
-                // (Computed by the next op, `dec_norm_add_norm`.)
+            if pre_norm.contains(&Some(i)) || glu_mv[i] {
+                // (Computed by the next op, `dec_norm_add_norm`, or a GLU by the matvec before.)
                 continue;
             }
             let mut smv: Option<([usize; 3], Option<[usize; 3]>)> = None;
@@ -3538,6 +3584,15 @@ impl MetalBackend {
                         LinMode::GeluPair => (MvMode::GeluPair, None),
                         LinMode::AddGated(v) => (MvMode::AddGated, Some(v)),
                     };
+                    // The GLU after it (see `dec_glu_after`).
+                    let glu = match g.ops.get(i + 1) {
+                        Some(&Op::Glu { u, gelu, .. }) if glu_mv.get(i + 1) == Some(&true) => Some((u, gelu)),
+                        _ => None,
+                    };
+                    let (mode, gate) = match glu {
+                        Some((u, gelu)) => (if gelu { MvMode::GeluMul } else { MvMode::SiluMul }, Some(u)),
+                        None => (mode, gate),
+                    };
                     if (mw2.is_some()) != matches!(mode, MvMode::SiluPair | MvMode::GeluPair) {
                         return None;
                     }
@@ -3575,7 +3630,7 @@ impl MetalBackend {
                         r.push(rng(y, n_out));
                     }
                     if let Some(v) = gate {
-                        r.push(rng(v, 1));
+                        r.push(rng(v, if glu.is_some() { n_out } else { 1 }));
                     }
                     (r, vec![rng(y, n_out)])
                 }
@@ -3790,6 +3845,7 @@ impl MetalBackend {
                             k: k as u32,
                             scale: expert_scale.map(&mut cst),
                             t: mt.then(|| (ts(logits) * 4, ts(sel) * 4)),
+                            slow: std::env::var("OXINFER_DEC_TOPK").is_ok_and(|v| v == "0") as u32,
                         });
                     }
                     (vec![rng(x, h), rng(logits, rows)], vec![rng(logits, rows), rng(sel, 2 * k)])
@@ -5944,10 +6000,11 @@ impl MetalPlan<'_> {
                 k,
                 scale,
                 t: tk,
+                slow,
             } => {
                 let (sl, ss) = tk.expect("multi-token top-k");
                 e.pipe(*pipe);
-                e.bytes(&[*n, *k, scale.is_some() as u32, 0], 2);
+                e.bytes(&[*n, *k, scale.is_some() as u32, *slow], 2);
                 e.buf(consts, scale.unwrap_or(0), 3);
                 for j in 0..t {
                     e.buf(arena, *logits + j * sl, 0);
@@ -7828,12 +7885,13 @@ impl MetalPlan<'_> {
                 n,
                 k,
                 scale,
+                slow,
                 ..
             } => {
                 e.pipe(*pipe);
                 e.buf(arena, *logits, 0);
                 e.buf(arena, *sel, 1);
-                e.bytes(&[*n, *k, scale.is_some() as u32, 0], 2);
+                e.bytes(&[*n, *k, scale.is_some() as u32, *slow], 2);
                 e.buf(consts, scale.unwrap_or(0), 3);
                 e.dispatch((1, 1), (*n as usize).next_multiple_of(32));
             }
@@ -9769,6 +9827,87 @@ mod tests {
             assert!(ok);
             let got = unsafe { *(ap as *const u32).add(1) };
             assert_eq!(got, crate::sampler::argmax(v), "case {ci} ({} values)", v.len());
+        }
+        unsafe { (f.void)(arena, f.s_release) };
+    }
+
+    /// `dec_topk`'s SIMD-group path (each SIMD-group's top k, then the best of those) against its
+    /// threadgroup rounds (`p.w` = 1) and a host reference: the same experts in the same order
+    /// (ties to the lower index), weights within rounding of the host's softmax.
+    #[test]
+    fn dec_topk_paths_agree() {
+        let Ok(be) = MetalBackend::new() else { return };
+        let f = Fns::new(&be);
+        let pipe = be.named_pipeline("dec_topk").unwrap();
+        let new_len: MsgNewBufLen = be.o.msg_send();
+        let arena = unsafe { new_len(be.device, be.sels.new_buffer_len, 4096 * 4, 0) };
+        assert!(!arena.is_null());
+        let ap = f.contents(arena) as *mut f32;
+        let mut seed = 3u64;
+        for (n, k) in [
+            (128usize, 8usize),
+            (256, 8),
+            (64, 4),
+            (60, 6),
+            (512, 4),
+            (128, 1),
+            (32, 32),
+            (256, 2),
+        ] {
+            for case in 0..4 {
+                let mut v: Vec<f32> = (0..n).map(|_| lcg(&mut seed) * 8.0).collect();
+                if case == 1 {
+                    // Ties among the best.
+                    for i in [n / 2, n / 3, n - 1, 3] {
+                        v[i] = 7.5;
+                    }
+                }
+                if case == 2 {
+                    // All in one SIMD-group.
+                    for x in v.iter_mut().take(k.min(32)) {
+                        *x += 20.0;
+                    }
+                }
+                if case == 3 {
+                    v.iter_mut().for_each(|x| *x = (*x * 2.0).round());
+                }
+                let scale: Vec<f32> = (0..n).map(|i| 0.5 + i as f32 / n as f32).collect();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(v.as_ptr(), ap, n);
+                    std::ptr::copy_nonoverlapping(scale.as_ptr(), ap.add(2048), n);
+                }
+                let mut outs = Vec::new();
+                for slow in [0u32, 1] {
+                    let (ok, _) = run_concurrent(&be, &f, std::slice::from_ref(&(0..1)), |e, _| {
+                        e.pipe(pipe);
+                        e.buf(arena, 0, 0);
+                        e.buf(arena, 1024 * 4, 1);
+                        e.bytes(&[n as u32, k as u32, 1u32, slow], 2);
+                        e.buf(arena, 2048 * 4, 3);
+                        e.dispatch((1, 1), n.next_multiple_of(32));
+                    });
+                    assert!(ok);
+                    outs.push(unsafe { std::slice::from_raw_parts(ap.add(1024), 2 * k).to_vec() });
+                }
+                // The host: k rounds of the largest value, the lowest index holding it.
+                let mut ids: Vec<usize> = (0..n).collect();
+                ids.sort_by(|&a, &b| v[b].total_cmp(&v[a]).then(a.cmp(&b)));
+                let ids = &ids[..k];
+                let m = v[ids[0]];
+                let e: Vec<f64> = ids.iter().map(|&i| ((v[i] - m) as f64).exp()).collect();
+                let s: f64 = e.iter().sum();
+                for (pi, o) in outs.iter().enumerate() {
+                    for j in 0..k {
+                        assert_eq!(o[j].to_bits() as usize, ids[j], "n {n} k {k} case {case} path {pi} pick {j}");
+                        let want = e[j] / s * scale[ids[j]] as f64;
+                        assert!(
+                            (o[k + j] as f64 - want).abs() <= 1e-6 * want.abs().max(1e-3),
+                            "n {n} k {k} case {case} path {pi} weight {j}: {} vs {want}",
+                            o[k + j]
+                        );
+                    }
+                }
+            }
         }
         unsafe { (f.void)(arena, f.s_release) };
     }
