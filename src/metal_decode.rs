@@ -2215,6 +2215,101 @@ struct AttnRope {
     cs: usize,
 }
 
+/// `dec_attv_*` / `dec_attvr_*` (one-token attention split finely over the keys, the chunks
+/// merged by the last of a head's threadgroups): the kernels for the op's query heads per
+/// threadgroup and its narrow ones (as `MOp::Attn::pipe` / `narrow`), the fused-RoPE ones when
+/// the op has its QkRope, and the policy read as the plan is built: up to `max_n` keys
+/// (`OXINFER_DEC_ATTV=0`: never; `OXINFER_DEC_ATTV_MAX`), chunks of `cmin` keys at least
+/// (`OXINFER_DEC_ATTV_CMIN`) and about `tgs` threadgroups (`OXINFER_DEC_ATTV_TGS`). (No kernel
+/// for G * D > 32: heads of 512 four at a time spilled, 2-4x slower than `dec_attn_*` at 2-4k
+/// keys in `dec_attv_matches_attn`'s timings; those take `dec_attn_*` past the narrow ranges.)
+#[derive(Clone)]
+struct Attv {
+    pipe: Option<Id>,
+    narrow: [Option<Id>; 2],
+    r: Option<(Option<Id>, [Option<Id>; 2])>,
+    /// The head size / 32.
+    d: usize,
+    max_n: usize,
+    cmin: usize,
+    tgs: usize,
+}
+
+/// Counters of `dec_attv_*` (one per head group) at the end of each token's split-attention
+/// region.
+const ATTV_CNT: usize = 128;
+
+impl Attv {
+    fn new(be: &MetalBackend, kt: &str, d: usize, grp: usize, narrow: &[Option<Id>; 2]) -> Option<Box<Attv>> {
+        let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let max_n = env("OXINFER_DEC_ATTV_MAX", 4096);
+        if std::env::var("OXINFER_DEC_ATTV").is_ok_and(|v| v == "0") || max_n == 0 {
+            return None;
+        }
+        let nw = [1, 2].map(|n| (n < grp).then(|| be.named_pipeline(&format!("dec_attv_{kt}{d}_{n}"))).flatten());
+        if nw.iter().zip(narrow.iter()).any(|(a, b)| a.is_some() != b.is_some()) {
+            return None;
+        }
+        Some(Box::new(Attv {
+            pipe: (grp * d <= 32)
+                .then(|| be.named_pipeline(&format!("dec_attv_{kt}{d}_{grp}")))
+                .flatten(),
+            narrow: nw,
+            r: None,
+            d,
+            max_n,
+            cmin: env("OXINFER_DEC_ATTV_CMIN", 32).max(8),
+            tgs: env("OXINFER_DEC_ATTV_TGS", 64).max(1),
+        }))
+    }
+
+    /// The fused-RoPE kernels (`dec_attvr_*`), as `AttnRope`'s.
+    fn with_rope(&mut self, be: &MetalBackend, kt: &str, d: usize, grp: usize) -> Option<()> {
+        let nw = [1, 2].map(|n| (n < grp).then(|| be.named_pipeline(&format!("dec_attvr_{kt}{d}_{n}"))).flatten());
+        if nw.iter().zip(self.narrow.iter()).any(|(a, b)| a.is_some() != b.is_some()) {
+            return None;
+        }
+        let full = (grp * d <= 32)
+            .then(|| be.named_pipeline(&format!("dec_attvr_{kt}{d}_{grp}")))
+            .flatten();
+        if full.is_some() != self.pipe.is_some() {
+            return None;
+        }
+        self.r = Some((full, nw));
+        Some(())
+    }
+
+    /// For `n` keys of `nh` query heads: the kernel (fused with the RoPE or not), its query heads
+    /// per threadgroup, the keys per chunk and the chunks, or None for `dec_attn_*`. The same for
+    /// a one-token step and a multi-token plan's token at the same position (the same sums).
+    fn choose(&self, grp: usize, n: usize, rope: bool, nh: usize) -> Option<(Id, usize, usize, usize)> {
+        if n > self.max_n || n == 0 {
+            return None;
+        }
+        let (full, nw) = match (rope, &self.r) {
+            (false, _) => (self.pipe, &self.narrow),
+            (true, Some((p, nw))) => (*p, nw),
+            (true, None) => return None,
+        };
+        // (`attn_narrow`'s choice.)
+        let (pipe, grp) = match (n, nw) {
+            (..=512, [Some(p), _]) => (*p, 1),
+            (..=1024, [_, Some(p)]) => (*p, 2),
+            _ => (full?, grp),
+        };
+        if nh / grp > ATTV_CNT || grp * self.d > 32 {
+            return None;
+        }
+        let want = self.tgs.div_ceil(nh / grp).clamp(1, ATTN_MAX_SPLIT);
+        let chunk = n
+            .div_ceil(want)
+            .next_multiple_of(8)
+            .max(self.cmin)
+            .max(n.div_ceil(ATTN_MAX_SPLIT).next_multiple_of(8));
+        Some((pipe, grp, chunk, n.div_ceil(chunk)))
+    }
+}
+
 /// Whether one-token plans fold each QkRope into the attention after it (`OXINFER_DEC_ATTN_ROPE=0`:
 /// not; read as each plan is built).
 fn dec_attn_rope() -> bool {
@@ -2508,6 +2603,8 @@ enum MOp {
         sel: Option<(Id, usize, usize, usize, usize)>,
         /// One-token plans: the `MOp::QkRope` before it folded in (`dec_attnr_*`).
         rope: Option<Box<AttnRope>>,
+        /// `dec_attv_*` (see [`Attv`]).
+        v: Option<Box<Attv>>,
     },
     /// See `Op::QsaKey`: `cs` is where the block-start RoPE table starts in a step's cos / sin
     /// floats; multi-token plans: the arena offset of that table's per-token rows.
@@ -5015,6 +5112,7 @@ impl MetalBackend {
                             ts(sel) * 4,
                         )),
                         rope: None,
+                        v: None,
                     });
                     let mut r = vec![rng(q, nh * hd), (KV_RES + kv, 0, usize::MAX), rng(sel, (top + 1) * ratio)];
                     if let Some((v, s)) = gate {
@@ -5146,6 +5244,10 @@ impl MetalBackend {
                         .unwrap_or(1);
                     let kt = if kv_half[kv] { "h_" } else { "" };
                     let narrow = [1, 2].map(|n| (n < grp).then(|| self.named_pipeline(&format!("dec_attn_{kt}{d}_{n}"))).flatten());
+                    let v = Attv::new(self, kt, d, grp, &narrow);
+                    if v.is_some() {
+                        part_floats = part_floats.max(nh * ATTN_MAX_SPLIT * (hd + 2) + ATTV_CNT);
+                    }
                     emit.push(MOp::Attn {
                         grp,
                         pipe: self.named_pipeline(&format!("dec_attn_{kt}{d}_{grp}"))?,
@@ -5175,6 +5277,7 @@ impl MetalBackend {
                         block,
                         sel: None,
                         rope: None,
+                        v,
                     });
                     let mut r = vec![rng(q, nh * hd), (KV_RES + kv, 0, usize::MAX)];
                     if let Some((v, s)) = gate {
@@ -5200,6 +5303,7 @@ impl MetalBackend {
                         rope: rope @ None,
                         grp,
                         narrow,
+                        v: av,
                         ..
                     },
                 ] = &mut emit[..]
@@ -5251,6 +5355,11 @@ impl MetalBackend {
                     })
                 })();
                 if let Some(f) = fused {
+                    if let Some(a) = av.as_mut()
+                        && a.with_rope(self, kt, d as usize, *grp).is_none()
+                    {
+                        *av = None;
+                    }
                     *rope = Some(Box::new(f));
                     ops.pop();
                     rd.clear();
@@ -6473,6 +6582,7 @@ impl MetalPlan<'_> {
                 t: tk,
                 block,
                 sel,
+                v,
                 ..
             } => {
                 let (sq, so, sg) = tk.expect("multi-token attention");
@@ -6505,9 +6615,16 @@ impl MetalPlan<'_> {
                     p.chunk = chunk as u32;
                     let part = self.part + j * self.part_stride;
                     let gt = gate.map_or(0, |g| g + j * sg);
+                    let av = v.as_deref().and_then(|v| v.choose(*grp, n, false, p.nh as usize));
                     let mut grp = *grp;
                     if sel.is_none() {
                         (pipe, grp) = attn_narrow(pipe, grp, narrow, n);
+                    }
+                    if let Some((vp, vg, chunk, ns)) = av {
+                        (pipe, grp) = (vp, vg);
+                        p.chunk = chunk as u32;
+                        p.nsplit = ns as u32;
+                        e.buf(arena, part + self.part_stride - ATTV_CNT * 4, 7);
                     }
                     e.pipe(pipe);
                     e.buf(arena, *q + j * sq, 0);
@@ -6518,7 +6635,7 @@ impl MetalPlan<'_> {
                     e.bytes(&p, 5);
                     e.buf(arena, part, 6);
                     e.dispatch((p.nh as usize / grp, p.nsplit as usize), *threads);
-                    if p.nsplit > 1 {
+                    if p.nsplit > 1 && av.is_none() {
                         e.barrier();
                         e.pipe(*combine);
                         e.buf(arena, part, 0);
@@ -8382,6 +8499,7 @@ impl MetalPlan<'_> {
                 hd,
                 sel,
                 rope,
+                v,
                 ..
             } => {
                 let mut p = *p;
@@ -8398,6 +8516,10 @@ impl MetalPlan<'_> {
                 let chunk = n.div_ceil(ATTN_MAX_SPLIT).next_multiple_of(256).max(256);
                 p.nsplit = n.div_ceil(chunk) as u32;
                 p.chunk = chunk as u32;
+                let av = v
+                    .as_deref()
+                    .filter(|_| sel.is_none() || qsa_list(sel, pos).is_none())
+                    .and_then(|v| v.choose(*grp, n, rope.is_some(), p.nh as usize));
                 let mut grp = *grp;
                 if let Some(r) = rope {
                     (pipe, grp) = attn_narrow(r.pipe, grp, &r.narrow, n);
@@ -8411,6 +8533,16 @@ impl MetalPlan<'_> {
                 } else if sel.is_none() {
                     (pipe, grp) = attn_narrow(pipe, grp, narrow, n);
                 }
+                if let Some((vp, vg, chunk, ns)) = av {
+                    (pipe, grp) = (vp, vg);
+                    p.chunk = chunk as u32;
+                    p.nsplit = ns as u32;
+                    e.buf(
+                        arena,
+                        self.part + self.part_stride - ATTV_CNT * 4,
+                        if rope.is_some() { 12 } else { 7 },
+                    );
+                }
                 e.pipe(pipe);
                 e.buf(arena, rope.as_ref().map_or(*q, |r| r.qkv), 0);
                 e.buf(kvb[*kv].0, 0, 1);
@@ -8420,7 +8552,7 @@ impl MetalPlan<'_> {
                 e.bytes(&p, 5);
                 e.buf(arena, self.part, 6);
                 e.dispatch((p.nh as usize / grp, p.nsplit as usize), *threads);
-                if p.nsplit > 1 {
+                if p.nsplit > 1 && av.is_none() {
                     e.barrier();
                     e.pipe(*combine);
                     e.buf(arena, self.part, 0);
@@ -8716,6 +8848,7 @@ impl MetalPlan<'_> {
                 threads,
                 hd,
                 t: tk,
+                v,
                 ..
             } => {
                 let (sq, so, sg) = tk.expect("multi-token attention");
@@ -8731,7 +8864,14 @@ impl MetalPlan<'_> {
                 p.chunk = chunk as u32;
                 let part = self.part + j * self.part_stride;
                 let gt = gate.map_or(0, |g| g + j * sg);
-                let (pipe, grp) = attn_narrow(*pipe, *grp, narrow, n);
+                let av = v.as_deref().and_then(|v| v.choose(*grp, n, false, p.nh as usize));
+                let (mut pipe, mut grp) = attn_narrow(*pipe, *grp, narrow, n);
+                if let Some((vp, vg, chunk, ns)) = av {
+                    (pipe, grp) = (vp, vg);
+                    p.chunk = chunk as u32;
+                    p.nsplit = ns as u32;
+                    e.buf(arena, part + self.part_stride - ATTV_CNT * 4, 7);
+                }
                 e.pipe(pipe);
                 e.buf(arena, *q + j * sq, 0);
                 e.buf(kvb[*kv].0, 0, 1);
@@ -8741,7 +8881,7 @@ impl MetalPlan<'_> {
                 e.bytes(&p, 5);
                 e.buf(arena, part, 6);
                 e.dispatch((p.nh as usize / grp, p.nsplit as usize), *threads);
-                if p.nsplit > 1 {
+                if p.nsplit > 1 && av.is_none() {
                     e.barrier();
                     e.pipe(*combine);
                     e.buf(arena, part, 0);
@@ -11142,6 +11282,147 @@ mod tests {
             let g = time(cb, be.o.sel(c"GPUEndTime")) - time(cb, be.o.sel(c"GPUStartTime"));
             (be.sels.pool_pop)(pool);
             g
+        }
+    }
+
+    /// `dec_attv_*` (the keys split finely, the chunks merged by the last threadgroup) against
+    /// `dec_attn_*` and its combine: the same outputs but for the sums' order, twice in a row
+    /// (the counters reset), at the chunkings the plans choose. `OXINFER_AB_ATTV=1` also times
+    /// both (GPU us per dispatch, 16 layers' caches attended in turn as in a pass), e.g. with
+    /// `OXINFER_AB_SHAPES=16:8:256,16:2:512 OXINFER_AB_N=150,1024,8192`.
+    #[test]
+    fn dec_attv_matches_attn() {
+        let Ok(be) = MetalBackend::new() else { return };
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or(d.into());
+        let time = std::env::var_os("OXINFER_AB_ATTV").is_some();
+        let mut seed = 11u64;
+        let combine = be.named_pipeline("dec_attn_combine").unwrap();
+        let shapes = env("OXINFER_AB_SHAPES", "16:8:256,16:2:512,32:8:128,16:2:256");
+        let ns = env("OXINFER_AB_N", "1,37,150,700,3000");
+        for shape in shapes.split(',') {
+            let v: Vec<usize> = shape.split(':').map(|x| x.parse().unwrap()).collect();
+            let (nh, nkv, hd) = (v[0], v[1], v[2]);
+            let d = hd / 32;
+            for half in [true, false] {
+                let kt = if half { "h_" } else { "" };
+                let fit = if half { 64 } else { 16 };
+                let grp = [8, 4, 2, 1]
+                    .into_iter()
+                    .find(|&g| (nh / nkv).is_multiple_of(g) && g * d <= fit && (g < 8 || d <= 2))
+                    .unwrap_or(1);
+                let narrow = [1, 2].map(|n| (n < grp).then(|| be.named_pipeline(&format!("dec_attn_{kt}{d}_{n}"))).flatten());
+                let old = be.named_pipeline(&format!("dec_attn_{kt}{d}_{grp}")).unwrap();
+                let av = Attv::new(&be, kt, d, grp, &narrow).expect("dec_attv kernels");
+                for n in ns.split(',').map(|x| x.parse::<usize>().unwrap()) {
+                    // (None: `dec_attn_*` at this range.)
+                    let Some(ch) = av.choose(grp, n, false, nh) else { continue };
+                    let layers = if time { 16 } else { 1 };
+                    let rnd = |len: usize, amp: f32, seed: &mut u64| {
+                        let mut v = PageVec::<f32>::zeroed(len);
+                        v.iter_mut().for_each(|x| *x = lcg(seed) * amp);
+                        v
+                    };
+                    // Half caches as f16 bits, two to a float.
+                    let pack = |c: &PageVec<f32>| {
+                        let h: Vec<u16> = c.iter().map(|&x| half::f16::from_f32(x).to_bits()).collect();
+                        let mut o = PageVec::<f32>::zeroed(c.len().div_ceil(2));
+                        for (i, w) in o.iter_mut().enumerate() {
+                            let lo = h[2 * i] as u32;
+                            let hi = h.get(2 * i + 1).copied().unwrap_or(0) as u32;
+                            *w = f32::from_bits(lo | hi << 16);
+                        }
+                        o
+                    };
+                    let q = rnd(nh * hd, 4.0, &mut seed);
+                    let caches: Vec<(PageVec<f32>, PageVec<f32>)> = (0..layers)
+                        .map(|_| {
+                            let (k, v) = (rnd(n * nkv * hd, 4.0, &mut seed), rnd(n * nkv * hd, 2.0, &mut seed));
+                            if half { (pack(&k), pack(&v)) } else { (k, v) }
+                        })
+                        .collect();
+                    let w32 = |v: &PageVec<f32>| be.wrap(v.as_ptr() as *const u8, v.len() * 4).unwrap();
+                    let wq = w32(&q);
+                    let wc: Vec<_> = caches.iter().map(|(k, v)| (w32(k), w32(v))).collect();
+                    let pfl = nh * ATTN_MAX_SPLIT * (hd + 2);
+                    let part = PageVec::<f32>::zeroed(pfl + ATTV_CNT);
+                    let wp = w32(&part);
+                    let outs: Vec<PageVec<f32>> = (0..2).map(|_| PageVec::<f32>::zeroed(nh * hd)).collect();
+                    let wo: Vec<_> = outs.iter().map(&w32).collect();
+                    let chunk = n.div_ceil(ATTN_MAX_SPLIT).next_multiple_of(256).max(256);
+                    let p0 = AttnParams {
+                        nh: nh as u32,
+                        nkv: nkv as u32,
+                        len: n as u32,
+                        lo: 0,
+                        scale: 1.0 / (hd as f32).sqrt(),
+                        has_gate: 0,
+                        g_stride: 0,
+                        g_off: 0,
+                        nsplit: n.div_ceil(chunk) as u32,
+                        chunk: chunk as u32,
+                        _p: [0; 2],
+                    };
+                    let enc = |e: &FastEnc, which: usize, li: usize| {
+                        let (k, v) = &wc[li];
+                        let mut p = p0;
+                        let (pipe, g) = if which == 0 {
+                            attn_narrow(old, grp, &narrow, n)
+                        } else {
+                            let (pp, g, chunk, ns) = ch;
+                            p.chunk = chunk as u32;
+                            p.nsplit = ns as u32;
+                            e.buf(wp.id, wp.offset_bytes + pfl * 4, 7);
+                            (pp, g)
+                        };
+                        e.pipe(pipe);
+                        e.buf(wq.id, wq.offset_bytes, 0);
+                        e.buf(k.id, k.offset_bytes, 1);
+                        e.buf(v.id, v.offset_bytes, 2);
+                        e.buf(wo[which].id, wo[which].offset_bytes, 3);
+                        e.buf(wq.id, wq.offset_bytes, 4);
+                        e.bytes(&p, 5);
+                        e.buf(wp.id, wp.offset_bytes, 6);
+                        e.dispatch((nh / g, p.nsplit as usize), 256);
+                        e.barrier();
+                        if which == 0 && p.nsplit > 1 {
+                            e.pipe(combine);
+                            e.buf(wp.id, wp.offset_bytes, 0);
+                            e.buf(wo[0].id, wo[0].offset_bytes, 1);
+                            e.buf(wq.id, wq.offset_bytes, 2);
+                            e.bytes(&p, 3);
+                            e.bytes(&(hd as u32), 4);
+                            e.dispatch((nh, 1), 256);
+                            e.barrier();
+                        }
+                    };
+                    let mut line = format!("{nh}x{hd} kv {nkv} {kt}n={n}");
+                    for rep in 0..2 {
+                        for which in 0..2 {
+                            timed_conc(&be, |e| enc(e, which, 0));
+                        }
+                        let (mut dd, mut m) = (0f32, 0f32);
+                        for (x, y) in outs[0].iter().zip(outs[1].iter()) {
+                            dd = dd.max((x - y).abs());
+                            m = m.max(x.abs());
+                        }
+                        assert!(m > 0.0 && dd <= 1e-5 * m.max(1.0), "{line} run {rep}: max diff {dd} of {m}");
+                        assert!(part[pfl..].iter().all(|&c| c.to_bits() == 0), "{line}: counters left set");
+                        let _ = write!(line, " d {:.1e}", dd / m);
+                    }
+                    if time {
+                        let (_, g, chunk, ns) = ch;
+                        let _ = write!(line, " [attv grp {g} chunk {chunk} x{ns}]");
+                        for which in 0..2 {
+                            let mut best = f64::MAX;
+                            for _ in 0..6 {
+                                best = best.min(timed_conc(&be, |e| (0..layers).for_each(|li| enc(e, which, li))) / layers as f64);
+                            }
+                            let _ = write!(line, " {}: {:.1} us", ["attn", "attv"][which], best * 1e6);
+                        }
+                    }
+                    println!("{line}");
+                }
+            }
         }
     }
 

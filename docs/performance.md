@@ -2176,6 +2176,95 @@ Gemma 4 26B-A4B Q4_0's chain against its one-token steps (the server's concurren
 the test itself passed 5 of 5 times with `OXINFER_E2E_CHAT` on the GGUF, also with
 `OXINFER_DEC_MOE_ORDER=0 OXINFER_DEC_TOPK=0`.
 
+#### Metal decode round 4 (November 2026)
+
+The two levers round 3 left, which change sums' order: the attention of heads of 256 / 512 on few
+threadgroups (Gemma 4), and the Gated DeltaNet rule (Qwen3.5 / 3.6 / 3.8). Plain greedy decoding
+(tg128, the device chain on) against llama.cpp master `de30697` (Metal, `llama-bench -n 128 -p 0
+-r 3`, `-d 8192 -r 2` for the depth rows) and `parity_bench MODEL pp= tg=128 reps=3 lookup=0
+draft=none mtp=0` (`depth=8192 reps=2`), best of the runs, run back to back twice per model under
+the bench lock ("before" is master `205fc58`). M5 Max shared with other sessions' builds and
+benchmarks. tok/s:
+
+| model | llama.cpp | before | after | after / llama.cpp |
+|---|---:|---:|---:|---:|
+| Gemma 4 26B-A4B Q4_0 | 130.4 / 112.0 | 162.6 / 160.4 | **164.1 / 167.1** | 1.26-1.49 |
+| Gemma 4 E4B Q8_0 | 84.1 / 84.2 | 96.7 / 97.7 | **99.8 / 100.1** | 1.19 |
+| Qwen3.5-35B-A3B Q4_K_M | 112.2 / 100.4 | 139.8 / 143.2 | 141.8 / 145.7 | 1.26-1.45 |
+| Qwen3.8-27B Q4_K_P (HauhauCS) | 22.3 / 21.0 | 21.5 / 23.9 | 21.6 / 28.1 | 0.97-1.34 |
+| Gemma 4 26B-A4B Q4_0, depth 8192 | 107.8 / 109.6 | 133.3 / 117.1 | 114.5 / 118.9 | 1.06-1.08 |
+| Gemma 4 E4B Q8_0, depth 8192 | 76.9 / 77.5 | 84.2 / 85.5 | 85.2 / 86.9 | 1.11-1.12 |
+| Qwen3.5-35B-A3B Q4_K_M, depth 8192 | 103.9 / 105.0 | 129.9 / 131.1 | 131.1 / 132.0 | 1.26 |
+
+(The machine's load moved single runs by up to 20%: the 27B's rounds and the 26B-A4B's first
+round at depth 8192 are noise either way; the alternated `dec_ab` runs below are the
+comparison. At depth 8192 the 26B-A4B's and E4B's global layers keep `dec_attn_*`, their
+sliding layers, 1024 / 512 keys, take the new kernel.)
+
+What changed:
+
+- **One-token attention split finely over the keys** (`dec_attv_*`, `dec_attvr_*` with the
+  token's RoPE fused as `dec_attnr_*`): a threadgroup per (query heads, chunk of keys) as before,
+  but the lanes of a SIMD-group across a head's dimensions and the SIMD-groups across the keys
+  (each key one coalesced row load and a SIMD-group sum, two keys' rows loaded together for heads
+  of 256, the first ones before the queries are made so that their latency passes during the
+  RoPE's barriers), chunks of 32 keys and more for about 64 threadgroups a layer (Gemma 4
+  26B-A4B's 16 heads at 150 keys: 4-5 chunks a head where `dec_attn_*` had one threadgroup), and
+  the last of a head's threadgroups to finish merges the chunks in their order (fences around a
+  counter at the end of the split-attention region, reset by the merger), no combine stage. Up to
+  4096 keys (`OXINFER_DEC_ATTV_MAX`) and query heads per threadgroup x head size / 32 up to 32
+  (heads of 512 four at a time spilled: 2-4x slower than `dec_attn_*` at 2-4k keys), `dec_attn_*`
+  past that. Multi-token plans' tokens (step rows, exact verification) take the same
+  kernel at the same chunking as a one-token step at their position, so batched rows keep their
+  one-token bits (`gpu_chain`, `server` tests). `OXINFER_DEC_ATTV=0` gives the logits of before
+  bit for bit; `OXINFER_DEC_ATTV_TGS` / `OXINFER_DEC_ATTV_CMIN` the policy;
+  `dec_attv_matches_attn` checks it against `dec_attn_*` (`OXINFER_AB_ATTV=1` times both).
+
+Where it went (`OXINFER_METAL_TRACE=1`, median us per chained pass of two 128-token runs): Gemma
+4 26B-A4B Q4_0 whole pass 6172 / 6228 -> 6074 / 6092 (two alternations); the attention with
+barriers alone (`OXINFER_DEC_ONLY=barrier,attn`, the barriers alone 84) 425 -> 298-315, so 11.3
+-> 7.5 us a layer, of which ~3 us the fused RoPE (the attention without it, `OXINFER_DEC_ATTN_ROPE=0`:
+~7.5 -> 4.7 us); Qwen3.5-35B-A3B's 10 attention layers 180 -> 150 (barriers 130).
+
+`dec_ab` (alternated in one process, best (median), the same token hash in every pair): Gemma 4
+26B-A4B Q4_0 160.2 (157.6) -> 165.4 (156.9), Gemma 4 E4B Q8_0 96.1 (95.0) -> 98.7 (97.5),
+Qwen3.5-35B-A3B Q4_K_M 144.4 (142.4) -> 145.6 (144.0), Qwen3.8-27B Q4_K_P 28.3 (27.2) -> 27.5
+(27.3); after a 10k-token prompt (dense cache, the 26B-A4B's and E4B's sliding layers on the new
+kernel, their global layers on `dec_attn_*`) 26B-A4B 115.9 (114.9) -> 116.5 (115.3), E4B 82.6
+(82.3) -> 83.7 (83.6).
+
+Logits (`pf_check`, 64 greedy steps with top-20 log-probabilities after a 200-token prompt,
+against master `205fc58`): all 64 tokens agree on Gemma 4 26B-A4B Q4_0, E4B Q8_0, Qwen3.5-35B-A3B
+and Qwen3.8-27B; the top-5 log-probabilities move by 2e-4 - 2e-3 per step (as two builds of
+before differ: round 3's files against `205fc58`'s), the largest move over the 64 steps 0.35 on
+the 26B-A4B (a step after a near-tie of its router; its builds of before differ by 0.36 too),
+6e-3 on E4B, 7e-4 / 1.1e-3 on the Qwens; after the 10k-token prompt the 26B-A4B's 64 tokens
+agree, largest move 2.6e-3. (Over 128 tokens after that prompt `dec_ab`'s 26B-A4B text differs
+from before's; at 150 keys with chunks of a quarter of 256 threadgroups the 26B-A4B's text had
+left before's after 58 of 64 steps, a top-2 margin of 0.15 at the step it left.)
+
+Measured and dropped:
+
+- **The Gated DeltaNet rule on more threadgroups** (`dec_gdn_rule` split over the value
+  columns, 32 a threadgroup: 128 threadgroups of 128 threads for Qwen3.5-35B-A3B's 32 heads,
+  the q / k norms made by each, the gated norm by the last of a head's threadgroups from the
+  others' SIMD-group sums in `tg_sum`'s order: the bits of before): the rule with barriers alone
+  404 / 409 -> 395 / 403 us a pass, the whole pass and `dec_ab` level (139.3 / 138.9). The rule
+  runs at ~9 us a layer alone: 2 MB of f32 state read and written per layer, ~450 GB/s, near the
+  memory's rate whatever the threadgroups (the 0.46 ms round 3 measured was the pass without it:
+  its stage's share of the pass, not its own time).
+- **The conv folded into the rule** (each threadgroup making the conv outputs it reads from the
+  conv's input and state, the state shifted by a kernel in the stage after the rule, beside the
+  output projection: round 3's race gone, a stage fewer a layer): slower (whole pass 6867 / 6917
+  -> 6934 / 6909 us, `dec_ab` 139.3 -> 137.8 tok/s: the conv's loads and weights now in the rule's
+  first latency chain, redundantly for each of a key head's threadgroups), and not bit-identical
+  (the compiler made the same conv code to other bits inside the rule, as the norms of round 3).
+- The RoPE preparation with a barrier fewer (raw rows stored with their sums, each thread
+  normalizing its value and its partner's itself): no faster (315 / 298 against 322 / 305 us).
+  Four keys' rows a step for heads of 256: no faster (330 / 322 against 328 / 309).
+- Chunks for 128 / 256 threadgroups a layer instead of 64: no faster on the 26B-A4B (151.7 /
+  151.3 against 152.8 tok/s median) and its text left before's after 58 of 64 steps at 256.
+
 #### M3 Ultra (November 2026)
 
 A Mac Studio with an M3 Ultra (24 performance and 8 efficiency cores, an 80-core GPU, 96 GB,

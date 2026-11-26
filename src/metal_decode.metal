@@ -1761,6 +1761,184 @@ kernel void dec_attn_combine(device const float* part [[buffer(0)]], device floa
     }
 }
 
+// ---- One-token attention split finely over the keys (`dec_attv_*`, `dec_attvr_*` with the
+// token's RoPE fused as `dec_attnr_*`): a threadgroup per (G query heads, chunk of keys) as
+// `dec_attn_*`, but the lanes of a SIMD-group across a head's dimensions (D each) and the
+// SIMD-groups across the keys (SIMD-group sg: keys j0 + sg + 8 m, KB at a time with their key
+// and value loads issued together, the first ones before the queries are made), each score a
+// SIMD-group sum: a key is one coalesced row load, chunks of 32 keys and more fill the GPU at
+// short ranges, and the last of a head's threadgroups to finish merges the chunks (in their
+// order), no combine stage after it. `cnt`: a counter per head group (zero between dispatches:
+// the merging threadgroup resets it).
+template <int D> struct AvRows {
+    static constexpr constant int KB = D <= 4 ? 4 : D == 8 ? 2 : 1;
+    float4 k[KB][D / 4], v[KB][D / 4];
+};
+template <int D, typename KT>
+inline void attv_load(thread AvRows<D>& r, device const KT* kb, device const KT* vb, ulong rs, uint base, uint j1) {
+    for (int u = 0; u < AvRows<D>::KB; u++) {
+        uint j = min(base + 8 * u, j1 - 1);
+        device const vec<KT, 4>* kr = (device const vec<KT, 4>*)(kb + (ulong)j * rs);
+        device const vec<KT, 4>* vr = (device const vec<KT, 4>*)(vb + (ulong)j * rs);
+        for (int d = 0; d < D / 4; d++) {
+            r.k[u][d] = float4(kr[d]);
+            r.v[u][d] = float4(vr[d]);
+        }
+    }
+}
+// The rows of SIMD-group sg's first keys (loaded before the queries are made: their latency
+// passes during the queries' barriers).
+template <int D, typename KT>
+inline void attv_first(thread AvRows<D>& r, device const KT* kc, device const KT* vc, constant AP& p, uint hg, uint G, uint split,
+                       uint sg, uint lane) {
+    constexpr uint HD = D * 32;
+    uint kvh = hg * G / (p.nh / p.nkv);
+    ulong rs = (ulong)p.nkv * HD;
+    uint j0 = p.lo + split * p.chunk, j1 = min(p.len, j0 + p.chunk);
+    attv_load<D, KT>(r, kc + (ulong)kvh * HD + lane * D, vc + (ulong)kvh * HD + lane * D, rs, j0 + sg, j1);
+}
+template <int D, int G, typename KT, bool R>
+inline void attv_body(thread AvRows<D>& rw, device const float* q, device const KT* kc, device const KT* vc, device float* out,
+                      device const float* gate, device float* part, device atomic_uint* cnt, constant AP& p, uint hg, uint split,
+                      uint tid, uint sg, uint lane, threadgroup float* sm, threadgroup float* so, threadgroup float* qs,
+                      threadgroup const float* kn, threadgroup const float* vn, uint jn) {
+    constexpr uint HD = D * 32;
+    constexpr int KB = AvRows<D>::KB;
+    constexpr int D4 = D / 4;
+    uint h0 = hg * G, kvh = h0 / (p.nh / p.nkv);
+    if (!R) {
+        for (uint i = tid; i < G * HD; i += 256) qs[i] = q[h0 * HD + i] * p.scale;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float4 qv[G][D4], o[G][D4];
+    float m[G], l[G];
+    for (int g = 0; g < G; g++) {
+        m[g] = -INFINITY;
+        l[g] = 0.f;
+        for (int d = 0; d < D4; d++) {
+            qv[g][d] = ((threadgroup const float4*)(qs + g * HD + lane * D))[d];
+            o[g][d] = 0.f;
+        }
+    }
+    ulong rs = (ulong)p.nkv * HD;
+    device const KT* kb = kc + (ulong)kvh * HD + lane * D;
+    device const KT* vb = vc + (ulong)kvh * HD + lane * D;
+    uint j0 = p.lo + split * p.chunk, j1 = min(p.len, j0 + p.chunk);
+    for (uint base = j0 + sg; base < j1; base += 8 * KB) {
+        // (The token's own row as the threadgroup made it.)
+        if (R && jn - base < uint(8 * KB))
+            for (int u = 0; u < KB; u++)
+                if (base + 8 * u == jn)
+                    for (int d = 0; d < D4; d++) {
+                        rw.k[u][d] = ((threadgroup const float4*)(kn + lane * D))[d];
+                        rw.v[u][d] = ((threadgroup const float4*)(vn + lane * D))[d];
+                    }
+        for (int g = 0; g < G; g++) {
+            float s[KB];
+            float mx = m[g];
+            for (int u = 0; u < KB; u++) {
+                float4 acc = 0.f;
+                for (int d = 0; d < D4; d++) acc = fma(rw.k[u][d], qv[g][d], acc);
+                float dot = simd_sum((acc.x + acc.y) + (acc.z + acc.w));
+                s[u] = base + 8 * u < j1 ? dot : -INFINITY;
+                mx = max(mx, s[u]);
+            }
+            float al = mx == -INFINITY ? 1.f : exp(m[g] - mx);
+            float ls = l[g] * al;
+            for (int d = 0; d < D4; d++) o[g][d] *= al;
+            for (int u = 0; u < KB; u++) {
+                float e = s[u] == -INFINITY ? 0.f : exp(s[u] - mx);
+                ls += e;
+                for (int d = 0; d < D4; d++) o[g][d] = fma(e, rw.v[u][d], o[g][d]);
+            }
+            l[g] = ls;
+            m[g] = mx;
+        }
+        if (base + 8 * KB < j1) attv_load<D, KT>(rw, kb, vb, rs, base + 8 * KB, j1);
+    }
+    // The SIMD-groups combined, one head at a time: the output, or the chunk's partial result.
+    for (int g = 0; g < G; g++) {
+        uint h = h0 + g;
+        if (lane == 0) { sm[sg] = m[g]; sm[8 + sg] = l[g]; }
+        for (int d = 0; d < D4; d++) ((threadgroup float4*)(so + sg * HD + lane * D))[d] = o[g][d];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float M = sm[0];
+        for (uint s = 1; s < 8; s++) M = max(M, sm[s]);
+        float L = 0.f;
+        for (uint s = 0; s < 8; s++) L += sm[s] == -INFINITY ? 0.f : sm[8 + s] * exp(sm[s] - M);
+        for (uint i = tid; i < HD; i += 256) {
+            float acc = 0.f;
+            for (uint s = 0; s < 8; s++) if (sm[s] != -INFINITY) acc += so[s * HD + i] * exp(sm[s] - M);
+            if (p.nsplit > 1) {
+                device float* pp = part + ((ulong)h * p.nsplit + split) * (HD + 2);
+                pp[i] = acc;
+                if (i == 0) { pp[HD] = M; pp[HD + 1] = L; }
+                continue;
+            }
+            float r = acc / L;
+            if (p.has_gate != 0) { float gt = gate[p.g_off + h * p.g_stride + i]; r *= 1.0f / (1.0f + exp(-gt)); }
+            out[h * HD + i] = r;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (p.nsplit == 1) return;
+    // The last of the head group's threadgroups merges the chunks (`dec_attn_combine`'s
+    // arithmetic; the others' partials made visible by the fences around the counter).
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) sm[0] = atomic_fetch_add_explicit(cnt + hg, 1u, memory_order_relaxed) == p.nsplit - 1 ? 1.f : 0.f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sm[0] == 0.f) return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    uint ns = p.nsplit;
+    for (uint i = tid; i < G * HD; i += 256) {
+        uint h = h0 + i / HD, d = i % HD;
+        device const float* ph = part + (ulong)h * ns * (HD + 2);
+        float M = -INFINITY;
+        for (uint s = 0; s < ns; s++) M = max(M, ph[s * (HD + 2) + HD]);
+        float L = 0.f, acc = 0.f;
+        for (uint s = 0; s < ns; s++) {
+            float ms = ph[s * (HD + 2) + HD];
+            if (ms == -INFINITY) continue;
+            float f = exp(ms - M);
+            L += ph[s * (HD + 2) + HD + 1] * f;
+            acc += ph[s * (HD + 2) + d] * f;
+        }
+        float r = acc / L;
+        if (p.has_gate != 0) { float gt = gate[p.g_off + h * p.g_stride + d]; r *= 1.0f / (1.0f + exp(-gt)); }
+        out[h * HD + d] = r;
+    }
+    if (tid == 0) atomic_store_explicit(cnt + hg, 0u, memory_order_relaxed);
+}
+#define ATTV(NAME, D, G, KT) \
+kernel void NAME(device const float* q [[buffer(0)]], device const KT* kc [[buffer(1)]], device const KT* vc [[buffer(2)]], \
+                 device float* out [[buffer(3)]], device const float* gate [[buffer(4)]], constant AP& p [[buffer(5)]], \
+                 device float* part [[buffer(6)]], device atomic_uint* cnt [[buffer(7)]], \
+                 uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+                 uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+    threadgroup float sm[16]; threadgroup float so[8 * D * 32]; threadgroup float qs[G * D * 32]; \
+    AvRows<D> rw; attv_first<D, KT>(rw, kc, vc, p, tg.x, G, tg.y, sg, lane); \
+    attv_body<D, G, KT, false>(rw, q, kc, vc, out, gate, part, cnt, p, tg.x, tg.y, tid, sg, lane, sm, so, qs, nullptr, nullptr, 0xFFFFFFFFu); }
+#define ATTVR(NAME, D, G, KT) \
+kernel void NAME(device const float* qkv [[buffer(0)]], device KT* kc [[buffer(1)]], device KT* vc [[buffer(2)]], \
+                 device float* out [[buffer(3)]], device const float* gate [[buffer(4)]], constant AP& p [[buffer(5)]], \
+                 device float* part [[buffer(6)]], constant float* cs [[buffer(7)]], constant QP& rp [[buffer(8)]], \
+                 device const float* qn [[buffer(9)]], device const float* kn [[buffer(10)]], device float* qo [[buffer(11)]], \
+                 device atomic_uint* cnt [[buffer(12)]], \
+                 uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+                 uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+    threadgroup float sm[16]; threadgroup float so[(G + 2 > 8 ? G + 2 : 8) * D * 32]; threadgroup float qs[G * D * 32]; \
+    threadgroup float nkv[2 * D * 32]; threadgroup float red[(G + 2) * 16]; \
+    AvRows<D> rw; attv_first<D, KT>(rw, kc, vc, p, tg.x, G, tg.y, sg, lane); \
+    attnr_prep<D, G, KT>(qkv, qo, kc, vc, qn, kn, rp, cs, p, tg.x, tg.y, tid, sg, lane, so, red, qs, nkv, nkv + D * 32); \
+    attv_body<D, G, KT, true>(rw, qkv, kc, vc, out, gate, part, cnt, p, tg.x, tg.y, tid, sg, lane, sm, so, qs, nkv, nkv + D * 32, \
+                              rp.nkv != 0 ? rp.pos : 0xFFFFFFFFu); }
+#define ATTV_ALL(D, G) ATTV(dec_attv_##D##_##G, D, G, float) ATTV(dec_attv_h_##D##_##G, D, G, half) \
+    ATTVR(dec_attvr_##D##_##G, D, G, float) ATTVR(dec_attvr_h_##D##_##G, D, G, half)
+// (Heads of 128 and more: a lane's dimensions are whole float4s.)
+ATTV_ALL(4, 1) ATTV_ALL(4, 2) ATTV_ALL(4, 4)
+ATTV_ALL(8, 1) ATTV_ALL(8, 2) ATTV_ALL(8, 4) ATTV_ALL(16, 1) ATTV_ALL(16, 2)
+
 // ---- Gated DeltaNet ------------------------------------------------------------------------------
 // Causal depthwise conv (kernel kc) with SiLU, one thread per channel; the state [kc-1][dim] holds
 // the earlier inputs (oldest first) and shifts in this one. The state is read from `si` and
