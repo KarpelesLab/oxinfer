@@ -314,6 +314,29 @@ What is measured and where the gap to llama-server comes from:
   tokens' x loaded up front (registers: 2.5-25x slower), the tokens split over SIMD-groups
   sharing the weights, eight rows a lane. With the x loads gone entirely, 8 rows would still
   take about 22 ms a step: exactness keeps 8 rows above the fast kernels.
+- **Then: Q4_K pairs and LM heads, and adds the compiler no longer chooses.** At 6-8 tokens the
+  Q4_K gate / up pair takes two packed rows reduced token by token (12288 x 4096, 8 tokens: 622
+  -> 493 us), and matrices of 32768 rows or more (the LM heads) more rows a threadgroup (151936 x
+  4096 at 8 tokens: Q6_K 4874 -> 2762 us on two half rows, Q4_K 4894 -> 2975 and Q8_0 2952 ->
+  2640 on four packed ones; 4096-row matrices keep fewer, they would leave the GPU short of
+  threadgroups). Qwen3-8B Q4_K_M batched step (`rows_bench`, alternated with the previous build
+  three times): 8 rows 42.6 -> 38.6 ms; 1, 2 and 4 rows and Q8_0 unchanged (9.4 / 12.3 / 19.8,
+  14.8 / 15.4 / 19.8 / 34.2 ms). The per-token kinds now take rows of up to four chunks a lane
+  (`MvkGeo::c`, the lane's chunks decoded once and kept): exact, but slower than the kinds that
+  keep a sum per token and row for long rows (4096 x 12288 at 8 tokens, three chunks a lane: Q8_0
+  385 against 298 us, Q4_K 394 against 304), so no table takes them; `OXINFER_MVK_KIND` can.
+  Making a long row's one-token kernel take a chunk a lane on more SIMD-groups (12 for 12288
+  values, 16 for 14336) keeps its one-token speed for 12288 values (Q8_0 92.7 against 94.2 us,
+  Q4_K 60.1 / 60.2) and lets its multi-token kernels reduce token by token (8 tokens: Q8_0 298
+  -> 259, Q4_K 304 -> 273), but Q8_0 at 4 tokens loses (171 -> 204), 14336 values on 16 groups
+  lose at one token (Q4_K 64 -> 76 us), and on Qwen3-8B Q4_K_M with Q4_K rows alone it gave 8
+  rows -0.6 ms for 2 rows +0.25 ms: not kept. The one-token and multi-token kernels now add each
+  chunk's dot product to the lane's sum without contraction (`#pragma clang fp contract(off)` in
+  `mv_acc` and the `mvk_*` bodies): the compiler fused the last product of a chunk into the sum
+  where a loop's shape let it, so a kernel holding several chunks a lane matched the one-token
+  kernel in some instantiations and not in others (oxinfer Q8 on one row: 7.0046625 against
+  7.0046644). One-token decoding rounds differently from before by that fused add, at the same
+  speed.
 - **Mixtures of experts are batched exactly** (above); what is left of their gap at 8 rows is
   the dense matvecs' (attention, the dense MLP, the head) on the exact multi-token kernels.
 - **Mixed prompts: the prompts are read at llama.cpp's rate; the decode steps after them are the
@@ -360,7 +383,8 @@ What is measured and where the gap to llama-server comes from:
   arrive mid-reply, DSpark / prompt-lookup rounds hand over to plain batched steps at the next
   round boundary.
 
-Not done: exact multi-token kernels that scale past 4 rows, batched decode of DeepSeek V4,
+Not done: exact multi-token kernels as fast as the fast ones at 8 rows (see above), batched
+decode of DeepSeek V4,
 cross-session KV sharing
 in memory (sessions share prefixes through the prompt cache on disk only), and mixing prompt
 chunks and decode rows in one pass (llama.cpp's mixed batches: at most ~2% here with exact rows,

@@ -568,9 +568,15 @@ inline float mdot(MGen<W> f, uint row, uint c, thread const X32& xr) {
 
 // Lane partial sums of rows r0 .. r0 + NR - 1 of f (into acc) and, for a pair, of f2 (rows
 // shifted by r2off, into acc2), times `scale`.
+// The chunks' dot products (`mdot`) are added without contraction: the compiler would fuse the
+// last product of a chunk with the sum where a loop's shape lets it, and the multi-token kernels
+// (`mvk_*`), which loop otherwise, must add the same values the same way.
 template <typename F, typename X, uint CH, int NR, int KS>
 inline void mv_acc(F f, F f2, bool pair, uint r2off, device const float* x, uint n_in, uint n_out, uint r0, uint sg, uint lane,
                    thread float* acc, thread float* acc2, float scale) {
+    // (Each chunk's dot product rounded, then added: not fused with the sum, whatever the loop
+    // around it, so that every kernel adds the chunks alike; see `mv_acc`.)
+#pragma clang fp contract(off)
     uint rows[NR];
     for (int r = 0; r < NR; r++) rows[r] = min(r0 + r, n_out - 1);
     uint nch = n_in / CH;
@@ -1100,6 +1106,9 @@ inline void mvk_finish(thread float (&a)[T][NR], thread float (&b)[T][NR], bool 
 template <typename F, typename X, uint CH, int NR, int KS, int T, int H>
 inline void mvk_part(F f, F f2, device const float* x, device float* y, device const float* gate, uint nt, constant MVK& q, uint tg,
                      uint sg, uint lane, threadgroup float* red) {
+    // (Each chunk's dot product rounded, then added: not fused with the sum, whatever the loop
+    // around it, so that every kernel adds the chunks alike; see `mv_acc`.)
+#pragma clang fp contract(off)
     constant MV& p = q.m;
     const bool pair = p.mode == 2 || p.mode == 3 || p.mode == 6;
     const uint r0 = tg * NR, nch = p.n_in / CH;
@@ -1134,30 +1143,46 @@ inline void mvk_part(F f, F f2, device const float* x, device float* y, device c
     }
     mvk_finish<NR, KS, T>(a, b, pair, nt, y, q, r0, sg, lane, red, gate);
 }
-// Rows of one chunk a lane (`H` 6, 7, 8: mvk_part's kinds 0, 1, 3, for n_in <= KS 32 CH): each
-// token's lane sums reduced over the SIMD-group as soon as they are computed, rather than kept
-// for every token until the end (T NR fewer registers), then over the KS SIMD-groups as
-// mvk_finish does. The single-token kernel's arithmetic: one chunk a lane added to zero, the
-// SIMD-group sum, the KS sums in order.
-template <typename F, typename X, uint CH, int NR, int KS, int T, int H>
+// Rows of a few chunks a lane (`H` 6, 7, 8: mvk_part's kinds 0, 1, 3, for n_in <= C KS 32 CH):
+// every chunk of the lane's rows decoded once and kept, then each token's lane sums (the lane's
+// chunks in order, as the single-token kernel adds them) reduced over the SIMD-group as soon as
+// they are computed, rather than kept for every token until the end (T NR fewer registers), then
+// over the KS SIMD-groups as mvk_finish does. The single-token kernel's arithmetic: the lane's
+// chunks added to zero in order, the SIMD-group sum, the KS sums in order.
+template <typename F, typename X, uint CH, int NR, int KS, int T, int H, int C>
 inline void mvk_one(F f, F f2, device const float* x, device float* y, device const float* gate, constant MVK& q, uint tg,
                     uint sg, uint lane, threadgroup float* red) {
+    // (Each chunk's dot product rounded, then added: not fused with the sum, whatever the loop
+    // around it, so that every kernel adds the chunks alike; see `mv_acc`.)
+#pragma clang fp contract(off)
     constant MV& p = q.m;
     const bool pair = p.mode == 2 || p.mode == 3 || p.mode == 6;
     const uint r0 = tg * NR, nch = p.n_in / CH;
-    const uint c = sg * 32 + lane;
-    const bool on = c < nch;
-    const uint cc = on ? c : nch - 1;
-    typename WDec<F, H == 8 ? 3 : H - 6>::T w[NR], w2[NR];
-    for (int r = 0; r < NR; r++) wdec(f, min(r0 + r, p.n_out - 1), cc, w[r]);
-    if (pair)
-        for (int r = 0; r < NR; r++) wdec(f2, min(r0 + r, p.n_out - 1), cc, w2[r]);
+    uint cs[C];
+    bool on[C];
+    typename WDec<F, H == 8 ? 3 : H - 6>::T w[C][NR], w2[C][NR];
+    for (int k = 0; k < C; k++) {
+        uint c = sg * 32 + lane + uint(k) * KS * 32;
+        on[k] = c < nch;
+        cs[k] = on[k] ? c : nch - 1;
+        for (int r = 0; r < NR; r++) wdec(f, min(r0 + r, p.n_out - 1), cs[k], w[k][r]);
+        if (pair)
+            for (int r = 0; r < NR; r++) wdec(f2, min(r0 + r, p.n_out - 1), cs[k], w2[k][r]);
+    }
     for (int t = 0; t < T; t++) {
-        X xr;
-        xload(x + (ulong)t * q.sx, cc, xr);
+        float sa[NR], sb[NR];
+        for (int r = 0; r < NR; r++) { sa[r] = 0.f; sb[r] = 0.f; }
+        for (int k = 0; k < C; k++) {
+            X xr;
+            xload(x + (ulong)t * q.sx, cs[k], xr);
+            for (int r = 0; r < NR; r++) {
+                if (on[k]) sa[r] += wdot(f, w[k][r], cs[k], xr);
+                if (pair && on[k]) sb[r] += wdot(f2, w2[k][r], cs[k], xr);
+            }
+        }
         for (int r = 0; r < NR; r++) {
-            float va = simd_sum(on ? 0.f + wdot(f, w[r], c, xr) : 0.f);
-            float vb = pair ? simd_sum(on ? 0.f + wdot(f2, w2[r], c, xr) : 0.f) : 0.f;
+            float va = simd_sum(0.f + sa[r]);
+            float vb = pair ? simd_sum(0.f + sb[r]) : 0.f;
             if (KS == 1) {
                 if (lane == 0 && r0 + r < p.n_out) mvk_out(y + (ulong)t * q.sy, r0 + r, p.mode, va, vb, gate + (ulong)t * q.sgate);
             } else if (lane == 0) {
@@ -1210,6 +1235,9 @@ inline void mvk_tfinish(thread float* acc, thread float* acc2, device float* y, 
 template <typename F, typename X, uint CH, int NR, int KS>
 inline void mvk_sweeps(F f, F f2, device const float* x, device float* y, constant MVK& q, uint tg, uint sg, uint lane,
                        threadgroup float* red, device const float* gate) {
+    // (Each chunk's dot product rounded, then added: not fused with the sum, whatever the loop
+    // around it, so that every kernel adds the chunks alike; see `mv_acc`.)
+#pragma clang fp contract(off)
     constant MV& p = q.m;
     const bool pair = p.mode == 2 || p.mode == 3 || p.mode == 6;
     const uint r0 = tg * NR, nch = p.n_in / CH;
@@ -1250,11 +1278,11 @@ inline void mvk_sweeps(F f, F f2, device const float* x, device float* y, consta
 // Kernels of up to 8 tokens run exactly T (no bounds on the token loops); of up to 16, as many
 // as the step has in groups of 8, a sweep over the rows each (the rows' weights from the cache
 // after the first): accumulators for 16 tokens measured 2-3 times slower than two sweeps.
-template <typename F, typename X, uint CH, int NR, int KS, int T, int H>
+template <typename F, typename X, uint CH, int NR, int KS, int T, int H, int C>
 inline void mvk_body(F f, F f2, device const float* x, device float* y, constant MVK& q, uint tg, uint sg, uint lane,
                      threadgroup float* red, device const float* gate) {
     if (H >= 6 && T <= 8) {
-        mvk_one<F, X, CH, NR, KS, T, H>(f, f2, x, y, gate, q, tg, sg, lane, red);
+        mvk_one<F, X, CH, NR, KS, T, H, C>(f, f2, x, y, gate, q, tg, sg, lane, red);
         return;
     }
     if (H == 2) {
@@ -1285,29 +1313,29 @@ kernel void NAME(device const uchar* wb [[buffer(0)]], device const uchar* sb [[
 #define MVK_G(NR, KS, TT, H, G) threadgroup float redg[MVK_RED(NR, KS, TT, H) * G]; \
     threadgroup float* red = redg + (sg / KS) * MVK_RED(NR, KS, TT, H); \
     tg = tg * G + sg / KS; sg = sg % KS; constant MV& p = q.m;
-#define MVK_RAW(NAME, T, X, CH, NR, KS, TT, H, G) \
+#define MVK_RAW(NAME, T, X, CH, NR, KS, TT, H, G, C) \
 MVK_SIG(NAME) { MVK_G(NR, KS, TT, H, G) \
     T f = { wb + p.w_off, p.gpr }; T f2 = { wb2 + p.w2_off, p.gpr }; \
-    mvk_body<T, X, CH, NR, KS, TT, H>(f, f2, x, y, q, tg, sg, lane, red, gate); }
-#define MVK_Q8(NAME, NR, KS, TT, H, G) \
+    mvk_body<T, X, CH, NR, KS, TT, H, C>(f, f2, x, y, q, tg, sg, lane, red, gate); }
+#define MVK_Q8(NAME, NR, KS, TT, H, G, C) \
 MVK_SIG(NAME) { MVK_G(NR, KS, TT, H, G) \
     MQ8 f = { (device const char*)(wb + p.w_off), (device const float*)(sb + p.s_off), p.n_in }; \
     MQ8 f2 = { (device const char*)(wb2 + p.w2_off), (device const float*)(sb2 + p.s2_off), p.n_in }; \
-    mvk_body<MQ8, X16, 16, NR, KS, TT, H>(f, f2, x, y, q, tg, sg, lane, red, gate); }
-#define MVK_IQ4(NAME, NR, KS, TT, H, G) \
+    mvk_body<MQ8, X16, 16, NR, KS, TT, H, C>(f, f2, x, y, q, tg, sg, lane, red, gate); }
+#define MVK_IQ4(NAME, NR, KS, TT, H, G, C) \
 MVK_SIG(NAME) { threadgroup float kvt[16]; if (sg == 0 && lane < 16) kvt[lane] = kvalues_iq4nl[lane]; \
     threadgroup_barrier(mem_flags::mem_threadgroup); MVK_G(NR, KS, TT, H, G) \
     MIQ4_XS f = { wb + p.w_off, p.gpr, kvt }; MIQ4_XS f2 = { wb2 + p.w2_off, p.gpr, kvt }; \
-    mvk_body<MIQ4_XS, X32, 32, NR, KS, TT, H>(f, f2, x, y, q, tg, sg, lane, red, gate); }
-#define MVK_Q4(NAME, NR, KS, TT, H, G) \
+    mvk_body<MIQ4_XS, X32, 32, NR, KS, TT, H, C>(f, f2, x, y, q, tg, sg, lane, red, gate); }
+#define MVK_Q4(NAME, NR, KS, TT, H, G, C) \
 MVK_SIG(NAME) { MVK_G(NR, KS, TT, H, G) \
     MQ4 f = { wb + p.w_off, (device const half*)(sb + p.s_off), p.n_in, (device const ushort*)(ob + p.o_off), p.gpr, p.gk }; \
     MQ4 f2 = { wb2 + p.w2_off, (device const half*)(sb2 + p.s2_off), p.n_in, (device const ushort*)(ob2 + p.o2_off), p.gpr, p.gk }; \
-    mvk_body<MQ4, X32, 32, NR, KS, TT, H>(f, f2, x, y, q, tg, sg, lane, red, gate); }
-#define MVK_GEN(NAME, W, NR, KS, TT, H, G) \
+    mvk_body<MQ4, X32, 32, NR, KS, TT, H, C>(f, f2, x, y, q, tg, sg, lane, red, gate); }
+#define MVK_GEN(NAME, W, NR, KS, TT, H, G, C) \
 MVK_SIG(NAME) { MVK_G(NR, KS, TT, H, G) \
     MGen<W> f = { W{ { wb + p.w_off, p.gpr } } }; MGen<W> f2 = { W{ { wb2 + p.w2_off, p.gpr } } }; \
-    mvk_body<MGen<W>, X32, 32, NR, KS, TT, H>(f, f2, x, y, q, tg, sg, lane, red, gate); }
+    mvk_body<MGen<W>, X32, 32, NR, KS, TT, H, C>(f, f2, x, y, q, tg, sg, lane, red, gate); }
 
 // ---- RMSNorm over rows of n: out = x * rsqrt(mean(x^2) + eps) * w (w optional; `add`: out += ...).
 // One threadgroup per row.

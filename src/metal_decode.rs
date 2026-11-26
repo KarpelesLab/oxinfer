@@ -30,7 +30,7 @@ pub(crate) fn mvk_variant(fmt: MvFmt, n_out: usize, n_in: usize, ks: usize, tt: 
     let (nr, kind, g) = if pair {
         mvk_pair_table(fmt, long, ks, tt)
     } else {
-        let (nr, kind) = mvk_table(fmt, long, ks, tt);
+        let (nr, kind) = mvk_table(fmt, long, n_out >= MVK_TALL, ks, tt);
         (nr, kind, 1)
     };
     // Few rows: a threadgroup each, to spread them over the GPU.
@@ -45,16 +45,21 @@ pub(crate) fn mvk_variant(fmt: MvFmt, n_out: usize, n_in: usize, ks: usize, tt: 
         )
     });
     let kind = h.map_or(kind, |k| MvkKind::ALL[k]);
+    // (Reduced token by token: rows of up to MVK_MAX_C chunks a lane, up to 8 tokens.)
+    let c = mvk_lane_chunks(fmt, n_in, ks);
+    let far = c > MVK_MAX_C || tt > 8;
     let kind = match kind {
         _ if !kind.ok(fmt) => MvkKind::Float,
-        // (Reduced token by token: rows of one chunk a lane, up to 8 tokens.)
-        MvkKind::OneF if long || tt > 8 => MvkKind::Float,
-        MvkKind::OneH if long || tt > 8 => MvkKind::Half,
-        MvkKind::OneP if long || tt > 8 => MvkKind::Packed,
+        MvkKind::OneF if far => MvkKind::Float,
+        MvkKind::OneH if far => MvkKind::Half,
+        MvkKind::OneP if far => MvkKind::Packed,
         k => k,
     };
     let nr = r.unwrap_or(nr);
-    let geo = MvkGeo { g: eg.unwrap_or(g) };
+    let geo = MvkGeo {
+        g: eg.unwrap_or(g),
+        c: if kind.per_token() { c } else { 1 },
+    };
     (nr, kind, if geo.valid(nr, ks, tt, kind) { geo } else { MvkGeo::ONE })
 }
 
@@ -93,19 +98,39 @@ fn mvk_bench_list(k: &str, d: &str) -> Vec<usize> {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) struct MvkGeo {
     pub g: usize,
+    /// Chunks a lane of the kinds reduced token by token ([`MvkKind::per_token`]; 1 for the
+    /// others): the row length in chunks over the SIMD-groups' lanes, at most [`MVK_MAX_C`].
+    pub c: usize,
 }
 
+/// Most chunks a lane of the kinds reduced token by token (their decoded quants all kept).
+pub(crate) const MVK_MAX_C: usize = 4;
+
 impl MvkGeo {
-    pub(crate) const ONE: MvkGeo = MvkGeo { g: 1 };
+    pub(crate) const ONE: MvkGeo = MvkGeo { g: 1, c: 1 };
     fn valid(self, nr: usize, ks: usize, tt: usize, kind: MvkKind) -> bool {
         // Threadgroup memory: the reductions' sums (`MVK_RED`).
         let red = 2 * nr * ks * if kind == MvkKind::Sweeps { 1 } else { tt.min(8) } * self.g;
-        self.g.is_power_of_two() && 32 * ks * self.g <= 1024 && 4 * red <= 16384
+        let c_ok = if kind.per_token() {
+            (1..=MVK_MAX_C).contains(&self.c) && tt <= 8
+        } else {
+            self.c == 1
+        };
+        c_ok && self.g.is_power_of_two() && 32 * ks * self.g <= 1024 && 4 * red <= 16384
     }
     /// The kernel name's suffix.
     fn suffix(self) -> String {
-        if self.g > 1 { format!("_g{}", self.g) } else { String::new() }
+        let mut s = if self.g > 1 { format!("_g{}", self.g) } else { String::new() };
+        if self.c > 1 {
+            s += &format!("_c{}", self.c);
+        }
+        s
     }
+}
+
+/// Chunks a lane for a row of `n_in` values of `fmt` on `ks` SIMD-groups.
+pub(crate) fn mvk_lane_chunks(fmt: MvFmt, n_in: usize, ks: usize) -> usize {
+    (n_in / fmt.chunk()).div_ceil(32 * ks).max(1)
 }
 
 /// [`mvk_table`] for SiLU / GELU pairs, where each lane holds both matrices' decoded chunks: one
@@ -113,9 +138,14 @@ impl MvkGeo {
 /// with `OXINFER_MVK_PAIR=1`, 12288 x 4096 and 4096 x 4096 pairs: Q8_0 at 8 tokens 851 us with two
 /// float rows, 375 with one half; Q4_K 2183 / 540; at 16 tokens Q4_K 1379 in sweeps against
 /// 1463-5073).
-fn mvk_pair_table(fmt: MvFmt, _long: bool, _ks: usize, tt: usize) -> (usize, MvkKind, usize) {
+fn mvk_pair_table(fmt: MvFmt, long: bool, ks: usize, tt: usize) -> (usize, MvkKind, usize) {
     if tt > 8 {
         return (2, MvkKind::Sweeps, 1);
+    }
+    // Q4_K pairs of rows of one chunk a lane at 6-8 tokens: two packed rows reduced token by
+    // token (12288 x 4096 pair, 8 tokens: 622 -> 493 us).
+    if !long && ks > 1 && tt >= 6 && fmt == MvFmt::Gguf(GgmlType::Q4_K) {
+        return (2, MvkKind::OneP, 1);
     }
     (
         1,
@@ -136,6 +166,10 @@ fn mvk_pair_table(fmt: MvFmt, _long: bool, _ks: usize, tt: usize) -> (usize, Mvk
 
 /// Matrices of fewer rows take one row a threadgroup ([`mvk_variant`]).
 const MVK_FEW_ROWS: usize = 1024;
+
+/// Matrices of this many rows or more (LM heads) take more rows a threadgroup at 6-8 tokens
+/// ([`mvk_table`]): their threadgroups are many enough to keep the GPU busy anyway.
+const MVK_TALL: usize = 32768;
 
 /// How a multi-token matvec kernel runs its tokens (the shader's `H`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -172,6 +206,10 @@ impl MvkKind {
     fn suffix(self) -> &'static str {
         ["", "h", "s", "p", "", "", "o", "oh", "op"][self as usize]
     }
+    /// The kinds reduced token by token (`mvk_one` in the shader).
+    pub(crate) fn per_token(self) -> bool {
+        matches!(self, MvkKind::OneF | MvkKind::OneH | MvkKind::OneP)
+    }
     /// Whether the format's kernels have this kind.
     fn ok(self, fmt: MvFmt) -> bool {
         !matches!(self, MvkKind::Packed | MvkKind::OneP) || fmt.packs()
@@ -186,7 +224,7 @@ impl MvkKind {
 /// one row where its registers would cost more. Half rows pay for Q4_0 / oxinfer Q4 on 4
 /// SIMD-groups and the K-quants of long rows; float rows for Q5_K (its merged fifth bit) and
 /// Q8_0 at 4 tokens or more.
-fn mvk_table(fmt: MvFmt, long: bool, ks: usize, tt: usize) -> (usize, MvkKind) {
+fn mvk_table(fmt: MvFmt, long: bool, tall: bool, ks: usize, tt: usize) -> (usize, MvkKind) {
     use GgmlType::*;
     use MvkKind::*;
     let many = tt >= 6;
@@ -207,6 +245,15 @@ fn mvk_table(fmt: MvFmt, long: bool, ks: usize, tt: usize) -> (usize, MvkKind) {
     // Rows of one chunk a lane on several SIMD-groups (4096 values on 4), 6 to 8 tokens: each
     // token reduced as it comes (`MvkKind::OneF`; 4096 x 4096 at 8 tokens: Q8_0 92 -> 63 us, Q4_K
     // 90 -> 78, Q4_0 80 -> 72).
+    // LM heads (151936 x 4096) at 6-8 tokens: more rows a threadgroup (8 tokens: Q6_K 4874 ->
+    // 2762 us, Q4_K 4894 -> 2975, Q8_0 2952 -> 2640).
+    if !long && tall && ks > 1 && many {
+        match fmt {
+            MvFmt::Gguf(Q8_0 | Q4_K) => return (4, OneP),
+            MvFmt::Gguf(Q6_K) => return (2, OneH),
+            _ => {}
+        }
+    }
     if !long && ks > 1 && many {
         match fmt {
             MvFmt::Gguf(Q8_0) => return (2, OneF),
@@ -306,7 +353,7 @@ impl MvFmt {
             rest.strip_suffix(')')
                 .unwrap()
                 .replacen(&format!("mv_{}_{nr}_{ks}", self.name()), &self.mvk_name(nr, ks, tt, kind, g), 1);
-        format!("{}({rest}, {tt}, {}, {})", mac.replacen("MV_", "MVK_", 1), kind as u8, g.g)
+        format!("{}({rest}, {tt}, {}, {}, {})", mac.replacen("MV_", "MVK_", 1), kind as u8, g.g, g.c)
     }
     fn mvk_name(self, nr: usize, ks: usize, tt: usize, kind: MvkKind, g: MvkGeo) -> String {
         format!("mvk_{}_{nr}_{ks}_{tt}{}{}", self.name(), kind.suffix(), g.suffix())
@@ -460,9 +507,13 @@ pub(crate) fn shader_src() -> String {
                         for nr in mvk_bench_list("OXINFER_MVK_NR", "1,2,4") {
                             for &k in &ks_ {
                                 for &g in &gs {
-                                    let (k, g) = (MvkKind::ALL[k.min(8)], MvkGeo { g });
-                                    if g.valid(nr, ks, tt, k) && k.ok(f) {
-                                        v.push((nr, k, g));
+                                    let k = MvkKind::ALL[k.min(8)];
+                                    let cs = if k.per_token() { 1..=MVK_MAX_C } else { 1..=1 };
+                                    for c in cs {
+                                        let g = MvkGeo { g, c };
+                                        if g.valid(nr, ks, tt, k) && k.ok(f) {
+                                            v.push((nr, k, g));
+                                        }
                                     }
                                 }
                             }
@@ -471,13 +522,14 @@ pub(crate) fn shader_src() -> String {
                     } else {
                         let chunk = f.chunk() * 32 * ks;
                         let few = MVK_FEW_ROWS - 1;
-                        [chunk, 2 * chunk]
-                            .into_iter()
+                        (1..=MVK_MAX_C + 1)
+                            .map(|c| c * chunk)
                             .flat_map(|n_in| {
                                 [false, true].into_iter().flat_map(move |pair| {
                                     [
                                         mvk_variant(f, MVK_FEW_ROWS, n_in, ks, tt, pair),
                                         mvk_variant(f, few, n_in, ks, tt, pair),
+                                        mvk_variant(f, MVK_TALL, n_in, ks, tt, pair),
                                     ]
                                 })
                             })
@@ -9979,7 +10031,13 @@ mod tests {
         let mut fmts: Vec<(MvFmt, u32)> = all_formats().into_iter().map(|f| (f, 0)).collect();
         fmts.push((MvFmt::Q4, 2));
         fmts.push((MvFmt::Q4, 1));
-        let shapes: &[(usize, usize, &[usize])] = &[(37, 512, &[2, 5, 8, 11]), (19, 4096, &[3, 8]), (13, 1536, &[4, 16])];
+        let shapes: &[(usize, usize, &[usize])] = &[
+            (37, 512, &[2, 5, 8, 11]),
+            (19, 4096, &[3, 8]),
+            (13, 1536, &[4, 16]),
+            (11, 3072, &[6, 7]),
+            (5, 12288, &[2, 8]),
+        ];
         for &(fmt, gk) in &fmts {
             for &(n_out, n_in, toks) in shapes {
                 let (d1, s1, _) = matrix(fmt, n_out, n_in, &mut seed);
@@ -10751,7 +10809,7 @@ mod tests {
             env("OXINFER_MVK_NR", "1,2,4")
                 .split(',')
                 .flat_map(|v| hs.iter().map(move |&h| (v.parse().unwrap(), h)))
-                .flat_map(|(nr, h)| gs.iter().map(move |&g| (nr, h, MvkGeo { g })))
+                .flat_map(|(nr, h)| gs.iter().map(move |&g| (nr, h, MvkGeo { g, c: 1 })))
                 .collect()
         } else {
             vec![(0, MvkKind::Float, MvkGeo::ONE)]
@@ -10840,9 +10898,16 @@ mod tests {
                         } else {
                             (nr, kind, g)
                         };
-                        // (The reduced-per-token kinds take rows of one chunk a lane, up to 8 tokens.)
-                        let per_tok = matches!(kind, MvkKind::OneF | MvkKind::OneH | MvkKind::OneP);
-                        if !g.valid(nr, ks, tt, kind) || !kind.ok(fmt) || (per_tok && (n_in / fmt.chunk() > 32 * ks || tt > 8)) {
+                        // (The reduced-per-token kinds: as many chunks a lane as the row takes.)
+                        let g = if kind.per_token() {
+                            MvkGeo {
+                                c: mvk_lane_chunks(fmt, n_in, ks),
+                                ..g
+                            }
+                        } else {
+                            g
+                        };
+                        if !g.valid(nr, ks, tt, kind) || !kind.ok(fmt) {
                             continue;
                         }
                         let Some(pipe) = be.mvk_pipe(fmt, nr, ks, tt, kind, g) else {
