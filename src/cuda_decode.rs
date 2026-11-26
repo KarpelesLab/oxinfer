@@ -191,6 +191,16 @@ enum COp {
     },
     /// A matvec over a ggml block format (`mv_K`): mode 0 stores, 1 adds; every token of the step
     /// in one launch. `fg`: the GEMM (`gemmi_K`) prefill plans take instead.
+    /// Two or three `Gmv` stores over one x in one format (decode plans: q / k / v), one
+    /// `mvq3_K` launch (`n[2]` 0: two).
+    Gmv3 {
+        k: super::GgKernels,
+        w: [Wg; 3],
+        x: P,
+        y: [P; 3],
+        n: [u32; 3],
+        n_in: u32,
+    },
     Gmv {
         k: super::GgKernels,
         w: Wg,
@@ -370,6 +380,7 @@ impl COp {
         match self {
             COp::Mv { w, x, y, gate, .. } => vec![&mut w.q, &mut x.a, &mut y.a, &mut gate.a],
             COp::Gmv { x, y, .. } => vec![&mut x.a, &mut y.a],
+            COp::Gmv3 { x, y: [a, b, c], .. } => vec![&mut x.a, &mut a.a, &mut b.a, &mut c.a],
             COp::Topk { logits, sel, scale, .. } => vec![&mut logits.a, &mut sel.a, &mut scale.a],
             COp::Experts { x, act, y, sel, lora, .. } => {
                 let mut v = vec![&mut x.a, &mut act.a, &mut y.a, &mut sel.a];
@@ -484,6 +495,11 @@ pub(super) struct CudaPlan<'b> {
     /// The input (address, width) of the op after the one launching, when it is a GEMM: a norm or
     /// GLU writing that input writes its f16 rows too (`dnorm_h`, `dglu_th`) and sets `xh_last`.
     xh_next: std::cell::Cell<(u64, u32)>,
+    /// Single-token steps as a CUDA graph (one launch instead of a few hundred): the instantiated
+    /// graph with what it was recorded for (the ops run and the session's device buffers), made
+    /// again when that changes. `graph_off`: recording failed once. `OXINFER_CUDA_GRAPH=0` off.
+    graph: std::cell::RefCell<Option<(Vec<u64>, *mut c_void)>>,
+    graph_off: std::cell::Cell<bool>,
     /// Prefill plans: each cache's new keys and values go down on a stream of their own as soon
     /// as the op writing them last has run (per cache, an event when written and one when
     /// landed in `kv_pinned`), and a host thread stages them into the host caches under the
@@ -586,6 +602,9 @@ unsafe impl Sync for CudaPlan<'_> {}
 impl Drop for CudaPlan<'_> {
     fn drop(&mut self) {
         if self.be.bind() {
+            if let Some((_, exec)) = self.graph.take() {
+                self.be.graph_free(exec);
+            }
             for &p in &self.owned {
                 unsafe { self.be.cu.cuMemFree_v2(p) };
             }
@@ -949,14 +968,56 @@ impl CudaBackend {
                             }
                             let (k, wg) = Wg::of(cw)?;
                             let mut mv = |k: super::GgKernels, w: Wg, y: P, mode: u32| {
+                                // A store after one of the same format over the same x (q / k
+                                // / v): one launch for up to three (`Gmv3`), not across the head.
+                                let (xp, n_out, n_in) = (byte(x), n_out as u32, n_in as u32);
+                                if !pf && mode == 0 && !k.mvq3.is_null() && head_from != ops.len() {
+                                    let same = |a: &P| a.a == xp.a && a.ts == xp.ts;
+                                    match ops.last_mut() {
+                                        Some(&mut COp::Gmv {
+                                            k: k0,
+                                            w: w0,
+                                            w2: None,
+                                            x: x0,
+                                            y: y0,
+                                            n_out: n0,
+                                            n_in: i0,
+                                            mode: 0,
+                                        }) if same(&x0) && i0 == n_in && k0.mvq3 == k.mvq3 && y0.a != xp.a => {
+                                            *ops.last_mut().unwrap() = COp::Gmv3 {
+                                                k: k0,
+                                                w: [w0, w, w],
+                                                x: x0,
+                                                y: [y0, y, P::default()],
+                                                n: [n0, n_out, 0],
+                                                n_in,
+                                            };
+                                            return;
+                                        }
+                                        Some(COp::Gmv3 {
+                                            k: k0,
+                                            w: ws,
+                                            x: x0,
+                                            y: ys,
+                                            n,
+                                            n_in: i0,
+                                        }) if same(x0) && *i0 == n_in && k0.mvq3 == k.mvq3 && n[2] == 0 && ys[1].a != xp.a => {
+                                            ws[2] = w;
+                                            ys[2] = y;
+                                            n[2] = n_out;
+                                            return;
+                                        }
+                                        _ => {}
+                                    }
+                                }
                                 ops.push(COp::Gmv {
                                     k,
                                     w,
                                     w2: None,
-                                    x: byte(x),
+                                    x: xp,
                                     y,
-                                    n_out: n_out as u32,
-                                    n_in: n_in as u32,
+                                    n_out,
+                                    n_in,
                                     mode,
                                 })
                             };
@@ -1596,6 +1657,8 @@ impl CudaBackend {
             q8_last: Default::default(),
             xh_last: Default::default(),
             xh_next: Default::default(),
+            graph: Default::default(),
+            graph_off: std::cell::Cell::new(std::env::var("OXINFER_CUDA_GRAPH").is_ok_and(|v| v == "0")),
             kv_stream: {
                 let mut st: *mut c_void = std::ptr::null_mut();
                 if !kv_async || unsafe { self.cu.cuStreamCreate(&mut st, 1) } != 0 {
@@ -1784,6 +1847,9 @@ impl CudaPlan<'_> {
                     32 * MV_ROWS,
                     &mut args![w, w2, x, y, n_out, n_in, mode, gate],
                 )
+            }
+            COp::Gmv3 { k, w, x, y, n, n_in } => {
+                self.launch_gmv3(&k, w, x.at(j), 1, [y[0].at(j), y[1].at(j), y[2].at(j)], [0; 3], n, n_in, 1)
             }
             COp::Gmv {
                 k,
@@ -2265,6 +2331,48 @@ impl CudaPlan<'_> {
         })
     }
 
+    /// A `Gmv3`: the int8 kernel over the three at once, or (int8 off) each with `mv_K`.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gmv3(
+        &self,
+        k: &super::GgKernels,
+        w: [Wg; 3],
+        x: u64,
+        xs: u32,
+        y: [u64; 3],
+        ys: [u32; 3],
+        n: [u32; 3],
+        n_in: u32,
+        t: u32,
+    ) -> bool {
+        let be = self.be;
+        if self.q8x.0 == 0 {
+            return (0..3).filter(|&i| n[i] > 0).all(|i| {
+                let (wi, yi, ni, ysi) = (w[i], y[i], n[i], ys[i]);
+                be.launch(
+                    k.mv,
+                    (ni.div_ceil(k.mv_block), t),
+                    k.mv_threads,
+                    &mut args![wi, x, yi, n_in, ni, xs, ysi, 0u32],
+                )
+            });
+        }
+        let (xq, xd) = self.q8x;
+        let rows = k.mv_threads / 32;
+        let key = (x, xs, n_in, t);
+        let fresh = self.q8_last.get() == key;
+        self.q8_last.set(key);
+        let blocks: u32 = n.iter().map(|&m| m.div_ceil(rows)).sum();
+        let ([w0, w1, w2], [y0, y1, y2], [n0, n1, n2], [s0, s1, s2]) = (w, y, n, ys);
+        (fresh || be.launch(k.dq8_x, ((n_in / 32).div_ceil(8), t), 256, &mut args![x, n_in, xs, xq, xd]))
+            && be.launch(
+                k.mvq3,
+                (blocks, t),
+                k.mv_threads,
+                &mut args![w0, w1, w2, xq, xd, y0, y1, y2, n_in, n0, n1, n2, s0, s1, s2],
+            )
+    }
+
     /// The int8 matvec (or gate / up pair) over `t` rows of x (`xs` floats apart): x rounded to
     /// int8 into the plan's rows (`dq8_x`), then `mvq_K` / `mvqp_K` with a grid row per token.
     #[allow(clippy::too_many_arguments)]
@@ -2339,6 +2447,20 @@ impl CudaPlan<'_> {
                         &mut args![w, w2, xa, xs, ya, ys, n_out, n_in, mode, ga, gs, nt],
                     )
                 });
+            }
+            COp::Gmv3 { k, w, x, y, n, n_in } if t > 1 => {
+                let st = |p: P| (p.ts / 4) as u32;
+                return self.launch_gmv3(
+                    &k,
+                    w,
+                    x.a,
+                    st(x),
+                    [y[0].a, y[1].a, y[2].a],
+                    [st(y[0]), st(y[1]), st(y[2])],
+                    n,
+                    n_in,
+                    t as u32,
+                );
             }
             COp::Gmv {
                 k,
@@ -2517,9 +2639,32 @@ impl DecodePlan for CudaPlan<'_> {
                 Some(at)
             })
             .collect();
+        // A single-token step without copies interleaved runs as a graph: replayed when recorded
+        // for the same ops and device buffers, else recorded (the launches below become its
+        // nodes) and then run.
+        let graph_key = (t == 1 && !per_op && stager.is_none() && !queue && !self.graph_off.get()).then(|| {
+            let mut k = vec![end as u64];
+            k.extend(ms.kv.iter().flat_map(|m| [m.k, m.v]));
+            k.extend(ms.states.iter().map(|s| s.0));
+            k
+        });
+        let replay = match (&graph_key, &*self.graph.borrow()) {
+            (Some(k), Some((gk, exec))) if k == gk => Some(*exec),
+            _ => None,
+        };
+        if let Some(exec) = replay
+            && !be.graph_launch(exec)
+        {
+            return false;
+        }
+        let replayed = replay.is_some();
+        let recording = !replayed && graph_key.is_some() && be.graph_begin();
         for (i, op) in self.ops[..end].iter().enumerate() {
+            if replayed {
+                break;
+            }
             let ts = std::time::Instant::now();
-            if !matches!(op, COp::Gmv { .. }) {
+            if !matches!(op, COp::Gmv { .. } | COp::Gmv3 { .. }) {
                 self.q8_last.set(Default::default());
                 self.xh_last.set(Default::default());
             }
@@ -2529,10 +2674,22 @@ impl DecodePlan for CudaPlan<'_> {
             });
             if !self.launch_tokens(op, ms, t) {
                 debug(&format!("step of {t} token(s): op {i} of {} did not launch", self.ops.len()));
+                if recording {
+                    // Not as a graph from now on (the step falls back as before).
+                    if let Some(exec) = be.graph_end() {
+                        be.graph_free(exec);
+                    }
+                    self.graph_off.set(true);
+                }
                 return false;
             }
             // A matvec writing into the rounded / converted x's rows makes them stale.
-            if let COp::Gmv { y, n_out, .. } = *op {
+            let outs: [(P, u32); 3] = match *op {
+                COp::Gmv { y, n_out, .. } => [(y, n_out), Default::default(), Default::default()],
+                COp::Gmv3 { y, n, .. } => [(y[0], n[0]), (y[1], n[1]), (y[2], n[2])],
+                _ => Default::default(),
+            };
+            for (y, n_out) in outs.into_iter().filter(|o| o.1 > 0) {
                 let y1 = y.a + (t as u64 - 1) * y.ts + 4 * n_out as u64;
                 for c in [&self.q8_last, &self.xh_last] {
                     let (x0, xs, n, tt) = c.get();
@@ -2547,7 +2704,7 @@ impl DecodePlan for CudaPlan<'_> {
                 let k = match op {
                     COp::Mv { fk: Some(_), .. } => "matvec",
                     COp::Mv { .. } => "matvec-1",
-                    COp::Gmv { .. } => "matvec-ggml",
+                    COp::Gmv { .. } | COp::Gmv3 { .. } => "matvec-ggml",
                     COp::Topk { .. } => "topk",
                     COp::Experts { .. } => "experts",
                     COp::Norm { .. } => "norm",
@@ -2596,6 +2753,18 @@ impl DecodePlan for CudaPlan<'_> {
                     }
                     queued += 1;
                 }
+            }
+        }
+        if recording {
+            let Some(exec) = be.graph_end() else {
+                self.graph_off.set(true);
+                return false;
+            };
+            if let Some((_, old)) = self.graph.replace(Some((graph_key.unwrap_or_default(), exec))) {
+                be.graph_free(old);
+            }
+            if !be.graph_launch(exec) {
+                return false;
             }
         }
         // States no op wrote (none in practice) go down after everything.

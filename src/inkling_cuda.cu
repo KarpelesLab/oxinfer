@@ -2242,10 +2242,11 @@ __device__ __forceinline__ float mvq_dot(const u8* rp, u32 b, const int* xq, flo
 #define MVQ_ROWS 1
 #endif
 template <int K, bool PAIR>
-__device__ __forceinline__ void mvq_body(const W& w, const W& w2, const u8* xq, const float2* xd, float* y, u32 n_in, u32 n_out, u32 ys, u32 mode) {
+__device__ __forceinline__ void mvq_body(const W& w, const W& w2, const u8* xq, const float2* xd, float* y, u32 n_in, u32 n_out, u32 ys, u32 mode,
+                                         u32 bx) {
     if constexpr (has_mvq<K>()) {
         u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-        u32 r0 = (blockIdx.x * (blockDim.x >> 5) + warp) * MVQ_ROWS;
+        u32 r0 = (bx * (blockDim.x >> 5) + warp) * MVQ_ROWS;
         if (r0 >= n_out) return;
         u32 nb = n_in / 32;
         const int4* xr = (const int4*)(xq + (u64)blockIdx.y * n_in);
@@ -2285,6 +2286,20 @@ __device__ __forceinline__ void mvq_body(const W& w, const W& w2, const u8* xq, 
             }
         }
     }
+}
+// Up to three matvecs over one x in one launch (`mvq3_K`: the q / k / v of a layer, one format):
+// the grid's blocks are the three's `mvq_K` blocks in turn (n2 0: two), each block's sums its own
+// launch's.
+template <int K>
+__device__ __forceinline__ void mvq3_body(const W& w0, const W& w1, const W& w2, const u8* xq, const float2* xd, float* y0, float* y1, float* y2,
+                                          u32 n_in, u32 n0, u32 n1, u32 n2, u32 ys0, u32 ys1, u32 ys2) {
+    u32 rpb = (blockDim.x >> 5) * MVQ_ROWS, b0 = (n0 + rpb - 1) / rpb, b1 = (n1 + rpb - 1) / rpb, b = blockIdx.x;
+    if (b < b0)
+        mvq_body<K, false>(w0, w0, xq, xd, y0, n_in, n0, ys0, 0, b);
+    else if (b < b0 + b1)
+        mvq_body<K, false>(w1, w1, xq, xd, y1, n_in, n1, ys1, 0, b - b0);
+    else
+        mvq_body<K, false>(w2, w2, xq, xd, y2, n_in, n2, ys2, 0, b - b0 - b1);
 }
 // x's rows (n floats, xs apart; grid (blocks, rows), a warp per block of 32) rounded to int8 for
 // `mvq_K`: rows of n bytes at xq, per block (d, d sum q) at xd (rows of n / 32).
@@ -2336,11 +2351,15 @@ __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
     extern "C" __global__ void __launch_bounds__(256, 1) gemmhk2_##K(W w, GemmH p, float* fix) { gemmhk_body<K, 256, 256>(w, p, fix); } \
     extern "C" __global__ void __launch_bounds__(256)                                                                                      \
         mvq_##K(W w, const u8* xq, const float2* xd, float* y, u32 n_in, u32 n_out, u32 ys, u32 mode) {                                  \
-        mvq_body<K, false>(w, w, xq, xd, y, n_in, n_out, ys, mode);                                                                        \
+        mvq_body<K, false>(w, w, xq, xd, y, n_in, n_out, ys, mode, blockIdx.x);                                                            \
     }                                                                                                                                      \
     extern "C" __global__ void __launch_bounds__(256)                                                                                      \
         mvqp_##K(W w, W w2, const u8* xq, const float2* xd, float* y, u32 n_in, u32 n_out, u32 ys, u32 gelu) {                           \
-        mvq_body<K, true>(w, w2, xq, xd, y, n_in, n_out, ys, gelu);                                                                        \
+        mvq_body<K, true>(w, w2, xq, xd, y, n_in, n_out, ys, gelu, blockIdx.x);                                                            \
+    }                                                                                                                                      \
+    extern "C" __global__ void __launch_bounds__(256) mvq3_##K(W w0, W w1, W w2, const u8* xq, const float2* xd, float* y0, float* y1,      \
+                                                               float* y2, u32 n_in, u32 n0, u32 n1, u32 n2, u32 ys0, u32 ys1, u32 ys2) {   \
+        mvq3_body<K>(w0, w1, w2, xq, xd, y0, y1, y2, n_in, n0, n1, n2, ys0, ys1, ys2);                                                   \
     }
 // The stream-K GEMM's second pass (grid (blocks of `gemmhk`, bm / 8), `fix` as its, bm its
 // tile's rows): a block whose share ends inside a tile it began adds, to 8 rows of the tile

@@ -254,7 +254,16 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   default; `gpu_exact=1` (or `OXINFER_CUDA_MVQ=0`) keeps f32 activations. Greedy decoding (64
   tokens of four `pf_check` prompts) agrees with the CPU's at least as far as the f32 matvec's:
   all four the same with both on three, and on the fourth (Qwen3-8B, 40 tokens) the int8 one
-  agrees with the CPU for all 64 tokens where the f32 one parts at the 43rd.
+  agrees with the CPU for all 64 tokens where the f32 one parts at the 43rd. Single-token steps
+  run as a CUDA graph (one `cuGraphLaunch` for the step's few hundred kernels, recorded on the
+  first step and again when the session's device buffers or the ops run change; steps with
+  copies interleaved and the per-op trace launch as before; `OXINFER_CUDA_GRAPH=0` off): the
+  host queues a step in 14 us instead of 415 (Llama-3.2-1B) / 727 (Qwen3-8B), and the GPU's
+  time per token goes 969 -> 934 us / 4346 -> 4263 (idle RTX PRO 6000, `--no-lookup`), the
+  kernels' own gaps being small already. Consecutive int8 matvecs of one format over one x (a
+  layer's q / k / v) run as one launch (`mvq3_K`, each block one matrix's `mvq_K` block, the
+  same sums bit for bit, `cuda::tests`), so the small k / v ones do not take the GPU alone:
+  934 -> 898 us / 4263 -> 4180; plain decode 844 -> 917 tok/s and 209.8 -> 218.9.
 - **Prompts, whole pass** (`decode_plan_prefill`, steps of up to 512 tokens,
   `OXINFER_CUDA_PREFILL_TOKENS`; `OXINFER_PREFILL_GPU=0` keeps the op-by-op path): the matmuls as
   tensor-core GEMMs. By default (`gemmh_*`) the activations go in as f16 rows (converted once per

@@ -105,6 +105,25 @@ pub(crate) fn usable_free(free: usize, total: usize) -> usize {
     crate::platform::memory_headroom().map_or(free, |h| h.min(total as u64) as usize)
 }
 
+/// `CUDA_KERNEL_NODE_PARAMS_v2`.
+#[repr(C)]
+pub struct KernelNodeParams {
+    func: *mut c_void,
+    grid: [u32; 3],
+    block: [u32; 3],
+    shmem: u32,
+    params: *mut *mut c_void,
+    extra: *mut *mut c_void,
+    kern: *mut c_void,
+    ctx: *mut c_void,
+}
+
+std::thread_local! {
+    /// While a decode plan records a step as a CUDA graph (`graph_begin`): the graph and its last
+    /// node; launches on this thread become nodes after it instead of running.
+    static GRAPH_REC: std::cell::Cell<Option<(*mut c_void, *mut c_void)>> = const { std::cell::Cell::new(None) };
+}
+
 dlsym::library! {
     pub struct Cu {
         unsafe extern "C" {
@@ -139,6 +158,20 @@ dlsym::library! {
             pub fn cuCtxSynchronize() -> c_int;
             #[optional]
             pub fn cuGetErrorString(err: c_int, s: *mut *const c_char) -> c_int;
+            #[optional]
+            pub fn cuGraphCreate(g: *mut *mut c_void, flags: u32) -> c_int;
+            #[optional]
+            pub fn cuGraphAddKernelNode_v2(
+                node: *mut *mut c_void, g: *mut c_void, deps: *const *mut c_void, n: usize, p: *const KernelNodeParams,
+            ) -> c_int;
+            #[optional]
+            pub fn cuGraphInstantiateWithFlags(exec: *mut *mut c_void, g: *mut c_void, flags: u64) -> c_int;
+            #[optional]
+            pub fn cuGraphLaunch(exec: *mut c_void, stream: *mut c_void) -> c_int;
+            #[optional]
+            pub fn cuGraphExecDestroy(exec: *mut c_void) -> c_int;
+            #[optional]
+            pub fn cuGraphDestroy(g: *mut c_void) -> c_int;
         }
     }
 }
@@ -457,6 +490,8 @@ struct GgKernels {
     /// other formats) over x rounded by `dq8_x`.
     pub(crate) mvq: *mut c_void,
     pub(crate) mvqp: *mut c_void,
+    /// `mvq3_K`: two or three int8 matvecs over one x in one launch (decode plans' q / k / v).
+    pub(crate) mvq3: *mut c_void,
     pub(crate) dq8_x: *mut c_void,
 }
 
@@ -1035,8 +1070,57 @@ impl CudaBackend {
         self.launch_shm(f, (grid.0, grid.1, grid.2), block, 0, params)
     }
 
+    /// Starts recording this thread's launches into a CUDA graph, in order (false without the
+    /// driver's graph API).
+    pub(crate) fn graph_begin(&self) -> bool {
+        let mut g = std::ptr::null_mut();
+        if GRAPH_REC.get().is_some() || unsafe { self.cu.cuGraphCreate(&mut g, 0) } != Some(0) {
+            return false;
+        }
+        GRAPH_REC.set(Some((g, std::ptr::null_mut())));
+        true
+    }
+
+    /// Ends the recording: the graph instantiated (None when nothing was recorded or it failed).
+    pub(crate) fn graph_end(&self) -> Option<*mut c_void> {
+        let (g, last) = GRAPH_REC.take()?;
+        let mut exec = std::ptr::null_mut();
+        let ok = !last.is_null() && unsafe { self.cu.cuGraphInstantiateWithFlags(&mut exec, g, 0) } == Some(0);
+        unsafe { self.cu.cuGraphDestroy(g) };
+        ok.then_some(exec)
+    }
+
+    /// Runs an instantiated graph on the default stream.
+    pub(crate) fn graph_launch(&self, exec: *mut c_void) -> bool {
+        (unsafe { self.cu.cuGraphLaunch(exec, std::ptr::null_mut()) }) == Some(0)
+    }
+
+    pub(crate) fn graph_free(&self, exec: *mut c_void) {
+        unsafe { self.cu.cuGraphExecDestroy(exec) };
+    }
+
     /// [`Self::launch3`] with `shmem` bytes of dynamic shared memory.
     fn launch_shm(&self, f: *mut c_void, grid: (u32, u32, u32), block: u32, shmem: u32, params: &mut [*mut c_void]) -> bool {
+        if let Some((g, last)) = GRAPH_REC.get() {
+            // Recording: a node after the last one (its argument values copied now).
+            let p = KernelNodeParams {
+                func: f,
+                grid: [grid.0, grid.1, grid.2],
+                block: [block, 1, 1],
+                shmem,
+                params: params.as_mut_ptr(),
+                extra: std::ptr::null_mut(),
+                kern: std::ptr::null_mut(),
+                ctx: std::ptr::null_mut(),
+            };
+            let mut node = std::ptr::null_mut();
+            let n = (!last.is_null()) as usize;
+            let ok = unsafe { self.cu.cuGraphAddKernelNode_v2(&mut node, g, &last, n, &p) } == Some(0);
+            if ok {
+                GRAPH_REC.set(Some((g, node)));
+            }
+            return ok;
+        }
         let rc = unsafe {
             self.cu.cuLaunchKernel(
                 f,
@@ -1136,6 +1220,7 @@ impl CudaBackend {
                     })?,
                     mvq: q8.then(|| get(format!("mvq_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
                     mvqp: q8.then(|| get(format!("mvqp_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
+                    mvq3: q8.then(|| get(format!("mvq3_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
                     dq8_x: get("dq8_x".to_string())?,
                 })
             }
@@ -3586,8 +3671,55 @@ mod tests {
                         })
                         .fold(0f64, f64::max);
                     assert!(worst < 2e-6, "{kind} int8 matvec mode {mode}: {worst:.2e}");
-                    // The pair: act(W x) (W2 x), mode 0 SiLU, 1 GELU.
                     let (_, wg2) = Wg::of(&cw2).unwrap();
+                    // Three at once (`mvq3`: W, W2, W into three outputs): each the same bits as
+                    // its own launch (W's), W2's within the same bound of its definition.
+                    if mode == 0 && !k.mvq3.is_null() {
+                        let (mut d1, mut d2) = (0u64, 0u64);
+                        assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut d1, t * n_out * 4) }, 0);
+                        assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut d2, t * n_out * 4) }, 0);
+                        let (mut d0, blocks) = (0u64, 3 * no.div_ceil(rws));
+                        assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut d0, t * n_out * 4) }, 0);
+                        let mut a = [
+                            &w as *const _ as *mut c_void,
+                            &wg2 as *const _ as *mut c_void,
+                            &w as *const _ as *mut c_void,
+                            &xq as *const _ as *mut c_void,
+                            &xd as *const _ as *mut c_void,
+                            &d0 as *const _ as *mut c_void,
+                            &d1 as *const _ as *mut c_void,
+                            &d2 as *const _ as *mut c_void,
+                            &ni as *const _ as *mut c_void,
+                            &no as *const _ as *mut c_void,
+                            &no as *const _ as *mut c_void,
+                            &no as *const _ as *mut c_void,
+                            &ysu as *const _ as *mut c_void,
+                            &ysu as *const _ as *mut c_void,
+                            &ysu as *const _ as *mut c_void,
+                        ];
+                        assert!(be.launch(k.mvq3, (blocks, t as u32), k.mv_threads, &mut a));
+                        let (mut y0b, mut y1b, mut y2b) = (vec![0f32; t * n_out], vec![0f32; t * n_out], vec![0f32; t * n_out]);
+                        assert!(be.dtoh(&mut y0b, d0) && be.dtoh(&mut y1b, d1) && be.dtoh(&mut y2b, d2));
+                        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                        assert_eq!(bits(&y0b), bits(&y), "{kind}: mvq3's first output");
+                        assert_eq!(bits(&y2b), bits(&y), "{kind}: mvq3's third output");
+                        let worst = (0..t * n_out)
+                            .map(|i| {
+                                let (j, o) = (i / n_out, i % n_out);
+                                let m2: f64 = dense2[o * n_in..(o + 1) * n_in]
+                                    .iter()
+                                    .zip(&xr[j * n_in..(j + 1) * n_in])
+                                    .map(|(&a, &b)| (a as f64 * b).abs())
+                                    .sum();
+                                (y1b[i] as f64 - dot(&dense2, j, o)).abs() / (m2 + 1e-3)
+                            })
+                            .fold(0f64, f64::max);
+                        assert!(worst < 2e-6, "{kind} mvq3's second output: {worst:.2e}");
+                        for p in [d0, d1, d2] {
+                            unsafe { be.cu.cuMemFree_v2(p) };
+                        }
+                    }
+                    // The pair: act(W x) (W2 x), mode 0 SiLU, 1 GELU.
                     let mut a = [
                         &w as *const _ as *mut c_void,
                         &wg2 as *const _ as *mut c_void,
