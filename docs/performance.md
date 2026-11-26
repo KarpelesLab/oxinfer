@@ -4071,6 +4071,84 @@ Round 5 read ahead whole projections, whose reads take longer than the mixes bes
 kept here are each well under a megabyte, short enough to finish inside the latency kernel's own
 time, and the stage after them then starts from the system cache.
 
+#### Inkling-2-Mini at long contexts on Metal (November 2026)
+
+The use this round aimed at is a coding agent's: `oxinfer serve` with prompts of 30k-130k tokens,
+each turn appending a few thousand. Two things were measured at depths of 0 to 128k positions: a
+chunk of 2048 tokens appended to the context (`examples/inkling2_ctx_bench MODEL DEPTH --prefill
+2048 --reps 2`, the caches filled with placeholder rows; the second pass runs 2048 positions
+further), and decoding there (32 one-token steps, not chained). llama.cpp: `llama-bench -fa 1 -p
+2048 -n 32 -d DEPTH -r 1` (master `de30697`, f16 caches; its depth is a real prompt).
+UD-IQ3_XXS, M5 Max, the two oxinfer builds alternated run by run under the bench lock, load
+averages 5-13 (other sessions' jobs). tok/s:
+
+| depth | KV | llama.cpp pp2048 / tg32 | before: 2048 at depth (two passes) / decode | after | after / llama.cpp |
+|---:|---|---|---|---|---|
+| 0 | f16 | 650 / 43.9 | 1563, 1305 / 101.0 | **1700, 1572 / 102.2** | 2.6x / 2.3x |
+| | f32 | | 1521, 1272 / 97.7 | 1585, 1419 / 96.3 | |
+| | q8 | | 1509, 1272 / 102.2 | 1570, 1418 / 103.0 | |
+| 16k | f16 | 373 / 34.6 | 944, 882 / 88.3 | **1469, 1427 / 89.5** | 3.9x / 2.6x |
+| | f32 | | 753, 618 / 69.8 | 1189, 1086 / 76.8 | |
+| | q8 | | 750, 678 / 86.6 | 1073, 995 / 91.5 | |
+| 32k | f16 | 273 / 39.1 | 642, 553 / 74.3 | **1328, 1224 / 79.9** | 4.9x / 2.0x |
+| | f32 | | 444, 372 / 54.2 | 970, 813 / 65.1 | |
+| | q8 | | 471, 429 / 74.2 | 813, 756 / 83.5 | |
+| 64k | f16 | 191 / 34.6 | 360, 326 / 56.8 | **1111, 911 / 65.1** | 5.8x / 1.9x |
+| | f32 | | 237, 214 / 32.8 | 639, 531 / 50.2 | |
+| | q8 | | 272, 257 / 57.0 | 591, 539 / 71.7 | |
+| 128k | f16 | 105 / 28.5 | 159, 148 / 33.6 | **813, 624 / 49.8** | 7.7x / 1.7x |
+| | f32 | | 86, 84 / 17.0 | 347, 323 / 35.6 | |
+| | q8 | | 143, 137 / 39.2 | 364, 348 / 59.2 | |
+
+(At 128k in a quieter window, before this round's last changes: f16 decoding 52-57 tok/s.) The
+cache type is now f16 by default on Metal (`kv_cache=auto`; it was f32): the "before" column's
+default row is f32, so a session at 128k went from 86 tok/s of prefill and 17.0 of decoding to 813
+and 49.8. What changed:
+
+- **Flash attention for the prefill passes' full-attention layers** (`ink_fa_*` in
+  `metal_inkling_pf.metal`). The 8 full-attention applications ran a threadgroup per (token, key
+  head, split of 256+ keys) walking its keys one by one in f32: every query read every key, so a
+  2048-token chunk at 128k read the caches 2048 times over (23 s for the chunk). A threadgroup now
+  takes 16 queries of one head and walks 128 keys at a time on the matrix units (`matmul2d`, as
+  `pfm_128`: S = Q K^T to threadgroup memory, an online softmax whose maximum moves lazily, P V into
+  a cooperative tensor), the f32 or f16 rows read in place; q8 rows are dequantized into a half
+  tile of 64 keys in threadgroup memory. The relative bias (16 bank profiles of the backward
+  distance, below 1024) is added on the tiles within its extent, the sink joins the sums at the
+  end and the gate multiplies the output, so the splits' merge kernel goes too. Against the split
+  kernels on the same caches (`fa_tests::flash_attention_matches_splits`: 24 / 8 heads of 128,
+  passes of 70-512 tokens from 0, 1800 and 4097 positions): max difference 7e-7 (f32 rows, f32
+  operands), 2.7e-4 (f16) and 4.5e-4 (q8) of outputs up to 0.7. In the engine, the attention outputs
+  of a real pass match the split kernels' to 1.4e-5. 16 queries and 128 keys beat 32 and 64, 16 and
+  64, and two SIMD-groups (64k positions, f16).
+- **Decoding: a threadgroup per key head from 16k positions.** One-token passes (`ink_attf`) ran a
+  threadgroup per query head, so each key and value row was read by 3 threadgroups (24 query heads
+  on 8 key heads). From 16384 positions a threadgroup takes a key head's three query heads (the
+  kernel already had that form): 32.1 -> 53.1 tok/s at 128k (f16), level at 16k. The sums are the
+  same, so the logits are bit for bit those of one head a threadgroup (checked at 0, 4k and 16k
+  positions after 64 steps) and verification passes still give the one-token logits. More keys in
+  flight per SIMD-group (4, 8, 16 instead of 2) did not help: 4 within noise, 16 slower.
+- **Full-attention caches grow by a quarter** (rounded to 1024 rows) instead of to the next power of
+  two: a 130k-position session in f32 rows held 17 GB of caches for 8.7 GB used.
+- **f16 caches by default on Metal**: half the bytes per decoded token (4.3 GB at 128k instead of
+  8.6) and the prefill's half operands read in place. `kv_cache=f32` (`--kv-cache f32`) keeps the
+  exact caches; the CPU and CUDA stay f32 by default.
+
+Agreement, on a real prompt (the first 120 KB of these docs, 40177 tokens, fed in chunks of 2048;
+`inkling2_ctx_bench --text`): the 24 greedy tokens after it are the same with f32 and f16 caches
+and with the split and flash kernels. The logits after the prompt differ by KL 1.2e-2 between
+the two f32 attention kernels, 3.7e-3 with f16 caches, 5.9e-3 between f32 and f16 caches with the
+old kernels; on 11589 tokens against the CPU (f32): KL 1.3e-2 for the split kernels, 2.6e-2 for
+the flash ones, top-1 the same. A perturbation of 1e-5 in one layer's attention outputs moves the
+logits as much as these, so this is the prompt's sensitivity (the 8-of-128 expert choices of
+thousands of tokens), not the kernels' error.
+
+What is left at 128k: decoding spends 9-10 ms of its 18-20 ms in the 8 full-attention layers
+reading 4.3 GB (about 450 GB/s, near this GPU's stream); q8 caches (2.4 GB) decode faster there
+(59.2 against 49.8) but prefill at half the speed of f16 (their tiles are dequantized through
+threadgroup memory). The flash kernel spends about 0.45 s of a 2048-token chunk at 64k (about 3
+TFLOPS); a threadgroup holding a key head's three query heads (each tile read once rather than
+three times) was not tried.
+
 #### DGX Spark, CUDA (November 2026)
 
 On a DGX Spark (GB10, 121 GB shared between the CPU and the GPU) against llama.cpp's CUDA backend

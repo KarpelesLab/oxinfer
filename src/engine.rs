@@ -115,8 +115,9 @@ pub struct EngineOptions {
     /// and replies stop at the limit. Key `max_context`. Default: unlimited.
     pub max_context: Option<usize>,
     /// Inkling-2: how the attention caches store keys and values. Key `kv_cache` (`f32`,
-    /// `f16`, `q8`). Default f32 (exact).
-    pub kv_cache: crate::inkling::KvCache,
+    /// `f16`, `q8`, `auto`). Default (None, `auto`): f16 on Metal, else f32 (exact); see
+    /// [`crate::inkling::KvCache::auto`].
+    pub kv_cache: Option<crate::inkling::KvCache>,
     /// Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token prediction layer
     /// (greedy and sampled; same output distribution). Also on, unless `draft` is set
     /// (`none`: plain decoding), for the models of [`crate::qwen_mtp::BY_DEFAULT`]. Key `mtp`.
@@ -507,7 +508,7 @@ impl Default for EngineOptions {
             device: DevicePref::Auto,
             prefill_chunk: None,
             max_context: None,
-            kv_cache: crate::inkling::KvCache::F32,
+            kv_cache: None,
             mtp: false,
             mtp_from: None,
             mtp_fixed: false,
@@ -676,7 +677,7 @@ impl EngineOptions {
             }
             "prefill_chunk" => self.prefill_chunk = parse_opt_usize(key, value)?,
             "max_context" => self.max_context = parse_opt_usize(key, value)?,
-            "kv_cache" => self.kv_cache = crate::inkling::KvCache::parse(value)?,
+            "kv_cache" => self.kv_cache = crate::inkling::KvCache::parse_opt(value)?,
             "mtp" => self.mtp = parse_bool(key, value)?,
             "mtp_from" => {
                 self.mtp_from = opt_str(value);
@@ -1938,7 +1939,8 @@ impl Engine {
         let ckpt_bytes = crate::safetensors::checkpoint_bytes(&dir);
         let runtime = match family {
             Family::Inkling2 => {
-                crate::inkling::runtime_bytes(opts.kv_cache, opts.max_context).saturating_sub(crate::stream::DeviceMemory::APP_RESERVE)
+                crate::inkling::runtime_bytes(opts.kv_cache.unwrap_or_else(crate::inkling::KvCache::auto), opts.max_context)
+                    .saturating_sub(crate::stream::DeviceMemory::APP_RESERVE)
             }
             _ => 0,
         };
@@ -2424,7 +2426,7 @@ impl Engine {
                 }
                 decision = None;
                 let mut model = Inkling2Model::load(crate::inkling::Inkling2Config::load(&dir)?, files, opts.quant)?;
-                model.kv = opts.kv_cache;
+                model.kv = opts.kv_cache.unwrap_or_else(crate::inkling::KvCache::auto);
                 // (Weights that do not fit the GPU's share keep the passes on the CPU.)
                 model.gpu_budget = device_mem.gpu_weight_budget().map(|b| b.saturating_sub(runtime));
                 loras = crate::lora::attach_specs(&mut model, &lora_specs, &dir, opts.lora_merge)?;

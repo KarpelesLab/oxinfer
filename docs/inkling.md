@@ -421,8 +421,8 @@ costs 8 x 2 x 1024 values:
 
 | `--kv-cache` (`kv_cache` key) | Per token of context | Sliding windows (fixed) | 128k context |
 |---|---:|---:|---:|
-| `f32` (default, exact) | 64 KB | 692 MB | 8.6 GB |
-| `f16` | 32 KB | 346 MB | 4.6 GB |
+| `f32` (exact; the default on the CPU and CUDA) | 64 KB | 692 MB | 8.6 GB |
+| `f16` (the default on Metal) | 32 KB | 346 MB | 4.6 GB |
 | `q8` (int8, a float32 scale per 32) | 18 KB | 195 MB | 2.6 GB |
 
 Measured with `examples/inkling2_ctx_bench` (the caches filled with placeholder keys and values,
@@ -459,6 +459,12 @@ either way. Small's NVFP4 release repacks its 40 NVFP4 layers as Mini's (290 GB;
 bytes given back the same way when it is read into memory). transformers' quantized path (PR
 51062) holds one copy of each too (9.9 GiB allocated on MPS at load, 21 GiB in the driver, a peak
 footprint of 31 GB in the run of the speed table).
+
+On Metal, prefill and decoding at depths of 16k-128k (flash attention for the prefill passes,
+f16 caches by default) are measured against llama.cpp in
+[performance.md](performance.md#inkling-2-mini-at-long-contexts-on-metal-november-2026): a
+2048-token chunk appended at 128k positions at 813 tok/s (llama.cpp 105), decoding there at 49.8
+tok/s (28.5) on UD-IQ3_XXS.
 
 What fits, from these sizes: weights + 1.3 GB (runtime and prefill chunks of 512, measured on
 the 9816-token prompt: 13.3 GB peak) + the windows + the context, in the memory a process can
@@ -506,7 +512,12 @@ resident on the device:
   (the routing read back at each MoE layer to build the tiles), SiTU and the routing-weighted sum
   on the device. A pass longer than a sliding window's spare rows keeps its keys and values in the
   arena and moves its last rows to the window's ring after; the convolution rings are written
-  once the convolutions have read them.
+  once the convolutions have read them. The full-attention layers' attention is flash attention
+  on the matrix units (`ink_fa_*`: 16 queries of a head a threadgroup, 128 keys at a time read
+  in place from f32 or f16 caches, or 64 dequantized from q8 rows into threadgroup memory; the
+  relative bias on the keys within its extent, the sink and the output gate in the same kernel),
+  rather than a threadgroup per token walking every key (`OXINFER_INKLING_FA=0`: the splits
+  of before).
 - **Greedy decoding chained on the device** (greedy decoding: `--temp 0`, no repetition
   penalty, no grammar; with prompt lookup, the stretches without a draft worth verifying): a pass ends with the argmax of its soft-capped logits
   (the host's rule: the first index of the largest) written to a token slot of the arena, and the
@@ -518,8 +529,11 @@ resident on the device:
   verification round. The embedding's norm
   sums its squares in another order than the host's: the same greedy text on the 9 replies of
   the speed checks (`inkling2_bench --chain` measures this path).
-- **KV caches** in f32, f16 or q8 rows (`--kv-cache`), the sliding windows as rings of
-  `window + 64` rows by position, the full-attention caches growing; a session's state moves to
+- **KV caches** in f32, f16 or q8 rows (`--kv-cache`; f16 by default on Metal, `auto`), the
+  full-attention caches grown by a quarter at a time (not to the next power of two), the
+  decoding passes' attention a threadgroup per key head (its three query heads together) from
+  16k positions, the sliding windows as rings of
+  `window + 64` rows by position; a session's state moves to
   the device on its first GPU pass and back to the host when a pass runs on the CPU (cloning a
   session reads it back), and `truncate` works on either side. Prompt checkpoints are read from
   and written to the device's buffers in place (the windows' rows at their ring positions, the

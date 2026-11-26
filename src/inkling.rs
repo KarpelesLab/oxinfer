@@ -913,6 +913,23 @@ pub enum KvCache {
 }
 
 impl KvCache {
+    /// `auto` (or empty): None, for [`KvCache::auto`]; else as [`KvCache::parse`].
+    pub fn parse_opt(s: &str) -> Result<Option<Self>> {
+        Ok(match s.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => None,
+            o => Some(Self::parse(o)?),
+        })
+    }
+    /// The cache type when none is asked for: f16 when the passes run on Metal (decoding at 128k
+    /// positions reads 4.3 GB of caches a token rather than 8.6: 1.6x faster with UD-IQ3_XXS; the
+    /// prefill's flash attention reads half rows too), else f32 (exact).
+    pub fn auto() -> Self {
+        if cfg!(any(target_os = "macos", target_os = "ios")) && crate::gpu::active().is_some() {
+            KvCache::F16
+        } else {
+            KvCache::F32
+        }
+    }
     /// `f32` (or `auto`), `f16` or `q8`.
     pub fn parse(s: &str) -> Result<Self> {
         Ok(match s.trim().to_ascii_lowercase().as_str() {

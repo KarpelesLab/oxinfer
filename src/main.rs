@@ -76,7 +76,7 @@ struct Args {
     preload: bool,
     mmap: bool,
     quant: Quant,
-    kv_cache: oxinfer::inkling::KvCache,
+    kv_cache: Option<oxinfer::inkling::KvCache>,
     profile: bool,
     dump_logits: Option<PathBuf>,
     show_tokens: bool,
@@ -274,7 +274,7 @@ fn usage() -> ! {
          \x20 --efficiency-threads N  of the threads, N at background QoS (efficiency cores)\n\
          \x20 --mmap               map weights from disk instead of copying into RAM\n\
          \x20 --quant bf16|q8|q4   weight precision for streamed matmuls (default bf16)\n\
-         \x20 --kv-cache f32|f16|q8  Inkling-2: how the attention caches store keys and values (default f32)\n\
+         \x20 --kv-cache f32|f16|q8|auto  Inkling-2: how the attention caches store keys and values (default auto: f16 on Metal, else f32)\n\
          \x20 --preload            with --mmap, touch all weight pages before starting\n\
          \x20 --profile            print per-operation timing breakdown\n\
          \x20 --prefill-chunk N    tokens per prefill chunk (default 512 on CPU, 1024 with a GPU backend)\n\
@@ -677,7 +677,7 @@ fn parse_args() -> Result<Args> {
         preload: false,
         mmap: false,
         quant: Quant::Bf16,
-        kv_cache: oxinfer::inkling::KvCache::F32,
+        kv_cache: None,
         profile: false,
         dump_logits: None,
         show_tokens: false,
@@ -867,7 +867,7 @@ fn parse_args() -> Result<Args> {
                     other => bail!("unknown quantization {other} (use bf16, q8 or q4)"),
                 }
             }
-            "--kv-cache" => a.kv_cache = oxinfer::inkling::KvCache::parse(&val()?)?,
+            "--kv-cache" => a.kv_cache = oxinfer::inkling::KvCache::parse_opt(&val()?)?,
             "--profile" => a.profile = true,
             "--prefill-chunk" => a.prefill_chunk = Some(val()?.parse()?),
             "--draft" => a.draft = Some(PathBuf::from(val()?)),
@@ -3179,7 +3179,8 @@ fn run_inkling(mut args: Args) -> Result<()> {
     // with the caches and activations beside the weights (as the engine does).
     let size: u64 = oxinfer::safetensors::checkpoint_bytes(&args.model);
     let dm = device_memory(&args);
-    let runtime = oxinfer::inkling::runtime_bytes(args.kv_cache, None).saturating_sub(oxinfer::stream::DeviceMemory::APP_RESERVE);
+    let kv = args.kv_cache.unwrap_or_else(oxinfer::inkling::KvCache::auto);
+    let runtime = oxinfer::inkling::runtime_bytes(kv, None).saturating_sub(oxinfer::stream::DeviceMemory::APP_RESERVE);
     let app_stream = dm
         .limits_app()
         .then(|| oxinfer::stream::auto_stream_on(&dm, size, runtime))
@@ -3210,7 +3211,7 @@ fn run_inkling(mut args: Args) -> Result<()> {
     args.mmap |= args.stream;
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let mut model = oxinfer::inkling::Inkling2Model::load(cfg, &files, args.quant)?;
-    model.kv = args.kv_cache;
+    model.kv = kv;
     model.gpu_budget = dm.gpu_weight_budget().map(|b| b.saturating_sub(runtime));
     attach_loras(&args, &mut model)?;
     // (Prompt lookup rolls back what the model refutes: a session goes back up to
