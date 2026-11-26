@@ -29,6 +29,10 @@ name = "membench"
 path = "src/bin/membench.rs"
 
 [[example]]
+name = "whisper_enc_bench"
+required-features = ["hf", "media"]
+
+[[example]]
 name = "embed"
 required-features = ["hf"]
 

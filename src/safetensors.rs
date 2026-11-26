@@ -117,6 +117,7 @@ impl Drop for Storage {
 /// A checkpoint file's bytes in memory (`FILES`): mapped, or read into memory (with the file
 /// open again, to map its pages back in place: [`release_copied`]).
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(unix), allow(dead_code))] // `len` / `heap`: pages are given back on unix only
 struct FileBytes {
     addr: usize,
     len: usize,
