@@ -8,7 +8,7 @@
 //! the engine (`prefill_gemm`'s default there: int8 activations).
 //!
 //! ```text
-//! inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--threads N] [--chunk N] [-v 2,4,8] [--chain] [--exact 2,4,8]
+//! inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--threads N] [--chunk N] [-v 2,4,8] [-b 2,4,8] [--chain] [--exact 2,4,8]
 //! ```
 //!
 //! `--chain`: `tg N` as greedy decoding with the passes chained on the device
@@ -16,6 +16,8 @@
 //! `forward` and argmax. `--exact N,..`: after prompts of 64 and of 200 random tokens, N tokens as
 //! one verification pass against the same N one at a time: the largest logit difference and how
 //! many logits differ (speculative decoding gives the plain greedy text when there are none).
+//! `-b N,..`: batched decode steps (the server's concurrent requests: `forward_rows`) of N
+//! sessions after prompts of 64 random tokens each, ms per step.
 
 use anyhow::{Context, Result};
 use oxinfer::inkling::{Inkling2Config, Inkling2Model, KvCache};
@@ -28,9 +30,10 @@ fn median(mut v: Vec<f64>) -> f64 {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--threads N] [--chunk N] [-v 2,4,8] [--chain] [--exact 2,4,8]";
+    let usage = "usage: inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--threads N] [--chunk N] [-v 2,4,8] [-b 2,4,8] [--chain] [--exact 2,4,8]";
     let model = args.next().context(usage)?;
     let mut verify: Vec<usize> = Vec::new();
+    let mut rows: Vec<usize> = Vec::new();
     let mut exact: Vec<usize> = Vec::new();
     let mut chain = false;
     let (mut pp, mut tg, mut reps, mut kv, mut cpu, mut chunk) = (vec![512usize], 128usize, 3usize, KvCache::F32, false, 2048usize);
@@ -56,6 +59,15 @@ fn main() -> Result<()> {
                 exact = args
                     .next()
                     .context("--exact N,..")?
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse())
+                    .collect::<Result<_, _>>()?
+            }
+            "-b" => {
+                rows = args
+                    .next()
+                    .context("-b N,..")?
                     .split(',')
                     .filter(|s| !s.is_empty())
                     .map(|s| s.parse())
@@ -176,6 +188,29 @@ fn main() -> Result<()> {
         }
         let t = median(times);
         println!("verify{n}: {:.2} ms per pass", t * 1e3);
+    }
+    // Batched decode steps of n sessions.
+    for &n in &rows {
+        let mut sess: Vec<_> = (0..n)
+            .map(|_| {
+                let mut s = m.new_session();
+                let ids: Vec<u32> = (0..64).map(|_| rnd()).collect();
+                m.forward(&mut s, &ids);
+                s
+            })
+            .collect();
+        let mut times = Vec::new();
+        for rep in 0..=reps.max(5) * 4 {
+            let toks: Vec<u32> = (0..n).map(|_| rnd()).collect();
+            let mut refs: Vec<&mut _> = sess.iter_mut().collect();
+            let t0 = std::time::Instant::now();
+            m.forward_rows(&mut refs, &toks).context("-b: no batched passes on this device")?;
+            if rep > 0 {
+                times.push(t0.elapsed().as_secs_f64());
+            }
+        }
+        let t = median(times);
+        println!("rows{n}: {:.2} ms per step ({:.1} tok/s)", t * 1e3, n as f64 / t);
     }
     // A verification pass against one-token passes.
     for &n in &exact {

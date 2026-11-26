@@ -327,7 +327,21 @@ whose Gated DeltaNet layers run each row's one-token conv and delta-rule kernels
 session's own recurrent states). Mixtures of experts (Gemma 4 26B-A4B, Qwen MoE) only with `batch_fast=1`: their
 multi-token expert kernels do not give the one-token kernels' bits, and each row reads its own
 experts anyway (Gemma 4 26B-A4B Q4_0: 4 batched rows decode about as fast as 4 one-token steps).
-Those, Inkling-2, DeepSeek V4, streamed models and sessions with
+Inkling-2 on Metal batches its decode steps exactly: one pass of up to 16 rows whose matvecs,
+expert groups (tokens choosing the same expert read it once) and mixes run over all the rows,
+and whose ops on a session's state (queries, keys and values into its caches, attention, the
+convolutions after the attention and the experts) run for each row on its own caches and rings
+at its own position, encoded as its one-token pass encodes them
+(`tests/gpu_chain.rs::inkling_batched_rows_match_one_token_passes`: the logits bit for bit). A
+request with the DSpark drafter (the default) decodes plainly beside others, from a checkpoint
+of its reply's start (one more than `prompt_checkpoints`), which its next turn goes back to
+for the draft to read the reply. Checked on Inkling-2-Mini UD-IQ3_XXS: 4 and 8 concurrent
+greedy requests give the replies each gets alone on a fresh server (the drafter on), and 4
+seeded ones at temperature 0.8 too with `OXINFER_DEVICE_SAMPLING=0`, `draft=none,lookup=0`.
+(With the defaults a sampled request alone draws its tokens on the device and in speculative
+rounds, whose draws differ from the host sampler's that batched rows take: the same
+distribution, not always the same tokens from a seed.)
+DeepSeek V4, streamed models and sessions with
 interventions run their decode steps one after the other, in turns (still interleaved with the
 other requests' prompts).
 

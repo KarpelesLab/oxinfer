@@ -1093,6 +1093,13 @@ pub(crate) trait DevEngine: Send + Sync {
     fn captures(&self) -> bool {
         true
     }
+    /// One token for each session (`x`: `[rows, hidden]`, embedding norm applied) in one pass,
+    /// advancing them: the capped logits of every row (`[rows, unpadded vocab]`), each the bits
+    /// of the row's one-token pass ([`crate::generate::TextLm::forward_batch`]); None when the
+    /// device does not take it (the sessions are then untouched).
+    fn run_rows(&self, _m: &Inkling2Model, _sess: &mut [&mut Inkling2Session], _x: &[f32]) -> Option<Vec<f32>> {
+        None
+    }
     /// Runs the embedded tokens `x` (`[t, hidden]`, embedding norm applied) from `sess.pos`,
     /// advancing it, into `want`; false when the device does not take the pass (the session is
     /// then untouched). By default [`DevEngine::forward`] and the head, without captured streams.
@@ -2706,6 +2713,21 @@ impl<'a> Inkling2Model<'a> {
         Some(kept)
     }
 
+    /// One token for each session in one pass on the device ([`DevEngine::run_rows`]): the
+    /// logits of each, those of its one-token pass. None where the device does not take it (a
+    /// session with interventions or kept on the host, no device, one row).
+    pub fn forward_rows(&self, sess: &mut [&mut Inkling2Session], tokens: &[u32]) -> Option<Vec<Vec<f32>>> {
+        let n = tokens.len();
+        if n < 2 || sess.len() != n || crate::gpu::decode::check() || sess.iter().any(|s| s.iv.active() || s.dev_off) {
+            return None;
+        }
+        let d = self.device()?;
+        let x = self.embed_rows(tokens, &[]);
+        let l = d.run_rows(self, sess, &x)?;
+        let u = self.cfg.unpadded_vocab_size;
+        Some(l.chunks_exact(u).map(<[f32]>::to_vec).collect())
+    }
+
     /// Runs `tokens` and returns the logits after the last one.
     pub fn forward(&self, sess: &mut Inkling2Session, tokens: &[u32]) -> Vec<f32> {
         let mut logits = Vec::new();
@@ -3506,6 +3528,15 @@ impl crate::generate::TextLm for Inkling2Model<'_> {
     fn forward(&self, sess: &mut Inkling2Session, tokens: &[u32]) -> Vec<f32> {
         Inkling2Model::forward(self, sess, tokens)
     }
+    fn forward_batch(&self, sess: &mut [&mut Inkling2Session], tokens: &[u32]) -> Vec<Vec<f32>> {
+        if let Some(l) = self.forward_rows(sess, tokens) {
+            return l;
+        }
+        sess.iter_mut()
+            .zip(tokens)
+            .map(|(s, &t)| Inkling2Model::forward(self, s, &[t]))
+            .collect()
+    }
     fn decode_greedy(
         &self,
         sess: &mut Inkling2Session,
@@ -3673,6 +3704,11 @@ impl crate::dspark::Target for Inkling2Model<'_> {
     }
     fn truncate(&self, sess: &mut Inkling2Session, len: usize) {
         if let Err(e) = sess.truncate(len) {
+            panic!("{e}");
+        }
+    }
+    fn cut_back(&self, sess: &mut Inkling2Session, len: usize) {
+        if let Err(e) = self.cut_to(sess, len) {
             panic!("{e}");
         }
     }

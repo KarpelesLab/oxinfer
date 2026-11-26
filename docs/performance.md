@@ -220,6 +220,28 @@ decode steps ran one after the other, in turns). Aggregate tok/s (per stream), t
 bf16, Q8 and Q4: rows bit for bit their one-token steps). The gap at 8 rows is the exact
 multi-token matvecs' (as for Qwen3-8B below; the 27B's K-quants scale worst).
 
+**Inkling-2-Mini UD-IQ3_XXS** (Metal, batched exactly since the steps above: one pass of the
+rows, each row's attention, caches and convolution rings its own session's; a request with the
+DSpark drafter hands over to plain batched steps when others decode). Decode-bound as above,
+aggregate tok/s (per stream), TTFT p50; "in turns" is the same build with `max_batch=1` (the
+steps one after the other, as before):
+
+| N | in turns | batched (exact) | llama-server |
+|---|---|---|---|
+| 1 | 90.3 (96.9), 0.20 | 87.9 (94.6), 0.22 | 40.1 (42.5), 0.37 |
+| 4 | 87.5 (24.0), 1.19 | 126.1 (35.5), 1.11 | 86.4 (23.8), 1.15 |
+| 8 | 90.9 (12.1), 1.52 | 150.3 (20.5), 1.17 | 115.4 (16.1), 1.79 |
+
+Mixed prompts (the table above): N=4 52.7 -> 54.1 tok/s, N=8 58.0 -> 64.5 (llama-server 41.2,
+56.9): the 24k prompt tokens dominate, and the 2048-token prompt chunks stall the others'
+decoding while they run. A batched step costs what a verification pass of as many tokens does
+(`inkling2_bench -v 1,2,4,8 -b 2,4,8`: 9.2 / 14.0 / 23.5 / 44.6 ms for 1 / 2 / 4 / 8 tokens
+verified, 14.4 / 22.9 / 43.9 ms for 2 / 4 / 8 rows), most of it in the routed experts, whose
+reads grow with the distinct experts the rows choose (8 of 128 each: about 50 distinct for 8
+rows of unrelated text; `OXINFER_INKLING_PROFILE` at 8 tokens: 19 of 36 ms in the expert
+kernels against 3.3 of 9 at one token), then the dense multi-token matvecs (the LM head 0.56 ->
+2.5 ms).
+
 Before, the decode-bound runs gave the single-stream rate in aggregate with the TTFT growing by
 a reply per queued request (Gemma 4 26B-A4B: 127.9 tok/s at N=8, TTFT p50 8.06 s against 0.40).
 On the CPU (Qwen3-8B Q4_K_M, `device=cpu`, 64 tokens): 4 requests 34.6 tok/s, TTFT p50 1.71 s
@@ -249,8 +271,8 @@ What is measured and where the gap to llama-server comes from:
   arrive mid-reply, DSpark / prompt-lookup rounds hand over to plain batched steps at the next
   round boundary.
 
-Not done: exact multi-token kernels that scale past 4 rows, batched decode of recurrent models
-(Qwen3.5 Gated DeltaNet, Inkling-2 on its own Metal path, DeepSeek V4), cross-session KV sharing
+Not done: exact multi-token kernels that scale past 4 rows, batched decode of DeepSeek V4,
+cross-session KV sharing
 in memory (sessions share prefixes through the prompt cache on disk only), and mixing prompt
 chunks and decode rows in one pass (llama.cpp's mixed batches).
 

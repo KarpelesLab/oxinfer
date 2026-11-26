@@ -16,7 +16,10 @@
 //! Every token of a pass is computed exactly as it would be alone (the token is a grid
 //! dimension of every kernel; the multi-token matvecs keep the one-token arithmetic; attention
 //! splits depend on a token's own range), so speculative verification gives the logits of
-//! plain decoding.
+//! plain decoding. A batched pass (`InkMetal::run_rows_impl`: the server's concurrent requests)
+//! is such a pass whose tokens are the next tokens of several sessions: the ops on a session's
+//! caches and rings run for each row on its own, at its own position, as its one-token pass
+//! encodes them (`InkMetal::per_row`), so each row's logits are its one-token pass's.
 //!
 //! A session's state moves to the device on its first pass there (`InkDev::upload`) and back
 //! to the host when a pass runs on the CPU (`InkDev::download`): sliding-window caches are
@@ -76,6 +79,11 @@ struct Pe<'f> {
     enc: std::cell::Cell<Id>,
     f: &'f Fns,
     prof: Option<&'f Prof<'f>>,
+    /// Batched rows ([`InkMetal::per_row`]): encodes only the stage `.1` of the ops being encoded
+    /// (their barriers counted in `.0`, not encoded), so that the rows' stages can be interleaved.
+    stage: std::cell::Cell<(usize, Option<usize>)>,
+    /// Whether something was encoded in the filtered stage.
+    hit: std::cell::Cell<bool>,
 }
 
 impl<'f> Pe<'f> {
@@ -84,9 +92,35 @@ impl<'f> Pe<'f> {
             enc: std::cell::Cell::new(e.enc),
             f: e.f,
             prof,
+            stage: std::cell::Cell::new((0, None)),
+            hit: std::cell::Cell::new(false),
         }
     }
+    /// Whether the op being encoded is in the filtered stage (or nothing is filtered).
+    fn on(&self) -> bool {
+        match self.stage.get() {
+            (_, None) => true,
+            (s, Some(w)) => {
+                if s == w {
+                    self.hit.set(true);
+                }
+                s == w
+            }
+        }
+    }
+    /// Encodes only stage `w` of what follows (None: everything), counting stages from 0.
+    fn filter(&self, w: Option<usize>) {
+        self.stage.set((0, w));
+    }
+    /// Stages seen since the last [`Self::filter`] (barriers plus one).
+    fn stages(&self) -> usize {
+        self.stage.get().0 + 1
+    }
     fn fe(&self) -> FastEnc<'f> {
+        debug_assert!(self.stage.get().1.is_none(), "raw encoding of a filtered stage");
+        self.raw()
+    }
+    fn raw(&self) -> FastEnc<'f> {
         FastEnc {
             enc: self.enc.get(),
             f: self.f,
@@ -94,12 +128,18 @@ impl<'f> Pe<'f> {
     }
     /// Notes a pipeline set by another encoding function (for the profile).
     fn note(&self, p: Id) {
+        if !self.on() {
+            return;
+        }
         if let Some(pr) = self.prof {
             pr.stage.borrow_mut().push(p as usize);
         }
     }
     #[track_caller]
     fn pipe(&self, p: Id) {
+        if !self.on() {
+            return;
+        }
         if self.prof.is_some() {
             // (Pipelines of other libraries are named by where they were set.)
             let l = std::panic::Location::caller();
@@ -109,29 +149,48 @@ impl<'f> Pe<'f> {
                 .insert(p as usize, format!("{}:{}", l.file(), l.line()));
         }
         self.note(p);
-        self.fe().pipe(p);
+        self.raw().pipe(p);
     }
     fn buf(&self, b: Id, offset: usize, index: usize) {
-        self.fe().buf(b, offset, index);
+        if !self.on() {
+            return;
+        }
+        self.raw().buf(b, offset, index);
     }
     fn bytes<T>(&self, v: &T, index: usize) {
-        self.fe().bytes(v, index);
+        if !self.on() {
+            return;
+        }
+        self.raw().bytes(v, index);
     }
     fn dispatch(&self, groups: (usize, usize), threads: usize) {
+        if !self.on() {
+            return;
+        }
         DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.fe().dispatch(groups, threads);
+        self.raw().dispatch(groups, threads);
     }
     fn dispatch3(&self, groups: (usize, usize, usize), threads: usize) {
+        if !self.on() {
+            return;
+        }
         DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.fe().dispatch3(groups, threads);
+        self.raw().dispatch3(groups, threads);
     }
     fn use_resources(&self, ids: &[Id]) {
-        self.fe().use_resources(ids);
+        if !self.on() {
+            return;
+        }
+        self.raw().use_resources(ids);
     }
     fn barrier(&self) {
+        if let (n, Some(w)) = self.stage.get() {
+            self.stage.set((n + 1, Some(w)));
+            return;
+        }
         BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.prof {
-            None => self.fe().barrier(),
+            None => self.raw().barrier(),
             Some(pr) => self.cut(pr),
         }
     }
@@ -3202,6 +3261,15 @@ impl InkMetal {
     /// A step's attention half and its routing (everything before the experts).
     #[allow(clippy::too_many_arguments)]
     fn enc_attn(&self, e: &Pe, c: &Cx, si: usize, t: usize, pos: usize, dev: &InkDev, capture: &[usize]) {
+        self.enc_attn_rows(e, c, si, t, pos, dev, capture, &[]);
+    }
+
+    /// [`Self::enc_attn`]; with `rows` (batched rows, `t` of them: [`InkMetal::run_rows`]), the
+    /// ops on a session's caches and rings (the queries' scaling, the keys and values, the
+    /// attention, the convolution after it) encoded for each row on its own state at its own
+    /// position, as its one-token pass encodes them ([`Self::per_row`]); `pos` and `dev` unused.
+    #[allow(clippy::too_many_arguments)]
+    fn enc_attn_rows(&self, e: &Pe, c: &Cx, si: usize, t: usize, pos: usize, dev: &InkDev, capture: &[usize], rows: &[RowRef]) {
         let (h, th) = (self.h, c.b.tm * self.h);
         let b = c.b;
         let sp = &self.plan[si];
@@ -3380,6 +3448,105 @@ impl InkMetal {
             }
         }
         e.barrier();
+        if rows.is_empty() {
+            self.enc_attn_core(e, c, si, t, pos, dev);
+        } else {
+            self.per_row(e, c, si, rows, |e, c, r| self.enc_attn_core(e, c, si, 1, r.pos, r.dev));
+        }
+        let lora = ld.o.lora.iter().any(|l| l.r != 0 && unsafe { (*l.d).strength() } != 0.0);
+        match ld.o.mvc {
+            // The output projection and the convolution after it in one kernel.
+            Some(pipe) if t == 1 && !lora && !self.skip(SK_DENSE | SK_CONV) && dconv_on() => {
+                let w = &ld.o.w;
+                let cp = self.conv_p(b.ab, b.x, ld.attn_conv, pos, !ld.boundary, t, None);
+                let p = MvParams {
+                    n_out: w.n_out as u32,
+                    n_in: w.n_in as u32,
+                    mode: 0,
+                    rows_per_tg: 0,
+                    w_off: w.data_off,
+                    s_off: w.scales_off,
+                    w2_off: w.data_off,
+                    s2_off: w.scales_off,
+                    o_off: w.offs_off,
+                    o2_off: w.offs_off,
+                    gpr: w.gpr,
+                    gk: w.gk,
+                    ldy: b.att as u32,
+                    _p: 0,
+                };
+                e.pipe(pipe);
+                e.buf(w.data, 0, 0);
+                e.buf(w.scales, 0, 1);
+                e.buf(c.a, 0, 2);
+                e.bytes(&p, 4);
+                e.buf(w.offs, 0, 7);
+                e.buf(self.consts, 0, 10);
+                e.bytes(&cp, 11);
+                e.buf(sd.rings[2].0, 0, 12);
+                e.dispatch((w.n_out.div_ceil(4), 1), 128);
+                e.barrier();
+            }
+            _ => {
+                if !self.skip(SK_DENSE) {
+                    self.mv(e, c, &ld.o, b.att, b.ab, t, MvMode::Store);
+                }
+                e.barrier();
+                if self.skip(SK_CONV) {
+                } else if rows.is_empty() {
+                    self.conv(e, c, b.ab, b.x, ld.attn_conv, sd.rings[2].0, pos, !ld.boundary, t);
+                } else {
+                    self.per_row(e, c, si, rows, |e, c, r| {
+                        let sd = &r.dev.slots[sp.slot];
+                        self.conv(e, c, c.b.ab, c.b.x, ld.attn_conv, sd.rings[2].0, r.pos, !ld.boundary, 1)
+                    });
+                }
+                e.barrier();
+            }
+        }
+        if !self.inline_rings(t) && rows.is_empty() {
+            self.ring_store(e, c, b.ab, h, sd.rings[2].0, pos, t);
+        }
+        // The MLP's input.
+        if msgs {
+            if !self.skip(SK_MIX) {
+                self.mix_cat(e, c, &sp.mlp_states, b.x, ld.mlp_query, 1, b.hm, None, t, Some((3, false, 0)));
+            }
+            self.prefetch(e, ld, PF_MGATE_DOWN, t);
+            self.prefetch(e, ld, PF_MGATE_FG, t);
+            e.barrier();
+            let (g, _) = ld.gates.as_ref().unwrap();
+            if !self.skip(SK_GATES) {
+                let pf = Some((ld, PF_ROUTER, usize::MAX));
+                self.gates(
+                    e,
+                    c,
+                    g,
+                    &[(3, b.hm, ld.ln_post, b.hn)],
+                    t,
+                    !self.skip(SK_MIX),
+                    self.mlp_fold(si, t),
+                    pf,
+                );
+            }
+        } else {
+            if !self.skip(SK_MIX) {
+                self.mix(e, c, &sp.mlp_states, b.x, ld.mlp_query, 1, b.hn, Some(ld.ln_post), t);
+            }
+            self.prefetch(e, ld, PF_ROUTER, t);
+        }
+        e.barrier();
+        self.route(e, c, si, t);
+    }
+
+    /// The attention of [`Self::enc_attn`] on a session's state: the queries' scaling, the keys
+    /// and values into the caches, the attention and its merge (from the projections in the
+    /// arena, after a barrier).
+    fn enc_attn_core(&self, e: &Pe, c: &Cx, si: usize, t: usize, pos: usize, dev: &InkDev) {
+        let b = c.b;
+        let sp = &self.plan[si];
+        let ld = &self.layers[sp.layer];
+        let sd = &dev.slots[sp.slot];
         let (nh, nkv, hd) = (ld.nh, ld.nkv, ld.hd);
         let (w, kw) = (nh * hd, nkv * hd);
         let qp = QP {
@@ -3664,84 +3831,53 @@ impl InkMetal {
             }
             e.barrier();
         }
-        let lora = ld.o.lora.iter().any(|l| l.r != 0 && unsafe { (*l.d).strength() } != 0.0);
-        match ld.o.mvc {
-            // The output projection and the convolution after it in one kernel.
-            Some(pipe) if t == 1 && !lora && !self.skip(SK_DENSE | SK_CONV) && dconv_on() => {
-                let w = &ld.o.w;
-                let cp = self.conv_p(b.ab, b.x, ld.attn_conv, pos, !ld.boundary, t, None);
-                let p = MvParams {
-                    n_out: w.n_out as u32,
-                    n_in: w.n_in as u32,
-                    mode: 0,
-                    rows_per_tg: 0,
-                    w_off: w.data_off,
-                    s_off: w.scales_off,
-                    w2_off: w.data_off,
-                    s2_off: w.scales_off,
-                    o_off: w.offs_off,
-                    o2_off: w.offs_off,
-                    gpr: w.gpr,
-                    gk: w.gk,
-                    ldy: b.att as u32,
-                    _p: 0,
-                };
-                e.pipe(pipe);
-                e.buf(w.data, 0, 0);
-                e.buf(w.scales, 0, 1);
-                e.buf(c.a, 0, 2);
-                e.bytes(&p, 4);
-                e.buf(w.offs, 0, 7);
-                e.buf(self.consts, 0, 10);
-                e.bytes(&cp, 11);
-                e.buf(sd.rings[2].0, 0, 12);
-                e.dispatch((w.n_out.div_ceil(4), 1), 128);
+    }
+
+    /// Encodes `f` (ops on a session's state, for one row) for every batched row of step `si`:
+    /// each on the arena's rows of its token (`Bufs` shifted, [`Self::row_bufs`]), the rows'
+    /// stages (between `f`'s barriers) interleaved so that a barrier separates the stages of all
+    /// of them at once.
+    fn per_row(&self, e: &Pe, c: &Cx, si: usize, rows: &[RowRef], f: impl Fn(&Pe, &Cx, &RowRef)) {
+        let ld = &self.layers[self.plan[si].layer];
+        let bufs: Vec<Bufs> = (0..rows.len()).map(|j| self.row_bufs(c.b, ld, j)).collect();
+        let (mut stage, mut n) = (0, 1);
+        while stage < n {
+            e.hit.set(false);
+            for (r, b) in rows.iter().zip(&bufs) {
+                e.filter(Some(stage));
+                f(e, &Cx { a: c.a, b }, r);
+                n = n.max(e.stages());
+            }
+            e.filter(None);
+            // (After the last stage, the barrier is the caller's, as after `f` alone.)
+            if e.hit.get() && stage + 1 < n {
                 e.barrier();
             }
-            _ => {
-                if !self.skip(SK_DENSE) {
-                    self.mv(e, c, &ld.o, b.att, b.ab, t, MvMode::Store);
-                }
-                e.barrier();
-                if !self.skip(SK_CONV) {
-                    self.conv(e, c, b.ab, b.x, ld.attn_conv, sd.rings[2].0, pos, !ld.boundary, t);
-                }
-                e.barrier();
-            }
+            stage += 1;
         }
-        if !self.inline_rings(t) {
-            self.ring_store(e, c, b.ab, h, sd.rings[2].0, pos, t);
-        }
-        // The MLP's input.
-        if msgs {
-            if !self.skip(SK_MIX) {
-                self.mix_cat(e, c, &sp.mlp_states, b.x, ld.mlp_query, 1, b.hm, None, t, Some((3, false, 0)));
-            }
-            self.prefetch(e, ld, PF_MGATE_DOWN, t);
-            self.prefetch(e, ld, PF_MGATE_FG, t);
-            e.barrier();
-            let (g, _) = ld.gates.as_ref().unwrap();
-            if !self.skip(SK_GATES) {
-                let pf = Some((ld, PF_ROUTER, usize::MAX));
-                self.gates(
-                    e,
-                    c,
-                    g,
-                    &[(3, b.hm, ld.ln_post, b.hn)],
-                    t,
-                    !self.skip(SK_MIX),
-                    self.mlp_fold(si, t),
-                    pf,
-                );
-            }
-        } else {
-            if !self.skip(SK_MIX) {
-                self.mix(e, c, &sp.mlp_states, b.x, ld.mlp_query, 1, b.hn, Some(ld.ln_post), t);
-            }
-            self.prefetch(e, ld, PF_ROUTER, t);
-        }
-        e.barrier();
-        self.route(e, c, si, t);
+    }
+
+    /// The arena offsets of token `j` of a pass as those of a one-token pass (the buffers the
+    /// ops of [`Self::per_row`] read and write, by `ld`'s widths, as its kernels index tokens).
+    fn row_bufs(&self, b: &Bufs, ld: &LayerDev, j: usize) -> Bufs {
+        let (h, w, kw) = (self.h, ld.nh * ld.hd, ld.nkv * ld.hd);
+        let mut r = b.clone();
+        r.x += j * h;
+        r.ab += j * h;
+        r.o += j * h;
+        r.od += j * self.topk * h;
+        r.q += j * w;
+        r.gate += j * w;
+        r.att += j * w;
+        r.r += j * ld.nh * self.dr;
+        r.sink += j * ld.nh;
+        r.k += j * kw;
+        r.v += j * kw;
+        r.kd += j * ld.nkv * self.kn;
+        r.vd += j * ld.nkv * self.kn;
+        r.part += j * ld.nh * b.maxsplit * (ld.hd + 2);
+        r.mcnt += j * ld.nh;
+        r
     }
 
     /// Reads `ld`'s read-ahead list `which` (`PF_*`) into the system cache beside the latency
@@ -3990,6 +4126,13 @@ impl InkMetal {
     /// A step's experts (one token at a time) and the convolution after them.
     #[allow(clippy::too_many_arguments)]
     fn enc_moe(&self, e: &Pe, c: &Cx, si: usize, t: usize, pos: usize, dev: &InkDev, grouped: bool) {
+        self.enc_moe_rows(e, c, si, t, pos, dev, grouped, &[]);
+    }
+
+    /// [`Self::enc_moe`]; with `rows` (batched rows: [`Self::enc_attn_rows`]), the convolution
+    /// after the experts for each row on its own ring at its own position.
+    #[allow(clippy::too_many_arguments)]
+    fn enc_moe_rows(&self, e: &Pe, c: &Cx, si: usize, t: usize, pos: usize, dev: &InkDev, grouped: bool, rows: &[RowRef]) {
         let (h, b) = (self.h, c.b);
         let sp = &self.plan[si];
         let ld = &self.layers[sp.layer];
@@ -4087,12 +4230,18 @@ impl InkMetal {
             e.barrier();
             if ld.exp.xlora.is_none() {
                 // The convolution sums the slots itself.
-                if !self.skip(SK_CONV) {
-                    let cp = self.conv_p(b.o, b.x, ld.mlp_conv, pos, true, t, Some(b.od));
+                let conv = |e: &Pe, c: &Cx, sd: &SlotDev, pos: usize, t: usize| {
+                    let cp = self.conv_p(c.b.o, c.b.x, ld.mlp_conv, pos, true, t, Some(c.b.od));
                     self.std(e, c, self.p.conv);
                     e.bytes(&cp, 2);
                     e.buf(sd.rings[3].0, 0, 3);
                     e.dispatch((self.h.div_ceil(256), t), 256);
+                };
+                if self.skip(SK_CONV) {
+                } else if rows.is_empty() {
+                    conv(e, c, sd, pos, t);
+                } else {
+                    self.per_row(e, c, si, rows, |e, c, r| conv(e, c, &r.dev.slots[sp.slot], r.pos, 1));
                 }
                 e.barrier();
                 return;
@@ -4163,11 +4312,16 @@ impl InkMetal {
                 self.xlora(e, c, xl, t, None);
             }
         }
-        if !self.skip(SK_CONV) {
+        if self.skip(SK_CONV) {
+        } else if rows.is_empty() {
             self.conv(e, c, b.o, b.x, ld.mlp_conv, sd.rings[3].0, pos, true, t);
+        } else {
+            self.per_row(e, c, si, rows, |e, c, r| {
+                self.conv(e, c, c.b.o, c.b.x, ld.mlp_conv, r.dev.slots[sp.slot].rings[3].0, r.pos, true, 1)
+            });
         }
         e.barrier();
-        if !self.inline_rings(t) {
+        if !self.inline_rings(t) && rows.is_empty() {
             self.ring_store(e, c, b.o, h, sd.rings[3].0, pos, t);
             e.barrier();
         }
@@ -4605,6 +4759,12 @@ struct Cx<'a> {
     b: &'a Bufs,
 }
 
+/// A row of a batched pass ([`InkMetal::run_rows`]): its session's state and position.
+struct RowRef<'d> {
+    dev: &'d InkDev,
+    pos: usize,
+}
+
 impl Cx<'_> {
     /// The arena offset of block state `s`.
     fn state(&self, s: usize) -> usize {
@@ -4626,6 +4786,10 @@ impl DevEngine for InkMetal {
 
     fn snapshots(&self) -> bool {
         true
+    }
+
+    fn run_rows(&self, m: &Inkling2Model, sess: &mut [&mut Inkling2Session], x: &[f32]) -> Option<Vec<f32>> {
+        self.run_rows_impl(m, sess, x)
     }
 
     fn forward(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize) -> Vec<f32> {
@@ -4794,6 +4958,78 @@ impl DevEngine for InkMetal {
 }
 
 impl InkMetal {
+    /// [`DevEngine::run_rows`]: a pass of one token for each session (`x`: `[rows, hidden]`), its
+    /// rows the tokens of one pass for every op but those on a session's caches and rings, which
+    /// each row runs on its own at its own position as its one-token pass would
+    /// ([`Self::enc_attn_rows`]): every row's logits are those of its one-token pass.
+    fn run_rows_impl(&self, m: &Inkling2Model, sess: &mut [&mut Inkling2Session], x: &[f32]) -> Option<Vec<f32>> {
+        let (h, n) = (self.h, sess.len());
+        if !(2..=MAX_T).contains(&n) || x.len() != n * h {
+            return None;
+        }
+        let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        for s in sess.iter_mut() {
+            if s.dev.is_none() && !self.upload(m, s) {
+                s.dev = None;
+                return None;
+            }
+            let pos = s.pos;
+            let dev = s.dev.as_mut().and_then(|d| d.0.as_any().downcast_mut::<InkDev>())?;
+            dev.pos = pos;
+            if !dev.reserve(pos + 1) {
+                return None;
+            }
+        }
+        let rows: Vec<RowRef> = sess
+            .iter_mut()
+            .map(|s| {
+                let pos = s.pos;
+                let dev: &InkDev = s
+                    .dev
+                    .as_mut()
+                    .and_then(|d| d.0.as_any().downcast_mut::<InkDev>())
+                    .expect("uploaded above");
+                RowRef { dev, pos }
+            })
+            .collect();
+        self.lora_strengths();
+        let arena = &self.dec;
+        let c = Cx { a: arena.id, b: &arena.b };
+        let base = self.f.contents(c.a) as *mut f32;
+        unsafe { std::ptr::copy_nonoverlapping(x.as_ptr(), base.add(c.b.x), n * h) };
+        let steps = self.plan.len() + 1;
+        let parts: Vec<std::ops::Range<usize>> = std::iter::once(0..2.min(steps))
+            .chain((2..steps).step_by(8).map(|s| s..(s + 8).min(steps)))
+            .collect();
+        let indirect = if self.be.residency.is_some() { &[][..] } else { &self.indirect[..] };
+        let dev0 = rows[0].dev;
+        let ok = run_concurrent(self.be, &self.f, &parts, |e, r| {
+            let e = &Pe::new(e, None);
+            e.use_resources(indirect);
+            for si in r {
+                if si == self.plan.len() {
+                    self.enc_final(e, &c, n, &[], n, None);
+                } else {
+                    self.enc_attn_rows(e, &c, si, n, 0, dev0, &[], &rows);
+                    self.enc_moe_rows(e, &c, si, n, 0, dev0, false, &rows);
+                }
+            }
+        })
+        .0;
+        drop(rows);
+        if !ok {
+            panic!("Metal: a batched Inkling-2 pass failed (OXINFER_GPU_PLAN_DEBUG=1 says why)");
+        }
+        let logits = unsafe { std::slice::from_raw_parts(base.add(c.b.capped), n * self.unpadded) }.to_vec();
+        for s in sess.iter_mut() {
+            s.pos += 1;
+            if let Some(d) = s.dev.as_mut().and_then(|d| d.0.as_any().downcast_mut::<InkDev>()) {
+                d.pos = s.pos;
+            }
+        }
+        Some(logits)
+    }
+
     /// [`DevEngine::greedy`], with `feats` (when set) receiving the streams `capture` lists
     /// (as [`DevWant::capture`]; the step count plus one is the final-normed output) of each
     /// kept pass, `[kept, capture.len(), hidden]`: pass k writes them to the capture rows of

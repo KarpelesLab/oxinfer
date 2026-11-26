@@ -681,3 +681,62 @@ fn batched_rows_match_one_token_steps() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Batched decode steps of a tiny Inkling-2 on Metal (`Inkling2Model::forward_rows`: one pass
+/// whose rows are the sessions' tokens, each row's attention, caches and convolution rings its
+/// own session's at its own position) against each session's own one-token passes on the same
+/// device: the same logits bit for bit (a pass computes each of its rows as a one-token pass
+/// does, by the kernels' design, whatever the chip), the sessions where theirs are.
+#[test]
+fn inkling_batched_rows_match_one_token_passes() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+    use oxinfer::inkling::{Inkling2Config, Inkling2Model};
+    let plat = oxinfer::platform::detect();
+    let Ok(Some(_)) = oxinfer::gpu::init(&plat, oxinfer::platform::DevicePref::Auto) else {
+        eprintln!("no GPU: skipped");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("oxinfer-gpu-rows-inkling-{}", std::process::id()));
+    oxinfer::inkling::tiny::write_tiny_metal(&dir, 5).unwrap();
+    let files = ModelFiles::open(&dir, true).unwrap();
+    let m = Inkling2Model::load(Inkling2Config::load(&dir).unwrap(), &files, Quant::Bf16).unwrap();
+    // Prompts shorter and longer than the sliding window (16), one past the first growth of the
+    // full layers' caches on the way.
+    let lens = [2usize, 7, 19, 45, 130, 1030];
+    let mut alone = Vec::new();
+    let mut toks = Vec::new();
+    for (i, &n) in lens.iter().enumerate() {
+        let prompt: Vec<u32> = (0..n as u32).map(|j| (j * 31 + 7 * i as u32 + 3) % 250).collect();
+        let mut s = m.new_session();
+        let l = m.forward(&mut s, &prompt);
+        toks.push(oxinfer::sampler::argmax(&l));
+        alone.push(s);
+    }
+    let mut batch = alone.clone();
+    for step in 0..12 {
+        let want: Vec<Vec<f32>> = alone.iter_mut().zip(&toks).map(|(s, &t)| m.forward(s, &[t])).collect();
+        // Rows of 2 to all the sessions (the others step alone).
+        let k = 2 + step % (lens.len() - 1);
+        let mut refs: Vec<&mut _> = batch.iter_mut().take(k).collect();
+        let Some(got) = m.forward_rows(&mut refs, &toks[..k]) else {
+            eprintln!("no batched Inkling-2 passes on this device: skipped");
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        };
+        for (j, s) in batch.iter_mut().enumerate().skip(k) {
+            assert!(bits(&m.forward(s, &[toks[j]])) == bits(&want[j]));
+        }
+        for (j, g) in got.iter().enumerate() {
+            assert_eq!(g.len(), want[j].len());
+            assert!(
+                bits(g) == bits(&want[j]),
+                "step {step} row {j} of {k}: logits differ from the one-token pass"
+            );
+        }
+        for (a, b) in alone.iter().zip(&batch) {
+            assert_eq!(a.pos, b.pos);
+        }
+        toks = want.iter().map(|l| oxinfer::sampler::argmax(l)).collect();
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -1748,6 +1748,31 @@ fn dspark_then_plain<M: crate::dspark::Target>(
     d.then(rest)
 }
 
+/// [`dspark_then_plain`] for a target that cannot cut back to the plain turn's start (Inkling-2):
+/// a checkpoint there first (keeping at most `max`), which the next prefill goes back to.
+#[allow(clippy::too_many_arguments)]
+fn dspark_then_plain_cp<M: crate::dspark::CheckpointTarget>(
+    dec: &mut DsparkDecoder<'_, M>,
+    d: Decoded,
+    yielded: bool,
+    max_cps: usize,
+    sampler: &mut Sampler,
+    stop: &[u32],
+    max: usize,
+    cb: &mut dyn FnMut(&[u32]) -> generate::Flow,
+) -> Decoded {
+    let Some(&last) = d.tokens.last().filter(|_| yielded) else {
+        return d;
+    };
+    let at = dec.plain_turn_checkpointed(max_cps);
+    let toks = d.tokens.clone();
+    let n = toks.len();
+    let rest = generate::decode_from(dec.model(), &mut dec.sess, toks, generate::Start::Run(last), sampler, stop, max, cb);
+    let fed = dec.model().session_len(&dec.sess) - at;
+    dec.end_plain_turn(at, &rest.tokens[n - 1..][..fed]);
+    d.then(rest)
+}
+
 /// A prompt-lookup drafter for a new conversation.
 fn reset_lookup(lk: Option<crate::lookup::Lookup>) -> Option<crate::lookup::Lookup> {
     lk.map(|mut l| {
@@ -3982,6 +4007,7 @@ impl PendingTurn {
             lookup,
             constrain,
             token_hook,
+            checkpoints,
             ..
         } = e;
         let tok: &Tokenizer = tok;
@@ -4237,14 +4263,25 @@ impl PendingTurn {
                 let logits = dec.prefill_mm(&ids, chunk, &overrides);
                 st.prefill_secs = t0.elapsed().as_secs_f64();
                 let max = limit(dec.sess.pos);
+                // (The session cannot cut back to a plain turn's start: a checkpoint there, one
+                // more than the prompt's.)
+                let cps = *checkpoints + 1;
                 if max == 0 {
                     empty(0.0)
+                } else if crate::batch::contended() {
+                    // As Qwen's above.
+                    let at = dec.plain_turn_checkpointed(cps);
+                    let d = generate::decode(dec.model(), &mut dec.sess, logits, sampler, stop, max, &mut cb);
+                    let fed = dec.sess.pos - at;
+                    dec.end_plain_turn(at, &d.tokens[..fed]);
+                    d
                 } else {
                     let before = dec.stats.clone();
-                    let d = generate::decode_rounds(&mut **dec, &logits, sampler, stop, max, &mut cb);
+                    let (d, yielded) =
+                        generate::decode_rounds_until(&mut **dec, &logits, sampler, stop, max, &mut cb, &crate::batch::contended);
                     st.drafted = dec.stats.drafted - before.drafted;
                     st.accepted = dec.stats.accepted - before.accepted;
-                    d
+                    dspark_then_plain_cp(dec, d, yielded, cps, sampler, stop, max, &mut cb)
                 }
             }
             Lm::DeepSeek4Dspark { dec } => {

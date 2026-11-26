@@ -102,6 +102,11 @@ pub trait Target: TextLm {
     fn vocab_size(&self) -> usize;
     /// Drops cached positions at or beyond `len`.
     fn truncate(&self, sess: &mut Self::Sess, len: usize);
+    /// Goes back to `len`, further than [`Target::truncate`] goes where the target keeps a
+    /// checkpoint there ([`DsparkDecoder::plain_turn_checkpointed`]); by default `truncate`.
+    fn cut_back(&self, sess: &mut Self::Sess, len: usize) {
+        self.truncate(sess, len)
+    }
     /// Greedy decoding with the passes chained on the device ([`TextLm::decode_greedy`]) that
     /// also appends to `feats` the features of each kept pass (as [`Target::forward_feats`]):
     /// a DSpark decoder's plain rounds back to back. None (nothing run) when the model does not.
@@ -3562,7 +3567,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         assert!(!tokens.is_empty());
         // After a plain turn: its tokens again, from where it started, for the draft's features.
         if let Some((at, mut again)) = self.stale.take() {
-            self.model.truncate(&mut self.sess, at);
+            self.model.cut_back(&mut self.sess, at);
             self.next = None;
             let shift = again.len();
             again.extend_from_slice(tokens);
@@ -3964,6 +3969,14 @@ impl<M: CheckpointTarget> DsparkDecoder<'_, M> {
         // The target's cap decides which go.
         let (model, sess) = (self.model, &self.sess);
         self.marks.retain(|m| model.has_checkpoint(sess, m.pos));
+    }
+
+    /// [`Self::plain_turn`] for a target that cannot cut back to the turn's start (Inkling-2):
+    /// a checkpoint of it first (keeping at most `max`, at least 1), which the next prefill goes
+    /// back to ([`Target::cut_back`]) to run the turn's tokens again with the draft's features.
+    pub fn plain_turn_checkpointed(&mut self, max: usize) -> usize {
+        self.checkpoint(max.max(1));
+        self.plain_turn()
     }
 
     /// Whether there is a checkpoint of position `pos`.
