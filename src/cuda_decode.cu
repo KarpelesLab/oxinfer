@@ -334,6 +334,30 @@ extern "C" __global__ void dnorm(const float* x, float* out, const float* w, DNP
     }
 }
 
+// `dnorm` (a row per block) that also writes its rows as f16 for the next GEMM (`xh`, rows of
+// p.n halves, the values `dhalf_t` would make of them) and sets *flag as `dhalf_t` does.
+extern "C" __global__ void dnorm_h(const float* x, float* out, const float* w, DNP p, unsigned short* xh, unsigned int* flag) {
+    __shared__ float red[32];
+    const float* xr = x + (size_t)blockIdx.x * p.x_stride;
+    float* o = out + (size_t)blockIdx.x * p.o_stride;
+    unsigned short* h = xh + (size_t)blockIdx.x * p.n;
+    float s = 0.f;
+    for (unsigned int i = threadIdx.x; i < p.n; i += blockDim.x) { float v = xr[i] * p.pre; s += v * v; }
+    float k = rsqrtf(dblock_sum(s, red) / (float)p.n + p.eps);
+    unsigned int top = 0u;
+    for (unsigned int i = threadIdx.x; i < p.n; i += blockDim.x) {
+        float v = xr[i] * p.pre * k;
+        if (p.has_w) v *= w[i];
+        if (p.add) v += o[i];
+        o[i] = v;
+        unsigned short hv;
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(v));
+        h[i] = hv;
+        top = max(top, __float_as_uint(v) & 0x7fffffffu);
+    }
+    if (top >= 0x47000000u) *flag = 1u;
+}
+
 // ---- x = (x + rmsnorm(y) * wy) * scale, then with has_next out = rmsnorm(x) * wn. One block.
 extern "C" __global__ void dadd_norm(const float* y, float* x, float* out, const float* wy, const float* wn, unsigned int n, float eps,
                                      float scale, unsigned int has_next) {
@@ -727,6 +751,22 @@ extern "C" __global__ void dglu_t(const float* g, const float* u, float* out, un
     if (i >= n) return;
     float a = g[t * gs + i];
     out[t * os + i] = (gelu ? dgelu(a) : a / (1.0f + expf(-a))) * u[t * us + i];
+}
+
+// `dglu_t` that also writes its rows as f16 for the next GEMM (`xh`, rows of n halves) and sets
+// *flag, as `dnorm_h`.
+extern "C" __global__ void dglu_th(const float* g, const float* u, float* out, unsigned int n, unsigned int gelu, unsigned int gs,
+                                   unsigned int us, unsigned int os, unsigned short* xh, unsigned int* flag) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t t = blockIdx.y;
+    if (i >= n) return;
+    float a = g[t * gs + i];
+    float v = (gelu ? dgelu(a) : a / (1.0f + expf(-a))) * u[t * us + i];
+    out[t * os + i] = v;
+    unsigned short hv;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hv) : "f"(v));
+    xh[t * n + i] = hv;
+    if ((__float_as_uint(v) & 0x7fffffffu) >= 0x47000000u) *flag = 1u;
 }
 
 // `dew` per token; grid (blocks of n, tokens).

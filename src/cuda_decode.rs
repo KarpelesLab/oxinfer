@@ -481,6 +481,9 @@ pub(super) struct CudaPlan<'b> {
     /// The same for the fast GEMM's f16 rows (`PfFuncs::xh`): q / k / v and gate / up convert
     /// their input once.
     xh_last: std::cell::Cell<(u64, u32, u32, u32)>,
+    /// The input (address, width) of the op after the one launching, when it is a GEMM: a norm or
+    /// GLU writing that input writes its f16 rows too (`dnorm_h`, `dglu_th`) and sets `xh_last`.
+    xh_next: std::cell::Cell<(u64, u32)>,
     /// Prefill plans: each cache's new keys and values go down on a stream of their own as soon
     /// as the op writing them last has run (per cache, an event when written and one when
     /// landed in `kv_pinned`), and a host thread stages them into the host caches under the
@@ -563,6 +566,10 @@ struct PfFuncs {
     /// of the widest GEMM input), else null.
     half: F,
     xh: u64,
+    /// Halves per row of `xh` (the widest GEMM input), and the norm / GLU kernels that write it.
+    xh_n: u32,
+    norm_h: F,
+    glu_h: F,
     /// The stream-K GEMM's scratch ([`super::gemmh_fix_floats`]).
     fix: u64,
     glu: F,
@@ -1588,6 +1595,7 @@ impl CudaBackend {
             },
             q8_last: Default::default(),
             xh_last: Default::default(),
+            xh_next: Default::default(),
             kv_stream: {
                 let mut st: *mut c_void = std::ptr::null_mut();
                 if !kv_async || unsafe { self.cu.cuStreamCreate(&mut st, 1) } != 0 {
@@ -1619,6 +1627,9 @@ impl CudaBackend {
                     flag: arena + flag_off as u64,
                     half: if fast_gemm { self.func("dhalf_t")? } else { std::ptr::null_mut() },
                     xh: arena + xh_off as u64,
+                    xh_n: gemm_in_max as u32,
+                    norm_h: if fast_gemm { self.func("dnorm_h")? } else { std::ptr::null_mut() },
+                    glu_h: if fast_gemm { self.func("dglu_th")? } else { std::ptr::null_mut() },
                     fix: arena + fix_off as u64,
                     glu: self.func("dglu_t")?,
                     ew: self.func("dew_t")?,
@@ -2022,6 +2033,13 @@ impl CudaPlan<'_> {
         }
     }
 
+    /// Whether the op launching writes the input (`out`, `n` floats a row) of a fast GEMM right
+    /// after it, which then takes its f16 rows from it (fast prefill plans; the GEMM over at
+    /// least `PF_GEMM_MIN` rows).
+    fn feeds_gemm(&self, pf: &PfFuncs, out: u64, n: u32, t: usize) -> bool {
+        !pf.norm_h.is_null() && t >= PF_GEMM_MIN && n <= pf.xh_n && self.xh_next.get() == (out, n)
+    }
+
     /// A prefill plan's launch of `op` over the step's `t` tokens at once; None for the ops
     /// without such a kernel (they run token by token).
     fn launch_pf(&self, pf: &PfFuncs, op: &COp, slot: &CudaSlot, t: usize) -> Option<bool> {
@@ -2102,11 +2120,29 @@ impl CudaPlan<'_> {
                 // A row per token.
                 (p.x_stride, p.o_stride) = (st(x), st(out));
                 let (x, out, w) = (x.a, out.a, w.a);
-                be.launch(f, (tt, 1), threads, &mut args![x, out, w, p])
+                if self.feeds_gemm(pf, out, p.n, t) {
+                    let (xh, flag) = (pf.xh, pf.flag);
+                    // The f16 rows the GEMM's `dhalf_t` would make (`xh_last`'s key as its).
+                    self.xh_last.set((out, p.o_stride, p.n, tt));
+                    be.launch(pf.norm_h, (tt, 1), threads, &mut args![x, out, w, p, xh, flag])
+                } else {
+                    be.launch(f, (tt, 1), threads, &mut args![x, out, w, p])
+                }
             }
             COp::Glu { g, u, out, n, gelu, .. } => {
                 let (ga, ua, oa, gs, us, os) = (g.a, u.a, out.a, st(g), st(u), st(out));
-                be.launch(pf.glu, (n.div_ceil(256), tt), 256, &mut args![ga, ua, oa, n, gelu, gs, us, os])
+                if self.feeds_gemm(pf, oa, n, t) {
+                    let (xh, flag) = (pf.xh, pf.flag);
+                    self.xh_last.set((oa, os, n, tt));
+                    be.launch(
+                        pf.glu_h,
+                        (n.div_ceil(256), tt),
+                        256,
+                        &mut args![ga, ua, oa, n, gelu, gs, us, os, xh, flag],
+                    )
+                } else {
+                    be.launch(pf.glu, (n.div_ceil(256), tt), 256, &mut args![ga, ua, oa, n, gelu, gs, us, os])
+                }
             }
             COp::Ew { a, b, out, n, kind, p, .. } => {
                 let (aa, ba, oa, sa, sb, so) = (a.a, b.a, out.a, st(a), st(b), st(out));
@@ -2487,6 +2523,10 @@ impl DecodePlan for CudaPlan<'_> {
                 self.q8_last.set(Default::default());
                 self.xh_last.set(Default::default());
             }
+            self.xh_next.set(match self.ops[..end].get(i + 1) {
+                Some(&COp::Gmv { x, n_in, w2: None, .. }) => (x.a, n_in),
+                _ => Default::default(),
+            });
             if !self.launch_tokens(op, ms, t) {
                 debug(&format!("step of {t} token(s): op {i} of {} did not launch", self.ops.len()));
                 return false;
@@ -2566,6 +2606,7 @@ impl DecodePlan for CudaPlan<'_> {
                 kinds.iter().map(|(k, (n, us))| format!("{k} {n}x {us:.0}us")).collect::<Vec<_>>()
             );
         }
+        let tl = std::time::Instant::now();
         if tr {
             unsafe { be.cu.cuCtxSynchronize() };
         }
@@ -2633,9 +2674,10 @@ impl DecodePlan for CudaPlan<'_> {
             let mut last = LAST.lock().unwrap();
             let gap = last.map_or(0.0, |l| t0.saturating_duration_since(l).as_secs_f64() * 1e6);
             eprintln!(
-                "[cuda decode step t={t}: states up {:.0} us, ops {:.0} us, results {:.0} us, states down {:.0} us; {gap:.0} us since the last step]",
+                "[cuda decode step t={t}: states up {:.0} us, ops {:.0} us (launched in {:.0}), results {:.0} us, states down {:.0} us; {gap:.0} us since the last step]",
                 (t1 - t0).as_secs_f64() * 1e6,
                 (t2 - t1).as_secs_f64() * 1e6,
+                (tl - t1).as_secs_f64() * 1e6,
                 (t3 - t2).as_secs_f64() * 1e6,
                 t3.elapsed().as_secs_f64() * 1e6
             );
