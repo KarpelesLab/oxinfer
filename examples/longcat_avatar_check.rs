@@ -239,7 +239,7 @@ fn check_sched(case: &Value) {
 }
 
 fn check_e2e(dir: &Path, case: &Value, avatar: &Path, base: &Path) -> Result<()> {
-    if case["e2e_noise"].is_null() {
+    if case["e2e_noise"].is_null() && case["e2e_noise_int8"].is_null() {
         return Ok(());
     }
     let prompts = case["prompts"].as_array().context("no prompts")?;

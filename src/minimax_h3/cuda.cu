@@ -493,8 +493,8 @@ __device__ __forceinline__ void store4(u32* d, uint4 v) { d[0] = v.x, d[1] = v.y
 
 // One 32-wide K step (from word k0) of a warp's 32 x 8 NT products: A rows from `a0` on in `ah` /
 // `al` (rows of `ald` words), B rows from `b0` on in `bh` / `bl`, three products; their sum
-// `hi + lo / 2048` is added to `acc`.
-template <int NT>
+// `hi + lo / 2048` is added to `acc`. NP 1: the product of the first halves only.
+template <int NT, int NP = 3>
 __device__ __forceinline__ void flash_step(float acc[2][NT][4], const u32* ah, const u32* al, u32 ald, const u32* bh, const u32* bl, u32 bld, u32 a0, u32 b0, u32 g, u32 c4, u32 k0) {
     float st[2][NT][4], stl[2][NT][4];
 #pragma unroll
@@ -524,12 +524,14 @@ __device__ __forceinline__ void flash_step(float acc[2][NT][4], const u32* ah, c
 #pragma unroll
             for (int nt = 0; nt < NT; nt++) {
                 mma16816(st[mt][nt], af[mt], bf[nt]);
-                mma16816(stl[mt][nt], alo[mt], bf[nt]);
+                if constexpr (NP == 3) mma16816(stl[mt][nt], alo[mt], bf[nt]);
             }
+        if constexpr (NP == 3) {
 #pragma unroll
-        for (int mt = 0; mt < 2; mt++)
+            for (int mt = 0; mt < 2; mt++)
 #pragma unroll
-            for (int nt = 0; nt < NT; nt++) mma16816(stl[mt][nt], af[mt], blo[nt]);
+                for (int nt = 0; nt < NT; nt++) mma16816(stl[mt][nt], af[mt], blo[nt]);
+        }
     }
 #pragma unroll
     for (int a = 0; a < 2; a++)
@@ -540,7 +542,7 @@ __device__ __forceinline__ void flash_step(float acc[2][NT][4], const u32* ah, c
 }
 
 // Queries `qlo..qhi` against keys `klo..khi` (rows of the same planes: `p.n` is their stride).
-template <int HD>
+template <int HD, int NP = 3>
 __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 klo, u32 khi) {
     const u32 HW = HD / 2, QLD = HW + 4;
     const u32 BW = FK * QLD > HD * PLD ? FK * QLD : HD * PLD;
@@ -565,7 +567,7 @@ __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 
         if (tr < nq) {
             u64 at = ((u64)head * p.n + q0 + tr) * HW + to + i;
             put8(Qh + tr * QLD + to + i, p.qh + at);
-            put8(Ql + tr * QLD + to + i, p.ql + at);
+            if constexpr (NP == 3) put8(Ql + tr * QLD + to + i, p.ql + at);
         } else {
             zero8(Qh + tr * QLD + to + i);
             zero8(Ql + tr * QLD + to + i);
@@ -600,7 +602,7 @@ __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 
             if (k0 + tr < p.n) {
                 u64 at = ((u64)head * p.n + k0 + tr) * HW + to + 4 * i;
                 kr[0][i] = *(const uint4*)(p.kh + at);
-                kr[1][i] = *(const uint4*)(p.kl + at);
+                if constexpr (NP == 3) kr[1][i] = *(const uint4*)(p.kl + at);
             } else {
                 kr[0][i] = kr[1][i] = make_uint4(0u, 0u, 0u, 0u);
             }
@@ -611,7 +613,7 @@ __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 
 #pragma unroll
         for (int i = 0; i < KN; i++) {
             store4(Bh + tr * QLD + to + 4 * i, kr[0][i]);
-            store4(Bl + tr * QLD + to + 4 * i, kr[1][i]);
+            if constexpr (NP == 3) store4(Bl + tr * QLD + to + 4 * i, kr[1][i]);
         }
         __syncthreads();
 #pragma unroll
@@ -620,7 +622,7 @@ __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 
             if (w0 < half_nk) {
                 u64 at = ((u64)head * HD + vr) * half_nk + w0;
                 vq[0][i] = *(const uint4*)(p.vh + at);
-                vq[1][i] = *(const uint4*)(p.vl + at);
+                if constexpr (NP == 3) vq[1][i] = *(const uint4*)(p.vl + at);
             } else {
                 vq[0][i] = vq[1][i] = make_uint4(0u, 0u, 0u, 0u);
             }
@@ -633,7 +635,7 @@ __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 
 #pragma unroll
                 for (int c = 0; c < 4; c++) s[a][b][c] = 0.f;
 #pragma unroll
-        for (u32 k = 0; k < HW; k += 16) flash_step<2>(s, Qh, Ql, QLD, Bh, Bl, QLD, wm, wn, g, c4, k);
+        for (u32 k = 0; k < HW; k += 16) flash_step<2, NP>(s, Qh, Ql, QLD, Bh, Bl, QLD, wm, wn, g, c4, k);
         // The scaled scores (keys past n: -inf) and each row's maximum over this warp's keys.
 #pragma unroll
         for (int mt = 0; mt < 2; mt++) {
@@ -660,7 +662,7 @@ __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 
 #pragma unroll
         for (int i = 0; i < VN; i++) {
             store4(Bh + vr * PLD + vo + 4 * i, vq[0][i]);
-            store4(Bl + vr * PLD + vo + 4 * i, vq[1][i]);
+            if constexpr (NP == 3) store4(Bl + vr * PLD + vo + 4 * i, vq[1][i]);
         }
         float alpha[2][2];
 #pragma unroll
@@ -705,8 +707,8 @@ __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 
 #pragma unroll
                 for (int q = 0; q < 4; q++) o[mt][nt][q] *= alpha[mt][q >> 1];
         }
-        flash_step<NO>(o, Ph, Pl, PLD, Bh, Bl, PLD, wm, cn, g, c4, 0);
-        flash_step<NO>(o, Ph, Pl, PLD, Bh, Bl, PLD, wm, cn, g, c4, 16);
+        flash_step<NO, NP>(o, Ph, Pl, PLD, Bh, Bl, PLD, wm, cn, g, c4, 0);
+        flash_step<NO, NP>(o, Ph, Pl, PLD, Bh, Bl, PLD, wm, cn, g, c4, 16);
         __syncthreads();
     }
     float f = p.vs[head] * (1.f / 16384.f);

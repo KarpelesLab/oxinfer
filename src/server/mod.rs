@@ -1185,7 +1185,7 @@ mod tests {
     #[test]
     fn avatar_presets_are_not_served() {
         for id in ["longcat-avatar", "longcat-avatar-int8", crate::longcat_avatar::AVATAR_REPO] {
-            let e = ModelSpec::new(id).err().expect(id).to_string();
+            let e = ModelSpec::new(id).expect_err(id).to_string();
             assert!(e.contains("not served"), "{e}");
         }
         assert!(ModelSpec::new("kromoss-dmd2").is_ok());

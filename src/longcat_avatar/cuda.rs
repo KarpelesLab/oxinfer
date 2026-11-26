@@ -1,11 +1,17 @@
 //! LongCat-Video-Avatar's block stack on CUDA, with the sequence kept on the device. The kernels
 //! are MiniMax-H3's (`minimax_h3/cuda.cu`: tensor-core GEMM with f16 operands and f32
-//! accumulation, activations as two halves `hi + lo 2^-11`, flash attention without a score
-//! matrix) plus `cuda.cu` of this folder: the GEMM over int8 rows with a scale each (the int8
+//! accumulation, flash attention without a score matrix) plus `cuda.cu` of this folder: the
+//! GEMM over int8 rows with a scale each (the int8
 //! bytes are read as stored and are exact in a half), attention over a range of queries and a
 //! range of keys (the conditioning frames' restricted self-attention, the text and the per-frame
 //! audio cross-attention), layer norms with the per-frame AdaLN sets, and the query / key
 //! preparation with adjacent-pair RoPE.
+//!
+//! Activations stay float32 between the kernels. Into a product they go as float16 after a power
+//! of two per row (about 3e-4 relative on an operand; the reference computes everything in
+//! bfloat16, whose mantissa is three bits shorter), or, with `OXINFER_AVATAR_GPU_EXACT=1`, as
+//! two halves `hi + lo 2^-11` (two products per GEMM, three per attention product: float32
+//! results to about 1e-6, at about twice the time).
 //!
 //! Weights: `base_model_int8/` goes to the device byte for byte (0.33 GB a block); the bf16
 //! `base_model/` as float16 (exact but for values under 2^-14; 0.66 GB a block). The LoRAs are
@@ -410,7 +416,13 @@ impl Engine {
             return None;
         }
         let be = crate::gpu::active()?.as_any()?.downcast_ref::<CudaBackend>()?;
-        match Self::build(be, dit) {
+        // Split operands when asked (`OXINFER_AVATAR_GPU_EXACT=1`, or the crate-wide `gpu_exact`).
+        let exact = std::env::var("OXINFER_AVATAR_GPU_EXACT")
+            .ok()
+            .map(|v| v != "0")
+            .or_else(crate::gpu::exact_forced)
+            .unwrap_or(false);
+        match Self::build(be, dit, exact) {
             Ok(e) => Some(e),
             Err(e) => {
                 debug(&format!("{e:#}"));
@@ -419,7 +431,7 @@ impl Engine {
         }
     }
 
-    fn build(be: &CudaBackend, dit: &Dit) -> Result<Engine> {
+    fn build(be: &CudaBackend, dit: &Dit, exact: bool) -> Result<Engine> {
         let c = &dit.cfg;
         let hd = dit.head_dim();
         let Some(b0) = dit.blocks.first() else { bail!("no blocks") };
@@ -443,13 +455,18 @@ impl Engine {
             Ok(f)
         };
         let f = Funcs {
-            gemm_i8: get("lc_gemm_i8_2")?,
-            gemm_h: get("gemm_h_2")?,
+            gemm_i8: get(if exact { "lc_gemm_i8_2" } else { "lc_gemm_i8_1" })?,
+            gemm_h: get(if exact { "gemm_h_2" } else { "gemm_h_1" })?,
             split_rows: get("split_rows")?,
             swiglu: get("swiglu")?,
             v_scale: get("v_scale")?,
             v_planes: get("v_planes")?,
-            attn: get(if hd == 128 { "lc_attn_flash_128" } else { "lc_attn_flash_64" })?,
+            attn: get(match (hd, exact) {
+                (128, true) => "lc_attn_flash_128",
+                (128, false) => "lc_attn_flash_128_fast",
+                (_, true) => "lc_attn_flash_64",
+                (_, false) => "lc_attn_flash_64_fast",
+            })?,
             ln_mod: get("lc_ln_mod")?,
             ln_affine: get("lc_ln_affine")?,
             resid: get("lc_resid")?,
@@ -1284,47 +1301,54 @@ mod tests {
         };
         for sub in ["base_model", "base_model_int8"] {
             let dit = Dit::load(&avatar.join(sub)).unwrap();
-            let e = Engine::build(be, &dit).unwrap();
-            let c = &dit.cfg;
-            let (lh, lw) = (8, 12);
-            for (n_t, num_cond, num_ref, mask) in [(4usize, 0usize, 0usize, 0usize), (4, 1, 0, 0), (6, 3, 1, 1)] {
-                for mix in [None, Some((0.3f32, 0.7f32))] {
-                    let frames = 1 + c.vae_scale * (n_t - num_ref - 1);
-                    let audio: Vec<f32> = (0..frames * c.audio_window * c.audio_block * c.audio_channel)
-                        .map(|_| rnd())
-                        .collect();
-                    let text: Vec<f32> = (0..5 * c.caption_channels).map(|_| rnd()).collect();
-                    let ts: Vec<f32> = (0..n_t).map(|f| if f < num_cond { 0.0 } else { 640.0 }).collect();
-                    let active: Vec<(&LoraNet, f32)> = match mix {
-                        Some((a, b)) => vec![(&nets[0], a), (&nets[1], b)],
-                        None => Vec::new(),
-                    };
-                    let cond = Cond {
-                        text: &text,
-                        text_len: 16,
-                        audio: &audio,
-                        humans: 1,
-                        num_cond,
-                        num_ref,
-                        ref_img_index: 2,
-                        mask_frame_range: mask,
-                        ref_masks: None,
-                        lora: Active { nets: &active },
-                    };
-                    let ctx = dit.context((n_t, lh, lw), &ts, &cond).unwrap();
-                    let n = n_t * ctx.s;
-                    let x: Vec<f32> = (0..n * c.hidden_size).map(|_| rnd()).collect();
-                    let (mut dev, mut cpu) = (x.clone(), x);
-                    assert!(e.run(&dit, &mut dev, &ctx), "{sub}: the engine declined");
-                    dit.blocks_cpu(&mut cpu, &ctx);
-                    let scale = cpu.iter().map(|v| v.abs()).sum::<f32>() / cpu.len() as f32;
-                    let max = dev.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-                    // The side paths' factors are float16 on the device.
-                    let tol = if mix.is_some() { 2e-3 } else { 2e-5 };
-                    assert!(
-                        max < tol * scale.max(1.0),
-                        "{sub} cond {num_cond} ref {num_ref} mix {mix:?}: {max:.3e} (mean |v| {scale:.3e})"
-                    );
+            for exact in [true, false] {
+                let e = Engine::build(be, &dit, exact).unwrap();
+                let c = &dit.cfg;
+                let (lh, lw) = (8, 12);
+                for (n_t, num_cond, num_ref, mask) in [(4usize, 0usize, 0usize, 0usize), (4, 1, 0, 0), (6, 3, 1, 1)] {
+                    for mix in [None, Some((0.3f32, 0.7f32))] {
+                        let frames = 1 + c.vae_scale * (n_t - num_ref - 1);
+                        let audio: Vec<f32> = (0..frames * c.audio_window * c.audio_block * c.audio_channel)
+                            .map(|_| rnd())
+                            .collect();
+                        let text: Vec<f32> = (0..5 * c.caption_channels).map(|_| rnd()).collect();
+                        let ts: Vec<f32> = (0..n_t).map(|f| if f < num_cond { 0.0 } else { 640.0 }).collect();
+                        let active: Vec<(&LoraNet, f32)> = match mix {
+                            Some((a, b)) => vec![(&nets[0], a), (&nets[1], b)],
+                            None => Vec::new(),
+                        };
+                        let cond = Cond {
+                            text: &text,
+                            text_len: 16,
+                            audio: &audio,
+                            humans: 1,
+                            num_cond,
+                            num_ref,
+                            ref_img_index: 2,
+                            mask_frame_range: mask,
+                            ref_masks: None,
+                            lora: Active { nets: &active },
+                        };
+                        let ctx = dit.context((n_t, lh, lw), &ts, &cond).unwrap();
+                        let n = n_t * ctx.s;
+                        let x: Vec<f32> = (0..n * c.hidden_size).map(|_| rnd()).collect();
+                        let (mut dev, mut cpu) = (x.clone(), x);
+                        assert!(e.run(&dit, &mut dev, &ctx), "{sub}: the engine declined");
+                        dit.blocks_cpu(&mut cpu, &ctx);
+                        let scale = cpu.iter().map(|v| v.abs()).sum::<f32>() / cpu.len() as f32;
+                        let max = dev.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                        // The side paths' factors are float16 on the device; without split operands
+                        // so are the activations.
+                        let tol = match (exact, mix.is_some()) {
+                            (true, false) => 2e-5,
+                            (true, true) => 2e-3,
+                            (false, _) => 2e-2,
+                        };
+                        assert!(
+                            max < tol * scale.max(1.0),
+                            "{sub} exact {exact} cond {num_cond} ref {num_ref} mix {mix:?}: {max:.3e} (mean |v| {scale:.3e})"
+                        );
+                    }
                 }
             }
         }

@@ -16,6 +16,10 @@ struct LcAttP {
 };
 extern "C" __global__ void __launch_bounds__(256) lc_attn_flash_64(LcAttP a) { flash_body<64>(a.p, a.qlo, a.qhi, a.klo, a.khi); }
 extern "C" __global__ void __launch_bounds__(256) lc_attn_flash_128(LcAttP a) { flash_body<128>(a.p, a.qlo, a.qhi, a.klo, a.khi); }
+// The same with the first halves of the operands only (float16 queries, keys, probabilities and
+// values: a third of the products).
+extern "C" __global__ void __launch_bounds__(256) lc_attn_flash_64_fast(LcAttP a) { flash_body<64, 1>(a.p, a.qlo, a.qhi, a.klo, a.khi); }
+extern "C" __global__ void __launch_bounds__(256) lc_attn_flash_128_fast(LcAttP a) { flash_body<128, 1>(a.p, a.qlo, a.qhi, a.klo, a.khi); }
 
 // ---- out[r] = layernorm(x[r]) (no weights), then (1 + scale) and + shift of the row's frame:
 // `tab` holds `stride` floats per frame, the shift at `shift_at` and the scale at `scale_at`;
