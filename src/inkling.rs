@@ -1378,6 +1378,14 @@ pub(crate) struct DevWant<'w> {
 }
 
 impl Inkling2Session {
+    /// Bytes of memory its caches hold: the attention caches on the host and on the device, and
+    /// its checkpoints.
+    pub fn cache_bytes(&self) -> usize {
+        let host: usize = self.layers.iter().map(|l| l.k.bytes() + l.v.bytes()).sum();
+        let dev = self.dev.as_ref().map_or(0, |d| d.0.bytes());
+        host + dev + self.checkpoints.iter().map(|c| c.bytes()).sum::<usize>()
+    }
+
     /// Goes back to position `len` (at most [`ROLLBACK`] before the current one), as if the
     /// tokens from `len` on had not been run.
     pub fn truncate(&mut self, len: usize) -> Result<()> {

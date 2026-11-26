@@ -310,6 +310,9 @@ pub(crate) struct Registry {
     /// Sessions of each chat model, the conversations it runs at once (a model's own `parallel`
     /// option overrides it; see [`super::ServerOptions::parallel`]).
     pub parallel: usize,
+    /// The memory the chat models' sessions' caches may hold together (None: no limit; see
+    /// [`super::ServerOptions::session_cache`]).
+    pub session_cache: Option<u64>,
     clock: AtomicU64,
     /// Serializes loads (and the memory accounting around them).
     loading: Mutex<()>,
@@ -448,6 +451,7 @@ impl Registry {
             prompt_cache: None,
             prompt_cache_gb: None,
             parallel: super::DEFAULT_PARALLEL,
+            session_cache: None,
             clock: AtomicU64::new(1),
             loading: Mutex::new(()),
             log,
@@ -941,6 +945,87 @@ impl Registry {
         true
     }
 
+    /// The loaded chat models' session pools.
+    fn chat_pools(&self) -> Vec<(String, Arc<EnginePool>)> {
+        self.active()
+            .into_iter()
+            .filter_map(|e| match e.slot.try_lock().ok().as_deref() {
+                Some(Some(Loaded::Chat(pool))) => Some((e.spec.id.clone(), pool.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Bytes the chat models' sessions' caches hold together (as last measured).
+    pub fn session_cache_bytes(&self) -> u64 {
+        self.chat_pools().iter().map(|(_, p)| p.cache_bytes()).sum()
+    }
+
+    /// Evicts idle sessions' caches over [`Registry::session_cache`] (see
+    /// [`super::ServerOptions::session_cache`]); returns the bytes freed.
+    pub fn trim_sessions(&self) -> u64 {
+        match self.session_cache {
+            Some(b) => self.evict_sessions(b, false).1,
+            None => 0,
+        }
+    }
+
+    /// Evicts the idle sessions' caches of every chat model, least recently used first
+    /// ([`EnginePool::evict`]), until they hold at most `budget` bytes together; with `pressure`
+    /// (the system short of memory), the least recently used one whatever the budget, more while
+    /// it stays short. The most recently used idle session is kept for the budget. Returns the
+    /// sessions evicted and the bytes freed.
+    pub fn evict_sessions(&self, budget: u64, pressure: bool) -> (usize, u64) {
+        let pools = self.chat_pools();
+        let mut idle: Vec<(usize, crate::engine::IdleCache)> = pools
+            .iter()
+            .enumerate()
+            .flat_map(|(i, (_, p))| p.idle_caches().into_iter().map(move |c| (i, c)))
+            .collect();
+        idle.sort_by_key(|(_, c)| c.used);
+        if !pressure {
+            // (The last one is the most recently used.)
+            idle.pop();
+        }
+        let (mut n, mut freed) = (0, 0);
+        for (i, c) in idle {
+            let short = pressure && crate::platform::memory_headroom() == Some(0);
+            if pressure {
+                if n > 0 && !short {
+                    break;
+                }
+            } else if pools.iter().map(|(_, p)| p.cache_bytes()).sum::<u64>() <= budget {
+                break;
+            }
+            if !pressure && c.bytes == 0 {
+                continue;
+            }
+            let (id, pool) = &pools[i];
+            match pool.evict(c.index) {
+                Some(Ok(b)) => {
+                    n += 1;
+                    freed += b;
+                    if self.log {
+                        let why = if short {
+                            "the system is short of memory"
+                        } else {
+                            "over the session cache budget"
+                        };
+                        eprintln!(
+                            "[{id}: session {} let go of its cache ({} tokens, {:.2} GB): {why}]",
+                            c.index,
+                            c.tokens,
+                            b as f64 / 1e9
+                        );
+                    }
+                }
+                Some(Err(e)) => eprintln!("[{id}: session {}: {e:#}]", c.index),
+                None => {}
+            }
+        }
+        (n, freed)
+    }
+
     /// The background upkeep ([`super::Api`] runs it every few seconds): unloads the models idle
     /// for `idle` or longer, and while the system is short of memory (below its reserve, other
     /// programs' demand included), the least recently used idle model.
@@ -955,7 +1040,9 @@ impl Registry {
                 }
             }
         }
-        if crate::platform::memory_headroom() == Some(0) {
+        self.trim_sessions();
+        // Short of memory: the idle sessions' caches go first, then idle models.
+        if crate::platform::memory_headroom() == Some(0) && self.evict_sessions(u64::MAX, true).0 == 0 {
             let mut idle: Vec<&Entry> = loaded().filter(|e| !e.busy()).collect();
             idle.sort_by_key(|e| e.last_used.load(Ordering::Relaxed));
             for e in idle {

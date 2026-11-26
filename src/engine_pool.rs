@@ -72,6 +72,44 @@ impl Engine {
     pub fn group(&self) -> Option<&Arc<Group>> {
         self.group.as_ref()
     }
+
+    /// Bytes of memory the conversation's caches hold (the KV caches on the host and their device
+    /// copies, recurrent states, checkpoints); None for the families that do not tell.
+    pub fn cache_bytes(&self) -> Option<u64> {
+        self.lm.cache_bytes().map(|b| b as u64)
+    }
+
+    /// Lets go of the conversation's caches (as [`Engine::reset`]) to free their memory, after
+    /// storing the conversation in the prompt cache ([`EngineOptions::prompt_cache`]) when one
+    /// is set and it is not there yet, so that the next request continuing it restores it from
+    /// there instead of reading it again. Returns the bytes the caches held (0 when they were
+    /// empty, or not measured).
+    pub fn evict_cache(&mut self) -> Result<u64> {
+        if self.context_len() == 0 {
+            return Ok(0);
+        }
+        let bytes = self.cache_bytes().unwrap_or(0);
+        let stored = if self.pcache.is_some() && self.lm.snapshots() {
+            self.pcache_pending = false;
+            let _run = run_lock();
+            self.store_snapshot()
+        } else {
+            Ok(false)
+        };
+        self.reset();
+        stored.map(|_| bytes)
+    }
+}
+
+/// The clock of the sessions' last uses, shared by every pool so that the least recently used
+/// session of several models can be told ([`EnginePool::idle_caches`]).
+static CLOCK: AtomicU64 = AtomicU64::new(0);
+
+/// The default memory budget of the sessions' caches ([`EnginePool::set_cache_budget`], the
+/// server's `session_cache_gb`): a quarter of the machine's memory, at least 2 GB (None when it
+/// is not known).
+pub fn default_cache_budget() -> Option<u64> {
+    crate::platform::total_memory().map(|m| (m / 4).max(2_000_000_000))
 }
 
 /// One session of an [`EnginePool`].
@@ -79,8 +117,10 @@ struct Slot {
     engine: Mutex<Engine>,
     /// The messages of the last conversation it ran (what the next request is matched against).
     last: Mutex<Vec<Message>>,
-    /// Pool clock of the last use.
+    /// Clock ([`CLOCK`]) of the last use.
     used: AtomicU64,
+    /// [`Engine::cache_bytes`] when it was last released (0: empty or not measured).
+    bytes: AtomicU64,
 }
 
 /// Up to [`EnginePool::len`] conversations of one model at a time: engines sharing the weights
@@ -91,8 +131,22 @@ pub struct EnginePool {
     slots: Vec<Slot>,
     tok: Tokenizer,
     group: Arc<Group>,
-    clock: AtomicU64,
     free: (Mutex<()>, Condvar),
+    /// [`EnginePool::set_cache_budget`] (`u64::MAX`: none).
+    budget: AtomicU64,
+}
+
+/// An idle session's cache ([`EnginePool::idle_caches`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IdleCache {
+    /// The session ([`PoolGuard::index`]).
+    pub index: usize,
+    /// When it was last used (a clock shared by all pools: lower is older).
+    pub used: u64,
+    /// Bytes its caches hold ([`Engine::cache_bytes`]; 0 when not measured).
+    pub bytes: u64,
+    /// Tokens of its conversation.
+    pub tokens: usize,
 }
 
 /// A session of an [`EnginePool`] in use (released on drop).
@@ -130,7 +184,14 @@ impl PoolGuard<'_> {
 impl Drop for PoolGuard<'_> {
     fn drop(&mut self) {
         let s = &self.pool.slots[self.index];
-        s.used.store(self.pool.clock.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        s.used.store(CLOCK.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        s.bytes.store(self.engine.cache_bytes().unwrap_or(0), Ordering::Relaxed);
+        // The other idle sessions over the budget (this one, still held, is kept: the budget
+        // bounds the others).
+        let budget = self.pool.budget.load(Ordering::Relaxed);
+        if budget != u64::MAX {
+            self.pool.trim(budget);
+        }
         let _g = self.pool.free.0.lock().unwrap_or_else(|p| p.into_inner());
         self.pool.free.1.notify_all();
     }
@@ -181,12 +242,89 @@ impl EnginePool {
                     engine: Mutex::new(e),
                     last: Mutex::new(Vec::new()),
                     used: AtomicU64::new(0),
+                    bytes: AtomicU64::new(0),
                 })
                 .collect(),
             group,
-            clock: AtomicU64::new(0),
             free: (Mutex::new(()), Condvar::new()),
+            budget: AtomicU64::new(u64::MAX),
         }
+    }
+
+    /// The memory the sessions' caches may hold together (None: no limit, the default for a
+    /// pool): when a request ends and the sessions hold more, the least recently used idle ones
+    /// let go of their caches ([`Engine::evict_cache`]: stored in the prompt cache first when one
+    /// is set) until they fit, the session just released kept whatever its size. Sessions of
+    /// families that do not measure their caches ([`Engine::cache_bytes`]) count for nothing.
+    /// (The server sets none per pool: it bounds all its models' sessions together, see
+    /// `ServerOptions::session_cache`.)
+    pub fn set_cache_budget(&self, bytes: Option<u64>) {
+        self.budget.store(bytes.unwrap_or(u64::MAX), Ordering::Relaxed);
+        if let Some(b) = bytes {
+            self.trim(b);
+        }
+    }
+
+    /// [`EnginePool::set_cache_budget`].
+    pub fn cache_budget(&self) -> Option<u64> {
+        Some(self.budget.load(Ordering::Relaxed)).filter(|&b| b != u64::MAX)
+    }
+
+    /// Bytes the sessions' caches hold, as last measured (a busy session's: when it was last
+    /// released).
+    pub fn cache_bytes(&self) -> u64 {
+        self.slots.iter().map(|s| s.bytes.load(Ordering::Relaxed)).sum()
+    }
+
+    /// The idle sessions holding a conversation, least recently used first (never waits).
+    pub fn idle_caches(&self) -> Vec<IdleCache> {
+        let mut v: Vec<IdleCache> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, s)| {
+                let e = s.engine.try_lock().ok()?;
+                let tokens = e.context_len();
+                (tokens > 0).then(|| IdleCache {
+                    index,
+                    used: s.used.load(Ordering::Relaxed),
+                    bytes: s.bytes.load(Ordering::Relaxed),
+                    tokens,
+                })
+            })
+            .collect();
+        v.sort_by_key(|c| c.used);
+        v
+    }
+
+    /// Lets idle session `index` go of its caches ([`Engine::evict_cache`]); None when it is
+    /// busy (or does not exist). Returns the bytes freed.
+    pub fn evict(&self, index: usize) -> Option<Result<u64>> {
+        let s = self.slots.get(index)?;
+        let mut e = s.engine.try_lock().ok()?;
+        let r = e.evict_cache();
+        s.bytes.store(e.cache_bytes().unwrap_or(0), Ordering::Relaxed);
+        Some(r)
+    }
+
+    /// Evicts the least recently used idle sessions' caches until the sessions hold at most
+    /// `budget` bytes (or no idle one is left); returns the bytes freed.
+    pub fn trim(&self, budget: u64) -> u64 {
+        let mut freed = 0;
+        for c in self.idle_caches() {
+            if self.cache_bytes() <= budget {
+                break;
+            }
+            if c.bytes == 0 {
+                continue;
+            }
+            match self.evict(c.index) {
+                Some(Ok(b)) => freed += b,
+                Some(Err(e)) => eprintln!("[session cache: {e:#}]"),
+                None => {}
+            }
+        }
+        freed
     }
 
     /// The model's tokenizer.
@@ -264,5 +402,77 @@ impl EnginePool {
             .iter()
             .filter_map(|s| s.engine.try_lock().ok().map(|mut e| f(&mut e)))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quiet(_: &Delta) -> Flow {
+        Flow::Continue
+    }
+
+    /// Over the budget, the least recently used idle session lets go of its cache, stored in the
+    /// prompt cache: its conversation, when it comes back, is restored from there and gets the
+    /// reply it would have got from the cache in memory.
+    #[test]
+    fn idle_sessions_over_the_budget_let_go_of_their_caches() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-pool-evict-{}", std::process::id()));
+        let cache = dir.join("pc");
+        crate::inkling::tiny::write_tiny(&dir, 3).unwrap();
+        let mut plain = EngineOptions::default();
+        plain.set("device", "cpu").unwrap();
+        let mut o = plain.clone();
+        o.set("prompt_cache", cache.to_str().unwrap()).unwrap();
+        o.set("prompt_cache_min_tokens", "8").unwrap();
+        let load = |o: &EngineOptions| {
+            let mut e = Engine::load(dir.to_str().unwrap(), o).unwrap();
+            e.config_mut().max_tokens = 6;
+            e
+        };
+        let a = vec![
+            Message::system("You answer briefly. ".repeat(6)),
+            Message::user("Hello there, how are you?"),
+        ];
+        let b = vec![
+            Message::system("Tell stories. ".repeat(8)),
+            Message::user("A story about a lantern."),
+        ];
+        let pool = EnginePool::new(load(&o), 2, BatchOptions::default());
+        assert_eq!(pool.len(), 2);
+        pool.set_cache_budget(Some(0));
+        let turn = |m: &[Message]| -> (usize, Reply) {
+            let mut g = pool.try_acquire(m).unwrap();
+            let r = g.chat(m, &mut quiet).unwrap();
+            g.remember(m);
+            (g.index(), r)
+        };
+        let (ia, ra) = turn(&a);
+        assert!(pool.cache_bytes() > 0);
+        // The other conversation on the other session: the first, now the least recently used
+        // and idle, lets go of its cache (the one just released is kept).
+        let (ib, _) = turn(&b);
+        assert_ne!(ia, ib);
+        let idle = pool.idle_caches();
+        assert_eq!(idle.iter().map(|c| c.index).collect::<Vec<_>>(), vec![ib]);
+        assert_eq!(pool.slot(ia).context_len(), 0);
+        // The first conversation goes on: restored from the prompt cache, as it would have gone
+        // on from memory.
+        let mut a2 = a.clone();
+        a2.push(Message::assistant(format!("{}.", ra.text)));
+        a2.push(Message::user("And then?"));
+        let (i2, r2) = turn(&a2);
+        assert_eq!(i2, ia);
+        assert!(r2.stats.restored_tokens > 0, "not restored");
+        let mut e = load(&plain);
+        e.chat(&a, &mut quiet).unwrap();
+        let r = e.chat(&a2, &mut quiet).unwrap();
+        assert_eq!(r.tokens, r2.tokens);
+        // No budget: nothing is evicted.
+        pool.set_cache_budget(None);
+        turn(&b);
+        assert_eq!(pool.idle_caches().len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

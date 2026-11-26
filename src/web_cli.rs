@@ -54,6 +54,9 @@ options:\n\
 \x20 --parallel N          conversations each chat model runs at once, each with its own caches\n\
 \x20                       (default 4; prompts interleaved with the others' decoding, decode\n\
 \x20                       steps batched; 1: one request at a time). Per model: parallel=N\n\
+\x20 --session-cache-gb F  memory the sessions' caches may hold together (default auto: a quarter\n\
+\x20                       of RAM; none: no limit); beyond it the least recently used idle\n\
+\x20                       sessions let go of theirs (stored in the prompt cache first, if set)\n\
 \x20 --no-remote-media     do not fetch http(s) image / audio / video URLs (data: URLs only)\n\
 \x20 --local-media         also accept local paths and file:// URLs as media (trusted clients only)\n\
 \x20 --tls-cert FILE --tls-key FILE  HTTPS with this certificate chain and key (PEM)\n\

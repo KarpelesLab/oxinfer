@@ -1594,6 +1594,10 @@ impl LayerCache {
             kept: 0,
         }
     }
+    /// Bytes of memory it holds (its allocated rows).
+    pub fn heap_bytes(&self) -> usize {
+        (self.k.capacity() + self.v.capacity() + self.aux.capacity()) * 4
+    }
     /// A cache holding `k` and `v` (`[len, n_kv, hd]` each).
     #[cfg(target_arch = "aarch64")]
     pub(crate) fn from_kv(k: Vec<f32>, v: Vec<f32>, n_kv: usize, hd: usize) -> Self {
@@ -1783,6 +1787,11 @@ pub struct Session {
 }
 
 impl Session {
+    /// Bytes of memory its caches hold (host and device copies).
+    pub fn cache_bytes(&self) -> usize {
+        self.caches.iter().flatten().map(LayerCache::heap_bytes).sum::<usize>() + self.gpu.bytes()
+    }
+
     /// Drops cached positions at or beyond `pos` (rewinding after rejected speculative tokens).
     pub fn truncate(&mut self, pos: usize) {
         for c in self.caches.iter_mut().flatten() {

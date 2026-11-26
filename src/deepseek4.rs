@@ -422,6 +422,14 @@ impl CompMark {
 }
 
 impl DeepSeek4Session {
+    /// Bytes of host memory its caches hold (the raw and compressed keys, the compressors' rows;
+    /// device copies are not counted).
+    pub fn cache_bytes(&self) -> usize {
+        let comp = |c: &Option<CompState>| c.as_ref().map_or(0, |c| c.keys.capacity() + c.kv.capacity() + c.sc.capacity());
+        let f: usize = self.layers.iter().map(|l| l.raw.capacity() + comp(&l.comp) + comp(&l.idx)).sum();
+        f * 4 + self.eng.capacity() * 4
+    }
+
     /// Drops cached positions at or beyond `pos` (at most [`ROLLBACK`] back, else to a
     /// checkpoint with [`DeepSeek4Session::cut_to`]).
     pub fn truncate(&mut self, pos: usize) {

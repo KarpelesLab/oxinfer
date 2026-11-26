@@ -887,6 +887,18 @@ pub trait DecodePlan: Send + Sync {
 #[derive(Default)]
 pub struct Slot(pub Option<Box<dyn Any + Send + Sync>>);
 
+impl Slot {
+    /// Bytes of device memory it holds (the KV cache copies; 0 for backends that do not tell).
+    pub fn bytes(&self) -> usize {
+        let Some(_s) = &self.0 else { return 0 };
+        #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+        if let Some(n) = crate::metal::decode::slot_bytes(&**_s) {
+            return n;
+        }
+        0
+    }
+}
+
 impl Clone for Slot {
     fn clone(&self) -> Self {
         Slot(None)

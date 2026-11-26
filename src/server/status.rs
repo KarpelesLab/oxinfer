@@ -307,6 +307,7 @@ pub(crate) fn status_json(api: &Api) -> Value {
         "models": model_list,
         "memory_budget": api.models.budget(),
         "models_memory": models.iter().map(|m| m.bytes).sum::<u64>(),
+        "session_cache": {"bytes": api.models.session_cache_bytes(), "budget": api.models.session_cache},
         "idle_unload": api.opts.idle_unload.map(|d| d.as_secs()),
         "process": activity::process_json(a),
         "machine": activity::machine_json(),

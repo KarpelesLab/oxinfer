@@ -328,20 +328,36 @@ multi-token expert kernels do not give the one-token kernels' bits, and each row
 experts anyway (Gemma 4 26B-A4B Q4_0: 4 batched rows decode about as fast as 4 one-token steps).
 Those, Qwen3.5 / 3.6 (Gated DeltaNet), Inkling-2, DeepSeek V4, streamed models and sessions with
 interventions run their decode steps one after the other, in turns (still interleaved with the
-other requests' prompts). Each session's caches grow with its
-conversation, so `parallel` sessions with long conversations take that much more memory.
+other requests' prompts).
+
+**The sessions' memory.** Each session's caches grow with its conversation (Inkling-2-Mini at 128k
+tokens: about 4 GB each), and an idle session keeps them for the next turn of its client. The
+sessions of all chat models together may hold `--session-cache-gb` (default `auto`: a quarter of
+the machine's memory, at least 2 GB; `none`: no limit): after a request, while they hold more,
+the least recently used idle session lets go of its caches, the most recently used one kept.
+With a prompt cache (`--prompt-cache`) the conversation is stored there first (unless it already
+is), so that when its client comes back it is restored from the disk instead of read again; it
+is read again otherwise. While the system is short of memory (other programs' demand included)
+idle sessions let go of their caches whatever the budget, the least recently used first, before
+idle models are unloaded. The caches counted are the KV caches on the host and their device
+copies, recurrent states and checkpoints (Gemma / Llama, Qwen3 / 3.5, Inkling-2, DeepSeek V4;
+other families' sessions are let go of only under memory pressure). The Status view's
+`session_cache` (`GET /api/web/activity`) has the bytes held and the budget.
 
 | key | where | |
 |---|---|---|
 | `parallel` | `--parallel`, server option, model option | sessions of each chat model (default 4) |
 | `max_batch` | model option | most rows of a batched step (default 8) |
 | `batch_fast` | model option | batched steps of 5+ rows on the fast kernels (default off) |
+| `session_cache_gb` | `--session-cache-gb`, server option | memory of all sessions' caches (default `auto`) |
 
-The library has them as `ServerOptions::parallel` and `EnginePool::new(engine, slots,
-BatchOptions)` (`Engine::fork` for one more session of a loaded engine); the C API through
-`oxi_server_new`'s options (`parallel=N`, model options `parallel=`, `max_batch=`,
-`batch_fast=`). `OXINFER_BATCH_TRACE=1` prints a line per batched step (rows, gather and run
-times).
+The library has them as `ServerOptions::parallel` / `ServerOptions::session_cache` and
+`EnginePool::new(engine, slots, BatchOptions)` (`Engine::fork` for one more session of a loaded
+engine; `EnginePool::set_cache_budget` bounds a pool's sessions the same way, `trim`, `evict` and
+`idle_caches` act on them directly, `Engine::cache_bytes` / `Engine::evict_cache` on one); the C
+API through `oxi_server_new`'s options (`parallel=N`, `session_cache_gb=F`, model options
+`parallel=`, `max_batch=`, `batch_fast=`). `OXINFER_BATCH_TRACE=1` prints a line per batched step
+(rows, gather and run times).
 
 ### Status, cancelling and the caches
 

@@ -260,6 +260,17 @@ pub struct ServerOptions {
     /// ([`crate::batch`]). Each session's caches take memory as its conversation grows. `1`:
     /// one request at a time per model, as before.
     pub parallel: usize,
+    /// The memory the chat models' sessions' caches may hold together, in bytes (key
+    /// `session_cache_gb`: GB, `auto` the default, `none` no limit): after a request, while they
+    /// hold more, the least recently used idle session lets go of its caches (stored in the
+    /// prompt cache first when [`ServerOptions::prompt_cache`] is set, so that the conversation
+    /// is restored from there when it comes back; otherwise it is read again), the most recently
+    /// used one kept. While the system is short of memory, idle sessions let go of their caches
+    /// whatever the budget, before idle models are unloaded. Default
+    /// ([`crate::engine::default_cache_budget`]): a quarter of the machine's memory, at least 2
+    /// GB. Families whose caches are not measured (see [`crate::engine::Engine::cache_bytes`])
+    /// are only evicted under memory pressure.
+    pub session_cache: Option<u64>,
     /// HTTP worker threads, the most connections served at once (key `workers`, default 32).
     pub workers: usize,
     /// Log one line per request to stderr (key `log`, default on).
@@ -332,6 +343,7 @@ impl Default for ServerOptions {
             self_signed: false,
             workers: 32,
             parallel: DEFAULT_PARALLEL,
+            session_cache: crate::engine::default_cache_budget(),
             log: true,
             prompt_cache: None,
             prompt_cache_gb: None,
@@ -373,6 +385,7 @@ impl ServerOptions {
         "self_signed",
         "workers",
         "parallel",
+        "session_cache_gb",
         "log",
         "prompt_cache",
         "prompt_cache_gb",
@@ -408,6 +421,19 @@ impl ServerOptions {
             "self_signed" => self.self_signed = parse_bool(key, value)?,
             "workers" => self.workers = value.parse().context("workers")?,
             "parallel" => self.parallel = value.parse::<usize>().context("parallel")?.max(1),
+            "session_cache_gb" => {
+                self.session_cache = match value {
+                    "" | "auto" => crate::engine::default_cache_budget(),
+                    "none" | "off" | "unlimited" => None,
+                    v => {
+                        let g = num(v)?;
+                        if !(g >= 0.0 && g.is_finite()) {
+                            bail!("session_cache_gb: expected GB >= 0 (auto, none), got {v:?}");
+                        }
+                        Some((g * 1e9) as u64)
+                    }
+                }
+            }
             "log" => self.log = parse_bool(key, value)?,
             "prompt_cache" => {
                 self.prompt_cache = match value {
@@ -737,6 +763,7 @@ impl Api {
         models.prompt_cache = opts.prompt_cache.clone();
         models.prompt_cache_gb = opts.prompt_cache_gb;
         models.parallel = opts.parallel;
+        models.session_cache = opts.session_cache;
         let api = Arc::new(Api {
             models,
             web: opts.web.then(|| web::WebState::new(&opts)),
@@ -803,9 +830,10 @@ impl Api {
     pub(crate) fn flush_prompt_cache_later(self: &Arc<Self>, id: &str) {
         let api = self.clone();
         let id = id.to_string();
-        let _ = std::thread::Builder::new()
-            .name("oxinfer-prompt-cache".into())
-            .spawn(move || api.models.flush_prompt_cache(&id));
+        let _ = std::thread::Builder::new().name("oxinfer-prompt-cache".into()).spawn(move || {
+            api.models.flush_prompt_cache(&id);
+            api.models.trim_sessions();
+        });
     }
 
     /// Unloads every idle model.

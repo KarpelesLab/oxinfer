@@ -598,6 +598,21 @@ pub(crate) struct Checkpoint {
 pub struct DeepStack(pub Vec<(usize, usize, Vec<f32>)>);
 
 impl QwenSession {
+    /// Bytes of memory its caches hold: the KV caches (host and device copies), the recurrent
+    /// states and what the last recording forward kept to rewind them.
+    pub fn cache_bytes(&self) -> usize {
+        let kv: usize = self.kv.iter().flatten().map(LayerCache::heap_bytes).sum();
+        let gdn: usize = self.gdn.iter().flatten().map(|g| (g.s.len() + g.conv.len()) * 4).sum();
+        let rec: usize = self
+            .rec
+            .iter()
+            .map(|r| (r.s0.capacity() + r.c.capacity() + r.b.capacity() + r.a.capacity() + r.qkv.capacity() + r.conv0.capacity()) * 4)
+            .sum();
+        kv + gdn + rec + self.gpu.bytes()
+    }
+}
+
+impl QwenSession {
     /// Declares `gh` x `gw` vision tokens (row-major, one image or one temporal patch of a video)
     /// at sequence position `start` (at or after `pos`), before they are fed: they take M-RoPE
     /// positions, and the text after them continues from `max(gh, gw)` positions later.

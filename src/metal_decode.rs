@@ -2955,6 +2955,12 @@ impl Drop for MetalSlot {
         }
     }
 }
+
+/// Bytes of the device KV copies a session's slot holds (None: not a Metal decode slot).
+pub(crate) fn slot_bytes(s: &(dyn std::any::Any + Send + Sync)) -> Option<usize> {
+    s.downcast_ref::<MetalSlot>().map(|m| m.kv.iter().map(|k| 2 * k.bytes).sum())
+}
+
 unsafe impl Send for MetalSlot {}
 unsafe impl Sync for MetalSlot {}
 

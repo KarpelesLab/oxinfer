@@ -1162,7 +1162,11 @@ typedef int (*oxi_bytes_fn)(void *user, const char *data, size_t len);
  *   parallel=N           conversations each chat model runs at once, each with its own caches
  *                        (default 4; model options parallel=N, max_batch=N, batch_fast=1; see
  *                        docs/server.md#concurrent-requests)
- *   log=0|1              one stderr line per request (default 1)
+ *   session_cache_gb=F   memory the chat sessions' caches may hold together (default auto: a
+ *                        quarter of RAM, at least 2 GB; none: no limit): beyond it the least
+ *                        recently used idle sessions let go of theirs (stored in the prompt cache
+ *                        first when one is set), as do idle sessions under memory pressure
+ *   log=0|1             one stderr line per request (default 1)
  *   web=0|1              also serve the web GUI at / and its management API under /api/web/
  *                        (catalog, downloads, cache, loading models; see docs/web.md)
  *   thinking_key=KEY     key of the HMAC signatures of /v1/messages thinking blocks, checked

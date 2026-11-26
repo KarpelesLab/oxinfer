@@ -1352,7 +1352,7 @@ pub use conversation::{Message, Role};
 
 #[path = "engine_pool.rs"]
 mod pool_slots;
-pub use pool_slots::{EnginePool, PoolGuard};
+pub use pool_slots::{EnginePool, IdleCache, PoolGuard, default_cache_budget};
 
 impl Lm {
     /// Writes the decoding state to a snapshot ([`crate::snapshot`]).
@@ -1563,6 +1563,21 @@ impl Lm {
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(c) => c.context_len(),
         }
+    }
+    /// Bytes of memory the conversation's caches hold (None: not measured for this family).
+    fn cache_bytes(&self) -> Option<usize> {
+        Some(match self {
+            Lm::Gemma { sess, .. } => sess.cache_bytes(),
+            Lm::GemmaDspark { dec } => dec.sess.cache_bytes(),
+            Lm::Qwen { sess, .. } => sess.cache_bytes(),
+            Lm::QwenMtp { dec } => dec.sess.cache_bytes(),
+            Lm::QwenDspark { dec } => dec.sess.cache_bytes(),
+            Lm::Inkling2 { sess, .. } => sess.cache_bytes(),
+            Lm::Inkling2Dspark { dec } => dec.sess.cache_bytes(),
+            Lm::DeepSeek4 { sess, .. } => sess.cache_bytes(),
+            Lm::DeepSeek4Dspark { dec } => dec.sess.cache_bytes(),
+            _ => return None,
+        })
     }
     fn reset(&mut self) {
         match self {
