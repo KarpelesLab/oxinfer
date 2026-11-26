@@ -1156,8 +1156,15 @@ kernel void ink_mvr(device float* a [[buffer(0)]], device const float* c [[buffe
 // With `am` (greedy decoding on the device, one row), each threadgroup's argmax as (value, index
 // bits) into `am + 2 tg` (`ink_amax` then takes the first index of the largest); with `inv_t`
 // above 0 as well (sampling), (its largest value m, its sum of exp((y - m) inv_t)) instead
-// (`ink_samp`).
-struct ICapP { uint v; uint u; uint x; uint out; float cap; uint am; float inv_t; uint _p2; };
+// (`ink_samp`, `ink_fsamp`). With `pen` above 0 and not 1 (a repetition penalty), the capped
+// logit of each token set in the bit set at `seen` (bit t % 32 of word t / 32) is divided by
+// it when positive and multiplied by it when negative before anything else (the host's
+// `sampler::apply_repetition_penalty`).
+struct ICapP { uint v; uint u; uint x; uint out; float cap; uint am; float inv_t; uint seen; float pen; uint _p0; uint _p1; uint _p2; };
+// Marks token `t` seen in the bit set at `seen` (none: 0xffffffff).
+inline void mark_seen(device float* a, uint seen, uint t) {
+    if (seen != 0xffffffffu) ((device uint*)a)[seen + (t >> 5)] |= 1u << (t & 31);
+}
 // (v, i) for (bv, bi): the larger value, the lower index on a tie (indices of no candidate:
 // 0xffffffff, value -inf).
 inline void amax_pick(thread float& bv, thread uint& bi, float v, uint i) {
@@ -1176,6 +1183,8 @@ kernel void ink_softcap(device float* a [[buffer(0)]], constant ICapP& p [[buffe
     if (in) {
         float x = a[p.x + (ulong)gid.y * p.v + gid.x];
         y = precise::tanh(x / p.cap) * p.cap;
+        if (p.pen > 0.f && p.pen != 1.f && ((((device uint*)a)[p.seen + (gid.x >> 5)] >> (gid.x & 31)) & 1u))
+            y = y < 0.f ? y * p.pen : y / p.pen;
         a[p.out + (ulong)gid.y * p.u + gid.x] = y;
     }
     if (p.am == 0) return;
@@ -1214,8 +1223,9 @@ kernel void ink_softcap(device float* a [[buffer(0)]], constant ICapP& p [[buffe
 // first token in token order at which the cumulative weight exp((y - max) inv_t) reaches the
 // uniform at `uni` times the total (the host's `sampler::sample_full`), first the threadgroup
 // whose prefix reaches it, then the token in it; the last token of nonzero weight when rounding
-// leaves the draw past the end. The token id (uint bits) into `tok`.
-struct ISampP { uint n; uint am; uint tok; uint uni; uint x; uint u; float inv_t; uint _p; };
+// leaves the draw past the end. The token id (uint bits) into `tok`, and marked seen (`seen`,
+// as `mark_seen`).
+struct ISampP { uint n; uint am; uint tok; uint uni; uint x; uint u; float inv_t; uint seen; };
 // The inclusive prefix sum of `v` over the threadgroup's 1024 threads (`ts`: 32 floats), and
 // the total in `tot`.
 inline float samp_scan(float v, threadgroup float* ts, uint sg, uint lane, thread float& tot) {
@@ -1277,10 +1287,15 @@ kernel void ink_samp(device float* a [[buffer(0)]], constant ISampP& p [[buffer(
     if (wi > 0.f && inc2 >= rk) atomic_fetch_min_explicit(&tw[0], i, memory_order_relaxed);
     if (wi > 0.f) atomic_fetch_max_explicit(&tw[1], i, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) ((device uint*)a)[p.tok] = samp_pick(tw);
+    if (tid == 0) {
+        uint t = samp_pick(tw);
+        ((device uint*)a)[p.tok] = t;
+        mark_seen(a, p.seen, t);
+    }
 }
-// The argmax over `n` partials (one threadgroup of 1024): the token id (uint bits) into `tok`.
-struct IAmP { uint n; uint am; uint tok; uint _p; };
+// The argmax over `n` partials (one threadgroup of 1024): the token id (uint bits) into `tok`,
+// marked seen (`seen`, as `mark_seen`).
+struct IAmP { uint n; uint am; uint tok; uint seen; };
 kernel void ink_amax(device float* a [[buffer(0)]], constant IAmP& p [[buffer(1)]], uint tid [[thread_index_in_threadgroup]],
                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float tv[32];
@@ -1293,23 +1308,228 @@ kernel void ink_amax(device float* a [[buffer(0)]], constant IAmP& p [[buffer(1)
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) {
         for (uint k = 1; k < 32; k++) amax_pick(bv, bi, tv[k], ti[k]);
-        ((device uint*)a)[p.tok] = bi == 0xffffffffu ? 0u : bi;
+        uint t = bi == 0xffffffffu ? 0u : bi;
+        ((device uint*)a)[p.tok] = t;
+        mark_seen(a, p.seen, t);
     }
 }
+
+// ---- A draw with top-k, top-p and min-p cuts (one threadgroup of 1024), as the host's
+// `sampler::cut_candidates` and `draw_prefix`: from `ink_softcap`'s partials at `am` (`n` of
+// them: each 256-logit threadgroup's largest value and sum of weights) the largest capped
+// logit M and the total weight W; the tokens ranked by decreasing logit, then increasing id;
+// top-k the first `k` (0: all), top-p then the shortest prefix whose weight reaches `top_p`
+// times the top-k set's (W without top-k), min-p then those of weight exp((y - M) inv_t) at
+// least `min_p`, at least one; the token the first in rank order whose prefix weight reaches
+// the uniform at `uni` times the kept weight.
+// Without sorting the vocabulary: histograms of the tokens by quarter nats below M (16 nats a
+// round, two rounds at most; counts, and weights in fixed point so that the sums do not depend
+// on the order of the atomics) find the first bin J by which every cut is decided (holding the
+// top-k set when top-p needs its weight); the tokens of bins up to J (at most FS_CAP; tokens
+// more than 32 nats below M, of weight below 1.3e-14, are never candidates) are gathered,
+// sorted, weighed and cut. When they do not fit (or are more than `cap`), the token is the first
+// largest logit's and `flag` is set to 1 (0 otherwise): the host then chooses from the capped logits at `x`. The
+// token id (uint bits) into `tok`, marked seen (`seen`).
+struct IFsP {
+    uint n; uint am; uint tok; uint uni; uint x; uint u; float inv_t; uint seen;
+    uint k; float top_p; float min_p; float min_l; uint flag; uint cap; uint _p1; uint _p2;
+};
+constant constexpr uint FS_CAP = 2048;
+constant constexpr uint FS_NB = 64;
+// The bits of `y` in total order (ascending; -0 below +0).
+inline uint fs_ord(float y) {
+    uint b = as_type<uint>(y);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+kernel void ink_fsamp(device float* a [[buffer(0)]], constant IFsP& p [[buffer(1)]], uint tid [[thread_index_in_threadgroup]],
+                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup ulong keys[FS_CAP];
+    threadgroup float ps[FS_CAP];
+    threadgroup atomic_uint hc[FS_NB];
+    threadgroup atomic_uint hw[FS_NB];
+    threadgroup float ts[32];
+    // 0: candidates gathered, 1: the min-p cut, 2: the top-p cut, 3: the draw, 4: the argmax.
+    threadgroup atomic_uint tw[5];
+    threadgroup uint tj[1];
+    device uint* au = (device uint*)a;
+    // M and W from the partials (as `ink_samp`).
+    bool in = tid < p.n;
+    float mk = in ? a[p.am + 2 * tid] : -INFINITY;
+    float sk = in ? a[p.am + 2 * tid + 1] : 0.f;
+    float m = simd_max(mk);
+    if (lane == 0) ts[sg] = m;
+    if (tid < FS_NB) {
+        atomic_store_explicit(&hc[tid], 0u, memory_order_relaxed);
+        atomic_store_explicit(&hw[tid], 0u, memory_order_relaxed);
+    }
+    if (tid == 0) {
+        atomic_store_explicit(&tw[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&tw[1], 0xffffffffu, memory_order_relaxed);
+        atomic_store_explicit(&tw[2], 0xffffffffu, memory_order_relaxed);
+        atomic_store_explicit(&tw[3], 0xffffffffu, memory_order_relaxed);
+        atomic_store_explicit(&tw[4], 0xffffffffu, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = simd_max(ts[lane]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!(m > -INFINITY)) {
+        if (tid == 0) { au[p.tok] = 0u; au[p.flag] = 0u; mark_seen(a, p.seen, 0u); }
+        return;
+    }
+    float f = mk > -INFINITY ? exp((mk - m) * p.inv_t) : 0.f;
+    float wtot;
+    (void)samp_scan(sk * f, ts, sg, lane, wtot);
+    uint k = (p.k == 0 || p.k >= p.u) ? 0u : p.k;
+    // The first bin by which every cut is decided.
+    bool need_k = k > 0 && p.top_p < 1.f;
+    uint J = 0xffffffffu, cnt = 0;
+    float lb = 0.f;
+    for (uint round = 0; round < 2 && J == 0xffffffffu; round++) {
+        if (round > 0) {
+            if (tid < FS_NB) {
+                atomic_store_explicit(&hc[tid], 0u, memory_order_relaxed);
+                atomic_store_explicit(&hw[tid], 0u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float lo = float(round * FS_NB);
+        for (uint i = tid; i < p.u; i += 1024) {
+            float q4 = (m - a[p.x + i]) * p.inv_t * 4.f;
+            if (q4 >= lo && q4 < lo + float(FS_NB)) {
+                uint b = uint(q4);
+                atomic_fetch_add_explicit(&hc[b - round * FS_NB], 1u, memory_order_relaxed);
+                // The weight relative to the bin's upper edge, in (e^-1/4, 1], in 2^-12.
+                uint q = uint(exp(-(q4 - float(b)) * 0.25f) * 4096.f);
+                atomic_fetch_add_explicit(&hw[b - round * FS_NB], q, memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            for (uint j = 0; j < FS_NB && J == 0xffffffffu; j++) {
+                uint b = round * FS_NB + j;
+                cnt += atomic_load_explicit(&hc[j], memory_order_relaxed);
+                lb += float(atomic_load_explicit(&hw[j], memory_order_relaxed)) * (1.f / 4096.f) * exp(-float(b) * 0.25f);
+                bool ok = k > 0 && cnt >= k;
+                if (!need_k) {
+                    ok = ok || (p.top_p < 1.f && lb * (1.f - 1e-5f) >= p.top_p * wtot);
+                    ok = ok || (p.min_p > 0.f && float(b + 1) * 0.25f >= p.min_l + 0.25f);
+                }
+                if (ok) J = b;
+            }
+            tj[0] = J;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        J = tj[0];
+    }
+    if (J == 0xffffffffu) J = 2 * FS_NB - 1;
+    // The candidates: bins 0..J.
+    float lim = float(J + 1);
+    for (uint i = tid; i < p.u; i += 1024) {
+        float y = a[p.x + i];
+        float q4 = (m - y) * p.inv_t * 4.f;
+        if (q4 < lim) {
+            uint s = atomic_fetch_add_explicit(&tw[0], 1u, memory_order_relaxed);
+            if (s < FS_CAP) keys[s] = (ulong(~fs_ord(y)) << 32) | ulong(i);
+            if (y == m) atomic_fetch_min_explicit(&tw[4], i, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint nc = atomic_load_explicit(&tw[0], memory_order_relaxed);
+    uint amx = atomic_load_explicit(&tw[4], memory_order_relaxed);
+    if (amx == 0xffffffffu) amx = 0u;
+    if (nc > min(p.cap, FS_CAP) || nc == 0) {
+        if (tid == 0) { au[p.tok] = amx; au[p.flag] = 1u; mark_seen(a, p.seen, amx); }
+        return;
+    }
+    // Bitonic sort of the keys (ascending: decreasing logit, then increasing id), padded to a
+    // power of two.
+    uint nn = 1;
+    while (nn < nc) nn <<= 1;
+    for (uint i = nc + tid; i < nn; i += 1024) keys[i] = 0xffffffffffffffffUL;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kk = 2; kk <= nn; kk <<= 1) {
+        for (uint j = kk >> 1; j > 0; j >>= 1) {
+            for (uint t = tid; t < nn / 2; t += 1024) {
+                uint i = ((t & ~(j - 1)) << 1) | (t & (j - 1));
+                uint l = i + j;
+                ulong x0 = keys[i], x1 = keys[l];
+                bool up = (i & kk) == 0;
+                if ((x0 > x1) == up) { keys[i] = x1; keys[l] = x0; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    // Weights in rank order and their prefix sums (two a thread).
+    uint r0 = 2 * tid, r1 = r0 + 1;
+    float w0 = r0 < nc ? exp((a[p.x + uint(keys[r0] & 0xffffffffUL)] - m) * p.inv_t) : 0.f;
+    float w1 = r1 < nc ? exp((a[p.x + uint(keys[r1] & 0xffffffffUL)] - m) * p.inv_t) : 0.f;
+    // (The exclusive prefix of the pairs, then each pair in order: no sum taken back out.)
+    float v = w0 + w1;
+    float exs = simd_prefix_exclusive_sum(v);
+    if (lane == 31) ts[sg] = exs + v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sv = ts[lane];
+    float before = simd_shuffle(simd_prefix_exclusive_sum(sv), sg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float p0 = (before + exs) + w0;
+    ps[r0] = p0;
+    ps[r1] = p0 + w1;
+    // min-p: the first rank of weight below min_p.
+    if (p.min_p > 0.f) {
+        if (r0 < nc && w0 < p.min_p) atomic_fetch_min_explicit(&tw[1], r0, memory_order_relaxed);
+        else if (r1 < nc && w1 < p.min_p) atomic_fetch_min_explicit(&tw[1], r1, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint mkk = k > 0 ? min(k, nc) : nc;
+    float d = k > 0 ? ps[mkk - 1] : wtot;
+    if (p.top_p < 1.f) {
+        float target = p.top_p * d;
+        if (r0 < mkk && ps[r0] >= target) atomic_fetch_min_explicit(&tw[2], r0, memory_order_relaxed);
+        else if (r1 < mkk && ps[r1] >= target) atomic_fetch_min_explicit(&tw[2], r1, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint mcut = mkk;
+    uint mp = atomic_load_explicit(&tw[2], memory_order_relaxed);
+    if (mp != 0xffffffffu) mcut = min(mcut, mp + 1);
+    uint mm = atomic_load_explicit(&tw[1], memory_order_relaxed);
+    if (mm != 0xffffffffu) mcut = min(mcut, mm);
+    mcut = max(mcut, 1u);
+    float rr = a[p.uni] * ps[mcut - 1];
+    if (r0 < mcut && ps[r0] >= rr) atomic_fetch_min_explicit(&tw[3], r0, memory_order_relaxed);
+    else if (r1 < mcut && ps[r1] >= rr) atomic_fetch_min_explicit(&tw[3], r1, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint r = atomic_load_explicit(&tw[3], memory_order_relaxed);
+        if (r == 0xffffffffu) r = mcut - 1;
+        uint t = uint(keys[r] & 0xffffffffUL);
+        au[p.tok] = t;
+        au[p.flag] = 0u;
+        mark_seen(a, p.seen, t);
+    }
+}
+
 
 // ---- The input row of a pass whose token the device chose (`ink_amax` of the pass before): the
 // embedding table's row of the token (uint at `tok`) dequantized as the host does, then the
 // embedding norm (weights at `nw`) into `x` (one threadgroup of 1024; h <= 4096). Tables: MLX
 // affine rows (`bits` 2, 4 or 8, a bf16 scale and offset per `group`; `q`, `s`, `b` addresses),
 // GGUF rows of `rb` bytes (`ink_embed_<type>`), bf16 rows.
+// The norm sums the squares in the host's order (`inkling::embed_norm`: 32 lanes, each over
+// elements lane, lane + 32, ... with fused multiply-adds, then halves added pairwise), and
+// scales with correctly rounded operations, so that a row embedded here is the host's bit for
+// bit (a chained pass and a verification pass of the same token give the same logits).
 struct IEmbP { ulong q; ulong s; ulong b; uint h; uint tok; uint x; uint nw; float eps; uint rb; uint bits; uint group; };
 inline void ink_embed_norm(device float* a, device const float* c, constant IEmbP& p, threadgroup float* xs, threadgroup float* red,
                            uint tid) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float ss = 0.f;
-    for (uint i = tid; i < p.h; i += 1024) ss += xs[i] * xs[i];
-    ss = ink_sum(ss, red, tid, 1024);
-    float r = 1.f / sqrt(ss / float(p.h) + p.eps);
+    if (tid < 32) {
+        float ss = 0.f;
+        for (uint i = tid; i < p.h; i += 32) ss = fma(xs[i], xs[i], ss);
+        for (ushort m = 16; m > 0; m >>= 1) ss = ss + simd_shuffle_xor(ss, m);
+        if (tid == 0) red[0] = precise::divide(1.f, precise::sqrt(precise::divide(ss, float(p.h)) + p.eps));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float r = red[0];
     for (uint i = tid; i < p.h; i += 1024) a[p.x + i] = xs[i] * (r * c[p.nw + i]);
 }
 inline float bf16f(ushort v) { return as_type<float>(uint(v) << 16); }

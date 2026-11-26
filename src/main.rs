@@ -230,6 +230,7 @@ struct Args {
     snac_encode: Option<PathBuf>,
     decode_codes: Option<PathBuf>,
     repetition_penalty: Option<f32>,
+    min_p: f32,
     // Set explicitly (text to speech has its own defaults).
     temperature_set: Option<f32>,
     top_p_set: Option<f32>,
@@ -267,6 +268,7 @@ fn usage() -> ! {
          \x20 --temp F             temperature, 0 = greedy (default 0)\n\
          \x20 --top-k N            top-k (default 64)\n\
          \x20 --top-p F            top-p (default 0.95)\n\
+         \x20 --min-p F            min-p: cut tokens less likely than F times the most likely (default 0)\n\
          \x20 --seed N             RNG seed\n\
          \x20 --threads N          worker threads (default: all cores)\n\
          \x20 --qos C              thread QoS on Apple platforms: interactive (default), initiated,\n\
@@ -808,6 +810,7 @@ fn parse_args() -> Result<Args> {
         snac_encode: None,
         decode_codes: None,
         repetition_penalty: None,
+        min_p: 0.0,
         temperature_set: None,
         top_p_set: None,
         max_tokens_set: None,
@@ -1143,6 +1146,7 @@ fn parse_args() -> Result<Args> {
             "--snac-encode" => a.snac_encode = Some(PathBuf::from(val()?)),
             "--decode-codes" => a.decode_codes = Some(PathBuf::from(val()?)),
             "--repetition-penalty" | "--repeat-penalty" => a.repetition_penalty = Some(val()?.parse()?),
+            "--min-p" => a.min_p = val()?.parse()?,
             "-h" | "--help" => usage(),
             _ if a.iv.parse(&k, &mut val)? => {}
             _ if a.moss.parse(&k, &mut val)? => {}
@@ -1617,6 +1621,7 @@ fn run_session(args: &Args) -> Result<()> {
         top_p: args.top_p,
         seed: args.seed,
         repetition_penalty: args.repetition_penalty.unwrap_or(1.0),
+        min_p: args.min_p,
     });
     let loaded = match &args.load_session {
         Some(p) => {
@@ -2238,8 +2243,9 @@ fn run_text<M: oxinfer::dspark::Target + oxinfer::intervene::Host>(
         let enc = tok.encode(text, false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
         Ok(enc.get_ids().to_vec())
     };
-    let mut sampler =
-        Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
+    let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed)
+        .with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0))
+        .with_min_p(args.min_p);
     let mut sess = model.new_session();
     let h = model.hidden_size();
     if args.chat {
@@ -3228,6 +3234,9 @@ fn run_inkling(mut args: Args) -> Result<()> {
         *LOOKUP.lock().unwrap() = None;
     } else if !model.can_draft() && draft.take().is_some() {
         eprintln!("[draft models are not available on this device (it does not capture their streams): prompt lookup only]");
+    } else if !args.mtp && args.draft.is_none() && !model.drafts_by_default() {
+        // (A draft found beside the model drafts unasked on the GPU only.)
+        draft = None;
     }
     let tok = load_tokenizer(&args.model)?;
     let fmt: &dyn ChatFormat = &chat::InklingChat;
@@ -3623,8 +3632,9 @@ fn run_qwen_mtp(
             ", exact verification"
         }
     );
-    let mut sampler =
-        Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
+    let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed)
+        .with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0))
+        .with_min_p(args.min_p);
     let mut dec = MtpDecoder::new(model, mtp, opts);
     dec.lookup = make_lookup(args, eos);
     if dec.opts.draft_tokens > oxinfer::qwen_mtp::max_exact_draft() {
@@ -3818,8 +3828,9 @@ fn run_dspark<M: oxinfer::dspark::Target<Sess: Clone>>(
         fast_verify: args.fast_verify,
         fast_draft: args.fast_draft,
     };
-    let mut sampler =
-        Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
+    let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed)
+        .with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0))
+        .with_min_p(args.min_p);
     let opts = DsparkOptions {
         draft_tokens: opts.draft_tokens.min(draft.verify_cap().unwrap_or(usize::MAX)),
         ..opts
@@ -4101,8 +4112,9 @@ fn run_gemma_loaded(args: &Args, model: &Model, files: &safetensors::ModelFiles,
         _ => None,
     };
 
-    let mut sampler =
-        Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
+    let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed)
+        .with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0))
+        .with_min_p(args.min_p);
     let mut sess = model.new_session();
     let chunk = args.prefill_chunk.unwrap_or(256);
     if intervene_cli::run_capture(

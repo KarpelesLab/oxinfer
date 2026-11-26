@@ -589,6 +589,23 @@ impl Lookup {
         Some((d.tokens, d.class))
     }
 
+    /// For a decoder with its own draft source, in a round its source does not draft (a plain
+    /// round otherwise): the lookup draft to verify instead, as [`LookupRounds`] chooses it (any
+    /// match whose cost-aware cut keeps a token), and the length of the context match found (0:
+    /// none).
+    pub fn draft_plain(&mut self, k_max: usize) -> (Option<crate::dspark::LookupPick>, usize) {
+        self.prepare();
+        let mut d = self.draft(k_max);
+        let m = d.matched;
+        let k = self.cut(&d);
+        if k == 0 {
+            return (None, m);
+        }
+        d.tokens.truncate(k);
+        d.class.truncate(k);
+        (Some((d.tokens, d.class)), m)
+    }
+
     /// Records a round of a decoder that verified `drafts` (from this drafter when `class` is
     /// not empty) and committed `out`, then appends `out` to the context.
     pub fn commit(&mut self, drafts: &[u32], class: &[usize], out: &[u32], accepted: usize) {
@@ -698,7 +715,7 @@ impl<M: Target> crate::generate::RoundDecoder for LookupRounds<'_, M> {
         // No draft worth verifying: greedy passes chained on the device (where the model has them),
         // each token committed and streamed as it comes, until a draft is worth verifying (the
         // pass already queued then still runs: its token is the next round's first).
-        if k == 0 && (sampler.plain_greedy() || sampler.plain_sampled()) && max_new > 0 {
+        if k == 0 && sampler.chainable() && max_new > 0 {
             let (sess, lookup) = (&mut *self.sess, &mut *self.lookup);
             let stop = lookup.opts.stop.clone();
             let mut out: Vec<u32> = Vec::new();
@@ -716,6 +733,9 @@ impl<M: Target> crate::generate::RoundDecoder for LookupRounds<'_, M> {
             };
             if let Some(kept) = crate::generate::decode_chain(model, sess, sampler, next, max_new, &mut on, &|| taken.get()) {
                 let secs = t0.elapsed().as_secs_f64();
+                if std::env::var_os("OXINFER_DEBUG_DRAFT").is_some() {
+                    eprintln!("[lookup: chained {kept} plain steps; ms: {:.1}]", secs * 1e3);
+                }
                 if kept > 0 {
                     self.lookup.policy.record_time(0, (secs - draft_secs) / kept as f64);
                 }

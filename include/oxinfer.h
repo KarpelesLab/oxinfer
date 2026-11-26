@@ -241,6 +241,7 @@ void oxi_engine_free(OxiEngine *engine);
  *                other keyword is an error); NULL, "" or "text" = unconstrained (default)
  *   temperature  0 = greedy (default)
  *   top_k, top_p, seed
+ *   min_p        0 = off (default); cuts tokens less likely than min_p times the most likely
  *   repetition_penalty  1 = off (default); > 1 penalizes tokens already generated
  * system and think shape the start of a conversation: set them before the first message or
  * call oxi_engine_reset(). Returns 0 or -1. */
@@ -1143,7 +1144,7 @@ typedef int (*oxi_bytes_fn)(void *user, const char *data, size_t len);
  *                        (quant, device, mmap, stream, mmproj, draft, mtp, max_context, ...) or
  *                        the loader's for other kinds, and kind=chat|embedding|image|
  *                        transcription|speech, system=TEXT, think=0|1, max_tokens=N,
- *                        temperature=F, top_p=F, top_k=N, repetition_penalty=F,
+ *                        temperature=F, top_p=F, top_k=N, min_p=F, repetition_penalty=F,
  *                        prompt_name=NAME (embeddings), memory_gb=F
  *   api_key=KEY          requests need "Authorization: Bearer KEY"
  *   cors=ORIGIN          CORS headers for browsers (* for any origin)

@@ -115,7 +115,10 @@ token reads its own 8 experts), so the cost-aware rounds fall back to plain step
 GPU the draft pass is one Metal submission (3-4 ms for 3 slots) and a 4-token verification costs
 1.6-2 steps: drafts gain 45-65% on code (Q8_0, 58 -> 80-95 tok/s), are about even on prose and
 chat, and the cost-aware rounds (which also choose how many to draft) stay near plain speed where
-drafting does not pay. Numbers: [Inkling-2 Mini](inkling.md#speculative-decoding).
+drafting does not pay. On Metal the drafter found beside a checkpoint is used by default: its
+decoder also takes prompt lookup's drafts in the rounds it does not draft, and probes with short
+blocks, so it stays within a few percent of prompt lookup alone where drafting does not pay and
+gains on code and code edits. Numbers: [Inkling-2 Mini](inkling.md#speculative-decoding).
 
 ## Multi-token passes and MoE experts on the CPU
 

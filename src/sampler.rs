@@ -89,6 +89,9 @@ pub struct Sampler {
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
+    /// Min-p (0 = off): after top-k and top-p, tokens less likely than `min_p` times the most
+    /// likely one are cut (transformers' `MinPLogitsWarper`, llama.cpp's `--min-p`).
+    pub min_p: f32,
     /// Repetition penalty as transformers and vLLM apply it (1 = off): before anything else,
     /// the logit of every token seen so far (passed to [`Sampler::observe`], or sampled by
     /// [`Sampler::sample`]) is divided by it when positive and multiplied by it when negative.
@@ -105,6 +108,7 @@ impl Sampler {
             temperature,
             top_k,
             top_p,
+            min_p: 0.0,
             repetition_penalty: 1.0,
             rng: seed.max(1),
             seen: Vec::new(),
@@ -205,6 +209,17 @@ impl Sampler {
         self
     }
 
+    /// Sets min-p (see [`Sampler::min_p`]).
+    pub fn with_min_p(mut self, min_p: f32) -> Self {
+        self.min_p = min_p;
+        self
+    }
+
+    /// The token bit set of the repetition penalty (bit `t % 64` of word `t / 64`).
+    pub fn seen_words(&self) -> &[u64] {
+        &self.seen
+    }
+
     /// Records tokens for the repetition penalty (e.g. the prompt, as transformers counts it).
     pub fn observe(&mut self, tokens: &[u32]) {
         for &t in tokens {
@@ -255,7 +270,7 @@ impl Sampler {
     /// Whether a temperature draw takes every token of a vocabulary of `n` as a candidate (no
     /// top-k or top-p cut): then the tokens are taken in token order ([`sample_full`]).
     fn whole_vocab(&self, n: usize) -> bool {
-        (self.top_k == 0 || self.top_k >= n) && self.top_p >= 1.0
+        (self.top_k == 0 || self.top_k >= n) && self.top_p >= 1.0 && self.min_p <= 0.0
     }
 
     /// Whether `sample` is a plain temperature draw over the whole vocabulary ([`sample_full`]
@@ -263,7 +278,39 @@ impl Sampler {
     /// repetition penalty, no guide. A device can then sample itself from uniforms the host
     /// draws ([`Sampler::uniform`]).
     pub fn plain_sampled(&self) -> bool {
-        self.temperature > 0.0 && self.top_k == 0 && self.top_p >= 1.0 && self.repetition_penalty == 1.0 && self.guide.is_none()
+        self.temperature > 0.0
+            && self.top_k == 0
+            && self.top_p >= 1.0
+            && self.min_p <= 0.0
+            && self.repetition_penalty == 1.0
+            && self.guide.is_none()
+    }
+
+    /// What a device needs to choose the tokens itself as [`Sampler::sample`] would (greedy or a
+    /// draw, with top-k, top-p, min-p and the repetition penalty; [`DeviceSampling::pick`]),
+    /// from uniforms the host draws ([`Sampler::uniform`]); None with a guide (a grammar's mask
+    /// or a log-probability record stays on the host).
+    pub fn device_sampling(&self) -> Option<DeviceSampling> {
+        if self.guide.is_some() || self.temperature.is_nan() || !(self.plain_greedy() || device_sampling_enabled()) {
+            return None;
+        }
+        Some(DeviceSampling {
+            temperature: self.temperature.max(0.0),
+            top_k: self.top_k,
+            top_p: self.top_p,
+            min_p: self.min_p,
+            repetition_penalty: self.repetition_penalty,
+            seen: if self.repetition_penalty != 1.0 {
+                self.seen.clone()
+            } else {
+                Vec::new()
+            },
+        })
+    }
+
+    /// Whether a device can choose the tokens ([`Sampler::device_sampling`]).
+    pub fn chainable(&self) -> bool {
+        self.guide.is_none() && !self.temperature.is_nan() && (self.plain_greedy() || device_sampling_enabled())
     }
 
     /// The generator's state, to replay draws ([`Sampler::set_state`]): a device chain draws a
@@ -305,50 +352,10 @@ impl Sampler {
             let total = probs.iter().map(|&p| p as f64).sum::<f64>() as f32;
             return ((0..logits.len() as u32).collect(), probs, logits.len(), total);
         }
-        let k = if self.top_k == 0 {
-            logits.len()
-        } else {
-            self.top_k.min(logits.len())
-        };
-        // Partial selection of the top-k indices.
-        let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
-        idx.select_nth_unstable_by(k - 1, |&a, &b| {
-            logits[b as usize]
-                .partial_cmp(&logits[a as usize])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        idx.truncate(k);
-        idx.sort_unstable_by(|&a, &b| {
-            logits[b as usize]
-                .partial_cmp(&logits[a as usize])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let inv_t = 1.0 / self.temperature;
-        let max = logits[idx[0] as usize];
-        let mut probs: Vec<f32> = idx.iter().map(|&i| ((logits[i as usize] - max) * inv_t).exp()).collect();
-        let sum: f32 = probs.iter().sum();
-        for p in probs.iter_mut() {
-            *p /= sum;
-        }
-        // top-p
-        let mut cut = probs.len();
-        if self.top_p < 1.0 {
-            let mut acc = 0f32;
-            for (i, &p) in probs.iter().enumerate() {
-                acc += p;
-                if acc >= self.top_p {
-                    cut = i + 1;
-                    break;
-                }
-            }
-        }
-        if masked {
-            while cut > 1 && probs[cut - 1] <= 0.0 {
-                cut -= 1;
-            }
-        }
-        let total: f32 = probs[..cut].iter().sum();
-        (idx, probs, cut, total)
+        let (idx, w, cut, total) = cut_candidates(logits, 1.0 / self.temperature, self.top_k, self.top_p, self.min_p, masked);
+        let inv = if total > 0.0 { 1.0 / total } else { 0.0 };
+        let probs = w.iter().map(|&x| x * inv).collect();
+        (idx, probs, cut, if total > 0.0 { 1.0 } else { 0.0 })
     }
 
     /// The exact distribution `sample` draws from (temperature, top-k, top-p applied), as
@@ -452,15 +459,9 @@ impl Sampler {
             let u = self.next_f32();
             return draw_weights(&w, total, u);
         }
-        let (idx, probs, cut, total) = self.candidates(&logits, masked);
-        let mut r = self.next_f32() * total;
-        for i in 0..cut {
-            r -= probs[i];
-            if r <= 0.0 {
-                return idx[i];
-            }
-        }
-        idx[cut - 1]
+        let (idx, w, cut, _) = cut_candidates(&logits, 1.0 / self.temperature, self.top_k, self.top_p, self.min_p, masked);
+        let u = self.next_f32();
+        idx[draw_prefix(&prefix_sums(&w[..cut]), u)]
     }
 }
 
@@ -477,6 +478,180 @@ pub fn apply_repetition_penalty(logits: &mut [f32], seen: &[u64], penalty: f32) 
                 *l = if *l < 0.0 { *l * penalty } else { *l / penalty };
             }
         }
+    }
+}
+
+/// The key a cut draw ranks logits by: decreasing value (NaN as -inf), then increasing token id
+/// ([`f32::total_cmp`]'s order: -0 below +0; devices rank by the same order on the bits).
+fn rank_cmp(logits: &[f32], a: u32, b: u32) -> std::cmp::Ordering {
+    let key = |i: u32| {
+        let l = logits[i as usize];
+        if l.is_nan() { f32::NEG_INFINITY } else { l }
+    };
+    key(b).total_cmp(&key(a)).then(a.cmp(&b))
+}
+
+/// The candidates of a draw with top-k, top-p or min-p cuts, in rank order (decreasing logit,
+/// then increasing token id: [`rank_cmp`]), with their weights `exp((l - max) * inv_t)`, how
+/// many survive the cuts and the sum of their weights:
+///
+/// - top-k: the first `top_k` (0: all);
+/// - top-p: then the shortest prefix whose weight reaches `top_p` times the top-k set's;
+/// - min-p: then those of weight at least `min_p` (relative to the most likely token's 1);
+/// - at least one; with `masked` (a guide's -inf), never a token of weight zero but the first.
+///
+/// [`draw_prefix`] then draws in rank order. Devices cut and draw the same way (Metal:
+/// `ink_fsamp`), to rounding.
+pub(crate) fn cut_candidates(
+    logits: &[f32],
+    inv_t: f32,
+    top_k: usize,
+    top_p: f32,
+    min_p: f32,
+    masked: bool,
+) -> (Vec<u32>, Vec<f32>, usize, f32) {
+    let n = logits.len();
+    let kk = if top_k == 0 { n } else { top_k.min(n) };
+    let cmp = |a: &u32, b: &u32| rank_cmp(logits, *a, *b);
+    let max = logits[argmax(logits) as usize];
+    let weight = |i: u32| {
+        let l = logits[i as usize];
+        if l > f32::NEG_INFINITY && max > f32::NEG_INFINITY {
+            crate::kernels::fast_exp((l - max) * inv_t)
+        } else {
+            0.0
+        }
+    };
+    let (mut idx, total_w): (Vec<u32>, f32) = if kk < n {
+        let mut idx: Vec<u32> = (0..n as u32).collect();
+        idx.select_nth_unstable_by(kk - 1, cmp);
+        idx.truncate(kk);
+        (idx, 0.0)
+    } else {
+        // Without top-k, top-p's set is a share of the whole vocabulary's weight W: tokens of
+        // weight below (1 - top_p) W / 2n together weigh less than half of what top-p leaves
+        // out, so the cut is among the others (and min-p's below min_p are cut anyway); only
+        // those are sorted.
+        let (w, total) = full_weights(logits, inv_t);
+        let mut tau = if min_p > 0.0 { min_p } else { 0.0 };
+        if top_p < 1.0 {
+            tau = tau.max(((1.0 - top_p as f64) * total / (2 * n) as f64) as f32);
+        }
+        let idx = (0..n as u32)
+            .filter(|&i| w[i as usize] >= tau && !(masked && w[i as usize] <= 0.0))
+            .collect();
+        (idx, total as f32)
+    };
+    if idx.is_empty() {
+        idx.push(argmax(logits));
+    }
+    idx.sort_unstable_by(cmp);
+    let w: Vec<f32> = idx.iter().map(|&i| weight(i)).collect();
+    let p = prefix_sums(&w);
+    let mut m = idx.len();
+    if top_p < 1.0 {
+        let d = if kk < n { p[kk - 1] } else { total_w };
+        let target = top_p * d;
+        if let Some(r) = p.iter().position(|&x| x >= target) {
+            m = m.min(r + 1);
+        }
+    }
+    if min_p > 0.0
+        && let Some(r) = w.iter().position(|&x| x < min_p)
+    {
+        m = m.min(r);
+    }
+    let mut m = m.max(1);
+    if masked {
+        while m > 1 && w[m - 1] <= 0.0 {
+            m -= 1;
+        }
+    }
+    let total = p[m - 1];
+    (idx, w, m, total)
+}
+
+/// The inclusive prefix sums of `w`.
+fn prefix_sums(w: &[f32]) -> Vec<f32> {
+    let mut acc = 0f32;
+    w.iter()
+        .map(|&x| {
+            acc += x;
+            acc
+        })
+        .collect()
+}
+
+/// The first index whose prefix sum (`p`, nondecreasing) reaches `u` times the last (the last
+/// index when rounding leaves it short).
+fn draw_prefix(p: &[f32], u: f32) -> usize {
+    let r = u * p[p.len() - 1];
+    p.iter().position(|&x| x >= r).unwrap_or(p.len() - 1)
+}
+
+/// Whether devices may choose sampled tokens themselves ([`Sampler::device_sampling`]; default
+/// on, `OXINFER_DEVICE_SAMPLING=0` keeps every draw on the host's sampler, whose rounding differs
+/// from a device's: the same distribution, but not always the same tokens from a seed).
+pub fn device_sampling_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OXINFER_DEVICE_SAMPLING").is_none_or(|v| v != "0"))
+}
+
+/// A device's sampling settings ([`Sampler::device_sampling`]): it chooses each token itself
+/// as [`DeviceSampling::pick`] does, from a uniform the host draws, and adds it to `seen`.
+#[derive(Clone, Debug, Default)]
+pub struct DeviceSampling {
+    /// 0: greedy (the argmax).
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub repetition_penalty: f32,
+    /// The tokens seen (repetition penalty; bit `t % 64` of word `t / 64`), empty without one.
+    pub seen: Vec<u64>,
+}
+
+impl DeviceSampling {
+    /// Whether a draw takes every token of a vocabulary of `n` (no top-k, top-p or min-p cut).
+    pub fn whole(&self, n: usize) -> bool {
+        (self.top_k == 0 || self.top_k >= n) && self.top_p >= 1.0 && self.min_p <= 0.0
+    }
+
+    /// Whether this is the plain argmax (greedy, no repetition penalty).
+    pub fn plain_greedy(&self) -> bool {
+        self.temperature <= 0.0 && self.repetition_penalty == 1.0
+    }
+
+    /// Whether a token's logit is penalized ([`Sampler::repetition_penalty`]).
+    pub fn penalized(&self) -> bool {
+        self.repetition_penalty != 1.0
+    }
+
+    /// Records `t` as seen (the repetition penalty's next logits).
+    pub fn observe(&mut self, t: u32) {
+        if !self.penalized() {
+            return;
+        }
+        let (w, b) = (t as usize / 64, t % 64);
+        if w >= self.seen.len() {
+            self.seen.resize(w + 1, 0);
+        }
+        self.seen[w] |= 1 << b;
+    }
+
+    /// The token [`Sampler::sample`] chooses from logits the repetition penalty was already
+    /// applied to (no guide), given the uniform it would draw: the reference of the device's
+    /// choice.
+    pub fn pick(&self, penalized: &[f32], u: f32) -> u32 {
+        if self.temperature <= 0.0 {
+            return argmax(penalized);
+        }
+        let inv_t = 1.0 / self.temperature;
+        if self.whole(penalized.len()) {
+            return sample_full(penalized, inv_t, u);
+        }
+        let (idx, w, m, _) = cut_candidates(penalized, inv_t, self.top_k, self.top_p, self.min_p, false);
+        idx[draw_prefix(&prefix_sums(&w[..m]), u)]
     }
 }
 
@@ -628,6 +803,62 @@ unsafe fn argmax_neon(x: &[f32]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cut draws: top-k, then top-p over the top-k set's weight, then min-p against the most
+    /// likely token, ties ranked by token id, the draw in rank order; `DeviceSampling::pick`
+    /// gives what `Sampler::sample` gives from the same uniform.
+    #[test]
+    fn cut_draws_follow_the_cuts() {
+        // Weights at temperature 1: e^0, e^-1 (twice, tied), e^-2, e^-3, and a far tail.
+        let mut logits = vec![-30.0f32; 64];
+        logits[9] = 0.0;
+        logits[4] = -1.0;
+        logits[2] = -1.0;
+        logits[7] = -2.0;
+        logits[30] = -3.0;
+        let e = |x: f32| x.exp();
+        let cut = |k, p, mp| {
+            let (idx, _, m, _) = cut_candidates(&logits, 1.0, k, p, mp, false);
+            idx[..m].to_vec()
+        };
+        assert_eq!(cut(3, 1.0, 0.0), vec![9, 2, 4]);
+        assert_eq!(cut(2, 1.0, 0.0), vec![9, 2]);
+        // top-p: 1 / (1 + 2/e + ...) of the top-4 weight is 0.52.
+        let w4 = 1.0 + 2.0 * e(-1.0) + e(-2.0);
+        assert_eq!(cut(4, 0.5, 0.0), vec![9]);
+        assert_eq!(cut(4, (1.0 + e(-1.0)) / w4 - 0.01, 0.0), vec![9, 2]);
+        assert_eq!(cut(0, 0.9, 0.0), vec![9, 2, 4]);
+        assert_eq!(cut(0, 0.95, 0.0), vec![9, 2, 4, 7]);
+        // min-p: weight at least min_p (e^-1 = 0.37 kept at 0.3, cut at 0.4).
+        assert_eq!(cut(0, 1.0, 0.3), vec![9, 2, 4]);
+        assert_eq!(cut(0, 1.0, 0.4), vec![9]);
+        assert_eq!(cut(40, 0.99, 0.1), vec![9, 2, 4, 7]);
+        // Draw frequencies over a cut, and the device reference against the sampler.
+        let mut s = Sampler::new(1.0, 4, 1.0, 5).with_min_p(0.2);
+        let mut ds = s.device_sampling().unwrap();
+        ds.seen.clear();
+        let mut hist = [0usize; 64];
+        let n = 100_000;
+        for _ in 0..n {
+            let st = s.state();
+            let u = s.uniform();
+            s.set_state(st, 0);
+            let t = s.sample(&logits);
+            assert_eq!(ds.pick(&logits, u), t);
+            hist[t as usize] += 1;
+        }
+        let z = 1.0 + 2.0 * e(-1.0);
+        for (t, want) in [(9usize, 1.0 / z), (2, e(-1.0) / z), (4, e(-1.0) / z), (7, 0.0)] {
+            let f = hist[t] as f32 / n as f32;
+            assert!((f - want).abs() < 0.01, "token {t}: {f} vs {want}");
+        }
+        // The repetition penalty: the device's settings carry the tokens seen.
+        let mut s = Sampler::new(0.0, 0, 1.0, 1).with_repetition_penalty(2.0);
+        s.observe(&[9]);
+        let ds = s.device_sampling().unwrap();
+        assert!(ds.penalized() && !ds.plain_greedy() && ds.seen[0] == 1 << 9);
+        assert!(Sampler::new(0.0, 0, 1.0, 1).device_sampling().unwrap().plain_greedy());
+    }
 
     /// Whole-vocabulary temperature draws ([`sample_full`], no sort) keep the softmax's
     /// frequencies, and the distribution lists every token in token order.

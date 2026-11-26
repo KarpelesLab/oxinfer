@@ -77,8 +77,8 @@ impl ModelSpec {
     ///   CLI's prompt with the local date and time);
     /// - `think`: thinking by default (`1` / `0`; requests override it);
     /// - `max_tokens`: reply length when a request sets none (default 4096);
-    /// - `temperature`, `top_p`, `top_k`, `repetition_penalty`: sampling defaults (OpenAI's:
-    ///   temperature 1, top-p 1, no top-k);
+    /// - `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`: sampling defaults
+    ///   (OpenAI's: temperature 1, top-p 1, no top-k, no min-p);
     /// - `prompt_name`: embedding models, the named prompt used when a request names none;
     /// - `memory_gb`: the memory the model is counted for (default: estimated from its files).
     pub const KEYS: &'static [&'static str] = &[
@@ -89,6 +89,7 @@ impl ModelSpec {
         "temperature",
         "top_p",
         "top_k",
+        "min_p",
         "repetition_penalty",
         "prompt_name",
         "memory_gb",

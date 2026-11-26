@@ -1134,10 +1134,13 @@ pub(crate) trait DevEngine: Send + Sync {
     ) -> Option<(usize, usize)> {
         None
     }
-    /// [`DevEngine::greedy`] where each pass's token is a temperature draw over the whole
-    /// vocabulary ([`crate::sampler::sample_full`]) from the uniform `draw` gives as the pass is
-    /// queued ([`Inkling2Model::decode_sampled`]); with `feats`, appending the streams `capture`
-    /// lists as [`DevEngine::greedy_capture`].
+    /// [`DevEngine::greedy`] where each pass's token is chosen as `samp` chooses it
+    /// ([`crate::sampler::DeviceSampling::pick`]) from the uniform `draw(j)` gives for pass `j`
+    /// ([`Inkling2Model::decode_sampled`]); with `feats`, appending the streams `capture` lists
+    /// as [`DevEngine::greedy_capture`]; without `ahead`, each pass queued only once the host has
+    /// the token before (no chaining). Also the token to go on from, and whether only its pass
+    /// is to run, when the chain ended because the host chose a pass's token (the device could
+    /// not) and it was not the one the next pass ran.
     #[allow(clippy::too_many_arguments)]
     fn sampled(
         &self,
@@ -1147,10 +1150,11 @@ pub(crate) trait DevEngine: Send + Sync {
         _max: usize,
         _capture: &[usize],
         _feats: Option<&mut Vec<f32>>,
-        _temperature: f32,
-        _draw: &mut dyn FnMut() -> f32,
+        _samp: &crate::sampler::DeviceSampling,
+        _ahead: bool,
+        _draw: &mut dyn FnMut(usize) -> f32,
         _on: &mut dyn FnMut(u32) -> crate::generate::Chain,
-    ) -> Option<(usize, usize)> {
+    ) -> Option<ChainEnd> {
         None
     }
     /// [`DevEngine::greedy`] that also appends to `feats` the streams `capture` lists (as
@@ -1169,6 +1173,52 @@ pub(crate) trait DevEngine: Send + Sync {
         None
     }
 }
+
+/// The embedding's RMS norm, in the order the devices' embedding kernels sum the squares (32
+/// lanes, lane `j` over elements `j, j + 32, ...` with fused multiply-adds, then the halves
+/// added pairwise: 16, 8, 4, 2, 1 apart) and with correctly rounded operations, so that a row the
+/// host embeds (prefill, verification passes) is the one a chained pass embeds on the device bit
+/// for bit, and greedy decoding gives the same tokens with and without speculation.
+pub(crate) fn embed_norm(x: &mut [f32], w: &[f32], eps: f32) {
+    let n = x.len();
+    let mut acc = [0f32; 32];
+    for (i, &v) in x.iter().enumerate() {
+        acc[i % 32] = v.mul_add(v, acc[i % 32]);
+    }
+    let mut m = 16;
+    while m > 0 {
+        let prev = acc;
+        for (j, a) in acc.iter_mut().enumerate() {
+            *a = prev[j] + prev[j ^ m];
+        }
+        m /= 2;
+    }
+    let r = 1.0 / (acc[0] / n as f32 + eps).sqrt();
+    for (v, &wi) in x.iter_mut().zip(w) {
+        *v *= r * wi;
+    }
+}
+
+static SAMPLE_CAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Tests: the most candidates a device's cut draw (top-k, top-p, min-p) takes itself before it
+/// leaves the token to the host (None: as many as it can), to exercise the host's choices in a
+/// chain. Process-wide.
+#[doc(hidden)]
+pub fn set_device_sample_cap(n: Option<usize>) {
+    SAMPLE_CAP.store(n.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`set_device_sample_cap`]. (Read by the Metal engine only.)
+#[allow(dead_code)]
+pub(crate) fn device_sample_cap() -> usize {
+    SAMPLE_CAP.load(std::sync::atomic::Ordering::Relaxed).min(u32::MAX as usize)
+}
+
+/// How a chain of sampled passes ended ([`DevEngine::sampled`]): the passes run, the passes
+/// kept, and the token to go on from (and whether only its pass is to run) when the host chose a
+/// token the next pass did not run.
+pub(crate) type ChainEnd = (usize, usize, Option<(u32, bool)>);
 
 /// A session's state on a device ([`DevEngine`]).
 pub(crate) trait DevSession: Send + Sync {
@@ -2215,6 +2265,13 @@ impl<'a> Inkling2Model<'a> {
         self.can_rollback() && self.device().is_none_or(|d| d.captures())
     }
 
+    /// Whether a draft model found beside the checkpoint is used when none is asked for: where
+    /// the passes run on a device that captures their streams (Metal; on the CPU a verification
+    /// pass costs nearly its tokens in one-token steps, so drafts are only probed at a loss).
+    pub fn drafts_by_default(&self) -> bool {
+        self.can_rollback() && self.device().is_some_and(|d| d.captures())
+    }
+
     /// Runs `tokens` on the device when it can (`want` as [`DevWant`]); false otherwise (the
     /// session then has its state on the host).
     fn run_device(&self, sess: &mut Inkling2Session, tokens: &[u32], mm: &[(usize, &[f32])], want: DevWant) -> bool {
@@ -2249,7 +2306,7 @@ impl<'a> Inkling2Model<'a> {
         let mut x = vec![0f32; t * h];
         for_chunks(&mut x, h, t > 1, |ti, row| {
             self.embed.row(tokens[ti] as usize, row);
-            rmsnorm_f32w_inplace(row, &self.embed_norm, eps);
+            embed_norm(row, &self.embed_norm, eps);
         });
         for &(i, e) in mm {
             x[i * h..(i + 1) * h].copy_from_slice(e);
@@ -2515,29 +2572,20 @@ impl<'a> Inkling2Model<'a> {
         Some(kept)
     }
 
-    /// [`Self::decode_greedy`] for a temperature draw over the whole vocabulary
-    /// ([`crate::generate::TextLm::decode_sampled`]): each pass's token drawn on the device from
-    /// the uniform `draw` gives (one a pass queued, in order). None (the session untouched)
-    /// when the device does not do it.
+    /// [`Self::decode_greedy`] for the device's sampling `samp`
+    /// ([`crate::generate::TextLm::decode_sampled`]): each pass's token chosen on the device from
+    /// the uniform `draw(j)` gives for the `j`-th token. None (the session untouched) when the
+    /// device does not do it.
     pub fn decode_sampled(
         &self,
         sess: &mut Inkling2Session,
         first: u32,
         max: usize,
-        temperature: f32,
-        draw: &mut dyn FnMut() -> f32,
+        samp: &crate::sampler::DeviceSampling,
+        draw: &mut dyn FnMut(usize) -> f32,
         on: &mut dyn FnMut(u32) -> crate::generate::Chain,
     ) -> Option<usize> {
-        if sess.iv.active() || sess.dev_off || crate::gpu::decode::check() || !crate::gpu::decode_chain_enabled() {
-            return None;
-        }
-        let d = self.device()?;
-        let pos0 = sess.pos;
-        let (ran, kept) = d.sampled(self, sess, first, max, &[], None, temperature, draw, on)?;
-        if kept < ran {
-            sess.truncate(pos0 + kept).expect("a pass past the stop goes back");
-        }
-        Some(kept)
+        self.decode_sampled_inner(sess, first, max, &[], None, samp, draw, on)
     }
 
     /// [`Self::decode_sampled`] that also appends to `feats` the streams entering `layers` of
@@ -2550,22 +2598,78 @@ impl<'a> Inkling2Model<'a> {
         max: usize,
         layers: &[usize],
         feats: &mut Vec<f32>,
-        temperature: f32,
-        draw: &mut dyn FnMut() -> f32,
+        samp: &crate::sampler::DeviceSampling,
+        draw: &mut dyn FnMut(usize) -> f32,
         on: &mut dyn FnMut(u32) -> crate::generate::Chain,
     ) -> Option<usize> {
-        if sess.iv.active() || sess.dev_off || crate::gpu::decode::check() || !crate::gpu::decode_chain_enabled() {
+        self.decode_sampled_inner(sess, first, max, layers, Some(feats), samp, draw, on)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_sampled_inner(
+        &self,
+        sess: &mut Inkling2Session,
+        first: u32,
+        max: usize,
+        layers: &[usize],
+        mut feats: Option<&mut Vec<f32>>,
+        samp: &crate::sampler::DeviceSampling,
+        draw: &mut dyn FnMut(usize) -> f32,
+        on: &mut dyn FnMut(u32) -> crate::generate::Chain,
+    ) -> Option<usize> {
+        if sess.iv.active() || sess.dev_off || crate::gpu::decode::check() {
             return None;
         }
+        // Without chaining (`OXINFER_GPU_CHAIN=0`) the device still chooses the tokens, one pass
+        // at a time: the same tokens as a chain from the same seed.
+        let ahead = crate::gpu::decode_chain_enabled();
         let d = self.device()?;
-        let pos0 = sess.pos;
-        let n0 = feats.len();
-        let (ran, kept) = d.sampled(self, sess, first, max, layers, Some(feats), temperature, draw, on)?;
-        if kept < ran {
-            sess.truncate(pos0 + kept).expect("a pass past the stop goes back");
+        let nf = layers.len() * self.cfg.hidden_size;
+        // A chain the host had to choose a token of goes on from it in another chain (the
+        // repetition penalty's tokens and the uniforms' index carried over).
+        let (mut ds, mut first, mut left, mut base, mut total) = (samp.clone(), first, max, 0usize, None);
+        loop {
+            let pos0 = sess.pos;
+            let n0 = feats.as_ref().map_or(0, |f| f.len());
+            let mut got: Vec<u32> = Vec::new();
+            let mut on2 = |t: u32| {
+                got.push(t);
+                on(t)
+            };
+            let Some((ran, kept, resume)) = d.sampled(
+                self,
+                sess,
+                first,
+                left,
+                layers,
+                feats.as_deref_mut(),
+                &ds,
+                ahead,
+                &mut |j| draw(base + j),
+                &mut on2,
+            ) else {
+                return total;
+            };
+            if kept < ran {
+                sess.truncate(pos0 + kept).expect("a pass past the stop goes back");
+            }
+            if let Some(f) = feats.as_deref_mut() {
+                f.truncate(n0 + kept * nf);
+            }
+            let sum = total.unwrap_or(0) + kept;
+            total = Some(sum);
+            match resume {
+                Some((t, only)) if kept < left => {
+                    for &g in &got {
+                        ds.observe(g);
+                    }
+                    first = t;
+                    base += kept;
+                    left = if only { 1 } else { left - kept };
+                }
+                _ => return total,
+            }
         }
-        feats.truncate(n0 + kept * layers.len() * self.cfg.hidden_size);
-        Some(kept)
     }
 
     /// [`Self::decode_greedy`] that also appends to `feats` the residual streams entering
@@ -3408,11 +3512,11 @@ impl crate::generate::TextLm for Inkling2Model<'_> {
         sess: &mut Inkling2Session,
         first: u32,
         max: usize,
-        temperature: f32,
-        draw: &mut dyn FnMut() -> f32,
+        samp: &crate::sampler::DeviceSampling,
+        draw: &mut dyn FnMut(usize) -> f32,
         on: &mut dyn FnMut(u32) -> crate::generate::Chain,
     ) -> Option<usize> {
-        Inkling2Model::decode_sampled(self, sess, first, max, temperature, draw, on)
+        Inkling2Model::decode_sampled(self, sess, first, max, samp, draw, on)
     }
 }
 
@@ -3499,11 +3603,11 @@ impl crate::dspark::Target for Inkling2Model<'_> {
         max: usize,
         layers: &[usize],
         feats: &mut Vec<f32>,
-        temperature: f32,
-        draw: &mut dyn FnMut() -> f32,
+        samp: &crate::sampler::DeviceSampling,
+        draw: &mut dyn FnMut(usize) -> f32,
         on: &mut dyn FnMut(u32) -> crate::generate::Chain,
     ) -> Option<usize> {
-        Inkling2Model::decode_sampled_feats(self, sess, first, max, layers, feats, temperature, draw, on)
+        Inkling2Model::decode_sampled_feats(self, sess, first, max, layers, feats, samp, draw, on)
     }
     fn forward_verify(&self, sess: &mut Inkling2Session, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>, _fast: bool) -> Vec<f32> {
         let t = tokens.len();
@@ -3525,7 +3629,7 @@ impl crate::dspark::Target for Inkling2Model<'_> {
     // The model's input: the embedding after its RMS norm (what a draft's anchor row takes).
     fn embed_row(&self, token: u32, out: &mut [f32]) {
         Inkling2Model::embed_row(self, token, out);
-        rmsnorm_f32w_inplace(out, &self.embed_norm, self.cfg.rms_norm_eps as f32);
+        embed_norm(out, &self.embed_norm, self.cfg.rms_norm_eps as f32);
     }
     fn head_raw(&self, hidden: &[f32], t: usize) -> Vec<f32> {
         self.head(hidden, t, false)

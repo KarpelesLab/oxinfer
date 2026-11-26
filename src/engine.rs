@@ -992,6 +992,8 @@ pub struct SamplingParams {
     /// Repetition penalty (1 = off; see [`Sampler::repetition_penalty`]) over the tokens the
     /// sampler has generated since it was set. Not used by MTP speculative decoding.
     pub repetition_penalty: f32,
+    /// Min-p (0 = off; see [`Sampler::min_p`]).
+    pub min_p: f32,
 }
 
 impl Default for SamplingParams {
@@ -1003,6 +1005,7 @@ impl Default for SamplingParams {
             top_p: 0.95,
             seed: 42,
             repetition_penalty: 1.0,
+            min_p: 0.0,
         }
     }
 }
@@ -2446,8 +2449,10 @@ impl Engine {
                     (false, d) => d.clone(),
                 };
                 // (A device whose sessions cannot go back, or that sends the drafts' captured
-                // passes to the CPU, runs no drafts.)
-                let draft = draft.filter(|_| model.can_draft());
+                // passes to the CPU, runs no drafts; one found beside the model is used unasked
+                // only on a device that captures them.)
+                let asked = mtp || opts.draft.is_some();
+                let draft = draft.filter(|_| model.can_draft() && (asked || model.drafts_by_default()));
                 let lm = match draft {
                     Some(d) => {
                         let dr = load_dspark(&mut arena, &d, c.hidden_size, c.vocab_size, model.quant)?;
@@ -4262,7 +4267,9 @@ impl PendingTurn {
 }
 
 fn sampler_for(s: &SamplingParams) -> Sampler {
-    Sampler::new(s.temperature, s.top_k, s.top_p, s.seed).with_repetition_penalty(s.repetition_penalty)
+    Sampler::new(s.temperature, s.top_k, s.top_p, s.seed)
+        .with_repetition_penalty(s.repetition_penalty)
+        .with_min_p(s.min_p)
 }
 
 /// Whether `dir` is a Core ML (ANEMLL-format) model directory: `meta.yaml` next to `.mlmodelc`

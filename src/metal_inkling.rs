@@ -31,8 +31,8 @@ use crate::generate::Chain;
 use crate::ggml::GgmlType;
 use crate::gpu::WeightRef;
 use crate::inkling::{
-    Checkpoint, DevBox, DevEngine, DevSession, DevWant, InNorm, Inkling2Model, Inkling2Session, KvCache, KvConv, KvRows, LayerState,
-    ROLLBACK, SlotCheckpoint,
+    ChainEnd, Checkpoint, DevBox, DevEngine, DevSession, DevWant, InNorm, Inkling2Model, Inkling2Session, KvCache, KvConv, KvRows,
+    LayerState, ROLLBACK, SlotCheckpoint,
 };
 use crate::model::Lin;
 use std::fmt::Write as _;
@@ -663,15 +663,29 @@ struct CapP {
     cap: f32,
     am: u32,
     inv_t: f32,
-    _p2: u32,
+    seen: u32,
+    pen: f32,
+    _p: [u32; 3],
 }
 /// What the last pass of a chain picks into the token slot `tok` ([`InkMetal::enc_final`]): the
-/// argmax of the capped logits, or with `samp` = (1 / temperature, uniform slot) a draw
-/// (`ink_samp`).
+/// argmax of the capped logits, or with `samp` a choice of the device's sampling.
 #[derive(Clone, Copy)]
 struct Pick {
     tok: usize,
-    samp: Option<(f32, usize)>,
+    samp: Option<SampPick>,
+}
+/// A device sampling's pick ([`crate::sampler::DeviceSampling`]): `inv_t` 0 for the argmax (of
+/// penalized logits), else a draw from the uniform in slot `uni`, with the cuts `cut` (top-k,
+/// top-p, min-p: `ink_fsamp`, which sets slot `fl` when the host must choose) or over the
+/// whole vocabulary (`ink_samp`); `pen` the repetition penalty (1: none) over the bit set
+/// [`Bufs::seen`], where the chosen token is marked.
+#[derive(Clone, Copy)]
+struct SampPick {
+    inv_t: f32,
+    uni: usize,
+    fl: usize,
+    cut: Option<(u32, f32, f32)>,
+    pen: f32,
 }
 /// An expert's projection in the address tables (`IXT`).
 #[repr(C)]
@@ -924,8 +938,12 @@ struct Bufs {
     /// Greedy decoding on the device: the argmax's partials, two token slots.
     amp: usize,
     tok: usize,
-    /// Sampling on the device: a uniform per token slot.
+    /// Sampling on the device: a uniform per token slot, whether the host must choose a slot's
+    /// token (`ink_fsamp`), and the repetition penalty's bit set of the tokens seen (a word per
+    /// 32 tokens).
     uni: usize,
+    fl: usize,
+    seen: usize,
     /// LoRA scratch (the down halves' outputs) and the largest rank.
     lu: usize,
     lora_r: usize,
@@ -999,6 +1017,7 @@ struct Pipes {
     softcap: Id,
     amax: Id,
     samp: Id,
+    fsamp: Id,
     xgroup: Id,
     xcombine: Id,
     gmix_norm: Id,
@@ -2153,6 +2172,8 @@ impl InkMetal {
                 amp: take(2 * c.unpadded_vocab_size.div_ceil(256)),
                 tok: take(2),
                 uni: take(2),
+                fl: take(2),
+                seen: take(c.unpadded_vocab_size.div_ceil(32)),
                 lu: take((t * topk + 15 * ne + 128) * lora_r),
                 grp: take(1 + 3 * MAX_T * topk),
                 asg: take(MAX_T * topk),
@@ -2312,6 +2333,7 @@ impl InkMetal {
             softcap: pipe("ink_softcap")?,
             amax: pipe("ink_amax")?,
             samp: pipe("ink_samp")?,
+            fsamp: pipe("ink_fsamp")?,
             xgroup: pipe("ink_xgroup")?,
             mix8: pipe("ink_mix8")?,
             mix5: pipe("ink_mix5")?,
@@ -3077,6 +3099,9 @@ impl InkMetal {
                 );
             }
             e.barrier();
+            let samp = amax.and_then(|a| a.samp);
+            let pen = samp.map_or(1.0, |s| s.pen);
+            let seen = if pen != 1.0 { b.seen as u32 } else { u32::MAX };
             let p = CapP {
                 v: self.vocab as u32,
                 u: self.unpadded as u32,
@@ -3084,7 +3109,9 @@ impl InkMetal {
                 out: b.capped as u32,
                 cap: self.caps.2,
                 am: amax.map_or(0, |_| b.amp as u32),
-                inv_t: amax.and_then(|a| a.samp).map_or(0.0, |s| s.0),
+                inv_t: samp.map_or(0.0, |s| s.inv_t),
+                seen,
+                pen: if pen != 1.0 { pen } else { 0.0 },
                 ..Default::default()
             };
             e.pipe(self.p.softcap);
@@ -3094,26 +3121,42 @@ impl InkMetal {
             if let Some(pk) = amax {
                 e.barrier();
                 let n = self.unpadded.div_ceil(256) as u32;
-                match pk.samp {
-                    None => {
-                        e.pipe(self.p.amax);
-                        e.buf(c.a, 0, 0);
-                        e.bytes(&[n, b.amp as u32, pk.tok as u32, 0], 1);
-                    }
-                    Some((inv_t, uni)) => {
-                        e.pipe(self.p.samp);
-                        e.buf(c.a, 0, 0);
-                        let p = [
+                match samp {
+                    Some(s) if s.inv_t > 0.0 => {
+                        let base = [
                             n,
                             b.amp as u32,
                             pk.tok as u32,
-                            uni as u32,
+                            s.uni as u32,
                             b.capped as u32,
                             self.unpadded as u32,
-                            inv_t.to_bits(),
-                            0,
+                            s.inv_t.to_bits(),
+                            seen,
                         ];
-                        e.bytes(&p, 1);
+                        e.buf(c.a, 0, 0);
+                        match s.cut {
+                            None => {
+                                e.pipe(self.p.samp);
+                                e.bytes(&base, 1);
+                            }
+                            Some((k, top_p, min_p)) => {
+                                e.pipe(self.p.fsamp);
+                                let mut p = [0u32; 16];
+                                p[..8].copy_from_slice(&base);
+                                p[8] = k;
+                                p[9] = top_p.to_bits();
+                                p[10] = min_p.to_bits();
+                                p[11] = if min_p > 0.0 { -min_p.ln() } else { 0.0f32 }.to_bits();
+                                p[12] = s.fl as u32;
+                                p[13] = crate::inkling::device_sample_cap() as u32;
+                                e.bytes(&p, 1);
+                            }
+                        }
+                    }
+                    _ => {
+                        e.pipe(self.p.amax);
+                        e.buf(c.a, 0, 0);
+                        e.bytes(&[n, b.amp as u32, pk.tok as u32, seen], 1);
                     }
                 }
                 e.dispatch((1, 1), 1024);
@@ -4617,7 +4660,7 @@ impl DevEngine for InkMetal {
         max: usize,
         on: &mut dyn FnMut(u32) -> Chain,
     ) -> Option<(usize, usize)> {
-        self.greedy_impl(m, sess, first, max, &[], None, None, on)
+        self.greedy_impl(m, sess, first, max, &[], None, None, true, on).map(|r| (r.0, r.1))
     }
 
     fn sampled(
@@ -4628,14 +4671,12 @@ impl DevEngine for InkMetal {
         max: usize,
         capture: &[usize],
         feats: Option<&mut Vec<f32>>,
-        temperature: f32,
-        draw: &mut dyn FnMut() -> f32,
+        samp: &crate::sampler::DeviceSampling,
+        ahead: bool,
+        draw: &mut dyn FnMut(usize) -> f32,
         on: &mut dyn FnMut(u32) -> Chain,
-    ) -> Option<(usize, usize)> {
-        if temperature.is_nan() || temperature <= 0.0 || self.unpadded.div_ceil(256) > 1024 {
-            return None;
-        }
-        self.greedy_impl(m, sess, first, max, capture, feats, Some((1.0 / temperature, draw)), on)
+    ) -> Option<ChainEnd> {
+        self.greedy_impl(m, sess, first, max, capture, feats, Some((samp, draw)), ahead, on)
     }
 
     fn greedy_capture(
@@ -4648,7 +4689,8 @@ impl DevEngine for InkMetal {
         feats: &mut Vec<f32>,
         on: &mut dyn FnMut(u32) -> Chain,
     ) -> Option<(usize, usize)> {
-        self.greedy_impl(m, sess, first, max, capture, Some(feats), None, on)
+        self.greedy_impl(m, sess, first, max, capture, Some(feats), None, true, on)
+            .map(|r| (r.0, r.1))
     }
 
     fn run(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize, mut want: DevWant) -> bool {
@@ -4765,11 +4807,27 @@ impl InkMetal {
         max: usize,
         capture: &[usize],
         mut feats: Option<&mut Vec<f32>>,
-        mut samp: Option<(f32, &mut dyn FnMut() -> f32)>,
+        mut samp: Option<(&crate::sampler::DeviceSampling, &mut dyn FnMut(usize) -> f32)>,
+        ahead: bool,
         on: &mut dyn FnMut(u32) -> Chain,
-    ) -> Option<(usize, usize)> {
+    ) -> Option<ChainEnd> {
         let em = self.emb.as_ref()?;
         if max == 0 || profile_every() > 0 || capture.len() > self.dec.b.nf {
+            return None;
+        }
+        // The device's sampling, if not the plain argmax.
+        let sp = samp.as_ref().map(|(ds, _)| SampPick {
+            inv_t: if ds.temperature > 0.0 { 1.0 / ds.temperature } else { 0.0 },
+            uni: 0,
+            fl: 0,
+            cut: (ds.temperature > 0.0 && !ds.whole(self.unpadded)).then_some((
+                ds.top_k.min(u32::MAX as usize) as u32,
+                ds.top_p,
+                ds.min_p.max(0.0),
+            )),
+            pen: ds.repetition_penalty,
+        });
+        if sp.is_some_and(|s| s.inv_t > 0.0 && (!s.inv_t.is_finite() || self.unpadded.div_ceil(256) > 1024)) {
             return None;
         }
         let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -4786,8 +4844,20 @@ impl InkMetal {
             b: &self.dec.b,
         };
         let slot = |k: usize| unsafe { (self.f.contents(c.a) as *mut u32).add(c.b.tok + k) };
+        let flag = |k: usize| unsafe { *(self.f.contents(c.a) as *const u32).add(c.b.fl + k) };
         // Pass k reads its token from slot (k + 1) % 2 and writes its argmax to slot k % 2.
         unsafe { *slot(1) = first };
+        if let Some((ds, _)) = &samp
+            && ds.penalized()
+        {
+            // SAFETY: no pass of this arena is in flight; the bit set's words are 32 bits.
+            let words =
+                unsafe { std::slice::from_raw_parts_mut((self.f.contents(c.a) as *mut u32).add(c.b.seen), self.unpadded.div_ceil(32)) };
+            for (i, w) in words.iter_mut().enumerate() {
+                let d = ds.seen.get(i / 2).copied().unwrap_or(0);
+                *w = (d >> (32 * (i % 2))) as u32;
+            }
+        }
         let steps = self.plan.len() + 1;
         let parts: Vec<std::ops::Range<usize>> = std::iter::once(0..2.min(steps))
             .chain((2..steps).step_by(8).map(|s| s..(s + 8).min(steps)))
@@ -4815,12 +4885,12 @@ impl InkMetal {
         };
         let (h, nf) = (self.h, capture.len());
         let fin = self.plan.len() + 1;
-        // Pass k's capture rows: token slot k % 2.
+        // Pass k's capture rows and (sampling) capped logits: token slot k % 2.
         let slot_bufs = |k: usize| Bufs {
             cap: self.dec.b.cap + (k % 2) * nf * h,
+            capped: self.dec.b.capped + if sp.is_some() { (k % 2) * self.unpadded } else { 0 },
             ..self.dec.b.clone()
         };
-        let inv_t = samp.as_ref().map(|s| s.0);
         // Pass k's uniform (sampling) is written to its slot before it is committed (the pass
         // before on that slot has completed).
         let submit = |k: usize, dev: &InkDev, u: f32| -> Vec<Id> {
@@ -4829,7 +4899,11 @@ impl InkMetal {
             let c = Cx { a: c.a, b: &bk };
             let pick = Pick {
                 tok: c.b.tok + k % 2,
-                samp: inv_t.map(|t| (t, c.b.uni + k % 2)),
+                samp: sp.map(|s| SampPick {
+                    uni: c.b.uni + k % 2,
+                    fl: c.b.fl + k % 2,
+                    ..s
+                }),
             };
             unsafe {
                 *(self.f.contents(c.a) as *mut f32).add(c.b.uni + k % 2) = u;
@@ -4865,24 +4939,32 @@ impl InkMetal {
             }
         };
         // One pass ahead: pass k + 1 runs while the host takes pass k's token.
-        let mut q: std::collections::VecDeque<(usize, Vec<Id>)> = std::collections::VecDeque::new();
+        let mut q: std::collections::VecDeque<(usize, Vec<Id>, f32)> = std::collections::VecDeque::new();
         let (mut sub, mut kept, mut stopped, mut last, mut ok) = (0usize, 0usize, false, false, true);
-        let mut uniform = || samp.as_mut().map_or(0.0, |s| (s.1)());
-        let push = |q: &mut std::collections::VecDeque<(usize, Vec<Id>)>, k: usize, dev: &mut InkDev, ok: &mut bool, u: f32| {
+        // A token the host chose other than the device's guess (`ink_fsamp`'s flag): the chain
+        // ends there and goes on from it ([`DevEngine::sampled`]).
+        let mut resume = None;
+        let (ds, mut uniform) = match samp.as_mut() {
+            Some((ds, draw)) => (Some(*ds), Some(draw)),
+            None => (None, None),
+        };
+        let mut uniform = |k: usize| uniform.as_mut().map_or(0.0, |d| d(k));
+        let push = |q: &mut std::collections::VecDeque<(usize, Vec<Id>, f32)>, k: usize, dev: &mut InkDev, ok: &mut bool, u: f32| {
             if dev.slots.iter().any(|s| s.ring == 0 && s.rows < pos0 + k + 1) {
                 // (Growing a cache copies it: the passes in flight finish first.)
-                for (_, cbs) in q.iter() {
+                for (_, cbs, _) in q.iter() {
                     *ok &= drain(cbs);
                 }
                 *ok &= dev.reserve(pos0 + k + 1);
             }
-            q.push_back((k, submit(k, dev, u)));
+            q.push_back((k, submit(k, dev, u), u));
         };
-        while sub < max.min(2) {
-            push(&mut q, sub, dev, &mut ok, uniform());
+        // (Without `ahead`, the next pass is queued once the host has this one's token.)
+        while sub < max.min(if ahead { 2 } else { 1 }) {
+            push(&mut q, sub, dev, &mut ok, uniform(sub));
             sub += 1;
         }
-        while let Some((k, cbs)) = q.pop_front() {
+        while let Some((k, cbs, u)) = q.pop_front() {
             ok &= drain(&cbs);
             release(cbs);
             if !ok || stopped {
@@ -4894,9 +4976,40 @@ impl InkMetal {
                 let src = unsafe { std::slice::from_raw_parts((self.f.contents(c.a) as *const f32).add(slot_bufs(k).cap), nf * h) };
                 f.extend_from_slice(src);
             }
-            match on(unsafe { *slot(k % 2) }) {
+            let mut t = unsafe { *slot(k % 2) };
+            let mut guessed = false;
+            if let Some(ds) = ds
+                && sp.is_some_and(|s| s.cut.is_some() && s.inv_t > 0.0)
+                && flag(k % 2) != 0
+            {
+                // SAFETY: pass k has completed; its capped logits are in its slot's row.
+                let l = unsafe { std::slice::from_raw_parts((self.f.contents(c.a) as *const f32).add(slot_bufs(k).capped), self.unpadded) };
+                let ht = ds.pick(l, u);
+                if debug_sample() {
+                    eprintln!("[device sampling: host chose token {ht} (device {t})]");
+                }
+                guessed = ht != t;
+                t = ht;
+            }
+            let r = on(t);
+            if guessed {
+                // The pass queued after this one ran the device's guess: undone, and the chain
+                // goes on from the host's token where the pass would have run it.
+                let next_queued = sub > k + 1;
+                let would_run = match r {
+                    Chain::Go => next_queued || (!last && sub < max),
+                    Chain::Last => next_queued,
+                    Chain::Stop => false,
+                };
+                if would_run {
+                    resume = Some((t, r == Chain::Last || last));
+                }
+                stopped = true;
+                continue;
+            }
+            match r {
                 Chain::Go if !last && sub < max => {
-                    push(&mut q, sub, dev, &mut ok, uniform());
+                    push(&mut q, sub, dev, &mut ok, uniform(sub));
                     sub += 1;
                 }
                 Chain::Go => {}
@@ -4909,8 +5022,14 @@ impl InkMetal {
         }
         dev.pos = pos0 + sub;
         sess.pos = pos0 + sub;
-        Some((sub, kept))
+        Some((sub, kept, resume))
     }
+}
+
+/// `OXINFER_DEBUG_SAMPLE`: report each token of a device sampling chain the host chose.
+fn debug_sample() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var_os("OXINFER_DEBUG_SAMPLE").is_some())
 }
 
 #[cfg(test)]
@@ -5475,5 +5594,181 @@ mod fa_tests {
         for b in [kb, vb, cb, ksb, vsb] {
             be.ink_release(b);
         }
+    }
+}
+
+#[cfg(test)]
+mod samp_tests {
+    use super::*;
+    use crate::sampler::DeviceSampling;
+
+    fn lcg(s: &mut u64) -> u32 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*s >> 33) as u32
+    }
+
+    fn normal(s: &mut u64) -> f32 {
+        let u1 = (lcg(s) as f32 + 1.0) / (u32::MAX as f32 + 2.0);
+        let u2 = lcg(s) as f32 / u32::MAX as f32;
+        (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+    }
+
+    /// The device's cut draws (`ink_softcap` partials, then `ink_fsamp`: top-k, top-p, min-p,
+    /// a repetition penalty) against the host's reference (`DeviceSampling::pick` over the
+    /// capped logits the device wrote) at Inkling-2's vocabulary, on peaked, spread, flat and
+    /// tied logits: the same token for every uniform but at a boundary's rounding, and the
+    /// host asked to choose only where the candidates do not fit.
+    #[test]
+    fn device_cut_draws_match_the_host() {
+        let Ok(be) = MetalBackend::new() else { return };
+        let lib = library(&be).unwrap();
+        let f = Fns::new(&be);
+        let (softcap, fsamp) = (lib.pipeline(&be, "ink_softcap").unwrap(), lib.pipeline(&be, "ink_fsamp").unwrap());
+        let u = 201_024usize;
+        let n = u.div_ceil(256);
+        let (x_off, cap_off, am_off) = (0usize, u, 2 * u);
+        let (uni, tok, fl) = (am_off + 2 * n, am_off + 2 * n + 1, am_off + 2 * n + 2);
+        let seen = fl + 1;
+        let arena = seen + u.div_ceil(32);
+        let (ab, ap) = be.ink_buffer(arena * 4).unwrap();
+        let a = unsafe { std::slice::from_raw_parts_mut(ap as *mut f32, arena) };
+        let au = |i: usize| unsafe { *(ap as *const u32).add(i) };
+        let mut s = 3u64;
+        let cases: Vec<(&str, Vec<f32>)> = vec![
+            (
+                "spread",
+                (0..u)
+                    .map(|i| normal(&mut s) * 2.0 + if i % 9973 == 5 { 9.0 + (i % 7) as f32 } else { 0.0 })
+                    .collect(),
+            ),
+            (
+                "peaked",
+                (0..u).map(|i| normal(&mut s) + if i == 777 { 24.0 } else { 0.0 }).collect(),
+            ),
+            ("flat", (0..u).map(|_| normal(&mut s) * 0.3).collect()),
+            ("ties", (0..u).map(|i| if i % 4001 == 13 { 10.0 } else { normal(&mut s) }).collect()),
+        ];
+        // (top_k, top_p, min_p, temperature, repetition penalty)
+        let settings = [
+            (40usize, 1.0f32, 0.0f32, 1.0f32, 1.0f32),
+            (40, 0.95, 0.0, 1.0, 1.0),
+            (0, 0.95, 0.0, 1.0, 1.0),
+            (0, 1.0, 0.05, 1.0, 1.0),
+            (20, 0.8, 0.0, 0.7, 1.1),
+            (1, 1.0, 0.0, 1.0, 1.0),
+            (0, 0.5, 0.1, 1.3, 1.0),
+            (100, 0.9, 0.02, 1.0, 1.3),
+            (5000, 0.97, 0.0, 1.0, 1.0),
+        ];
+        let (mut total, mut differ, mut flagged) = (0usize, 0usize, 0usize);
+        for (name, raw) in &cases {
+            for &(k, top_p, min_p, temp, pen) in &settings {
+                let mut set_flags = 0;
+                a[x_off..x_off + u].copy_from_slice(raw);
+                let mut ds = DeviceSampling {
+                    temperature: temp,
+                    top_k: k,
+                    top_p,
+                    min_p,
+                    repetition_penalty: pen,
+                    seen: Vec::new(),
+                };
+                for t in (3..u as u32).step_by(1013) {
+                    ds.observe(t);
+                }
+                ds.observe(777);
+                for i in 0..u.div_ceil(32) {
+                    let d = ds.seen.get(i / 2).copied().unwrap_or(0);
+                    unsafe { *(ap as *mut u32).add(seen + i) = (d >> (32 * (i % 2))) as u32 };
+                }
+                for j in 0..48u32 {
+                    let r = match j {
+                        0 => 0.0,
+                        1 => 0.999_999_9,
+                        _ => lcg(&mut s) as f32 / u32::MAX as f32 * 0.999_999,
+                    };
+                    a[uni] = r;
+                    let cp = CapP {
+                        v: u as u32,
+                        u: u as u32,
+                        x: x_off as u32,
+                        out: cap_off as u32,
+                        cap: 30.0,
+                        am: am_off as u32,
+                        inv_t: 1.0 / temp,
+                        seen: if pen != 1.0 { seen as u32 } else { u32::MAX },
+                        pen: if pen != 1.0 { pen } else { 0.0 },
+                        ..Default::default()
+                    };
+                    let mut fp = [0u32; 16];
+                    fp[..8].copy_from_slice(&[
+                        n as u32,
+                        am_off as u32,
+                        tok as u32,
+                        uni as u32,
+                        cap_off as u32,
+                        u as u32,
+                        (1.0 / temp).to_bits(),
+                        u32::MAX,
+                    ]);
+                    fp[8] = k as u32;
+                    fp[9] = top_p.to_bits();
+                    fp[10] = min_p.to_bits();
+                    fp[11] = if min_p > 0.0 { -min_p.ln() } else { 0.0f32 }.to_bits();
+                    fp[12] = fl as u32;
+                    fp[13] = u32::MAX;
+                    let (ok, _) = run_concurrent(&be, &f, &[std::ops::Range { start: 0, end: 1 }], |fe, _| {
+                        fe.pipe(softcap);
+                        fe.buf(ab, 0, 0);
+                        fe.bytes(&cp, 1);
+                        fe.dispatch((n, 1), 256);
+                        fe.barrier();
+                        fe.pipe(fsamp);
+                        fe.buf(ab, 0, 0);
+                        fe.bytes(&fp, 1);
+                        fe.dispatch((1, 1), 1024);
+                    });
+                    assert!(ok);
+                    let capped = &a[cap_off..cap_off + u];
+                    if j == 0 {
+                        // The penalty: the capped logits of the tokens seen.
+                        for t in [3usize, 777, 1016] {
+                            let y = (raw[t] / 30.0).tanh() * 30.0;
+                            let want = if pen == 1.0 || !ds.seen.get(t / 64).is_some_and(|w| (w >> (t % 64)) & 1 == 1) {
+                                y
+                            } else if y < 0.0 {
+                                y * pen
+                            } else {
+                                y / pen
+                            };
+                            assert!(
+                                (capped[t] - want).abs() < 1e-4,
+                                "{name}: token {t} capped {} want {want}",
+                                capped[t]
+                            );
+                        }
+                    }
+                    total += 1;
+                    if au(fl) != 0 {
+                        flagged += 1;
+                        set_flags += 1;
+                        continue;
+                    }
+                    let want = ds.pick(capped, r);
+                    if au(tok) != want {
+                        differ += 1;
+                        eprintln!(
+                            "{name} k {k} top_p {top_p} min_p {min_p} t {temp}: u {r}: device {} host {want}",
+                            au(tok)
+                        );
+                    }
+                }
+                eprintln!("{name} k {k} top_p {top_p} min_p {min_p} t {temp}: {set_flags} of 48 to the host");
+            }
+        }
+        be.ink_release(ab);
+        eprintln!("{total} draws: {differ} differ, {flagged} left to the host");
+        assert!(differ * 200 <= total, "{differ} of {total} draws differ");
+        assert!(flagged * 3 <= total, "{flagged} of {total} draws left to the host");
     }
 }

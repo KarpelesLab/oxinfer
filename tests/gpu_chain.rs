@@ -505,3 +505,93 @@ fn inkling_sampled_chain_matches_host_steps() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Sampling with top-k, top-p, min-p and a repetition penalty chained on the device
+/// (`ink_fsamp`, the penalty applied in `ink_softcap` and its token set kept on the device)
+/// against one-token host steps with `Sampler::sample` on a tiny Inkling-2: the same tokens and
+/// generator state, with the device choosing and with every cut draw left to the host (whose
+/// tokens the chain then goes on from when they are not the device's guess).
+#[test]
+fn inkling_cut_sampling_chain_matches_host_steps() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+    use oxinfer::inkling::{Inkling2Config, Inkling2Model};
+    use oxinfer::sampler::Sampler;
+    let plat = oxinfer::platform::detect();
+    let Ok(Some(_)) = oxinfer::gpu::init(&plat, oxinfer::platform::DevicePref::Auto) else {
+        eprintln!("no GPU: skipped");
+        return;
+    };
+    oxinfer::gpu::set_decode_chain(Some(true));
+    let dir = std::env::temp_dir().join(format!("oxinfer-gpu-chain-inkling-cut-{}", std::process::id()));
+    oxinfer::inkling::tiny::write_tiny_metal(&dir, 4).unwrap();
+    let files = ModelFiles::open(&dir, true).unwrap();
+    let m = Inkling2Model::load(Inkling2Config::load(&dir).unwrap(), &files, Quant::Bf16).unwrap();
+    let prompt: Vec<u32> = (0..13u32).map(|i| (i * 29 + 3) % 250).collect();
+    let mut base = m.new_session();
+    let l0 = m.forward(&mut base, &prompt);
+    let n = 24;
+    // (temperature, top-k, top-p, min-p, repetition penalty)
+    let settings = [
+        (1.0f32, 40usize, 0.95f32, 0.0f32, 1.0f32),
+        (1.3, 0, 0.9, 0.0, 1.0),
+        (0.9, 0, 1.0, 0.05, 1.0),
+        (1.0, 20, 0.8, 0.02, 1.3),
+        (1.0, 0, 1.0, 0.0, 1.5),
+        (0.0, 0, 1.0, 0.0, 1.4),
+    ];
+    let sampler = |s: &(f32, usize, f32, f32, f32)| {
+        let mut x = Sampler::new(s.0, s.1, s.2, 9).with_min_p(s.3).with_repetition_penalty(s.4);
+        x.observe(&prompt);
+        x
+    };
+    for s in &settings {
+        let mut hs = sampler(s);
+        let first = hs.sample(&l0);
+        let mut host = base.clone();
+        let mut toks = vec![first];
+        for i in 0..=n {
+            let l = m.forward(&mut host, &[toks[i]]);
+            toks.push(hs.sample(&l));
+        }
+        for cap in [None, Some(1)] {
+            oxinfer::inkling::set_device_sample_cap(cap);
+            for stop_at in [n, 7] {
+                let mut ds = sampler(s);
+                assert_eq!(ds.sample(&l0), first);
+                let mut sess = base.clone();
+                let got = std::cell::RefCell::new(Vec::new());
+                let mut on = |t: u32| {
+                    got.borrow_mut().push(t);
+                    if got.borrow().len() == stop_at { Chain::Stop } else { Chain::Go }
+                };
+                let Some(kept) = oxinfer::generate::decode_chain(&m, &mut sess, &mut ds, first, n, &mut on, &|| got.borrow().len()) else {
+                    if m.decode_greedy(&mut base.clone(), first, 2, &mut |_| Chain::Go).is_none() {
+                        eprintln!("no Inkling-2 chain on this device: skipped");
+                        oxinfer::inkling::set_device_sample_cap(None);
+                        std::fs::remove_dir_all(&dir).unwrap();
+                        return;
+                    }
+                    panic!("{s:?}: greedy chains but sampling does not");
+                };
+                let got = got.into_inner();
+                assert_eq!(kept, stop_at, "{s:?} cap {cap:?}: passes kept");
+                assert_eq!(got[..], toks[1..=kept], "{s:?} cap {cap:?}, stop at {stop_at}: tokens");
+                assert_eq!(sess.pos, base.pos + kept, "{s:?} cap {cap:?}: session length");
+                // The generator and the penalty's tokens where the host's are after as many
+                // tokens.
+                let mut hr = sampler(s);
+                hr.sample(&l0);
+                let mut hsess = base.clone();
+                let mut t = first;
+                for _ in 0..kept {
+                    let l = m.forward(&mut hsess, &[t]);
+                    t = hr.sample(&l);
+                }
+                assert_eq!(ds.state(), hr.state(), "{s:?} cap {cap:?}: generator state");
+                assert_eq!(ds.seen_words(), hr.seen_words(), "{s:?} cap {cap:?}: tokens seen");
+            }
+        }
+    }
+    oxinfer::inkling::set_device_sample_cap(None);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

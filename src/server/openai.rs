@@ -38,6 +38,7 @@ struct Gen {
     temperature: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<usize>,
+    min_p: Option<f32>,
     repetition_penalty: Option<f32>,
     seed: Option<u64>,
     max_tokens: Option<usize>,
@@ -140,10 +141,15 @@ impl Gen {
         if top_p.is_some_and(|p| !(0.0..=1.0).contains(&p)) {
             return Err(ApiError::bad("top_p must be between 0 and 1").param("top_p"));
         }
+        let min_p = num(v, "min_p")?;
+        if min_p.is_some_and(|p| !(0.0..=1.0).contains(&p)) {
+            return Err(ApiError::bad("min_p must be between 0 and 1").param("min_p"));
+        }
         Ok(Self {
             temperature: temperature.map(|t| t as f32),
             top_p: top_p.map(|p| p as f32),
             top_k: num(v, "top_k")?.map(|k| k as usize),
+            min_p: min_p.map(|p| p as f32),
             repetition_penalty: num(v, "repetition_penalty")?.map(|p| p as f32),
             seed: match v.get("seed") {
                 Some(Value::Number(n)) => n.as_u64().or_else(|| n.as_i64().map(|i| i as u64)),
@@ -161,7 +167,8 @@ impl Gen {
     }
 
     /// The sampler for choice `i`, the request's values over the model's defaults (the `temperature`,
-    /// `top_p`, `top_k` and `repetition_penalty` options) over OpenAI's (temperature 1, top-p 1).
+    /// `top_p`, `top_k`, `min_p` and `repetition_penalty` options) over OpenAI's (temperature 1,
+    /// top-p 1).
     fn sampling(&self, spec: &super::ModelSpec, seed: u64) -> SamplingParams {
         let opt = |k: &str| spec.option(k).and_then(|v| v.parse::<f64>().ok());
         SamplingParams {
@@ -173,6 +180,7 @@ impl Gen {
                 .repetition_penalty
                 .or(opt("repetition_penalty").map(|v| v as f32))
                 .unwrap_or(1.0),
+            min_p: self.min_p.or(opt("min_p").map(|v| v as f32)).unwrap_or(0.0),
         }
     }
 }

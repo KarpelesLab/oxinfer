@@ -542,6 +542,24 @@ resident on the device:
   generator is left as if it had drawn for the tokens kept only, so a chain and one-token steps
   give the same tokens from the same seed (256 tokens at temperature 1 on UD-IQ3_XXS: the same
   text with `OXINFER_GPU_CHAIN=0`; `tests/gpu_chain.rs` checks it on a tiny checkpoint).
+- **Top-k, top-p, min-p and the repetition penalty** chain on the device too (a grammar or a
+  log-probability record keeps the host's sampler). The penalty is applied by the soft-cap
+  kernel to the tokens of a bit set kept on the device (uploaded from the sampler's at the start
+  of a chain, each chosen token marked by the pass that chose it), so its partials are those of
+  the penalized logits. A cut draw is ranked as the host ranks it (`sampler::cut_candidates`:
+  decreasing logit, then increasing token id; top-k, then top-p over the top-k set's weight, then
+  min-p against the most likely token; the draw in rank order) without sorting the vocabulary:
+  one threadgroup (`ink_fsamp`) counts the tokens by quarter nats below the largest logit (and
+  sums their weights in fixed point, so that the result does not depend on the order of the
+  atomics), up to the first bin by which every cut is decided, gathers the tokens of those bins
+  (at most 2048), sorts them (bitonic, in threadgroup memory), weighs them and cuts and draws
+  as the host does. When more tokens than that are candidates (top-p alone on a flat
+  distribution), the device sets a flag and the host chooses that token from the pass's capped
+  logits with the same uniform; when it is not the device's guess (the largest logit), the pass
+  queued after it is undone and the chain goes on from the host's token. The same seed gives
+  the same tokens with `OXINFER_GPU_CHAIN=0` (`tests/gpu_chain.rs`, with every cut draw also
+  left to the host; `metal::inkling::samp_tests` compares the kernel with the host on 200k-token
+  vocabularies).
 - **KV caches** in f32, f16 or q8 rows (`--kv-cache`; f16 by default on Metal, `auto`), the
   full-attention caches grown by a quarter at a time (not to the next power of two), the
   decoding passes' attention a threadgroup per key head (its three query heads together) from
@@ -1323,9 +1341,40 @@ draft's second choice is right more than about a third of those times. The draft
 one chain (each slot's head is conditioned on the previous slot's token), so a branch needs its
 own draft pass. Shorter chains chosen per round (above) are the better use of the expert floor.
 
+**By default on the GPU.** A drafter found beside the checkpoint (unsloth's `dspark-*.gguf`
+beside its GGUFs, the release's `mtp.safetensors`, or unsloth's draft in the download cache for
+the release and ggml-org's files) is used unasked where the passes run on Metal (`--no-draft`,
+`draft=none` opt out; on the CPU it is used only when asked for). The decoder then chooses each
+round between a plain step, a prompt-lookup draft and a draft pass, so that it does not lose to
+prompt lookup where the drafter does not pay:
+
+- **prompt lookup inside it** at any match length in a round the drafter does not draft (as
+  plain prompt lookup decoding verifies them), and a long match in place of a draft pass when it
+  promises more;
+- **cheaper probes**: the first two draft rounds and the probes made while draft rounds lose
+  draft at most 3 tokens (a 7-token block rejected early cost about 4 plain steps at 3 bits, 3
+  drafts about 2), probes come at most every 16 plain steps per draft round measured (was 4),
+  sooner (after 4) once prompt lookup finds a long match (the reply copies its context, where the
+  drafter's blocks are accepted whole), and draft rounds must beat plain steps by 12% a token to
+  go on (a round also breaks the chain of plain passes, which its own time does not show);
+- **the prompt's context on the device**: the drafter is made on the accelerator after the
+  prompt's first chunk ran on the target (not after the whole prompt), so the prompt's context
+  goes in there (12 tokens: 1.6 ms, was a CPU pass).
+
+The chained plain rounds of the DSpark decoder cost what prompt lookup's cost (9.26-9.58 ms a
+step on both, the same chat prompt, back to back: capturing the draft's streams costs nothing
+measurable).
+
+Greedy text is the same with and without speculation also at long contexts: the host's
+embedding norm (prefill and verification passes) now sums the squares in the order the device's
+chained passes do (`inkling::embed_norm`), so a verified position's logits are a chained
+pass's bit for bit (before, a 10k-token code edit's greedy reply under prompt lookup left the
+plain text after about 150 tokens).
+
 ```sh
 oxinfer --model thinkingmachines/Inkling-2-Mini --mtp --prompt "..."
-oxinfer --model unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS --draft auto --prompt "..."
+oxinfer --model unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS --prompt "..."   # its draft beside it
+oxinfer --model unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS --no-draft --prompt "..."
 ```
 
 ## iOS / iPadOS

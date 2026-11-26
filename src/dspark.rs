@@ -116,8 +116,8 @@ pub trait Target: TextLm {
     ) -> Option<usize> {
         None
     }
-    /// [`Target::decode_greedy_feats`] for a plain temperature draw over the whole vocabulary
-    /// ([`TextLm::decode_sampled`]: `draw` gives each queued pass's uniform).
+    /// [`Target::decode_greedy_feats`] for the device's sampling `samp`
+    /// ([`TextLm::decode_sampled`]: `draw(j)` gives pass `j`'s uniform).
     #[allow(clippy::too_many_arguments)]
     fn decode_sampled_feats(
         &self,
@@ -126,8 +126,8 @@ pub trait Target: TextLm {
         _max: usize,
         _layers: &[usize],
         _feats: &mut Vec<f32>,
-        _temperature: f32,
-        _draw: &mut dyn FnMut() -> f32,
+        _samp: &crate::sampler::DeviceSampling,
+        _draw: &mut dyn FnMut(usize) -> f32,
         _on: &mut dyn FnMut(u32) -> crate::generate::Chain,
     ) -> Option<usize> {
         None
@@ -1020,7 +1020,7 @@ pub const KNOWN: &[(&str, &str, ByDefault)] = &[
     ),
     ("google/gemma-4-31B-it", "Hikari07jp/DSpark-Gemma-4-31B-draft", ByDefault::No),
     // Inkling-2-Mini's own drafter (`mtp.safetensors` of the release) as unsloth converted it.
-    ("thinkingmachines/Inkling-2-Mini", "unsloth/Inkling-2-Mini-GGUF", ByDefault::No),
+    ("thinkingmachines/Inkling-2-Mini", "unsloth/Inkling-2-Mini-GGUF", ByDefault::Yes),
 ];
 
 /// Whether a `-`-separated part of a GGUF file name is its quantization (`Q8_0`, `IQ4_XS`,
@@ -3118,7 +3118,13 @@ pub struct DsparkDecoder<'m, M: Target> {
     /// The draft's side of the target's checkpoints ([`DsparkDecoder::checkpoint`]), lowest
     /// first.
     marks: Vec<DraftMark>,
+    /// A lookup draft chosen for the round at a position (by [`Self::step_emit`] before it
+    /// leaves the round to [`Self::step`]).
+    planned: Option<(usize, LookupPick)>,
 }
+
+/// A prompt-lookup draft chosen for a round: its tokens and their calibration classes.
+pub type LookupPick = (Vec<u32>, Vec<usize>);
 
 /// The draft's state at a checkpoint of the target ([`DsparkDecoder::checkpoint`]): what a later
 /// [`DsparkDecoder::cut_to`] cannot get back by cutting the draft's session back. The context
@@ -3182,6 +3188,10 @@ pub struct Adaptive {
     rounds: usize,
     /// The shape of verification costs by length where they are not measured.
     pub prior: crate::spec_cost::CostPrior,
+    /// Whether the reply is copying its context (prompt lookup found a long match since the last
+    /// draft round): where draft rounds lose, a probe comes sooner then (copied text is where a
+    /// draft model's blocks are accepted whole).
+    pub hint: bool,
 }
 
 impl Default for Adaptive {
@@ -3196,6 +3206,7 @@ impl Default for Adaptive {
             slots: Vec::new(),
             rounds: 0,
             prior: crate::spec_cost::CostPrior::default(),
+            hint: false,
         }
     }
 }
@@ -3210,6 +3221,23 @@ impl Adaptive {
     const SLOT_DECAY: f64 = 0.97;
     /// Draft rounds averaged evenly before [`Adaptive::gain`] becomes a moving average.
     const GAIN_MEAN: usize = 4;
+    /// Where draft rounds lose, a probe at least every this many plain steps per draft round
+    /// measured (at most 256; [`crate::spec_cost::probe_due_every`]): a probe pays a whole draft
+    /// pass, and a short reply probed every 4 per sample (the lookup's rate) lost 4-5% on
+    /// Inkling-2.
+    const PROBE_PER_SAMPLE: usize = 16;
+    /// Plain steps before a probe once prompt lookup suggests the reply copies its context.
+    const HINT_STEPS: usize = 4;
+    /// The most drafts of a probe (and of the first two draft rounds): a block rejected early
+    /// costs its whole verification (7 drafts: about 4 plain steps on Inkling-2 at 3 bits, 3
+    /// drafts 2); where drafts are accepted, the next rounds draft the whole block.
+    const PROBE_K: usize = 3;
+    /// How much faster per token draft rounds must have been than plain steps to go on drafting:
+    /// a round also breaks the chain of plain steps (the next pass then starts cold), which its
+    /// measured time does not hold; drafting at a measured 0-5% gain lost 2-4% end to end on
+    /// Inkling-2 (short prompts; 4 requests of a code prompt drafted at 9.5 ms a token against
+    /// 9.48 for plain steps).
+    const MARGIN: f64 = 0.12;
 
     /// A moving average whose second sample replaces the first (which may include compiling a
     /// GPU plan or warming caches).
@@ -3229,6 +3257,7 @@ impl Adaptive {
             return;
         }
         Self::ema(&mut self.draft, draft);
+        self.hint = false;
         if self.draft_k.len() <= probs.len() {
             self.draft_k.resize(probs.len() + 1, (0.0, 0));
         }
@@ -3308,17 +3337,20 @@ impl Adaptive {
             return 0;
         };
         if self.draft.1 < 2 {
-            return k_max;
+            return k_max.min(Self::PROBE_K);
         }
-        // The time a draft round takes beyond the plain time of the tokens it gives.
-        let loss = self.gain.1 - self.gain.0 * plain;
+        // The time a draft round takes beyond the plain time of the tokens it gives (less the
+        // margin).
+        let loss = self.gain.1 - self.gain.0 * plain * (1.0 - Self::MARGIN);
         if loss <= 0.0 {
             return self.best_k(k_max);
         }
         // Draft rounds lose: a probe once the plain steps since the last one have earned its
-        // expected loss.
-        if crate::spec_cost::probe_due(self.plain_run, loss, plain, self.gain.2) {
-            return self.best_k(k_max);
+        // expected loss, or soon when the reply copies its context.
+        if crate::spec_cost::probe_due_every(self.plain_run, loss, plain, self.gain.2, Self::PROBE_PER_SAMPLE)
+            || (self.hint && self.plain_run >= Self::HINT_STEPS)
+        {
+            return self.best_k(k_max).min(Self::PROBE_K);
         }
         0
     }
@@ -3429,6 +3461,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
             pending: (Vec::new(), 0),
             lookup: None,
             marks: Vec::new(),
+            planned: None,
         }
     }
 
@@ -3484,10 +3517,25 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
     fn run(&mut self, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
         self.flush();
         let mut feats = Vec::new();
+        let t0 = crate::clock::Instant::now();
         let hs = self
             .model
             .forward_feats(&mut self.sess, tokens, mm, &self.draft.cfg.target_layers, &mut feats);
+        let t1 = t0.elapsed().as_secs_f64();
+        // Inkling-2's drafter on the accelerator (made once, after the target's first pass made
+        // its device state: the head product runs there), so that the context goes in there.
+        if let Some(d) = &self.draft.ink {
+            d.warm(self.model);
+        }
         self.draft.inject(&mut self.dsess, &feats, tokens.len());
+        if std::env::var_os("OXINFER_DEBUG_DRAFT").is_some() {
+            eprintln!(
+                "[draft: prefill {} tokens: target {:.1} ms, draft context {:.1} ms]",
+                tokens.len(),
+                t1 * 1e3,
+                (t0.elapsed().as_secs_f64() - t1) * 1e3
+            );
+        }
         hs
     }
 
@@ -3526,9 +3574,6 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
             let hs = self.run(c, &local);
             last = hs[hs.len() - h..].to_vec();
         }
-        if let Some(d) = &self.draft.ink {
-            d.warm(self.model);
-        }
         self.model.logits(&last, 1)
     }
 
@@ -3556,13 +3601,22 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         let k = self.k_cur.min(max_new.max(1) - 1);
 
         let t_round = crate::clock::Instant::now();
-        // A long prompt-lookup match that promises more than this round would (a draft pass at
-        // the recent rate of draft rounds, or a plain step) replaces the draft pass.
-        let looked = self.lookup.as_mut().and_then(|lk| {
-            let other = if k > 0 && self.adapt.gain.2 > 0 {
-                (self.adapt.gain.0, self.adapt.gain.1)
+        // A long prompt-lookup match that promises more than this round's draft pass would (at
+        // the recent rate of draft rounds) replaces it; in a plain round, any lookup draft the
+        // lookup's own policy verifies (as plain lookup decoding would).
+        let adapt = &mut self.adapt;
+        let planned = self.planned.take().filter(|p| p.0 == n).map(|p| p.1);
+        let looked = planned.or_else(|| {
+            let lk = self.lookup.as_mut()?;
+            if k == 0 {
+                let (d, matched) = lk.draft_plain(max_new.max(1) - 1);
+                adapt.hint |= matched >= crate::lookup::LONG_MATCH;
+                return d;
+            }
+            let other = if adapt.gain.2 > 0 {
+                (adapt.gain.0, adapt.gain.1)
             } else {
-                (1.0, self.adapt.verify.first().map_or(0.0, |v| v.0))
+                (1.0, adapt.verify.first().map_or(0.0, |v| v.0))
             };
             lk.draft_over(max_new.max(1) - 1, other.0, other.1)
         });
@@ -3950,19 +4004,21 @@ where
         let next = self.next?;
         if self.k_cur != 0
             || !self.opts.cost_aware
-            || !(sampler.plain_greedy() || sampler.plain_sampled())
+            || !sampler.chainable()
             || max_new < 2
             || sweep()
             || *OFF.get_or_init(|| std::env::var_os("OXINFER_DSPARK_CHAIN").is_some_and(|v| v == "0"))
         {
             return None;
         }
-        // A long prompt-lookup match: `step` verifies it.
-        let plain = self.adapt.verify.first().map_or(0.0, |v| v.0);
-        if let Some(lk) = &mut self.lookup
-            && lk.draft_over(max_new - 1, 1.0, plain).is_some()
-        {
-            return None;
+        // A lookup draft worth verifying: `step` verifies it.
+        if let Some(lk) = &mut self.lookup {
+            let (d, matched) = lk.draft_plain(max_new - 1);
+            self.adapt.hint |= matched >= crate::lookup::LONG_MATCH;
+            if let Some(d) = d {
+                self.planned = Some((self.model.session_len(&self.sess), d));
+                return None;
+            }
         }
         let t0 = crate::clock::Instant::now();
         let model = self.model;
@@ -3987,14 +4043,19 @@ where
             if !emit(t) || stop.contains(&t) || out.len() >= max_new {
                 return Chain::Stop;
             }
-            // A draft round next (the pass already queued still runs: its token comes too).
-            let plain = adapt.verify[0].0;
+            // A draft round next, or a lookup draft (the pass already queued still runs: its
+            // token comes too).
             let rest = max_new - out.len();
-            if adapt.choose(k_max) > 0
-                || lookup
-                    .as_mut()
-                    .is_some_and(|lk| rest > 1 && lk.draft_over(rest - 1, 1.0, plain).is_some())
+            if let Some(lk) = lookup.as_mut()
+                && rest > 1
             {
+                let (d, matched) = lk.draft_plain(rest - 1);
+                adapt.hint |= matched >= crate::lookup::LONG_MATCH;
+                if d.is_some() {
+                    return Chain::Last;
+                }
+            }
+            if adapt.choose(k_max) > 0 {
                 return Chain::Last;
             }
             Chain::Go
@@ -4003,11 +4064,11 @@ where
         let kept = if sampler.plain_greedy() {
             model.decode_greedy_feats(sess, next, max_new, layers, &mut feats, &mut on)?
         } else {
-            // (The generator left as if it had drawn for the tokens taken only.)
-            let (st, temp) = (sampler.state(), sampler.temperature);
-            let kept = model.decode_sampled_feats(sess, next, max_new, layers, &mut feats, temp, &mut || sampler.uniform(), &mut on);
-            sampler.set_state(st, if kept.is_some() { taken.get() } else { 0 });
-            kept?
+            // (The generator and the repetition penalty left as if the host had chosen the
+            // tokens taken only.)
+            crate::generate::chain_sampled(sampler, &mut on, &|| taken.get(), &mut |ds, draw, on| {
+                model.decode_sampled_feats(sess, next, max_new, layers, &mut feats, ds, draw, on)
+            })?
         };
         let secs = t0.elapsed().as_secs_f64();
         self.pending.0.extend_from_slice(&feats);
@@ -5040,16 +5101,16 @@ mod tests {
     #[test]
     fn adaptive_policy() {
         let mut a = Adaptive::default();
-        // Two plain rounds, two draft rounds to measure, then the rates decide.
+        // Two plain rounds, two short draft rounds to measure, then the rates decide.
         assert_eq!(a.choose(7), 0);
         a.record(&[], 0, 0, 1, 0.0, 0.010);
         assert_eq!(a.choose(7), 0);
         a.record(&[], 0, 0, 1, 0.0, 0.010);
-        assert_eq!(a.choose(7), 7);
-        a.record(&[0.99; 7], 7, 7, 8, 0.010, 0.020);
-        assert_eq!(a.choose(7), 7);
-        a.record(&[0.99; 7], 7, 7, 8, 0.010, 0.020);
-        // 8 tokens in 30 ms beats 1 in 10 ms.
+        assert_eq!(a.choose(7), 3);
+        a.record(&[0.99; 3], 3, 3, 4, 0.006, 0.014);
+        assert_eq!(a.choose(7), 3);
+        a.record(&[0.99; 3], 3, 3, 4, 0.006, 0.014);
+        // 4 tokens in 20 ms beats 1 in 10 ms: the whole block from now on.
         assert_eq!(a.choose(7), 7);
         // Verification costs 10 ms plus 10 ms per draft: confident drafts are all verified, a
         // block whose drafts are all unlikely is not verified at all.
@@ -5059,7 +5120,7 @@ mod tests {
         assert_eq!(a.cut(&[0.999, 0.999, 0.05, 0.999, 0.999, 0.999, 0.999], 0.010), 2);
         // Draft rounds that lose: plain steps, with probes as rare as keeps their expected loss
         // (a draft round's time beyond the plain time of its token: 80 ms, then 58) within 2%
-        // of the plain steps' time, at most every 256 steps, and at most every 4 per draft round
+        // of the plain steps' time, at most every 256 steps, and at most every 16 per draft round
         // measured (a loss measured on two rounds is no reason to stop looking).
         let mut a = Adaptive::default();
         for _ in 0..2 {
@@ -5080,7 +5141,7 @@ mod tests {
                 a.record(&[], 0, 0, 1, 0.0, 0.010);
             }
         }
-        assert_eq!(drafts[0], 6, "probes at {drafts:?}");
+        assert_eq!(drafts[0], 30, "probes at {drafts:?}");
         let gaps: Vec<usize> = drafts.windows(2).map(|w| w[1] - w[0]).collect();
         assert!(gaps.windows(2).all(|g| g[1] > g[0]) && drafts.len() < 20, "probes at {drafts:?}");
         // Draft rounds that lose little are probed often.

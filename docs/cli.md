@@ -11,7 +11,7 @@ Useful flags:
 
 | Flag | Meaning |
 |---|---|
-| `--temp F --top-k N --top-p F --seed N` | sampling (default is greedy, `--temp 0`) |
+| `--temp F --top-k N --top-p F --min-p F --seed N` | sampling (default is greedy, `--temp 0`); `--min-p` cuts tokens less likely than F times the most likely one, after top-k and top-p |
 | `--system TEXT` | system prompt (default: a short one saying the model runs locally, with the local date, time and zone) |
 | `--no-system` | no system prompt (also implied by `--raw` and `--dump-logits`) |
 | `--tools` | let the model call built-in tools: `get_current_datetime` and `calculate` (see [Tool calling](tool-calling.md)) |

@@ -4324,8 +4324,8 @@ their largest logit and sum of weights, and `ink_samp` (one threadgroup of 1024)
 and then the token as `sample_full` does. The generator is left as if it had drawn only for the
 tokens kept, so chained and one-token sampling give the same tokens from the same seed (256
 tokens at temperature 1: the same text with `OXINFER_GPU_CHAIN=0`; `tests/gpu_chain.rs` on a tiny
-checkpoint). Top-k / top-p cuts, a repetition penalty or a grammar keep the host's sampler (top-k
-and top-p still sorted, but only once a token).
+checkpoint). Top-k / top-p cuts, a repetition penalty or a grammar kept the host's sampler (top-k
+and top-p still sorted, but only once a token; all but a grammar chain since the round below).
 
 Before / after (unsloth UD-IQ3_XXS, the CLI with the server's sampling: `--temp 1 --top-k 0
 --top-p 1 --seed 7 -n 384`, `--no-system`; prompt lookup on as by default; "DSpark" adds
@@ -4353,10 +4353,112 @@ tokens): prompt lookup stays the default. It accepts 57-95% of its drafts and pa
 reply copies the context (the code edit: 1.2-2.3 tokens a forward); DSpark accepts 55-88% and gains
 most there too (2.4-2.5 tokens a forward: 130 against 110 tok/s, the best run of all), but costs
 4-23% on short prompts (its plain rounds capture the draft's features; its prefill is 10-50%
-slower) and has to be asked for (`--draft auto`, `draft=auto`). A verification pass is cheap
+slower) and has to be asked for (`--draft auto`, `draft=auto`; the default since the round
+below). A verification pass is cheap
 only as far as its tokens share experts: each drafted token reads 8 experts of 128 of its own,
 so a round of 7 drafts costs about two plain steps, and drafting pays only where most of a
 block is accepted (copied code at long contexts).
+
+#### Inkling-2-Mini: sampling cuts on the device, its drafter by default (November 2026)
+
+**Top-k, top-p, min-p and the repetition penalty chained on the device.** After the round above
+only a plain temperature draw chained: a cut (a client's `top_p: 0.95`, llama.cpp-style
+`top_k 40`, min-p) or a repetition penalty went back to one-token passes with the logits copied
+back, and top-p without top-k sorted the whole vocabulary on the host every token. Now:
+
+- the repetition penalty is applied by `ink_softcap` to the tokens of a bit set kept on the
+  device (the sampler's, uploaded when a chain starts; each pass marks the token it chose), so
+  the partials it writes are those of the penalized logits (greedy with a penalty chains too);
+- `ink_fsamp` (one threadgroup) ranks, cuts and draws as the host does without sorting the
+  vocabulary: histograms of the tokens by quarter nats below the largest logit (counts, and
+  weights in fixed point, sums that do not depend on the order of the atomics) find the first bin
+  by which top-k, top-p and min-p are decided; the tokens up to it (at most 2048) are gathered,
+  sorted (bitonic, in threadgroup memory), weighed, cut and drawn from in rank order. More
+  candidates than that (top-p alone over a flat distribution) set a flag: the host chooses that
+  token from the pass's capped logits with the same uniform, and when it is not the device's guess
+  the chain goes on from it (the pass queued after it undone). None of the runs below needed the
+  host;
+- the host's sampler ranks the same way (`sampler::cut_candidates`: decreasing logit, then
+  increasing token id; top-p over the top-k set's weight; min-p against the most likely token;
+  without top-k, only the tokens heavy enough to matter sorted), the same distribution.
+
+The same seed gives the same tokens with chaining off (`OXINFER_GPU_CHAIN=0` now still lets the
+device choose, one pass at a time; `OXINFER_DEVICE_SAMPLING=0` keeps every draw on the host's
+sampler, whose sums round differently, so its text leaves a chain's after a hundred tokens or
+so at temperature 1, as plain sampling already did): 200 tokens of the code and chat prompts with
+each of the settings below, the same text both ways. min-p is new (`--min-p`, request and model
+option `min_p`, C API `min_p`).
+
+CLI, UD-IQ3_XXS, 384 tokens, `--seed 7`, prompt lookup on (the default), tok/s (code / chat;
+the two builds alternated under the bench lock):
+
+| sampling | before | after |
+|---|---:|---:|
+| `--temp 1 --top-p 0.95` | 81.9 / 81.1 | **117.9 / 117.6** |
+| `--temp 1 --top-k 40 --top-p 0.95` | 119.9 / 113.5 | 118.3 / 118.3 |
+| `--temp 1 --min-p 0.05` | (none) | 119.4 / 117.8 |
+| `--top-k 40 --top-p 0.95 --repetition-penalty 1.1` | | 117.4 / 118.4 |
+| `--temp 1` (whole vocabulary) | 121.9 / 119.0 | 122.1 / 119.2 |
+| greedy | 121.2 / 118.2 | 120.9 / 117.4 |
+
+(top-k 40 was already near: a one-token pass and a partial selection of 40 cost little more than
+a chained pass.) Through `oxinfer serve` with `top_p 0.95, top_k 40` in the request the two builds
+were level (102-106 tok/s, the machine slower that hour); with `top_p 0.95` alone the host's sort
+is gone there too.
+
+**Its drafter by default.** A drafter found beside the checkpoint (unsloth's
+`dspark-Inkling-2-Mini-Q8_0.gguf`, the release's `mtp.safetensors`) now drafts unasked where the
+passes run on Metal (`KNOWN` default; `--no-draft` / `draft=none` opt out; on the CPU only when
+asked for). Its decoder had lost to prompt lookup alone where drafting does not pay; it now
+chooses, per round, between a plain step, a prompt-lookup draft and a draft pass:
+
+- prompt lookup's drafts at any match length in rounds without a draft pass (they were taken
+  only from 8 matched tokens on, so short prompts lost lookup's gains), a long match in place of a
+  draft pass when it promises more;
+- probes and the first two draft rounds draft at most 3 tokens (a 7-token block rejected early
+  cost about 4 plain steps), probes come at most every 16 plain steps per draft round measured
+  (was 4: 14 probes in a 384-token reply), after 4 once prompt lookup sees a long match (the
+  reply copying its context, where the drafter's blocks are accepted whole), and draft rounds
+  must have been 12% faster a token than plain steps to go on (a round also breaks the chain of
+  plain passes, which its own time does not show: 4 requests of the code prompt drafted at 9.5
+  ms a token against 9.48 for plain steps);
+- the drafter is made on the GPU after the prompt's first chunk (not after the whole prompt), so
+  the prompt's context goes in there (the 12 tokens of a chat prompt: 85 ms once, then 1 ms;
+  they ran on the CPU).
+
+The chained plain rounds cost what prompt lookup's cost (the same chat prompt back to back: 9.36 /
+9.26 ms a step with the draft, 9.58 / 9.26 without). Greedy text is the same with and without
+speculation, now also at long contexts (the embedding norm in the device's order on the host,
+above: before, the 10.5k-token code edit's greedy reply under prompt lookup left the plain text
+after about 150 tokens).
+
+`oxinfer serve`, all three servers resident and each request sent to each in turn (so heat and
+other work weigh alike; the machine was slower that hour: plain steps 9.5 ms), 384 tokens, the
+mean tok/s of requests 2-4 (prompt cached; seeds 8-10, the same for every server), "g" greedy,
+"d" the server's sampling (temperature 1), "p" `top_p 0.95, top_k 40`:
+
+| prompt | | lookup only (`draft=none`) | drafter, before | drafter by default, after |
+|---|---|---:|---:|---:|
+| code | g | 98.0 | 98.0 | 97.9 |
+| | d | 99.1 | 97.1 | 98.0 |
+| | p | 96.6 | 93.8 | 96.8 |
+| chat | g | 97.9 | 96.1 | 96.3 |
+| | d | 97.1 | 94.9 | 95.7 |
+| | p | 97.4 | 92.6 | 95.0 |
+| code edit after 10.5k tokens | g | 94.0 | 103.7 | 97.6 |
+| | d | 95.6 | 104.8 | 101.6 |
+| | p | 96.5 | 100.3 | **121.6** |
+
+So the drafter costs 0-2.5% on short prompts where it does not pay (within the requests'
+spread: 1-3% on code, more on chat, whose replies differ in length), and gains up to a quarter on
+the code edit; the earlier runs of this round (two servers, the machine faster) gave the same
+picture: -1 to -3% on code and chat, +1 to +26% on the code edit. The first request of each
+server (prompt prefill, the drafter's one-time setup) took the same time with and without it.
+
+The release checkpoint (NVFP4) with its MTP head, now used unasked the same way (CLI, 256 tokens,
+temperature 1, two rounds alternated, the machine at load 4): code 84.5 / 82.6 tok/s against
+83.9 / 85.6 with `--no-draft` (before: `--mtp` 77.0 / 86.8), chat 82.2 / 79.9 against
+74.6 / 79.9 (`--mtp` 78.6 / 78.9): level.
 
 #### DGX Spark, CUDA (November 2026)
 

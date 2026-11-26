@@ -304,9 +304,15 @@ impl ChainPolicy {
 /// every `4 * samples` steps, since a loss measured on a few rounds (the first of which may also
 /// compile a GPU plan) is no reason to stop looking.
 pub fn probe_due(plain_run: usize, loss: f64, plain: f64, samples: usize) -> bool {
+    probe_due_every(plain_run, loss, plain, samples, 4)
+}
+
+/// [`probe_due`] with at most every `per_sample * samples` steps (at least every `per_sample`)
+/// instead of 4: a drafter whose probes cost a whole draft pass explores less eagerly.
+pub fn probe_due_every(plain_run: usize, loss: f64, plain: f64, samples: usize, per_sample: usize) -> bool {
     let every = (loss.max(0.0) / (ChainPolicy::PROBE_BUDGET * plain).max(1e-12)).ceil();
-    let most = (4 * samples).clamp(4, 256) as f64;
-    plain_run as f64 >= every.clamp(4.0, most)
+    let most = (per_sample * samples).clamp(per_sample, 256) as f64;
+    plain_run as f64 >= every.clamp(4.0, most.max(4.0))
 }
 
 #[cfg(test)]

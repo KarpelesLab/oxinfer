@@ -13,7 +13,7 @@ use crate::model::{Model, Session};
 use crate::prof;
 use crate::qwen::{QwenModel, QwenSession};
 use crate::qwen_mtp::MtpDecoder;
-use crate::sampler::{Sampler, argmax};
+use crate::sampler::{DeviceSampling, Sampler, argmax};
 use crate::tokenizer::Tokenizer;
 
 /// Tokens per prefill chunk on the CPU (the CLI's and the engine's default without a GPU
@@ -72,22 +72,65 @@ pub trait TextLm {
     fn decode_greedy(&self, _sess: &mut Self::Sess, _first: u32, _max: usize, _on: &mut dyn FnMut(u32) -> Chain) -> Option<usize> {
         None
     }
-    /// [`TextLm::decode_greedy`] for a plain temperature draw over the whole vocabulary
-    /// ([`Sampler::plain_sampled`]): each pass's token drawn on the device as
-    /// [`crate::sampler::sample_full`] draws it, from the uniform `draw` returns when the pass is
-    /// queued (one a pass, in order; a pass queued past the last kept one draws too).
+    /// [`TextLm::decode_greedy`] for the sampling `samp` ([`Sampler::device_sampling`]: greedy
+    /// or a temperature draw, with top-k, top-p, min-p and a repetition penalty): each pass's
+    /// token chosen on the device as [`DeviceSampling::pick`] chooses it, from the uniform
+    /// `draw(j)` returns for the chain's pass `j` (asked for in order as passes are queued; a
+    /// pass queued past the last kept one draws too, and a pass run again draws its index
+    /// again).
     fn decode_sampled(
         &self,
         _sess: &mut Self::Sess,
         _first: u32,
         _max: usize,
-        _temperature: f32,
-        _draw: &mut dyn FnMut() -> f32,
+        _samp: &DeviceSampling,
+        _draw: &mut dyn FnMut(usize) -> f32,
         _on: &mut dyn FnMut(u32) -> Chain,
     ) -> Option<usize> {
         None
     }
 }
+
+/// Runs `run` (a chain of passes that choose their tokens on the device: [`TextLm::decode_sampled`]
+/// and its kin) with the sampler's [`DeviceSampling`] and its generator's uniforms, then leaves the
+/// sampler as one-token steps would have for the first `used()` tokens the chain gave `on`: the
+/// generator advanced by their draws only, those tokens seen by the repetition penalty. None
+/// (nothing run) without device sampling for this sampler (a guide) or when `run` returns None.
+pub fn chain_sampled(
+    sampler: &mut Sampler,
+    on: &mut dyn FnMut(u32) -> Chain,
+    used: &dyn Fn() -> usize,
+    run: &mut ChainRun<'_>,
+) -> Option<usize> {
+    let ds = sampler.device_sampling()?;
+    let st = sampler.state();
+    let mut toks: Vec<u32> = Vec::new();
+    let n = {
+        let mut us: Vec<f32> = Vec::new();
+        let s = &mut *sampler;
+        let mut draw = |j: usize| -> f32 {
+            while us.len() <= j {
+                us.push(s.uniform());
+            }
+            us[j]
+        };
+        let mut on2 = |t: u32| -> Chain {
+            toks.push(t);
+            on(t)
+        };
+        run(&ds, &mut draw, &mut on2)
+    };
+    let u = if n.is_some() { used().min(toks.len()) } else { 0 };
+    sampler.set_state(st, if ds.temperature > 0.0 { u } else { 0 });
+    if ds.penalized() {
+        sampler.observe(&toks[..u]);
+    }
+    n
+}
+
+/// A chain run by [`chain_sampled`]: given the device's sampling, the uniform of each pass and
+/// the per-token callback, the passes kept (None: nothing run).
+pub type ChainRun<'a> = dyn FnMut(&DeviceSampling, &mut dyn FnMut(usize) -> f32, &mut dyn FnMut(u32) -> Chain) -> Option<usize> + 'a;
 
 /// Chained device passes for `sampler` ([`TextLm::decode_greedy`], or
 /// [`TextLm::decode_sampled`] with uniforms from the sampler's generator); `used` says, after
@@ -106,14 +149,9 @@ pub fn decode_chain<M: TextLm + ?Sized>(
     if sampler.plain_greedy() {
         return model.decode_greedy(sess, first, max, on);
     }
-    if !sampler.plain_sampled() {
-        return None;
-    }
-    let st = sampler.state();
-    let temp = sampler.temperature;
-    let n = model.decode_sampled(sess, first, max, temp, &mut || sampler.uniform(), on);
-    sampler.set_state(st, if n.is_some() { used() } else { 0 });
-    n
+    chain_sampled(sampler, on, used, &mut |ds, draw, on| {
+        model.decode_sampled(sess, first, max, ds, draw, on)
+    })
 }
 
 /// What a chain of greedy passes on the device does after a pass's token ([`TextLm::decode_greedy`]).
@@ -361,9 +399,8 @@ pub fn decode<M: TextLm + ?Sized>(
             unfed = Some(id);
             break;
         }
-        // Greedy decoding (or plain sampling) the device chains (the rest of the reply in one
-        // call).
-        if sampler.plain_greedy() || sampler.plain_sampled() {
+        // Decoding the device chains (the rest of the reply in one call).
+        if sampler.chainable() {
             let n0 = out.len();
             let taken = std::cell::Cell::new(0usize);
             let mut stopped = None;
