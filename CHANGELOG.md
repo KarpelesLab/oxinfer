@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.22](https://github.com/KarpelesLab/oxinfer/compare/v0.0.21...v0.0.22) - 2026-11-26
+
+### Added
+
+- Qwen3.5 / 3.6 / 3.8 reuse a conversation's prompt across turns: in-memory prompt checkpoints of the Gated DeltaNet layers' recurrent and conv states (QwenSession::checkpoint / reachable / cut_to; the MTP decoder's layer cache length and pending rows; DSpark drafts through CheckpointTarget), copied back into the buffers GPU decoding reads in place, so a next turn whose past reply lost its thinking goes back to the previous prompt (prompt_checkpoints, default 2); dense, MoE, VL, with MTP or DSpark, CPU and Metal (steps, chains, verification passes); a tiny random Qwen3.5 and DSpark draft (qwen::tiny) for model, engine and server tests. Qwen3.8-27B turn 2 prefill 7.9-8.6 s -> 0.56-0.62 s
+- prompt checkpoints and session snapshots with a speculative draft: Inkling-2 with its MTP / DSpark drafter and DeepSeek V4 with its DSpark draft keep the draft's state beside the target's (DsparkDecoder::checkpoint / cut_to over CheckpointTarget: the waiting features, Inkling-2's head rows, a windowed cache's oldest rows; snapshots hold the draft's cache, features and head rows), so a next turn or a regenerated reply reuses the prompt and drafts as a fresh decoder; tiny random Inkling-2 MTP drafter and DeepSeek V4 DSpark draft for tests
+
+### Fixed
+
+- *(clippy)* drop a duplicated too_many_arguments allow on the UNet prep (clippy 1.100 duplicated_attributes, failing CI)
+- *(engine)* the trained context is also read from config.json's model_max_length (Inkling-2's safetensors releases: text_config.model_max_length 1048576), so opencode and /v1/models no longer fall back to 32768
+- *(chat)* conversations with images reuse the cache past them: each soft token's identity (a hash of its attachment's embeddings and its row, snapshot::MediaMarks / mm::soft_token_marks) is kept beside the cache's tokens and in snapshots' footers, and Engine::chat reuses memory, checkpoints and snapshots as far as the prompt's soft tokens are the same (any placeholder in the reused part used to restart the conversation: opencode's tool results with pictures had Inkling-2 prefill everything after the first one again at each request, ~28k / 126k tokens a turn); parts fed before a checkpoint get their soft tokens (Lm::prefill_only takes overrides); Qwen (M-RoPE spans) keeps the old rule. Prompt cache: no post-reply snapshots for recurrent models (the prompt but its last token is stored; 9.4 GB a turn at 136k tokens), a found shared prefix is touched so it outlives large snapshots, the cap holds for the directory (rescan before evicting; a vanished entry rescans). Inkling-2 tiny model with a vision tower (inkling::tiny::write_tiny_vision); engine, server and snapshot tests. Real model (UD-IQ3_XXS, Metal): tokens fed per turn at 60k 50797 -> 8434, after a restart 1
+
+### Other
+
+- *(sd, metal)* lean 1x1 GEMMs for the UNet transformers, q / k / v in one dispatch with whole-tile half stores (padded heads from padded weight copies), fewer passes (guided SD 1.5 step 43.1 -> 39.4 ms GPU, SDXL 276-292 -> 260-264 ms)
+- CUDA decode: single-token steps as a CUDA graph (recorded on the first step and when the session's device buffers or the ops change; OXINFER_CUDA_GRAPH=0 off; the host queues a step in 14 us instead of 415-727), and a layer's q / k / v int8 matvecs of one format in one launch (mvq3_K: each block one matrix's mvq_K block, bit-identical, tested); GPU time per token Llama-3.2-1B 969 -> 898 us, Qwen3-8B 4346 -> 4180; plain decode 844 -> 917 tok/s and 209.8 -> 218.9
+- *(cpu, bf16 matvec)* decode epilogues in the matmul's pool jobs, shrinking one-pass blocks, three- and four-token tiles walked in four passes (same bits); Whisper CPU decoder steps on the decode threads
+- CUDA prefill plans: a norm or GLU whose output is the next GEMM's input writes its f16 rows too (dnorm_h, dglu_th: the values and range flag dhalf_t would make), so 3 of a layer's 4 conversions go; logits identical; Qwen3-8B Q4_K_M 2048-token prompts 13234 -> 13353 tok/s, Llama-3.2-1B 512 61276 -> 62082; the decode step trace also reports the host's launch time
+- *(sd, metal)* UNet GEMM tiles planned by waves (tiles past the last full wave split along their inputs, summed by un_gemm_red), 16x16 / 8x8 convolutions unfolded, cooperative stores for f32 rows (guided SD 1.5 step 47.7 -> 43.1 ms GPU, SDXL 286-288 -> 276-281 ms, SD 1.5 VAE 62.0 -> 60.0 ms)
+- *(inkling)* Inkling-2 Mini on a DGX Spark (GB10 and its CPU)
+- *(inkling)* short passes' message gates as dot products on the CPU
+- *(inkling)* write output pages before downloads on unified devices
+- *(inkling)* read weight pages before uploads on unified devices
+- *(inkling)* time the CUDA decode kernels on Mini's shapes
+- *(inkling)* a lane per block in the CUDA matvecs on unified devices
+- CUDA prefill GEMM: the 256-row stream-K tile on 8 warps of 64 x 64 outputs (256 threads, a third fewer fragment loads per MMA), and Q4_K (Q6_K with four threads a row) loads the next step's weight bytes into registers before the current step's MMAs, unpacking after (clock64 per phase showed the loads waiting ~490 cycles on L2); Q4_K 4096 x 12288 196 -> 170 us, 12288 x 4096 210 -> 186, the 128-row kernel 222 -> 204, Q6_K unchanged; logits identical; Qwen3-8B Q4_K_M prompts 13240 -> 13470 tok/s at 512 tokens, 12669 -> 13234 at 2048, Llama-3.2-1B 58828 -> 61276 at 512
+- Whisper against whisper.cpp on Metal after the decoder's fused stages (496 s clip, best of two alternated runs): tiny to large-v3 2.29 / 2.13 / 1.87 / 1.72 / 1.78 / 1.57x (was 1.99 / 1.79 / 1.55 / 1.48 / 1.46 / 1.29x), large-v3 8.98 vs 14.13 s, medium 5.45 vs 9.71 s, same word error rates
+- *(whisper, metal)* the decoder attention's last chunk of a head merges the chunks (device-coherent partials, a per-head count), no merge stage (medium 4.62 -> 4.56 s, large-v3 7.25 -> 7.17 s decoder, same transcripts)
+- CUDA prefill attention: dfattn2 for longer steps (the heads of a GQA group in one 256-thread block, 128 query rows per key / value tile, tiles streamed by cp.async behind the MMAs, longest blocks first; from 1024 positions at head dimension 128, always at 64; OXINFER_CUDA_FATTN2=0/1); Qwen3-8B per layer 512 tokens after 1536 110 -> 91 us, after 3584 218 -> 164, Llama-3.2-1B 2048-token step 121 -> 100; outputs bit-identical to dfattn; Qwen3-8B Q4_K_M 4096-token prompts 11773 -> 12038 tok/s; fattn_bench (ignored) times the kernels
+- *(sd, flux, metal)* flash attention in matrix registers (UNet, FLUX.1, Qwen-Image), GEGLU fused into the feed-forward GEMM, group-norm sums spread over channels (guided SD 1.5 step 65.5 -> 47.7 ms GPU, SDXL 353-372 -> 289-304 ms, FLUX.1 Q4_0 1024^2 1.83-1.97 -> 1.70-1.73 s/step)
+- *(whisper, metal)* decoder steps in fewer, shorter stages (fused bias / residual / GELU matvec epilogues, a threadgroup-wide LayerNorm kernel, 2 rows a threadgroup), one command buffer per chained step, steps past the end token skipped by indirect dispatch (medium 5.61 -> 4.62 s, large-v3 8.87 -> 7.25 s decoder on the 496 s clip, same transcripts)
+- *(cpu prefill)* bit-exact NEON prompt attention check only against the SME GEMM; without SME (M1-M3, CI's runner) the NEON GEMM's head-size-20 edge tiles round to ~1.6e-5 relative, so compare within 1e-4
+- *(sd, metal)* UNet GEMMs on 128x64 / 64x64 tiles, lazy base-2 UNet softmax over the scores' memory (guided SD 1.5 step 94.8 -> 65.5 ms GPU, SDXL 467 -> ~365 ms), bf16 prefill GEMMs 64 wide on the matrix units (FLUX.1 bf16 1.95 -> 1.7 s/step), text K/V once per generation, degraded-mode warnings
+- *(flux, sd, metal)* T5 and CLIP text encoders as one GPU pass each
+- SDXL base 1.0 (public fp16 files) against stable-diffusion.cpp, 1024^2, 20 Euler steps: 0.47-0.62 s vs 0.83-1.04 s per step, text 0.18 vs 0.8-1.0 s, VAE 0.45 vs 4.1 s; 47.6 / 44.9 dB from diffusers f32 on the same noise and timesteps
+- Whisper against whisper.cpp on Metal and the CPU (tiny to large-v3, LibriSpeech 496 s: 1.29-1.99x on Metal, 1.25-1.79x on the CPU, same word error rates within a word), the device sessions
+- image generation against stable-diffusion.cpp and mflux, final table (FLUX.1 Q4_0 / Q8_0 with the device VAE, SD 1.5 / SD-Turbo whole-pass UNet)
+- *(qwen-image, metal)* split-precision attention (queries / keys as hi + lo halves on the half matrix units, scores as exact as f32 operands; 2.7 -> 2.4-2.7 s per 1024^2 pass, 4.9 -> 4.4 s interleaved on a loaded GPU) and LoRA side paths side by side
+- *(whisper metal)* greedy decoding chained on the device, lighter decoder steps, lazy encoder softmax
+- *(sd, metal)* VAE encoders on the device plan (SD 512^2 0.44 -> 0.10 s, FLUX.1 1024^2 1.75 -> 0.3 s), unbarriered q/k/v projections (SD 1.5 guided step 98 -> 95 ms GPU), heads of 40 padded to 48
+- *(kernels)* lib tests' decode_max_tokens / moe_batched are per thread, so parallel tests no longer move each other's 8..=15-token passes between the decode kernels and the prefill GEMM
+- *(qwen)* the tiny Qwen3.5 checkpoint tests keep every pass off the 8..=15 token window (a 9-token turn ran the decode kernels or the prefill GEMM after the process-wide decode_max_tokens, which lookup / DSpark / TTS-batch / Janus tests raise and restore concurrently, so the cut-back and fresh passes could part: the mtp_checkpoint_cut_back_matches_fresh flake)
+- *(whisper metal)* whole encoder and decoder passes on the device (gpu::whisper sessions)
+- *(qwen-image, metal)* whole transformer passes on the GPU through FLUX.1's plan (Qwen-Image-2512 Q4_0 1024^2 CFG 4: 10.1 -> 5.4 s per step, stable-diffusion.cpp 12.4 s; Edit-2511 bf16 + Lightning 16.5 -> 10-11 s per pass)
+- *(sd, metal)* whole UNet passes and VAE decodes on the GPU (SD 1.5 512^2: 0.60 -> 0.10-0.15 s per guided step, stable-diffusion.cpp 0.24-0.30; VAE 0.56 -> 0.10 s, sd.cpp 1.2 s; FLUX.1 VAE 1024^2 2.9 -> 0.57 s)
+- *(metal)* lazy rescaling in flash_attn128_mma (the running max moves only past +8, the output rescale is skipped for key blocks where no row moved; FLUX.1 attention about -20%, same quality)
+- Metal prefill round 8 (the routed experts: Qwen3.5 / 3.6 MoE take the prefill plan, 0.26x -> 1.16x llama.cpp at 512 tokens and 1.47x at 2048; gate / up pairs as one grouped GEMM; the grouped kernels' probes and a dozen designs measured and dropped)
+- *(metal)* prefill plans take MoE layers whose experts add to a shared expert's output (Qwen3.5 / 3.6 MoE: 0.2x -> 1.16x llama.cpp at 512 tokens), and the routed experts' gate / up pairs run as one grouped GEMM with the activation in its stores
+- *(flux, metal)* whole transformer passes on the GPU (FLUX.1 [schnell] Q4_0 1024^2: 3.5-4.2 -> 1.9 s per step; stable-diffusion.cpp 5.2 s, mflux -q 4 2.6 s)
+- CPU prefill round 4, what was measured and not kept (half-precision SME, SME shares, attention tiles)
+- CPU prefill round 4 (NEON prompt attention, 512-token CPU chunks) against llama.cpp
+- Metal decode round 2 (tg128 against llama.cpp master of 2026-11-25: 1.04-1.26x on every row; RoPE folded into the attention, IQ4_XS matvecs, chained per-pass GPU breakdown; shape-dependent matvec splits measured in isolation and dropped for want of a gain in passes)
+- *(metal decode)* RoPE folded into one-token attention (dec_attnr_*: each threadgroup ropes its query heads and its key head's new key and value with qk_rope_body's arithmetic and reads them from threadgroup memory, one per key head stores them; a dispatch and a barrier fewer per layer, bit-identical on Llama, Qwen3, Qwen3.8, Gemma 4 dense / MoE, Orpheus; OXINFER_DEC_ATTN_ROPE=0 keeps the QkRope op) and an IQ4_XS matvec of its own (MV_IQ4 / MVK_IQ4: the non-linear values from a threadgroup copy instead of constant-memory lookups, on the shape splits of the other K-quants; 17408 x 5120 471 -> 560 GB/s alone, Qwen3.8-27B Q4_K_P passes -3%). Chains time their passes (OXINFER_METAL_TRACE) and honour OXINFER_DEC_ONLY; examples/dec_ab alternates decode configurations in one process.
+- Metal prefill round 7 (pooled KV buffers keep their residency, SwiGLU pairs as one GEMM; against llama.cpp master of 2026-11-25: 1.02-1.14x at 512 tokens, 1.08-1.21x at 2048 on the dense models; the grouped experts' probes and what was dropped)
+- *(metal)* prefill: pooled device KV buffers stay in the residency set, and SwiGLU gate / up pairs run as one GEMM with the GLU in its stores
+- *(cpu)* prompt attention on every core's NEON units, CPU prefill chunks of 512
+- *(cpu decode)* a MoE's shared expert joins the experts' fused gate / up region
+- *(cpu decode)* the MoE router over the pool and fewer regions per MoE layer
+- prompt checkpoints and snapshots with a draft, measured on Inkling-2-Mini with its MTP head (turn 2: 5.2-5.8 s prefill -> 0.2 s); chat_turns prints the drafts accepted
+
 ## [0.0.21](https://github.com/KarpelesLab/oxinfer/compare/v0.0.20...v0.0.21) - 2026-11-24
 
 ### Added
