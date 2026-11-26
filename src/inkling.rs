@@ -1134,6 +1134,25 @@ pub(crate) trait DevEngine: Send + Sync {
     ) -> Option<(usize, usize)> {
         None
     }
+    /// [`DevEngine::greedy`] where each pass's token is a temperature draw over the whole
+    /// vocabulary ([`crate::sampler::sample_full`]) from the uniform `draw` gives as the pass is
+    /// queued ([`Inkling2Model::decode_sampled`]); with `feats`, appending the streams `capture`
+    /// lists as [`DevEngine::greedy_capture`].
+    #[allow(clippy::too_many_arguments)]
+    fn sampled(
+        &self,
+        _m: &Inkling2Model,
+        _sess: &mut Inkling2Session,
+        _first: u32,
+        _max: usize,
+        _capture: &[usize],
+        _feats: Option<&mut Vec<f32>>,
+        _temperature: f32,
+        _draw: &mut dyn FnMut() -> f32,
+        _on: &mut dyn FnMut(u32) -> crate::generate::Chain,
+    ) -> Option<(usize, usize)> {
+        None
+    }
     /// [`DevEngine::greedy`] that also appends to `feats` the streams `capture` lists (as
     /// [`DevWant::capture`]: `[t, capture.len(), hidden]`) of each kept pass.
     #[allow(clippy::too_many_arguments)]
@@ -2496,6 +2515,59 @@ impl<'a> Inkling2Model<'a> {
         Some(kept)
     }
 
+    /// [`Self::decode_greedy`] for a temperature draw over the whole vocabulary
+    /// ([`crate::generate::TextLm::decode_sampled`]): each pass's token drawn on the device from
+    /// the uniform `draw` gives (one a pass queued, in order). None (the session untouched)
+    /// when the device does not do it.
+    pub fn decode_sampled(
+        &self,
+        sess: &mut Inkling2Session,
+        first: u32,
+        max: usize,
+        temperature: f32,
+        draw: &mut dyn FnMut() -> f32,
+        on: &mut dyn FnMut(u32) -> crate::generate::Chain,
+    ) -> Option<usize> {
+        if sess.iv.active() || sess.dev_off || crate::gpu::decode::check() || !crate::gpu::decode_chain_enabled() {
+            return None;
+        }
+        let d = self.device()?;
+        let pos0 = sess.pos;
+        let (ran, kept) = d.sampled(self, sess, first, max, &[], None, temperature, draw, on)?;
+        if kept < ran {
+            sess.truncate(pos0 + kept).expect("a pass past the stop goes back");
+        }
+        Some(kept)
+    }
+
+    /// [`Self::decode_sampled`] that also appends to `feats` the streams entering `layers` of
+    /// each kept pass (as [`Self::decode_greedy_feats`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_sampled_feats(
+        &self,
+        sess: &mut Inkling2Session,
+        first: u32,
+        max: usize,
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+        temperature: f32,
+        draw: &mut dyn FnMut() -> f32,
+        on: &mut dyn FnMut(u32) -> crate::generate::Chain,
+    ) -> Option<usize> {
+        if sess.iv.active() || sess.dev_off || crate::gpu::decode::check() || !crate::gpu::decode_chain_enabled() {
+            return None;
+        }
+        let d = self.device()?;
+        let pos0 = sess.pos;
+        let n0 = feats.len();
+        let (ran, kept) = d.sampled(self, sess, first, max, layers, Some(feats), temperature, draw, on)?;
+        if kept < ran {
+            sess.truncate(pos0 + kept).expect("a pass past the stop goes back");
+        }
+        feats.truncate(n0 + kept * layers.len() * self.cfg.hidden_size);
+        Some(kept)
+    }
+
     /// [`Self::decode_greedy`] that also appends to `feats` the residual streams entering
     /// `layers` of each kept pass (as [`crate::dspark::Target::forward_feats`]), for a DSpark
     /// draft's context. None (the session and `feats` untouched) when the device does not do it.
@@ -3331,6 +3403,17 @@ impl crate::generate::TextLm for Inkling2Model<'_> {
     ) -> Option<usize> {
         Inkling2Model::decode_greedy(self, sess, first, max, on)
     }
+    fn decode_sampled(
+        &self,
+        sess: &mut Inkling2Session,
+        first: u32,
+        max: usize,
+        temperature: f32,
+        draw: &mut dyn FnMut() -> f32,
+        on: &mut dyn FnMut(u32) -> crate::generate::Chain,
+    ) -> Option<usize> {
+        Inkling2Model::decode_sampled(self, sess, first, max, temperature, draw, on)
+    }
 }
 
 /// Runtime interventions (`crate::intervene`): the stream after the embedding, after each
@@ -3408,6 +3491,19 @@ impl crate::dspark::Target for Inkling2Model<'_> {
         on: &mut dyn FnMut(u32) -> crate::generate::Chain,
     ) -> Option<usize> {
         Inkling2Model::decode_greedy_feats(self, sess, first, max, layers, feats, on)
+    }
+    fn decode_sampled_feats(
+        &self,
+        sess: &mut Inkling2Session,
+        first: u32,
+        max: usize,
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+        temperature: f32,
+        draw: &mut dyn FnMut() -> f32,
+        on: &mut dyn FnMut(u32) -> crate::generate::Chain,
+    ) -> Option<usize> {
+        Inkling2Model::decode_sampled_feats(self, sess, first, max, layers, feats, temperature, draw, on)
     }
     fn forward_verify(&self, sess: &mut Inkling2Session, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>, _fast: bool) -> Vec<f32> {
         let t = tokens.len();

@@ -1154,8 +1154,10 @@ kernel void ink_mvr(device float* a [[buffer(0)]], device const float* c [[buffe
 // ---- The soft-capped logits of the tokens (`cap tanh(x / cap)`), cut to the first `u` of each
 // row of `v` (grid: blocks, token).
 // With `am` (greedy decoding on the device, one row), each threadgroup's argmax as (value, index
-// bits) into `am + 2 tg` (`ink_amax` then takes the first index of the largest).
-struct ICapP { uint v; uint u; uint x; uint out; float cap; uint am; uint _p1; uint _p2; };
+// bits) into `am + 2 tg` (`ink_amax` then takes the first index of the largest); with `inv_t`
+// above 0 as well (sampling), (its largest value m, its sum of exp((y - m) inv_t)) instead
+// (`ink_samp`).
+struct ICapP { uint v; uint u; uint x; uint out; float cap; uint am; float inv_t; uint _p2; };
 // (v, i) for (bv, bi): the larger value, the lower index on a tie (indices of no candidate:
 // 0xffffffff, value -inf).
 inline void amax_pick(thread float& bv, thread uint& bi, float v, uint i) {
@@ -1184,11 +1186,98 @@ kernel void ink_softcap(device float* a [[buffer(0)]], constant ICapP& p [[buffe
     amax_simd(bv, bi);
     if (lane == 0) { tv[sg] = bv; ti[sg] = bi; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (p.inv_t > 0.f) {
+        float m = tv[0];
+        for (uint k = 1; k < 8; k++) m = max(m, tv[k]);
+        float w = c && m > -INFINITY ? exp((y - m) * p.inv_t) : 0.f;
+        float sw = simd_sum(w);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) tv[sg] = sw;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float t = 0.f;
+            for (uint k = 0; k < 8; k++) t += tv[k];
+            a[p.am + 2 * tg.x] = m;
+            a[p.am + 2 * tg.x + 1] = t;
+        }
+        return;
+    }
     if (tid == 0) {
         for (uint k = 1; k < 8; k++) amax_pick(bv, bi, tv[k], ti[k]);
         a[p.am + 2 * tg.x] = bv;
         a[p.am + 2 * tg.x + 1] = as_type<float>(bi);
     }
+}
+
+// A temperature draw over the whole vocabulary (one threadgroup of 1024; at most 1024 partials of
+// `ink_softcap`'s 256-logit threadgroups at `am`, the capped logits at `x`, `u` of them): the
+// first token in token order at which the cumulative weight exp((y - max) inv_t) reaches the
+// uniform at `uni` times the total (the host's `sampler::sample_full`), first the threadgroup
+// whose prefix reaches it, then the token in it; the last token of nonzero weight when rounding
+// leaves the draw past the end. The token id (uint bits) into `tok`.
+struct ISampP { uint n; uint am; uint tok; uint uni; uint x; uint u; float inv_t; uint _p; };
+// The inclusive prefix sum of `v` over the threadgroup's 1024 threads (`ts`: 32 floats), and
+// the total in `tot`.
+inline float samp_scan(float v, threadgroup float* ts, uint sg, uint lane, thread float& tot) {
+    float inc = simd_prefix_inclusive_sum(v);
+    if (lane == 31) ts[sg] = inc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sv = ts[lane];
+    float sinc = simd_prefix_inclusive_sum(sv);
+    float before = simd_shuffle(sinc - sv, sg);
+    tot = simd_shuffle(sinc, 31);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return before + inc;
+}
+inline void samp_reset(threadgroup atomic_uint* tw) {
+    atomic_store_explicit(&tw[0], 0xffffffffu, memory_order_relaxed);
+    atomic_store_explicit(&tw[1], 0u, memory_order_relaxed);
+}
+// The first index found, else the last of nonzero weight.
+inline uint samp_pick(threadgroup atomic_uint* tw) {
+    uint f = atomic_load_explicit(&tw[0], memory_order_relaxed);
+    return f != 0xffffffffu ? f : atomic_load_explicit(&tw[1], memory_order_relaxed);
+}
+kernel void ink_samp(device float* a [[buffer(0)]], constant ISampP& p [[buffer(1)]], uint tid [[thread_index_in_threadgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float ts[32];
+    threadgroup atomic_uint tw[2];
+    threadgroup float tr[2];
+    bool in = tid < p.n;
+    float mk = in ? a[p.am + 2 * tid] : -INFINITY;
+    float sk = in ? a[p.am + 2 * tid + 1] : 0.f;
+    float m = simd_max(mk);
+    if (lane == 0) ts[sg] = m;
+    if (tid == 0) samp_reset(tw);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = simd_max(ts[lane]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float f = mk > -INFINITY ? exp((mk - m) * p.inv_t) : 0.f;
+    float w = sk * f;
+    float tot;
+    float inc = samp_scan(w, ts, sg, lane, tot);
+    float r = min(a[p.uni] * tot, tot);
+    // The first threadgroup of nonzero weight whose prefix reaches r; the last of nonzero weight.
+    if (w > 0.f && inc >= r) atomic_fetch_min_explicit(&tw[0], tid, memory_order_relaxed);
+    if (w > 0.f) atomic_fetch_max_explicit(&tw[1], tid, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint k = samp_pick(tw);
+    if (tid == k) { tr[0] = r - (inc - w); tr[1] = f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rk = tr[0], fk = tr[1];
+    float mk2 = a[p.am + 2 * k];
+    if (tid == 0) samp_reset(tw);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Within threadgroup k: its 256 logits, weighted as the partial was.
+    uint i = k * 256 + tid;
+    float y = tid < 256 && i < p.u ? a[p.x + i] : -INFINITY;
+    float wi = y > -INFINITY ? exp((y - mk2) * p.inv_t) * fk : 0.f;
+    float tot2;
+    float inc2 = samp_scan(wi, ts, sg, lane, tot2);
+    if (wi > 0.f && inc2 >= rk) atomic_fetch_min_explicit(&tw[0], i, memory_order_relaxed);
+    if (wi > 0.f) atomic_fetch_max_explicit(&tw[1], i, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) ((device uint*)a)[p.tok] = samp_pick(tw);
 }
 // The argmax over `n` partials (one threadgroup of 1024): the token id (uint bits) into `tok`.
 struct IAmP { uint n; uint am; uint tok; uint _p; };

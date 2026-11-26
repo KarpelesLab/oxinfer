@@ -30,7 +30,7 @@ use crate::kernels::*;
 use crate::model::{LayerCache, Lin, Quant, Table, linear};
 use crate::qwen::{Attn, Ffn, Loader, QwenModel, QwenSession};
 use crate::safetensors::ModelFiles;
-use crate::sampler::Sampler;
+use crate::sampler::{Dist, Sampler};
 use anyhow::{Context, Result, bail};
 
 /// A trimmed output head for drafting: logits over `d2t.len()` tokens, draft index `i` standing
@@ -1164,18 +1164,108 @@ pub fn speculative_accept(sampler: &mut Sampler, p: &[(u32, f32)], q: &[(u32, f3
     if pd >= qd || sampler.uniform() < pd / qd {
         return None;
     }
-    let qm: std::collections::HashMap<u32, f32> = q.iter().copied().collect();
+    // (q densely by token: a whole vocabulary's distribution made a hash map a draft.)
+    let n = q.iter().map(|e| e.0 as usize + 1).max().unwrap_or(0);
+    let mut qd = vec![0f32; n];
+    for &(t, qt) in q {
+        qd[t as usize] += qt;
+    }
     let r: Vec<(u32, f32)> = p
         .iter()
-        .map(|&(t, pt)| (t, (pt - qm.get(&t).copied().unwrap_or(0.0)).max(0.0)))
+        .map(|&(t, pt)| (t, (pt - qd.get(t as usize).copied().unwrap_or(0.0)).max(0.0)))
         .filter(|e| e.1 > 0.0)
         .collect();
     Some(sampler.sample_from(if r.is_empty() { p } else { &r }))
 }
 
+/// [`speculative_accept`] over [`Dist`]s (dense distributions over the whole vocabulary need no
+/// pairs): the same test and the same draws from the sampler's generator.
+pub fn speculative_accept_dist(sampler: &mut Sampler, p: &Dist, q: &Dist, d: u32) -> Option<u32> {
+    let (pd, qd) = (p.prob(d), q.prob(d));
+    if pd >= qd || sampler.uniform() < pd / qd {
+        return None;
+    }
+    // The residual max(0, p - q), q densely by token where it is many pairs.
+    let dense_q = |n: usize| -> Vec<f32> {
+        match q {
+            Dist::Dense(v) => v.clone(),
+            Dist::Pairs(v) => {
+                let mut o = vec![0f32; n.max(v.iter().map(|e| e.0 as usize + 1).max().unwrap_or(0))];
+                for &(t, qt) in v {
+                    o[t as usize] += qt;
+                }
+                o
+            }
+        }
+    };
+    let r = match p {
+        Dist::Dense(pv) => {
+            let mut r = pv.clone();
+            match q {
+                Dist::Pairs(v) if v.len() <= 16 => {
+                    for &(t, qt) in v {
+                        if let Some(x) = r.get_mut(t as usize) {
+                            *x = (*x - qt).max(0.0);
+                        }
+                    }
+                }
+                _ => {
+                    for (x, &qt) in r.iter_mut().zip(&dense_q(pv.len())) {
+                        *x = (*x - qt).max(0.0);
+                    }
+                }
+            }
+            Dist::Dense(r)
+        }
+        Dist::Pairs(pp) => {
+            let r: Vec<(u32, f32)> = match q {
+                Dist::Pairs(v) if v.len() <= 16 => pp.iter().map(|&(t, pt)| (t, (pt - q.prob(t)).max(0.0))).collect(),
+                _ => {
+                    let qv = dense_q(0);
+                    pp.iter()
+                        .map(|&(t, pt)| (t, (pt - qv.get(t as usize).copied().unwrap_or(0.0)).max(0.0)))
+                        .collect()
+                }
+            };
+            Dist::Pairs(r.into_iter().filter(|e| e.1 > 0.0).collect())
+        }
+    };
+    let empty = match &r {
+        Dist::Pairs(v) => v.is_empty(),
+        Dist::Dense(v) => v.iter().all(|&x| x <= 0.0),
+    };
+    Some(sampler.sample_dist(if empty { p } else { &r }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`speculative_accept_dist`] with dense distributions (the whole vocabulary) keeps the
+    /// target's: a dense draft, a point draft and a draft of pairs.
+    #[test]
+    fn dense_speculative_sampling_preserves_target() {
+        let p = Dist::Dense(vec![0.5, 0.3, 0.0, 0.2]);
+        let qs = [
+            Dist::Dense(vec![0.1, 0.5, 0.3, 0.1]),
+            Dist::point(1),
+            Dist::Pairs(vec![(3, 0.6), (2, 0.4)]),
+        ];
+        for q in &qs {
+            let mut s = Sampler::new(1.0, 0, 1.0, 11);
+            let n = 300_000;
+            let mut hist = [0usize; 4];
+            for _ in 0..n {
+                let d = s.sample_dist(q);
+                let t = speculative_accept_dist(&mut s, &p, q, d).unwrap_or(d);
+                hist[t as usize] += 1;
+            }
+            for t in 0..4u32 {
+                let f = hist[t as usize] as f32 / n as f32;
+                assert!((f - p.prob(t)).abs() < 0.005, "{q:?}: token {t}: {f} vs {}", p.prob(t));
+            }
+        }
+    }
 
     #[test]
     fn speculative_sampling_preserves_target() {

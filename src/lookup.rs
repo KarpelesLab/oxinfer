@@ -33,8 +33,8 @@
 //! the draft model's when it promises more accepted tokens.
 
 use crate::dspark::Target;
-use crate::qwen_mtp::{MtpStats, speculative_accept};
-use crate::sampler::Sampler;
+use crate::qwen_mtp::{MtpStats, speculative_accept_dist};
+use crate::sampler::{Dist, Sampler};
 use std::collections::HashMap;
 
 /// Prompt-lookup settings.
@@ -614,8 +614,8 @@ pub fn accept(sampler: &mut Sampler, logits: &[f32], v: usize, drafts: &[u32], s
     let mut accepted = 0;
     let penalty = sampler.repetition_penalty != 1.0;
     for (j, &d) in drafts.iter().enumerate() {
-        let p = sampler.distribution(&logits[j * v..(j + 1) * v]);
-        let t = speculative_accept(sampler, &p, &[(d, 1.0)], d).unwrap_or(d);
+        let p = sampler.dist_of(&logits[j * v..(j + 1) * v], false);
+        let t = speculative_accept_dist(sampler, &p, &Dist::point(d), d).unwrap_or(d);
         sampler.commit(t);
         if penalty {
             sampler.observe(&[t]);
@@ -698,13 +698,15 @@ impl<M: Target> crate::generate::RoundDecoder for LookupRounds<'_, M> {
         // No draft worth verifying: greedy passes chained on the device (where the model has them),
         // each token committed and streamed as it comes, until a draft is worth verifying (the
         // pass already queued then still runs: its token is the next round's first).
-        if k == 0 && sampler.plain_greedy() && max_new > 0 {
+        if k == 0 && (sampler.plain_greedy() || sampler.plain_sampled()) && max_new > 0 {
             let (sess, lookup) = (&mut *self.sess, &mut *self.lookup);
             let stop = lookup.opts.stop.clone();
             let mut out: Vec<u32> = Vec::new();
+            let taken = std::cell::Cell::new(0usize);
             let mut on = |t: u32| -> crate::generate::Chain {
                 use crate::generate::Chain;
                 out.push(t);
+                taken.set(out.len());
                 lookup.extend(&[t]);
                 if !emit(t) || stop.contains(&t) {
                     return Chain::Stop;
@@ -712,7 +714,7 @@ impl<M: Target> crate::generate::RoundDecoder for LookupRounds<'_, M> {
                 let d = lookup.draft((max_new - out.len()).saturating_sub(1));
                 if lookup.cut(&d) > 0 { Chain::Last } else { Chain::Go }
             };
-            if let Some(kept) = model.decode_greedy(sess, next, max_new, &mut on) {
+            if let Some(kept) = crate::generate::decode_chain(model, sess, sampler, next, max_new, &mut on, &|| taken.get()) {
                 let secs = t0.elapsed().as_secs_f64();
                 if kept > 0 {
                     self.lookup.policy.record_time(0, (secs - draft_secs) / kept as f64);

@@ -252,6 +252,34 @@ impl Sampler {
         self.next_f32()
     }
 
+    /// Whether a temperature draw takes every token of a vocabulary of `n` as a candidate (no
+    /// top-k or top-p cut): then the tokens are taken in token order ([`sample_full`]).
+    fn whole_vocab(&self, n: usize) -> bool {
+        (self.top_k == 0 || self.top_k >= n) && self.top_p >= 1.0
+    }
+
+    /// Whether `sample` is a plain temperature draw over the whole vocabulary ([`sample_full`]
+    /// with the generator's next uniform): above temperature 0, no top-k or top-p cut, no
+    /// repetition penalty, no guide. A device can then sample itself from uniforms the host
+    /// draws ([`Sampler::uniform`]).
+    pub fn plain_sampled(&self) -> bool {
+        self.temperature > 0.0 && self.top_k == 0 && self.top_p >= 1.0 && self.repetition_penalty == 1.0 && self.guide.is_none()
+    }
+
+    /// The generator's state, to replay draws ([`Sampler::set_state`]): a device chain draws a
+    /// uniform for every pass it queues and keeps the draws of the passes it keeps only.
+    pub fn state(&self) -> u64 {
+        self.rng
+    }
+
+    /// Restores a state [`Sampler::state`] returned, then skips `draws` uniforms.
+    pub fn set_state(&mut self, state: u64, draws: usize) {
+        self.rng = state;
+        for _ in 0..draws {
+            self.next_f32();
+        }
+    }
+
     /// Whether `sample` is greedy (argmax).
     pub fn greedy(&self) -> bool {
         self.temperature <= 0.0
@@ -263,10 +291,20 @@ impl Sampler {
         self.greedy() && self.repetition_penalty == 1.0 && self.guide.is_none()
     }
 
-    /// The candidates `sample` draws from: token ids by decreasing probability, the
+    /// The candidates `sample` draws from: token ids by decreasing probability (in token order
+    /// when every token is one: no top-k or top-p cut), the
     /// (unnormalized over the cut) probabilities, how many survive top-p, and their total.
     /// With `masked`, tokens of probability zero (masked out) are never candidates.
     fn candidates(&self, logits: &[f32], masked: bool) -> (Vec<u32>, Vec<f32>, usize, f32) {
+        if self.whole_vocab(logits.len()) {
+            // Every token a candidate: in token order, no sort (a vocabulary of 200k took
+            // milliseconds to sort per token).
+            let (w, total) = full_weights(logits, 1.0 / self.temperature);
+            let inv = (1.0 / total) as f32;
+            let probs: Vec<f32> = w.iter().map(|&x| x * inv).collect();
+            let total = probs.iter().map(|&p| p as f64).sum::<f64>() as f32;
+            return ((0..logits.len() as u32).collect(), probs, logits.len(), total);
+        }
         let k = if self.top_k == 0 {
             logits.len()
         } else {
@@ -314,7 +352,8 @@ impl Sampler {
     }
 
     /// The exact distribution `sample` draws from (temperature, top-k, top-p applied), as
-    /// `(token, probability)` pairs summing to 1 by decreasing probability; one token with
+    /// `(token, probability)` pairs summing to 1 by decreasing probability (in token order
+    /// without a top-k or top-p cut, every token listed); one token with
     /// probability 1 when greedy. With a guide, the distribution is the filtered one, and the
     /// token chosen from it must be given to [`Sampler::commit`].
     pub fn distribution(&self, logits: &[f32]) -> Vec<(u32, f32)> {
@@ -349,6 +388,36 @@ impl Sampler {
         idx[..cut].iter().zip(&probs[..cut]).map(|(&i, &p)| (i, p / total)).collect()
     }
 
+    /// [`Sampler::distribution`] (`draft`: [`Sampler::draft_distribution`]) as a [`Dist`]:
+    /// dense for a draw over the whole vocabulary without a guide's mask (the same
+    /// probabilities, in token order, without building pairs).
+    pub fn dist_of(&self, logits: &[f32], draft: bool) -> Dist {
+        if !self.greedy() && self.whole_vocab(logits.len()) {
+            let (logits, masked) = self.prepared(logits, draft);
+            if !masked {
+                let (mut w, total) = full_weights(&logits, 1.0 / self.temperature);
+                let inv = if total > 0.0 { (1.0 / total) as f32 } else { 0.0 };
+                for x in w.iter_mut() {
+                    *x *= inv;
+                }
+                return Dist::Dense(w);
+            }
+        }
+        Dist::Pairs(self.dist(logits, draft))
+    }
+
+    /// Draws from a [`Dist`] (dense ones in token order, as [`sample_full`]).
+    pub fn sample_dist(&mut self, dist: &Dist) -> u32 {
+        match dist {
+            Dist::Pairs(p) => self.sample_from(p),
+            Dist::Dense(p) => {
+                let total = p.iter().map(|&x| x as f64).sum::<f64>();
+                let u = self.next_f32();
+                draw_weights(p, total, u)
+            }
+        }
+    }
+
     /// Draws from a distribution such as `distribution` returns.
     pub fn sample_from(&mut self, dist: &[(u32, f32)]) -> u32 {
         let total: f32 = dist.iter().map(|d| d.1).sum();
@@ -378,6 +447,11 @@ impl Sampler {
         if self.greedy() {
             return argmax(&logits);
         }
+        if !masked && self.whole_vocab(logits.len()) {
+            let (w, total) = full_weights(&logits, 1.0 / self.temperature);
+            let u = self.next_f32();
+            return draw_weights(&w, total, u);
+        }
         let (idx, probs, cut, total) = self.candidates(&logits, masked);
         let mut r = self.next_f32() * total;
         for i in 0..cut {
@@ -402,6 +476,90 @@ pub fn apply_repetition_penalty(logits: &mut [f32], seen: &[u64], penalty: f32) 
             if let Some(l) = logits.get_mut(t) {
                 *l = if *l < 0.0 { *l * penalty } else { *l / penalty };
             }
+        }
+    }
+}
+
+/// The weights `exp((l - max) * inv_t)` of every logit (0 for NaN and -inf) and their sum.
+fn full_weights(logits: &[f32], inv_t: f32) -> (Vec<f32>, f64) {
+    let max = logits[argmax(logits) as usize];
+    let mut w = vec![0f32; logits.len()];
+    let mut total = 0f64;
+    if max == f32::NEG_INFINITY || max.is_nan() {
+        return (w, total);
+    }
+    for (wc, lc) in w.chunks_mut(1024).zip(logits.chunks(1024)) {
+        let mut s = 0f32;
+        for (o, &l) in wc.iter_mut().zip(lc) {
+            // (fast_exp clamps: -inf and NaN by hand.)
+            let e = if l > f32::NEG_INFINITY {
+                crate::kernels::fast_exp((l - max) * inv_t)
+            } else {
+                0.0
+            };
+            *o = e;
+            s += e;
+        }
+        total += s as f64;
+    }
+    (w, total)
+}
+
+/// The first index in order at which the cumulative weight of `w` reaches `u` times its total
+/// (the last of nonzero weight when rounding leaves `u` past the end; 0 when all are zero).
+fn draw_weights(w: &[f32], total: f64, u: f32) -> u32 {
+    let mut r = u as f64 * total;
+    let mut last = 0;
+    for (i, &x) in w.iter().enumerate() {
+        if x > 0.0 {
+            r -= x as f64;
+            last = i;
+            if r <= 0.0 {
+                return i as u32;
+            }
+        }
+    }
+    last as u32
+}
+
+/// A temperature draw over the whole vocabulary from the uniform `u` in [0, 1): the first token
+/// in token order at which the cumulative weight `exp((l - max) * inv_t)` reaches `u` times
+/// the total (the inverse of the distribution's CDF in token order; the last token of nonzero
+/// weight when rounding leaves `u` past the end). Device samplers draw the same way.
+pub fn sample_full(logits: &[f32], inv_t: f32, u: f32) -> u32 {
+    let (w, total) = full_weights(logits, inv_t);
+    draw_weights(&w, total, u)
+}
+
+/// A distribution a token is drawn from ([`Sampler::dist_of`]): `(token, probability)` pairs as
+/// [`Sampler::distribution`] gives them, or, for a draw over the whole vocabulary, every
+/// token's probability in token order (no pairs to build: speculative rounds take one a
+/// verified position).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Dist {
+    Pairs(Vec<(u32, f32)>),
+    Dense(Vec<f32>),
+}
+
+impl Dist {
+    /// One token with probability 1 (a greedy or a looked-up draft).
+    pub fn point(t: u32) -> Self {
+        Dist::Pairs(vec![(t, 1.0)])
+    }
+
+    /// The probability of `t`.
+    pub fn prob(&self, t: u32) -> f32 {
+        match self {
+            Dist::Pairs(p) => p.iter().find(|e| e.0 == t).map_or(0.0, |e| e.1),
+            Dist::Dense(p) => p.get(t as usize).copied().unwrap_or(0.0),
+        }
+    }
+
+    /// The first token listed (the most likely of pairs; a greedy distribution's only one).
+    pub fn first(&self) -> u32 {
+        match self {
+            Dist::Pairs(p) => p.first().map_or(0, |e| e.0),
+            Dist::Dense(p) => argmax(p),
         }
     }
 }
@@ -470,6 +628,44 @@ unsafe fn argmax_neon(x: &[f32]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whole-vocabulary temperature draws ([`sample_full`], no sort) keep the softmax's
+    /// frequencies, and the distribution lists every token in token order.
+    #[test]
+    fn whole_vocab_draws_follow_the_softmax() {
+        let logits = [1.0f32, f32::NEG_INFINITY, 0.0, 2.0, -1.0, f32::NAN];
+        let mut s = Sampler::new(0.8, 0, 1.0, 11);
+        let d = s.distribution(&logits);
+        let z: f64 = logits
+            .iter()
+            .filter(|l| l.is_finite())
+            .map(|&l| ((l - 2.0) / 0.8).exp() as f64)
+            .sum();
+        for (t, p) in &d {
+            let l = logits[*t as usize];
+            let want = if l.is_finite() { ((l - 2.0) / 0.8).exp() as f64 / z } else { 0.0 };
+            assert!((*p as f64 - want).abs() < 1e-6, "{t}: {p} vs {want}");
+        }
+        assert!(d.windows(2).all(|w| w[0].0 < w[1].0));
+        let n = 200_000;
+        let mut hist = [0usize; 6];
+        for _ in 0..n {
+            hist[s.sample(&logits) as usize] += 1;
+        }
+        assert_eq!((hist[1], hist[5]), (0, 0));
+        for (t, p) in &d {
+            let f = hist[*t as usize] as f32 / n as f32;
+            assert!((f - p).abs() < 0.005, "token {t}: {f} vs {p}");
+        }
+        // The end of the range and replayed states.
+        assert_eq!(sample_full(&logits, 1.0, 0.0), 0);
+        assert_eq!(sample_full(&logits, 1.0, 0.999_999_9), 4);
+        let st = s.state();
+        let a: Vec<u32> = (0..8).map(|_| s.sample(&logits)).collect();
+        s.set_state(st, 3);
+        let b: Vec<u32> = (0..5).map(|_| s.sample(&logits)).collect();
+        assert_eq!(&a[3..], &b[..]);
+    }
 
     /// The NEON argmax against the scalar loop: ties (first index), NaNs, infinities.
     #[test]

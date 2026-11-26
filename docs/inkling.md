@@ -529,6 +529,19 @@ resident on the device:
   verification round. The embedding's norm
   sums its squares in another order than the host's: the same greedy text on the 9 replies of
   the speed checks (`inkling2_bench --chain` measures this path).
+- **Sampling chained on the device** the same way, for a plain temperature draw over the whole
+  vocabulary (temperature above 0, no top-k or top-p cut, no repetition penalty, no grammar:
+  the model's own defaults, temperature 1, and what the server samples with when a request sets
+  nothing else; `Inkling2Model::decode_sampled`, also the plain rounds of prompt lookup and of
+  the DSpark / MTP decoders). The host draws one uniform from the sampler's generator per pass it
+  queues and writes it to the pass's slot; the soft-cap kernel's threadgroups write their largest
+  logit and their sum of `exp((y - max) / T)`, and one threadgroup (`ink_samp`) takes the first
+  token, in token order, at which the cumulative weight reaches the uniform times the total:
+  first the 256-logit block whose prefix reaches it, then the token within it. The host's
+  sampler draws the same way (`sampler::sample_full`, no sort of the vocabulary), and the
+  generator is left as if it had drawn for the tokens kept only, so a chain and one-token steps
+  give the same tokens from the same seed (256 tokens at temperature 1 on UD-IQ3_XXS: the same
+  text with `OXINFER_GPU_CHAIN=0`; `tests/gpu_chain.rs` checks it on a tiny checkpoint).
 - **KV caches** in f32, f16 or q8 rows (`--kv-cache`; f16 by default on Metal, `auto`), the
   full-attention caches grown by a quarter at a time (not to the next power of two), the
   decoding passes' attention a threadgroup per key head (its three query heads together) from

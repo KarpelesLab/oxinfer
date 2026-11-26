@@ -4297,6 +4297,67 @@ faster. Qwen3-8B Q8_0, `parity_bench pp=2048 pp_depth=16384,32768` (new: N token
 prompt of D, as llama-bench's `-p N -d D`): 1502 and 898 tok/s against llama.cpp's 1050 and 698
 (`llama-bench -fa 1 -p 2048 -d ...`; 2793 at depth 0).
 
+#### Inkling-2-Mini sampled decoding on Metal (November 2026)
+
+The server samples unless a request says otherwise: OpenAI's defaults (temperature 1, top-p 1,
+no top-k) over the model's own (`generation_config.json`: temperature 1), which is what a client
+such as opencode gets. Every round before this one measured greedy decoding (`--temp 0`, the
+CLI's default); sampled, the same model decoded about a third slower:
+
+- the host's sampler **sorted the whole vocabulary** for every token (`Sampler::candidates`: top-k
+  0 means every one of the 201024 tokens a candidate, sorted by probability before the top-p walk),
+  about 3 ms a token, and each verified position of a speculative round sorted again
+  (`Sampler::distribution`), then built a hash map of the draft's distribution (DSpark: the whole
+  vocabulary as well);
+- **no chaining**: only greedy passes were chained on the device (`decode_greedy`), so every
+  sampled token was a one-token pass with its 0.8 MB of logits copied back, a wait for the host
+  and a cold start of the next command buffer.
+
+Now: a draw over the whole vocabulary takes the tokens in token order (`sampler::sample_full`: the
+first token at which the cumulative weight `exp((l - max) / T)` reaches the uniform times the
+total; the same distribution, no sort, 0.2 ms), speculative rounds keep such distributions dense
+(`sampler::Dist`, `qwen_mtp::speculative_accept_dist`: the same acceptance test and draws), and
+Inkling's passes chain on the device when sampling too (`Inkling2Model::decode_sampled`, its
+`_feats` variant for the DSpark / MTP decoders' plain rounds): the host writes one uniform from
+the sampler's generator into each queued pass's slot, the soft-cap kernel's threadgroups write
+their largest logit and sum of weights, and `ink_samp` (one threadgroup of 1024) picks the block
+and then the token as `sample_full` does. The generator is left as if it had drawn only for the
+tokens kept, so chained and one-token sampling give the same tokens from the same seed (256
+tokens at temperature 1: the same text with `OXINFER_GPU_CHAIN=0`; `tests/gpu_chain.rs` on a tiny
+checkpoint). Top-k / top-p cuts, a repetition penalty or a grammar keep the host's sampler (top-k
+and top-p still sorted, but only once a token).
+
+Before / after (unsloth UD-IQ3_XXS, the CLI with the server's sampling: `--temp 1 --top-k 0
+--top-p 1 --seed 7 -n 384`, `--no-system`; prompt lookup on as by default; "DSpark" adds
+`--draft` with unsloth's Q8_0 draft; the two builds alternated twice under the bench lock, load
+2.0-2.5; tok/s of each run):
+
+| Prompt | default (lookup) before | after | DSpark before | after |
+|---|---:|---:|---:|---:|
+| code (40-token prompt) | 81.3, 80.3 | **121.2, 119.7** | 78.7, 77.9 | 116.0, 92.9 |
+| chat (27 tokens) | 81.4, 72.5 | **118.2, 118.9** | 76.9, 71.1 | 113.5, 113.5 |
+| a code edit after 10.5k tokens of context | 85.4, 77.1 | **110.3, 90.3** | 71.1, 65.4 | **130.1, 108.1** (2.4-2.5 tokens a forward) |
+
+Greedy decoding is unchanged (the same text on both prompts, before and after). Sampled decoding
+now runs at greedy speed: 118-121 tok/s at short contexts against 121.0 for `inkling2_bench -p 0
+-n 128 --chain` (llama.cpp de30697, `llama-bench -p 0 -n 128`: 46.4-46.5 tok/s; its
+`llama-speculative-simple --spec-type ngram-simple` 41.5 greedy, 43.8 at temperature 1 on the
+code prompt; `--spec-type draft-dspark` does not load unsloth's draft beside this file, whose
+`markov_w1` has 201024 rows where it expects the file's 200058). Through `oxinfer serve`
+(`/v1/chat/completions` with no sampling options, 384 tokens, prompt cached after the first
+request): the code prompt 4.78 -> 3.27 s a request, the chat prompt 4.01 -> 2.81 s (80 -> 117
+and 115 tok/s, prefill and HTTP included).
+
+**Speculative decoding while sampling** (the same runs, and greedy ones of this build, 512
+tokens): prompt lookup stays the default. It accepts 57-95% of its drafts and pays where the
+reply copies the context (the code edit: 1.2-2.3 tokens a forward); DSpark accepts 55-88% and gains
+most there too (2.4-2.5 tokens a forward: 130 against 110 tok/s, the best run of all), but costs
+4-23% on short prompts (its plain rounds capture the draft's features; its prefill is 10-50%
+slower) and has to be asked for (`--draft auto`, `draft=auto`). A verification pass is cheap
+only as far as its tokens share experts: each drafted token reads 8 experts of 128 of its own,
+so a round of 7 drafts costs about two plain steps, and drafting pays only where most of a
+block is accepted (copied code at long contexts).
+
 #### DGX Spark, CUDA (November 2026)
 
 On a DGX Spark (GB10, 121 GB shared between the CPU and the GPU) against llama.cpp's CUDA backend

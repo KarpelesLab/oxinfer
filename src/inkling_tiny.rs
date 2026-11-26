@@ -157,19 +157,61 @@ pub(crate) fn byte_tokenizer(special: &[&str], base: u32) -> Value {
 /// Writes the checkpoint folder `dir` (`config.json`, `model.safetensors`, `tokenizer.json`);
 /// the weights depend on `seed` only.
 pub fn write_tiny(dir: &Path, seed: u64) -> Result<()> {
-    write_tiny_with(dir, seed, false)
+    write_tiny_with(dir, seed, false, &TINY)
 }
+
+/// [`write_tiny`] in the shapes the Metal engine takes (heads of 128 channels, 256 wide, a
+/// relative bias of 16), for tests of the GPU passes.
+pub fn write_tiny_metal(dir: &Path, seed: u64) -> Result<()> {
+    let d = Dims {
+        h: 256,
+        full: (4, 2, 128),
+        swa: (4, 2, 128),
+        d_rel: 16,
+        extent: 24,
+        inter: 128,
+        experts: 8,
+        rank: 64,
+    };
+    write_tiny_with(dir, seed, false, &d)
+}
+
+/// The text model's widths: hidden size, (heads, key / value heads, head size) of the full and
+/// of the sliding layers, relative bias rank and extent, expert width and count.
+struct Dims {
+    h: usize,
+    full: (usize, usize, usize),
+    swa: (usize, usize, usize),
+    d_rel: usize,
+    extent: usize,
+    inter: usize,
+    experts: usize,
+    rank: usize,
+}
+
+const TINY: Dims = Dims {
+    h: H,
+    full: FULL,
+    swa: SWA,
+    d_rel: D_REL,
+    extent: EXTENT,
+    inter: INTER,
+    experts: EXPERTS,
+    rank: RANK,
+};
 
 /// [`write_tiny`] with a vision tower (`model.visual.*`: a ViT of one layer, 32 wide, on native
 /// patches of 4 pixels merged 2 x 2, so one soft token per 8 x 8 tile of an image).
 pub fn write_tiny_vision(dir: &Path, seed: u64) -> Result<()> {
-    write_tiny_with(dir, seed, true)
+    write_tiny_with(dir, seed, true, &TINY)
 }
 
 /// The vision tower's width, layers' hidden size, patch, merge, position grid and projection.
 const VIS: (usize, usize, usize, usize, usize, usize) = (32, 64, 4, 2, 4, 32);
 
-fn write_tiny_with(dir: &Path, seed: u64, vision: bool) -> Result<()> {
+fn write_tiny_with(dir: &Path, seed: u64, vision: bool, d: &Dims) -> Result<()> {
+    let (hs, full, swa, d_rel, extent_full, inter, experts) = (d.h, d.full, d.swa, d.d_rel, d.extent, d.inter, d.experts);
+    let rank = d.rank;
     std::fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
     let end_turn = SPECIAL_BASE + SPECIAL.iter().position(|s| *s == "<|content_model_end_sampling|>").unwrap() as u32;
     let image = SPECIAL_BASE + SPECIAL.len() as u32 - 1;
@@ -180,17 +222,17 @@ fn write_tiny_with(dir: &Path, seed: u64, vision: bool) -> Result<()> {
         "image_token_id": image,
         "eos_token_id": end_turn,
         "text_config": {
-            "vocab_size": VOCAB, "unpadded_vocab_size": UNPADDED, "hidden_size": H, "num_hidden_layers": LAYERS,
-            "num_attention_heads": FULL.0, "num_key_value_heads": FULL.1, "head_dim": FULL.2,
-            "swa_num_attention_heads": SWA.0, "swa_num_key_value_heads": SWA.1, "swa_head_dim": SWA.2,
-            "sliding_window_size": WINDOW, "d_rel": D_REL, "rel_extent": EXTENT,
+            "vocab_size": VOCAB, "unpadded_vocab_size": UNPADDED, "hidden_size": hs, "num_hidden_layers": LAYERS,
+            "num_attention_heads": full.0, "num_key_value_heads": full.1, "head_dim": full.2,
+            "swa_num_attention_heads": swa.0, "swa_num_key_value_heads": swa.1, "swa_head_dim": swa.2,
+            "sliding_window_size": WINDOW, "d_rel": d_rel, "rel_extent": extent_full,
             "log_scaling_n_floor": 32, "log_scaling_alpha": 0.3, "conv_kernel_size": KERNEL,
-            "moe_intermediate_size": INTER, "n_routed_experts": EXPERTS, "num_experts_per_tok": 2,
+            "moe_intermediate_size": inter, "n_routed_experts": experts, "num_experts_per_tok": 2,
             "route_scale": 2.0, "qk_l2_clip_threshold": 4.0, "rel_l2_clip_threshold": 4.0,
             "n_layers_per_attn_res_block": BLOCK, "mlp_gate_softcap": 0.8, "mlp_up_softcap": 1.5,
             "final_logit_softcapping": 10.0, "rms_norm_eps": 1e-6, "eos_token_id": end_turn,
             "loop_layer_index_start": LOOP.0, "loop_layer_index_end": LOOP.1, "loop_num_passes": 3,
-            "loop_gate_rank": RANK, "layer_types": layer_types,
+            "loop_gate_rank": rank, "layer_types": layer_types,
         },
     });
     let (vh, vinter, patch, merge, grid, proj) = VIS;
@@ -198,7 +240,7 @@ fn write_tiny_with(dir: &Path, seed: u64, vision: bool) -> Result<()> {
         config["vision_config"] = json!({
             "model_type": "inkling2_vision", "hidden_size": vh, "num_hidden_layers": 1, "num_attention_heads": 4,
             "intermediate_size": vinter, "patch_size": patch, "spatial_merge_size": merge, "posemb_grid_size": grid,
-            "projection_hidden_dim": proj, "layer_norm_eps": 1e-5, "text_hidden_size": H,
+            "projection_hidden_dim": proj, "layer_norm_eps": 1e-5, "text_hidden_size": hs,
         });
     }
     std::fs::write(dir.join("config.json"), serde_json::to_vec_pretty(&config)?)?;
@@ -208,60 +250,60 @@ fn write_tiny_with(dir: &Path, seed: u64, vision: bool) -> Result<()> {
         list: Vec::new(),
         rng: Rng(seed ^ 0x1234_5678_9abc_def0),
     };
-    t.uni("embed.weight", &[VOCAB, H], 1.0, 0.0);
-    t.mat("unembed.weight", &[VOCAB, H], 1.0);
-    t.ones("embed_norm.weight", H);
-    t.ones("norm.weight", H);
-    t.uni("attn_res.output_query", &[H], 1.0, 0.0);
+    t.uni("embed.weight", &[VOCAB, hs], 1.0, 0.0);
+    t.mat("unembed.weight", &[VOCAB, hs], 1.0);
+    t.ones("embed_norm.weight", hs);
+    t.ones("norm.weight", hs);
+    t.uni("attn_res.output_query", &[hs], 1.0, 0.0);
     for l in 0..LAYERS {
-        let (nh, nkv, d) = if sliding(l) { SWA } else { FULL };
+        let (nh, nkv, d) = if sliding(l) { swa } else { full };
         let (w, kw) = (nh * d, nkv * d);
         let a = format!("layers.{l}.attn.");
-        t.mat(&format!("{a}wq_du.weight"), &[w, H], 1.0);
-        t.mat(&format!("{a}wk_dv.weight"), &[kw, H], 1.0);
-        t.mat(&format!("{a}wv_dv.weight"), &[kw, H], 1.0);
-        t.mat(&format!("{a}wr_du.weight"), &[nh * D_REL, H], 1.0);
-        t.mat(&format!("{a}gate_attn.weight"), &[w, H], 1.0);
-        t.mat(&format!("{a}attn_sink_proj.weight"), &[nh, H], 0.5);
-        t.mat(&format!("{a}wo_ud.weight"), &[H, w], 0.7);
+        t.mat(&format!("{a}wq_du.weight"), &[w, hs], 1.0);
+        t.mat(&format!("{a}wk_dv.weight"), &[kw, hs], 1.0);
+        t.mat(&format!("{a}wv_dv.weight"), &[kw, hs], 1.0);
+        t.mat(&format!("{a}wr_du.weight"), &[nh * d_rel, hs], 1.0);
+        t.mat(&format!("{a}gate_attn.weight"), &[w, hs], 1.0);
+        t.mat(&format!("{a}attn_sink_proj.weight"), &[nh, hs], 0.5);
+        t.mat(&format!("{a}wo_ud.weight"), &[hs, w], 0.7);
         t.ones(&format!("{a}q_l2_clip.scale"), w);
-        t.ones(&format!("{a}rel_l2_clip.scale"), nh * D_REL);
-        let extent = if sliding(l) { WINDOW } else { EXTENT };
-        t.uni(&format!("{a}rel_logits_proj.proj"), &[D_REL, extent], 0.5, 0.0);
+        t.ones(&format!("{a}rel_l2_clip.scale"), nh * d_rel);
+        let extent = if sliding(l) { WINDOW } else { extent_full };
+        t.uni(&format!("{a}rel_logits_proj.proj"), &[d_rel, extent], 0.5, 0.0);
         for kv in ["k_sconv", "v_sconv"] {
             t.uni(&format!("{a}{kv}.weight"), &[kw, 1, KERNEL], 0.3, 0.0);
             if !sliding(l) {
-                t.mat(&format!("{a}{kv}.weight_proj"), &[nkv * KERNEL, H], 0.3);
+                t.mat(&format!("{a}{kv}.weight_proj"), &[nkv * KERNEL, hs], 0.3);
             }
         }
         let p = format!("layers.{l}.");
         if sliding(l) {
-            t.ones(&format!("{p}attn_norm.weight"), H);
+            t.ones(&format!("{p}attn_norm.weight"), hs);
         } else {
             for n in ["q_input_norm", "k_input_norm", "v_input_norm"] {
-                t.ones(&format!("{p}{n}.weight"), H);
+                t.ones(&format!("{p}{n}.weight"), hs);
             }
         }
         if l > 0 {
-            let shape: &[usize] = if sliding(l) { &[H] } else { &[3, H] };
+            let shape: &[usize] = if sliding(l) { &[hs] } else { &[3, hs] };
             t.uni(&format!("attn_res.attn_queries.{}", l - 1), shape, 1.0, 0.0);
         }
-        t.uni(&format!("attn_res.mlp_queries.{l}"), &[H], 1.0, 0.0);
-        t.ones(&format!("{p}mlp_norm.weight"), H);
-        t.uni(&format!("{p}attn_sconv.weight"), &[H, 1, KERNEL], 0.3, 0.0);
-        t.uni(&format!("{p}mlp_sconv.weight"), &[H, 1, KERNEL], 0.3, 0.0);
-        t.mat(&format!("{p}mlp.gate.weight"), &[EXPERTS, H], 1.0);
-        t.uni(&format!("{p}mlp.gate.bias"), &[EXPERTS], 0.1, 0.0);
-        t.mat(&format!("{p}mlp.experts.w13_weight"), &[EXPERTS, 2 * INTER, H], 1.0);
-        t.mat(&format!("{p}mlp.experts.w2_weight"), &[EXPERTS, H, INTER], 0.7);
+        t.uni(&format!("attn_res.mlp_queries.{l}"), &[hs], 1.0, 0.0);
+        t.ones(&format!("{p}mlp_norm.weight"), hs);
+        t.uni(&format!("{p}attn_sconv.weight"), &[hs, 1, KERNEL], 0.3, 0.0);
+        t.uni(&format!("{p}mlp_sconv.weight"), &[hs, 1, KERNEL], 0.3, 0.0);
+        t.mat(&format!("{p}mlp.gate.weight"), &[experts, hs], 1.0);
+        t.uni(&format!("{p}mlp.gate.bias"), &[experts], 0.1, 0.0);
+        t.mat(&format!("{p}mlp.experts.w13_weight"), &[experts, 2 * inter, hs], 1.0);
+        t.mat(&format!("{p}mlp.experts.w2_weight"), &[experts, hs, inter], 0.7);
         if (LOOP.0..LOOP.1).contains(&l) {
             for kind in ["attn", "k", "v", "mlp"] {
                 let c = format!("{p}controllers.{kind}.");
-                t.mat(&format!("{c}down_weight"), &[RANK, 2 * H], 1.0);
-                t.mat(&format!("{c}forget_weight"), &[H, RANK], 0.5);
-                t.mat(&format!("{c}gain_weight"), &[H, RANK], 0.5);
+                t.mat(&format!("{c}down_weight"), &[rank, 2 * hs], 1.0);
+                t.mat(&format!("{c}forget_weight"), &[hs, rank], 0.5);
+                t.mat(&format!("{c}gain_weight"), &[hs, rank], 0.5);
             }
-            t.uni(&format!("{p}loop_msg_query"), &[4, H], 1.0, 0.0);
+            t.uni(&format!("{p}loop_msg_query"), &[4, hs], 1.0, 0.0);
         }
     }
     if vision {
@@ -292,7 +334,7 @@ fn write_tiny_with(dir: &Path, seed: u64, vision: bool) -> Result<()> {
         t.raw(&format!("{l}ls_2.gamma"), &[vh], 0.1, 0.5);
         let m2 = merge * merge * vh;
         t.raw(&format!("{v}proj_in.weight"), &[proj, m2], (3.0 / m2 as f32).sqrt(), 0.0);
-        t.raw(&format!("{v}proj_out.weight"), &[H, proj], (3.0 / proj as f32).sqrt(), 0.0);
+        t.raw(&format!("{v}proj_out.weight"), &[hs, proj], (3.0 / proj as f32).sqrt(), 0.0);
     }
     t.write(&dir.join("model.safetensors"))
 }

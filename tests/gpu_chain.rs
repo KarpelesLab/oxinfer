@@ -435,3 +435,73 @@ fn qwen35_checkpoints_on_the_device() {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+/// Plain sampling chained on the device (`Inkling2Model::decode_sampled`, `ink_samp`: a
+/// temperature draw over the whole vocabulary in token order from a uniform the host draws per
+/// pass) against one-token host steps with the host's `Sampler::sample` on a tiny Inkling-2:
+/// the same tokens, the sampler's generator left where the host's is, the session after a
+/// stop the host's logits (to the rounding of the chain's embedding norm).
+#[test]
+fn inkling_sampled_chain_matches_host_steps() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+    use oxinfer::inkling::{Inkling2Config, Inkling2Model};
+    use oxinfer::sampler::Sampler;
+    let plat = oxinfer::platform::detect();
+    let Ok(Some(_)) = oxinfer::gpu::init(&plat, oxinfer::platform::DevicePref::Auto) else {
+        eprintln!("no GPU: skipped");
+        return;
+    };
+    oxinfer::gpu::set_decode_chain(Some(true));
+    let dir = std::env::temp_dir().join(format!("oxinfer-gpu-chain-inkling-{}", std::process::id()));
+    oxinfer::inkling::tiny::write_tiny_metal(&dir, 4).unwrap();
+    let files = ModelFiles::open(&dir, true).unwrap();
+    let m = Inkling2Model::load(Inkling2Config::load(&dir).unwrap(), &files, Quant::Bf16).unwrap();
+    let prompt: Vec<u32> = (0..13u32).map(|i| (i * 29 + 3) % 250).collect();
+    let mut base = m.new_session();
+    let l0 = m.forward(&mut base, &prompt);
+    let n = 24;
+    for temp in [0.7f32, 1.0, 1.6] {
+        let mut hs = Sampler::new(temp, 0, 1.0, 9);
+        let first = hs.sample(&l0);
+        let mut host = base.clone();
+        let (mut toks, mut after) = (vec![first], Vec::new());
+        for i in 0..=n {
+            let l = m.forward(&mut host, &[toks[i]]);
+            toks.push(hs.sample(&l));
+            after.push(l);
+        }
+        let distinct = toks.iter().collect::<std::collections::BTreeSet<_>>().len();
+        assert!(distinct > 3, "degenerate reference ({distinct} distinct tokens)");
+        for stop_at in [n, 9, 1] {
+            let mut ds = Sampler::new(temp, 0, 1.0, 9);
+            assert_eq!(ds.sample(&l0), first);
+            let mut sess = base.clone();
+            let got = std::cell::RefCell::new(Vec::new());
+            let mut on = |t: u32| {
+                got.borrow_mut().push(t);
+                if got.borrow().len() == stop_at { Chain::Stop } else { Chain::Go }
+            };
+            let Some(kept) = oxinfer::generate::decode_chain(&m, &mut sess, &mut ds, first, n, &mut on, &|| got.borrow().len()) else {
+                if m.decode_greedy(&mut base.clone(), first, 2, &mut |_| Chain::Go).is_none() {
+                    eprintln!("no Inkling-2 chain on this device: skipped");
+                    std::fs::remove_dir_all(&dir).unwrap();
+                    return;
+                }
+                panic!("greedy chains but sampling does not");
+            };
+            let got = got.into_inner();
+            assert_eq!(kept, stop_at, "temp {temp}: passes kept");
+            assert_eq!(got[..], toks[1..=kept], "temp {temp}, stop at {stop_at}: tokens");
+            // The generator where the host's is after as many draws.
+            let mut hr = Sampler::new(temp, 0, 1.0, 9);
+            hr.set_state(hr.state(), kept + 1);
+            assert_eq!(ds.state(), hr.state(), "temp {temp}: generator state");
+            // (The chain norms its embedding rows on the device, in another order than the
+            // host: the logits agree to rounding.)
+            let l = m.forward(&mut sess, &[got[kept - 1]]);
+            let d = l.iter().zip(&after[kept]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(d < 1e-3, "temp {temp}: logits after {kept} passes differ by {d}");
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -72,6 +72,48 @@ pub trait TextLm {
     fn decode_greedy(&self, _sess: &mut Self::Sess, _first: u32, _max: usize, _on: &mut dyn FnMut(u32) -> Chain) -> Option<usize> {
         None
     }
+    /// [`TextLm::decode_greedy`] for a plain temperature draw over the whole vocabulary
+    /// ([`Sampler::plain_sampled`]): each pass's token drawn on the device as
+    /// [`crate::sampler::sample_full`] draws it, from the uniform `draw` returns when the pass is
+    /// queued (one a pass, in order; a pass queued past the last kept one draws too).
+    fn decode_sampled(
+        &self,
+        _sess: &mut Self::Sess,
+        _first: u32,
+        _max: usize,
+        _temperature: f32,
+        _draw: &mut dyn FnMut() -> f32,
+        _on: &mut dyn FnMut(u32) -> Chain,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+/// Chained device passes for `sampler` ([`TextLm::decode_greedy`], or
+/// [`TextLm::decode_sampled`] with uniforms from the sampler's generator); `used` says, after
+/// the chain, how many of its tokens were taken: the generator is left as if it had drawn for
+/// those only, as one-token steps would have. None (nothing run) when the model does not chain
+/// for this sampler.
+pub fn decode_chain<M: TextLm + ?Sized>(
+    model: &M,
+    sess: &mut M::Sess,
+    sampler: &mut Sampler,
+    first: u32,
+    max: usize,
+    on: &mut dyn FnMut(u32) -> Chain,
+    used: &dyn Fn() -> usize,
+) -> Option<usize> {
+    if sampler.plain_greedy() {
+        return model.decode_greedy(sess, first, max, on);
+    }
+    if !sampler.plain_sampled() {
+        return None;
+    }
+    let st = sampler.state();
+    let temp = sampler.temperature;
+    let n = model.decode_sampled(sess, first, max, temp, &mut || sampler.uniform(), on);
+    sampler.set_state(st, if n.is_some() { used() } else { 0 });
+    n
 }
 
 /// What a chain of greedy passes on the device does after a pass's token ([`TextLm::decode_greedy`]).
@@ -319,8 +361,11 @@ pub fn decode<M: TextLm + ?Sized>(
             unfed = Some(id);
             break;
         }
-        // Greedy decoding the device chains (the rest of the reply in one call).
-        if sampler.plain_greedy() {
+        // Greedy decoding (or plain sampling) the device chains (the rest of the reply in one
+        // call).
+        if sampler.plain_greedy() || sampler.plain_sampled() {
+            let n0 = out.len();
+            let taken = std::cell::Cell::new(0usize);
             let mut stopped = None;
             let mut on = |t: u32| -> Chain {
                 if out.len() >= max_tokens {
@@ -328,6 +373,7 @@ pub fn decode<M: TextLm + ?Sized>(
                     return Chain::Stop;
                 }
                 out.push(t);
+                taken.set(out.len() - n0);
                 if stop.contains(&t) {
                     stopped = Some((StopReason::Stop, None));
                 } else if on_token(&out) == Flow::Stop {
@@ -335,7 +381,7 @@ pub fn decode<M: TextLm + ?Sized>(
                 }
                 if stopped.is_none() { Chain::Go } else { Chain::Stop }
             };
-            if let Some(n) = model.decode_greedy(sess, id, max_tokens - i, &mut on) {
+            if let Some(n) = decode_chain(model, sess, sampler, id, max_tokens - i, &mut on, &|| taken.get()) {
                 forwards += n;
                 if let Some((r, u)) = stopped {
                     (reason, unfed) = (r, u);

@@ -662,8 +662,16 @@ struct CapP {
     out: u32,
     cap: f32,
     am: u32,
-    _p1: u32,
+    inv_t: f32,
     _p2: u32,
+}
+/// What the last pass of a chain picks into the token slot `tok` ([`InkMetal::enc_final`]): the
+/// argmax of the capped logits, or with `samp` = (1 / temperature, uniform slot) a draw
+/// (`ink_samp`).
+#[derive(Clone, Copy)]
+struct Pick {
+    tok: usize,
+    samp: Option<(f32, usize)>,
 }
 /// An expert's projection in the address tables (`IXT`).
 #[repr(C)]
@@ -916,6 +924,8 @@ struct Bufs {
     /// Greedy decoding on the device: the argmax's partials, two token slots.
     amp: usize,
     tok: usize,
+    /// Sampling on the device: a uniform per token slot.
+    uni: usize,
     /// LoRA scratch (the down halves' outputs) and the largest rank.
     lu: usize,
     lora_r: usize,
@@ -988,6 +998,7 @@ struct Pipes {
     mvf: Id,
     softcap: Id,
     amax: Id,
+    samp: Id,
     xgroup: Id,
     xcombine: Id,
     gmix_norm: Id,
@@ -2141,6 +2152,7 @@ impl InkMetal {
                 cap: take(t * nf * h),
                 amp: take(2 * c.unpadded_vocab_size.div_ceil(256)),
                 tok: take(2),
+                uni: take(2),
                 lu: take((t * topk + 15 * ne + 128) * lora_r),
                 grp: take(1 + 3 * MAX_T * topk),
                 asg: take(MAX_T * topk),
@@ -2299,6 +2311,7 @@ impl InkMetal {
             mvf: pipe("ink_mvf")?,
             softcap: pipe("ink_softcap")?,
             amax: pipe("ink_amax")?,
+            samp: pipe("ink_samp")?,
             xgroup: pipe("ink_xgroup")?,
             mix8: pipe("ink_mix8")?,
             mix5: pipe("ink_mix5")?,
@@ -3032,7 +3045,7 @@ impl InkMetal {
 
     /// The final mix, and the LM head with its cap over the last `head_rows` tokens; with `amax`
     /// (one row), the argmax of the capped logits into the token slot there.
-    fn enc_final(&self, e: &Pe, c: &Cx, t: usize, capture: &[usize], head_rows: usize, amax: Option<usize>) {
+    fn enc_final(&self, e: &Pe, c: &Cx, t: usize, capture: &[usize], head_rows: usize, amax: Option<Pick>) {
         let (h, b) = (self.h, c.b);
         if self.capture(e, c, self.plan.len(), t, capture) {
             e.barrier();
@@ -3071,17 +3084,38 @@ impl InkMetal {
                 out: b.capped as u32,
                 cap: self.caps.2,
                 am: amax.map_or(0, |_| b.amp as u32),
+                inv_t: amax.and_then(|a| a.samp).map_or(0.0, |s| s.0),
                 ..Default::default()
             };
             e.pipe(self.p.softcap);
             e.buf(c.a, 0, 0);
             e.bytes(&p, 1);
             e.dispatch((self.unpadded.div_ceil(256), head_rows), 256);
-            if let Some(tok) = amax {
+            if let Some(pk) = amax {
                 e.barrier();
-                e.pipe(self.p.amax);
-                e.buf(c.a, 0, 0);
-                e.bytes(&[self.unpadded.div_ceil(256) as u32, b.amp as u32, tok as u32, 0], 1);
+                let n = self.unpadded.div_ceil(256) as u32;
+                match pk.samp {
+                    None => {
+                        e.pipe(self.p.amax);
+                        e.buf(c.a, 0, 0);
+                        e.bytes(&[n, b.amp as u32, pk.tok as u32, 0], 1);
+                    }
+                    Some((inv_t, uni)) => {
+                        e.pipe(self.p.samp);
+                        e.buf(c.a, 0, 0);
+                        let p = [
+                            n,
+                            b.amp as u32,
+                            pk.tok as u32,
+                            uni as u32,
+                            b.capped as u32,
+                            self.unpadded as u32,
+                            inv_t.to_bits(),
+                            0,
+                        ];
+                        e.bytes(&p, 1);
+                    }
+                }
                 e.dispatch((1, 1), 1024);
             }
         }
@@ -4583,7 +4617,25 @@ impl DevEngine for InkMetal {
         max: usize,
         on: &mut dyn FnMut(u32) -> Chain,
     ) -> Option<(usize, usize)> {
-        self.greedy_impl(m, sess, first, max, &[], None, on)
+        self.greedy_impl(m, sess, first, max, &[], None, None, on)
+    }
+
+    fn sampled(
+        &self,
+        m: &Inkling2Model,
+        sess: &mut Inkling2Session,
+        first: u32,
+        max: usize,
+        capture: &[usize],
+        feats: Option<&mut Vec<f32>>,
+        temperature: f32,
+        draw: &mut dyn FnMut() -> f32,
+        on: &mut dyn FnMut(u32) -> Chain,
+    ) -> Option<(usize, usize)> {
+        if temperature.is_nan() || temperature <= 0.0 || self.unpadded.div_ceil(256) > 1024 {
+            return None;
+        }
+        self.greedy_impl(m, sess, first, max, capture, feats, Some((1.0 / temperature, draw)), on)
     }
 
     fn greedy_capture(
@@ -4596,7 +4648,7 @@ impl DevEngine for InkMetal {
         feats: &mut Vec<f32>,
         on: &mut dyn FnMut(u32) -> Chain,
     ) -> Option<(usize, usize)> {
-        self.greedy_impl(m, sess, first, max, capture, Some(feats), on)
+        self.greedy_impl(m, sess, first, max, capture, Some(feats), None, on)
     }
 
     fn run(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize, mut want: DevWant) -> bool {
@@ -4713,6 +4765,7 @@ impl InkMetal {
         max: usize,
         capture: &[usize],
         mut feats: Option<&mut Vec<f32>>,
+        mut samp: Option<(f32, &mut dyn FnMut() -> f32)>,
         on: &mut dyn FnMut(u32) -> Chain,
     ) -> Option<(usize, usize)> {
         let em = self.emb.as_ref()?;
@@ -4767,11 +4820,19 @@ impl InkMetal {
             cap: self.dec.b.cap + (k % 2) * nf * h,
             ..self.dec.b.clone()
         };
-        let submit = |k: usize, dev: &InkDev| -> Vec<Id> {
+        let inv_t = samp.as_ref().map(|s| s.0);
+        // Pass k's uniform (sampling) is written to its slot before it is committed (the pass
+        // before on that slot has completed).
+        let submit = |k: usize, dev: &InkDev, u: f32| -> Vec<Id> {
             let pos = pos0 + k;
             let bk = slot_bufs(k);
             let c = Cx { a: c.a, b: &bk };
+            let pick = Pick {
+                tok: c.b.tok + k % 2,
+                samp: inv_t.map(|t| (t, c.b.uni + k % 2)),
+            };
             unsafe {
+                *(self.f.contents(c.a) as *mut f32).add(c.b.uni + k % 2) = u;
                 let pool = (be.sels.pool_push)();
                 let mut cbs = Vec::with_capacity(parts.len());
                 for r in &parts {
@@ -4785,7 +4846,7 @@ impl InkMetal {
                             e.barrier();
                         }
                         if si == self.plan.len() {
-                            self.enc_final(e, &c, 1, capture, 1, Some(c.b.tok + k % 2));
+                            self.enc_final(e, &c, 1, capture, 1, Some(pick));
                             for (j, _) in capture.iter().enumerate().filter(|x| *x.1 == fin) {
                                 e.barrier();
                                 self.copy(e, &c, c.b.hidden, c.b.cap + j * h, h, nf * h, 1);
@@ -4806,7 +4867,8 @@ impl InkMetal {
         // One pass ahead: pass k + 1 runs while the host takes pass k's token.
         let mut q: std::collections::VecDeque<(usize, Vec<Id>)> = std::collections::VecDeque::new();
         let (mut sub, mut kept, mut stopped, mut last, mut ok) = (0usize, 0usize, false, false, true);
-        let push = |q: &mut std::collections::VecDeque<(usize, Vec<Id>)>, k: usize, dev: &mut InkDev, ok: &mut bool| {
+        let mut uniform = || samp.as_mut().map_or(0.0, |s| (s.1)());
+        let push = |q: &mut std::collections::VecDeque<(usize, Vec<Id>)>, k: usize, dev: &mut InkDev, ok: &mut bool, u: f32| {
             if dev.slots.iter().any(|s| s.ring == 0 && s.rows < pos0 + k + 1) {
                 // (Growing a cache copies it: the passes in flight finish first.)
                 for (_, cbs) in q.iter() {
@@ -4814,10 +4876,10 @@ impl InkMetal {
                 }
                 *ok &= dev.reserve(pos0 + k + 1);
             }
-            q.push_back((k, submit(k, dev)));
+            q.push_back((k, submit(k, dev, u)));
         };
         while sub < max.min(2) {
-            push(&mut q, sub, dev, &mut ok);
+            push(&mut q, sub, dev, &mut ok, uniform());
             sub += 1;
         }
         while let Some((k, cbs)) = q.pop_front() {
@@ -4834,7 +4896,7 @@ impl InkMetal {
             }
             match on(unsafe { *slot(k % 2) }) {
                 Chain::Go if !last && sub < max => {
-                    push(&mut q, sub, dev, &mut ok);
+                    push(&mut q, sub, dev, &mut ok, uniform());
                     sub += 1;
                 }
                 Chain::Go => {}

@@ -43,9 +43,9 @@ use crate::generate::TextLm;
 use crate::gguf::{Header, Value};
 use crate::kernels::*;
 use crate::model::{LayerCache, Lin, Quant, Table, linear, linear_multi, linear_rows_device, load_lin};
-use crate::qwen_mtp::{MtpStats, speculative_accept};
+use crate::qwen_mtp::{MtpStats, speculative_accept_dist};
 use crate::safetensors::ModelFiles;
-use crate::sampler::Sampler;
+use crate::sampler::{Dist, Sampler};
 use anyhow::{Context, Result, bail};
 use serde_json::Value as Json;
 use std::path::{Path, PathBuf};
@@ -112,6 +112,22 @@ pub trait Target: TextLm {
         _max: usize,
         _layers: &[usize],
         _feats: &mut Vec<f32>,
+        _on: &mut dyn FnMut(u32) -> crate::generate::Chain,
+    ) -> Option<usize> {
+        None
+    }
+    /// [`Target::decode_greedy_feats`] for a plain temperature draw over the whole vocabulary
+    /// ([`TextLm::decode_sampled`]: `draw` gives each queued pass's uniform).
+    #[allow(clippy::too_many_arguments)]
+    fn decode_sampled_feats(
+        &self,
+        _sess: &mut Self::Sess,
+        _first: u32,
+        _max: usize,
+        _layers: &[usize],
+        _feats: &mut Vec<f32>,
+        _temperature: f32,
+        _draw: &mut dyn FnMut() -> f32,
         _on: &mut dyn FnMut(u32) -> crate::generate::Chain,
     ) -> Option<usize> {
         None
@@ -2263,8 +2279,8 @@ impl<'a> Dspark<'a> {
             if conf.is_some_and(|c| c < conf_min) {
                 return None;
             }
-            let q = sampler.draft_distribution(logits);
-            let d = if sampler.greedy() { q[0].0 } else { sampler.sample_from(&q) };
+            let q = sampler.dist_of(logits, true);
+            let d = if sampler.greedy() { q.first() } else { sampler.sample_dist(&q) };
             let pd = softmax_at(logits, d);
             if pd < p_min {
                 return None;
@@ -3008,7 +3024,7 @@ pub struct Proposal {
     pub tokens: Vec<u32>,
     /// The distribution each draft was drawn from (the sampler's temperature / top-k / top-p
     /// over the draft logits; one token with probability 1 when greedy).
-    pub dists: Vec<Vec<(u32, f32)>>,
+    pub dists: Vec<Dist>,
     /// Each draft's probability under the draft's own softmax (temperature 1).
     pub probs: Vec<f32>,
     /// Each draft's confidence-head estimate (NaN without one).
@@ -3556,7 +3572,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         let mut catch_up = (0usize, 0.0f64);
         let mut prop = if let Some((tokens, _)) = looked {
             Proposal {
-                dists: tokens.iter().map(|&t| vec![(t, 1.0)]).collect(),
+                dists: tokens.iter().map(|&t| Dist::point(t)).collect(),
                 tokens,
                 ..Proposal::default()
             }
@@ -3602,8 +3618,8 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         let mut out = Vec::with_capacity(kd + 1);
         let mut accepted = 0;
         for (j, (&d, q)) in drafts.iter().zip(qs).enumerate() {
-            let p = sampler.distribution(&logits[j * v..(j + 1) * v]);
-            match speculative_accept(sampler, &p, q, d) {
+            let p = sampler.dist_of(&logits[j * v..(j + 1) * v], false);
+            match speculative_accept_dist(sampler, &p, q, d) {
                 None => {
                     sampler.commit(d);
                     out.push(d);
@@ -3934,7 +3950,7 @@ where
         let next = self.next?;
         if self.k_cur != 0
             || !self.opts.cost_aware
-            || !sampler.plain_greedy()
+            || !(sampler.plain_greedy() || sampler.plain_sampled())
             || max_new < 2
             || sweep()
             || *OFF.get_or_init(|| std::env::var_os("OXINFER_DSPARK_CHAIN").is_some_and(|v| v == "0"))
@@ -3955,6 +3971,7 @@ where
         let mut out: Vec<u32> = Vec::new();
         let mut feats = Vec::new();
         let mut last = t0;
+        let taken = std::cell::Cell::new(0usize);
         let mut on = |t: u32| -> crate::generate::Chain {
             use crate::generate::Chain;
             let now = crate::clock::Instant::now();
@@ -3962,6 +3979,7 @@ where
             last = now;
             adapt.record_plain(dt);
             out.push(t);
+            taken.set(out.len());
             if let Some(lk) = lookup.as_mut() {
                 lk.policy.record_time(0, dt);
                 lk.extend(&[t]);
@@ -3981,7 +3999,16 @@ where
             }
             Chain::Go
         };
-        let kept = model.decode_greedy_feats(sess, next, max_new, &self.draft.cfg.target_layers, &mut feats, &mut on)?;
+        let layers = &self.draft.cfg.target_layers;
+        let kept = if sampler.plain_greedy() {
+            model.decode_greedy_feats(sess, next, max_new, layers, &mut feats, &mut on)?
+        } else {
+            // (The generator left as if it had drawn for the tokens taken only.)
+            let (st, temp) = (sampler.state(), sampler.temperature);
+            let kept = model.decode_sampled_feats(sess, next, max_new, layers, &mut feats, temp, &mut || sampler.uniform(), &mut on);
+            sampler.set_state(st, if kept.is_some() { taken.get() } else { 0 });
+            kept?
+        };
         let secs = t0.elapsed().as_secs_f64();
         self.pending.0.extend_from_slice(&feats);
         self.pending.1 += kept;
