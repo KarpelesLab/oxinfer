@@ -537,6 +537,39 @@ pub fn set_kv_half(on: Option<bool>) {
     );
 }
 
+/// Copies the routed experts of quantized GGUF checkpoints into a tiled layout for the prefill
+/// GEMMs (Metal: each band of 64 rows stored block column by block column, so that a grouped
+/// GEMM tile reads each K step's weights as one run of memory; the same values, so the same
+/// results). The copies are made when a model builds its prefill plans, once per model (forced
+/// on, also by the per-layer MoE uploads of models without prefill plans), and take as much
+/// memory as the experts again (decoding keeps reading the checkpoint's layout).
+/// `Some(true)`: always (also on GPUs without matrix units); `Some(false)`: never; None (the
+/// default, or `OXINFER_GPU_EXPERT_TILES=0|1`): on GPUs with matrix units, while the copies stay
+/// within a quarter of the machine's memory, and not where the OS limits an app's memory (iOS).
+/// Process-wide, read when a model builds its plans.
+pub fn set_expert_tiles(on: Option<bool>) {
+    EXPERT_TILES.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// See [`set_expert_tiles`] (None: automatic).
+pub fn expert_tiles() -> Option<bool> {
+    match EXPERT_TILES.load(Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        // (Read as each model builds its plans, so that `pf_ab` can compare.)
+        _ => std::env::var("OXINFER_GPU_EXPERT_TILES").ok().map(|v| v != "0"),
+    }
+}
+
+static EXPERT_TILES: AtomicU8 = AtomicU8::new(0);
+
 /// See [`set_kv_half`].
 pub fn kv_half_enabled() -> bool {
     static ENV: OnceLock<Option<String>> = OnceLock::new();

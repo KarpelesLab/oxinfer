@@ -267,6 +267,15 @@ pub struct EngineOptions {
     /// Process-wide, applied on load (read as a model builds its plans); None leaves the current
     /// setting ([`crate::gpu::set_kv_half`]). Key `gpu_kv` (`f16`, `f32` or `auto`).
     pub gpu_kv: Option<bool>,
+    /// Tiled copies of a GGUF checkpoint's routed experts for the GPU prefill GEMMs (Metal: each
+    /// band of 64 rows stored block column by block column, so that each K step of a grouped GEMM
+    /// tile reads one run of memory; the same results, 3-7% faster MoE prefill passes on an M5 Max, for
+    /// as much memory again as the experts take). `Some(true)`: always; `Some(false)`: never.
+    /// Process-wide, applied on load (read as a model builds its prefill plans); None leaves the
+    /// current setting (default automatic: on GPUs with matrix units, while the copies stay within
+    /// a quarter of the machine's memory; [`crate::gpu::set_expert_tiles`]). Key
+    /// `gpu_expert_tiles` (`1`, `0` or `auto`).
+    pub gpu_expert_tiles: Option<bool>,
     /// Streamed models (see [`EngineOptions::stream`]) decode on the GPU too: the resident layers
     /// stay wrapped, the others are wrapped per pass as they arrive and released after (Metal;
     /// Qwen3.5 / 3.8 dense and MoE, Gemma 4 / Gemma 3 dense and 26B-A4B; DeepSeek V4.1 as one
@@ -525,6 +534,7 @@ impl Default for EngineOptions {
             gpu_decode: None,
             gpu_chain: None,
             gpu_kv: None,
+            gpu_expert_tiles: None,
             stream_gpu: None,
             stream_predict: None,
             decision_from: None,
@@ -617,6 +627,7 @@ impl EngineOptions {
         "gpu_decode",
         "gpu_chain",
         "gpu_kv",
+        "gpu_expert_tiles",
         "stream_gpu",
         "stream_predict",
         "decision_from",
@@ -766,6 +777,12 @@ impl EngineOptions {
                     "f32" => Some(false),
                     "" | "auto" => None,
                     v => bail!("gpu_kv: expected f16, f32 or auto, got {v:?}"),
+                }
+            }
+            "gpu_expert_tiles" => {
+                self.gpu_expert_tiles = match value.trim() {
+                    "" | "auto" => None,
+                    v => Some(parse_bool(key, v)?),
                 }
             }
             "stream_predict" => {
@@ -1792,6 +1809,9 @@ impl Engine {
         }
         if let Some(on) = opts.gpu_kv {
             crate::gpu::set_kv_half(Some(on));
+        }
+        if let Some(on) = opts.gpu_expert_tiles {
+            crate::gpu::set_expert_tiles(Some(on));
         }
         if let Some(on) = opts.stream_gpu {
             crate::gpu::set_stream_decode(Some(on));
@@ -4558,6 +4578,11 @@ mod tests {
         assert_eq!(o.gpu_kv, Some(false));
         o.set("gpu_kv", "auto").unwrap();
         assert_eq!(o.gpu_kv, None);
+        o.set("gpu_expert_tiles", "0").unwrap();
+        assert_eq!(o.gpu_expert_tiles, Some(false));
+        o.set("gpu_expert_tiles", "auto").unwrap();
+        assert_eq!(o.gpu_expert_tiles, None);
+        assert!(o.set("gpu_expert_tiles", "x").is_err());
         assert!(o.set("gpu_kv", "q8").is_err());
         for u in [CoreMlUnits::Ane, CoreMlUnits::All, CoreMlUnits::Gpu, CoreMlUnits::Cpu] {
             assert_eq!(CoreMlUnits::parse(u.as_str()), Some(u));

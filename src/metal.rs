@@ -552,13 +552,33 @@ kernel void flash_attn128(device const float* q [[buffer(0)]], device const floa
 const GGUF_SHADER_SRC: &str = r#"
 struct GgW { device const uchar* q; uint rb; };
 #define MK_GG(T) T{ { (device const uchar*)qb + p.w_off, p.s_off } }
+// Block `b` (of `bs` bytes) of row `row`: rows of `rb` bytes one after another, or, with rb's top
+// bit set (routed experts copied for the grouped GEMMs, `MetalBackend::tiled_experts`), each band
+// of 64 rows stored block column by block column (block b of row r at block ((r / 64) * nb + b) *
+// 64 + r % 64 of the matrix, nb blocks a row), so that a grouped tile's K step reads one run of
+// memory rather than 64 pieces 64 rows apart.
+#define GG_TILED 0x80000000u
+inline device const uchar* gblk(GgW w, uint row, uint b, uint bs) {
+    uint rb = w.rb & ~GG_TILED;
+    if (w.rb & GG_TILED) return w.q + (ulong)(row & ~63u) * rb + (ulong)b * (64 * bs) + (row & 63u) * bs;
+    return w.q + (ulong)row * rb + (ulong)b * bs;
+}
+// Tiled Q4_K, Q5_K and Q6_K go further: each band's column of 64 super-blocks of `tsz` bytes is
+// stored part by part (what every 32-block of a super-block reads, then the parts later K steps
+// read: see `kquant_parts`), the 64 rows' copies of a part one after another, so that a K step
+// reads the parts it needs as runs. The part of `len` bytes that starts `off` bytes into a
+// super-block (after the parts before it) of row `row`, super-block `b / 8`.
+inline device const uchar* kpart(GgW w, uint row, uint b, uint tsz, uint off, uint len) {
+    uint rb = w.rb & ~GG_TILED;
+    return w.q + (ulong)(row & ~63u) * rb + (ulong)(b / 8) * (64 * tsz) + 64 * off + (row & 63u) * len;
+}
 inline float h2f(device const uchar* p) { return float(as_type<half>(ushort(ushort(p[0]) | (ushort(p[1]) << 8)))); }
 inline uint rd16(device const uchar* p) { return uint(p[0]) | (uint(p[1]) << 8); }
 inline uint rd32(device const uchar* p) { return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24); }
 inline uchar4 ld4(device const uchar* p) { return uchar4(*(device const packed_uchar4*)p); }
 inline float4 f4(uchar4 v) { return float4(v); }
 inline float4 f4(char4 v) { return float4(v); }
-inline device const uchar* sblk(GgW w, uint row, uint b, uint tsz) { return w.q + (ulong)row * w.rb + (ulong)(b / 8) * tsz; }
+inline device const uchar* sblk(GgW w, uint row, uint b, uint tsz) { return gblk(w, row, b / 8, tsz); }
 // 8 values of an i-quant grid entry (bytes, lowest first) with sign bits `s` (bit j: value j negative).
 inline void grid8(ulong g, uint s, float db, thread float4* o) {
     float v[8];
@@ -572,7 +592,7 @@ inline uint ksign(uint i) { return i | ((popcount(i) & 1) << 7); }
 
 struct Q4_0W { GgW g; };
 inline void load(Q4_0W w, uint row, uint b, thread float4* out) {
-    device const uchar* B = w.g.q + (ulong)row * w.g.rb + b * 18;
+    device const uchar* B = gblk(w.g, row, b, 18);
     float d = h2f(B);
     for (uint i = 0; i < 4; i++) {
         uchar4 v = ld4(B + 2 + 4 * i);
@@ -583,7 +603,7 @@ inline void load(Q4_0W w, uint row, uint b, thread float4* out) {
 struct IQ4_NLW { GgW g; };
 inline float4 kv4(uchar4 v) { return float4(kvalues_iq4nl[v.x], kvalues_iq4nl[v.y], kvalues_iq4nl[v.z], kvalues_iq4nl[v.w]); }
 inline void load(IQ4_NLW w, uint row, uint b, thread float4* out) {
-    device const uchar* B = w.g.q + (ulong)row * w.g.rb + b * 18;
+    device const uchar* B = gblk(w.g, row, b, 18);
     float d = h2f(B);
     for (uint i = 0; i < 4; i++) {
         uchar4 v = ld4(B + 2 + 4 * i);
@@ -594,7 +614,7 @@ inline void load(IQ4_NLW w, uint row, uint b, thread float4* out) {
 struct MXFP4W { GgW g; };
 inline float4 kvm4(uchar4 v) { return float4(kvalues_mxfp4[v.x], kvalues_mxfp4[v.y], kvalues_mxfp4[v.z], kvalues_mxfp4[v.w]); }
 inline void load(MXFP4W w, uint row, uint b, thread float4* out) {
-    device const uchar* B = w.g.q + (ulong)row * w.g.rb + b * 17;
+    device const uchar* B = gblk(w.g, row, b, 17);
     uint e = B[0];
     float d = e < 2 ? as_type<float>(0x00200000u << e) : as_type<float>((e - 1) << 23);
     for (uint i = 0; i < 4; i++) {
@@ -605,7 +625,7 @@ inline void load(MXFP4W w, uint row, uint b, thread float4* out) {
 }
 struct Q8_0W { GgW g; };
 inline void load(Q8_0W w, uint row, uint b, thread float4* out) {
-    device const uchar* B = w.g.q + (ulong)row * w.g.rb + b * 34;
+    device const uchar* B = gblk(w.g, row, b, 34);
     float d = h2f(B);
     for (uint i = 0; i < 8; i++) out[i] = f4(as_type<char4>(ld4(B + 2 + 4 * i))) * d;
 }
@@ -629,13 +649,15 @@ inline void scale_min_w(uint j, uint s0, uint s1, uint s2, thread float& sc, thr
 }
 struct Q4_KW { GgW g; };
 inline void load(Q4_KW w, uint row, uint b, thread float4* out) {
-    device const uint* B = (device const uint*)sblk(w.g, row, b, 144);
     uint j = b % 8;
+    // Tiled: the 16 bytes of scales, then each pair of 32-blocks' 32 quant bytes.
+    bool t = w.g.rb & GG_TILED;
+    device const uint* B = (device const uint*)(t ? kpart(w.g, row, b, 144, 0, 16) : sblk(w.g, row, b, 144));
+    device const uint2* q = (device const uint2*)(t ? kpart(w.g, row, b, 144, 16 + 32 * (j / 2), 32) : (device const uchar*)(B + 4 + 8 * (j / 2)));
     half2 dm = as_type<half2>(B[0]);
     float sc, mn;
     scale_min_w(j, B[1], B[2], B[3], sc, mn);
     float d1 = float(dm.x) * sc, m1 = float(dm.y) * mn;
-    device const uint2* q = (device const uint2*)(B + 4 + 8 * (j / 2));
     uint sh = 4 * (j % 2);
     for (uint i = 0; i < 4; i++) {
         uint2 u = q[i];
@@ -646,14 +668,16 @@ inline void load(Q4_KW w, uint row, uint b, thread float4* out) {
 // Q5_K: as words too (176-byte blocks).
 struct Q5_KW { GgW g; };
 inline void load(Q5_KW w, uint row, uint b, thread float4* out) {
-    device const uint* B = (device const uint*)sblk(w.g, row, b, 176);
     uint j = b % 8;
+    // Tiled: the 48 bytes of scales and high bits, then each pair of 32-blocks' quant bytes.
+    bool t = w.g.rb & GG_TILED;
+    device const uint* B = (device const uint*)(t ? kpart(w.g, row, b, 176, 0, 48) : sblk(w.g, row, b, 176));
+    device const uint2* q = (device const uint2*)(t ? kpart(w.g, row, b, 176, 48 + 32 * (j / 2), 32) : (device const uchar*)(B + 12 + 8 * (j / 2)));
     half2 dm = as_type<half2>(B[0]);
     float sc, mn;
     scale_min_w(j, B[1], B[2], B[3], sc, mn);
     float d1 = float(dm.x) * sc, m1 = float(dm.y) * mn;
     device const uint2* qh = (device const uint2*)(B + 4);
-    device const uint2* q = (device const uint2*)(B + 12 + 8 * (j / 2));
     uint sh = 4 * (j % 2);
     for (uint i = 0; i < 4; i++) {
         uint2 u = q[i], h = qh[i];
@@ -666,12 +690,24 @@ inline void load(Q5_KW w, uint row, uint b, thread float4* out) {
 // byte reads made Q6_K the slowest of the matrix-unit GEMMs, 15-25% behind these).
 struct Q6_KW { GgW g; };
 inline void load(Q6_KW w, uint row, uint b, thread float4* out) {
-    device const uchar* B = sblk(w.g, row, b, 210);
     uint j = b % 8, n = j / 4, jj = j % 4;
-    device const ushort* ql = (device const ushort*)(B + 64 * n + 32 * (jj & 1));
-    device const ushort* qh = (device const ushort*)(B + 128 + 32 * n);
-    uint scs = *(device const ushort*)(B + 192 + 8 * n + 2 * jj);
-    float d = float(as_type<half>(*(device const ushort*)(B + 208)));
+    // Tiled: the 16 scales and d (18 bytes), then each half's 64 low and 32 high quant bytes.
+    device const uchar *ql8, *qh8, *sc8;
+    if (w.g.rb & GG_TILED) {
+        sc8 = kpart(w.g, row, b, 210, 0, 18);
+        device const uchar* P = kpart(w.g, row, b, 210, 18 + 96 * n, 96);
+        ql8 = P;
+        qh8 = P + 64;
+    } else {
+        device const uchar* B = sblk(w.g, row, b, 210);
+        ql8 = B + 64 * n;
+        qh8 = B + 128 + 32 * n;
+        sc8 = B + 192;
+    }
+    device const ushort* ql = (device const ushort*)(ql8 + 32 * (jj & 1));
+    device const ushort* qh = (device const ushort*)qh8;
+    uint scs = *(device const ushort*)(sc8 + 8 * n + 2 * jj);
+    float d = float(as_type<half>(*(device const ushort*)(sc8 + 16)));
     float dl0 = d * float(as_type<char>(uchar(scs & 255))), dl1 = d * float(as_type<char>(uchar(scs >> 8)));
     uint lsh = 4 * (jj >> 1), hsh = 2 * jj;
     for (uint i = 0; i < 8; i++) {
@@ -827,14 +863,14 @@ inline void load_q45(device const uchar* B, bool MIN, bool HB, thread float4* ou
     }
 }
 struct Q4_1W { GgW g; };
-inline void load(Q4_1W w, uint row, uint b, thread float4* out) { load_q45(w.g.q + (ulong)row * w.g.rb + b * 20, true, false, out); }
+inline void load(Q4_1W w, uint row, uint b, thread float4* out) { load_q45(gblk(w.g, row, b, 20), true, false, out); }
 struct Q5_0W { GgW g; };
-inline void load(Q5_0W w, uint row, uint b, thread float4* out) { load_q45(w.g.q + (ulong)row * w.g.rb + b * 22, false, true, out); }
+inline void load(Q5_0W w, uint row, uint b, thread float4* out) { load_q45(gblk(w.g, row, b, 22), false, true, out); }
 // Bits 0..3 of x moved to bit 4 of bytes 0..3.
 inline uint spread4(uint x) { return ((x & 1u) | ((x & 2u) << 7) | ((x & 4u) << 14) | ((x & 8u) << 21)) << 4; }
 struct Q5_1W { GgW g; };
 inline void load(Q5_1W w, uint row, uint b, thread float4* out) {
-    device const uint* B = (device const uint*)(w.g.q + (ulong)row * w.g.rb + b * 24);
+    device const uint* B = (device const uint*)(gblk(w.g, row, b, 24));
     half2 dm = as_type<half2>(B[0]);
     float d = float(dm.x), m = float(dm.y);
     uint qh = B[1];
@@ -848,12 +884,12 @@ inline void load(Q5_1W w, uint row, uint b, thread float4* out) {
 }
 struct F16W { GgW g; };
 inline void load(F16W w, uint row, uint b, thread float4* out) {
-    device const packed_half4* p = (device const packed_half4*)(w.g.q + (ulong)row * w.g.rb + b * 64);
+    device const packed_half4* p = (device const packed_half4*)(gblk(w.g, row, b, 64));
     for (uint i = 0; i < 8; i++) out[i] = float4(half4(p[i]));
 }
 struct F32W2 { GgW g; };
 inline void load(F32W2 w, uint row, uint b, thread float4* out) {
-    device const packed_float4* p = (device const packed_float4*)(w.g.q + (ulong)row * w.g.rb + b * 128);
+    device const packed_float4* p = (device const packed_float4*)(gblk(w.g, row, b, 128));
     for (uint i = 0; i < 8; i++) out[i] = float4(p[i]);
 }
 // FP8 E4M3 with one f32 scale per 128 x 128 block (DeepSeek / Mistral `weight_scale_inv`): rows
@@ -938,12 +974,12 @@ inline void loadh(W w, uint row, uint b, thread half4* out) {
     for (uint i = 0; i < 8; i++) out[i] = half4(t[i]);
 }
 inline void loadh(Q8_0W w, uint row, uint b, thread half4* out) {
-    device const ushort* B = (device const ushort*)(w.g.q + (ulong)row * w.g.rb + b * 34);
+    device const ushort* B = (device const ushort*)(gblk(w.g, row, b, 34));
     half d = as_type<half>(B[0]);
     for (uint i = 0; i < 8; i++) out[i] = half4(as_type<char4>(ushort2(B[1 + 2 * i], B[2 + 2 * i]))) * d;
 }
 inline void loadh(Q4_0W w, uint row, uint b, thread half4* out) {
-    device const ushort* B = (device const ushort*)(w.g.q + (ulong)row * w.g.rb + b * 18);
+    device const ushort* B = (device const ushort*)(gblk(w.g, row, b, 18));
     half d = as_type<half>(B[0]);
     for (uint i = 0; i < 4; i++) {
         uchar4 v = as_type<uchar4>(ushort2(B[1 + 2 * i], B[2 + 2 * i]));
@@ -1673,6 +1709,32 @@ kernel void pf_route(device const float* sel [[buffer(0)]], device uint* src [[b
         base += tot;
     }
 }
+// Routed experts' matrices in the grouped GEMMs' tiled layout (see `gblk` and `kpart`;
+// `tiled_experts`): expert e's rows (nb blocks of bs bytes each) from the address at src[e *
+// stride] to dst + e * mb, one thread per block of the destination, in its order (block j: band
+// j / (64 nb), column (j / 64) % nb, row j % 64 of the band).
+// A block's bytes go as `nseg` segments: seg[i] = (offset in the block, length, offset in the
+// band's 64-block column, part length: the row's copy at that offset plus row % 64 times it).
+struct TB { uint rows; uint nb; uint bs; uint stride; ulong mb; uint nseg; uint even; uint4 seg[8]; };
+struct TSrc { device const uchar* q; };
+kernel void tile_blocks(device const TSrc* src [[buffer(0)]], device uchar* dst [[buffer(1)]], constant TB& p [[buffer(2)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    uint j = gid.x, e = gid.y;
+    if (j >= p.rows * p.nb) return;
+    uint band = j / (64 * p.nb), c = (j / 64) % p.nb, slot = j % 64, r = band * 64 + slot;
+    device const uchar* s = src[e * p.stride].q + ((ulong)r * p.nb + c) * p.bs;
+    device uchar* col = dst + e * p.mb + (ulong)(j - slot) * p.bs;
+    for (uint k = 0; k < p.nseg; k++) {
+        uint4 g = p.seg[k];
+        device const uchar* a = s + g.x;
+        device uchar* d = col + g.z + slot * g.w;
+        if (p.even != 0) {
+            for (uint i = 0; i < g.y / 2; i++) ((device ushort*)d)[i] = ((device const ushort*)a)[i];
+        } else {
+            for (uint i = 0; i < g.y; i++) d[i] = a[i];
+        }
+    }
+}
 "#;
 
 /// GGUF types with a Metal GEMM (`gemm_<TYPE>` in `GGUF_SHADER_SRC`) and a decode matvec
@@ -2145,6 +2207,23 @@ struct Stats {
     copy_out_ns: AtomicU64,
 }
 
+/// `GgW::rb`'s flag (the row length the GGUF kernels get in `P::s_off`) for weights in the
+/// grouped GEMMs' tiled layout ([`MetalBackend::tiled_experts`]).
+pub(crate) const GG_TILED: u32 = 1 << 31;
+
+/// The parts of a tiled K-quant super-block (`kpart` in the shaders), in the order they are
+/// stored, each as byte ranges of the super-block: first what every 32-block reads (scales, Q5_K's
+/// high bits, Q6_K's d), then what each K step of 64 values reads (Q4_K / Q5_K: a pair of
+/// 32-blocks' quant bytes; Q6_K: a half's low and high bits).
+fn kquant_parts(k: GgmlType) -> Option<&'static [&'static [(u32, u32)]]> {
+    Some(match k {
+        GgmlType::Q4_K => &[&[(0, 16)], &[(16, 32)], &[(48, 32)], &[(80, 32)], &[(112, 32)]],
+        GgmlType::Q5_K => &[&[(0, 48)], &[(48, 32)], &[(80, 32)], &[(112, 32)], &[(144, 32)]],
+        GgmlType::Q6_K => &[&[(192, 18)], &[(0, 64), (128, 32)], &[(64, 64), (160, 32)]],
+        _ => return None,
+    })
+}
+
 /// A shared wrap (`MetalBackend::shared_wraps`): buffer, GPU address, plans using it.
 type SharedWrap = (usize, u64, usize);
 
@@ -2186,6 +2265,8 @@ pub struct MetalBackend {
     /// single- and multi-token plans would otherwise each wire every expert: 78 GB twice for
     /// Qwen3.8-Flash-Next at Q4): `(start, len) -> (buffer, plans using it)`.
     pub(crate) shared_wraps: Mutex<std::collections::HashMap<(usize, usize), SharedWrap>>,
+    /// The bytes of the live tiled expert copies of plans (`tiled_experts`), by buffer.
+    tiled: Mutex<std::collections::HashMap<usize, usize>>,
 }
 unsafe impl Send for MetalBackend {}
 unsafe impl Sync for MetalBackend {}
@@ -2571,6 +2652,7 @@ impl MetalBackend {
             lib,
             named: Mutex::new(std::collections::HashMap::new()),
             shared_wraps: Mutex::new(std::collections::HashMap::new()),
+            tiled: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -2647,9 +2729,151 @@ impl MetalBackend {
         e.2 -= 1;
         if e.2 == 0 {
             m.remove(&k);
+            self.tiled.lock().unwrap().remove(&(id as usize));
             return true;
         }
         false
+    }
+
+    /// The routed experts `ws` (GGUF matrices of one block format, `n_out` x `n_in` each) copied
+    /// into one private buffer in the grouped GEMMs' tiled layout (`gblk` in the shaders: the
+    /// kernels see it through [`GG_TILED`] in their row length), expert e at e times the bytes of
+    /// a matrix, by the GPU from the addresses in `src` (rows of `stride` u64s, the data address
+    /// first) in the buffers `uses`. `shared`: kept in `shared_wraps` for the other plans of the
+    /// same model (each gives it back with `unwrap_shared`), else the caller's (forced copies
+    /// only). `mode`: as [`crate::gpu::expert_tiles`]. None when the mode, the format or the
+    /// shape rule it out, or (automatic) where the OS limits the app's memory or the live copies
+    /// would pass a quarter of the machine's memory. Returns the buffer, its GPU address and the
+    /// bytes of one expert.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn tiled_experts(
+        &self,
+        ws: &[WeightRef],
+        n_out: usize,
+        n_in: usize,
+        src: Id,
+        stride: usize,
+        uses: &[Id],
+        shared: bool,
+        mode: Option<bool>,
+    ) -> Option<(Id, u64, usize)> {
+        let forced = match mode {
+            Some(false) => return None,
+            Some(true) => true,
+            None => false,
+        };
+        if !forced && !self.mma().is_some_and(|m| m.units) {
+            return None;
+        }
+        let ok = |w: &WeightRef, k0: Option<GgmlType>| match w {
+            WeightRef::Gguf(g) => {
+                g.n_out == n_out
+                    && g.n_in == n_in
+                    && g.block_scales.is_none()
+                    && !g.x4
+                    && k0.is_none_or(|k| k == g.kind)
+                    && g.kind != GgmlType::F8E4M3
+                    && GGUF_MMA_TYPES.contains(&g.kind)
+                    && n_in.is_multiple_of(g.kind.block_size().max(32))
+            }
+            _ => false,
+        };
+        let WeightRef::Gguf(g0) = ws.first()? else { return None };
+        if !n_out.is_multiple_of(64) || !ws.iter().all(|w| ok(w, Some(g0.kind))) {
+            return None;
+        }
+        // The blocks the dequantizers address (`gblk`): the format's, or for F16 32 values.
+        let (be, bs) = match g0.kind {
+            GgmlType::F16 => (32, 64),
+            k => (k.block_size(), k.type_size()),
+        };
+        let (nb, mb) = (n_in / be, g0.row_bytes() * n_out);
+        let total = mb * ws.len();
+        let key = (g0.data.as_ptr() as usize, total | 1 << 63);
+        if shared && let Some(e) = self.shared_wraps.lock().unwrap().get_mut(&key) {
+            e.2 += 1;
+            return Some((e.0 as Id, e.1, mb));
+        }
+        // Automatic: not where the OS limits the app's memory (iOS), and all the live copies
+        // within a quarter of the machine's memory.
+        if !forced {
+            let live: usize = self.tiled.lock().unwrap().values().sum();
+            let cap = crate::platform::total_memory().unwrap_or(0) as usize / 4;
+            if !shared || crate::platform::process_available_memory().is_some() || live + total > cap {
+                return None;
+            }
+        }
+        let pipe = self.named_pipeline("tile_blocks")?;
+        let new_len: MsgNewBufLen = self.o.msg_send();
+        // MTLResourceStorageModePrivate
+        let id = unsafe { new_len(self.device, self.sels.new_buffer_len, total, 2 << 4) };
+        if id.is_null() {
+            return None;
+        }
+        // The block's bytes as segments (`tile_blocks`): one, or a K-quant's parts in turn.
+        let whole: &[&[(u32, u32)]] = &[&[(0, bs as u32)]];
+        let mut seg = [[0u32; 4]; 8];
+        let mut nseg = 0;
+        let mut off = 0;
+        for part in kquant_parts(g0.kind).unwrap_or(whole) {
+            let len: u32 = part.iter().map(|r| r.1).sum();
+            let mut pos = 0;
+            for &(src, n) in part.iter() {
+                seg[nseg] = [src, n, 64 * off + pos, len];
+                nseg += 1;
+                pos += n;
+            }
+            off += len;
+        }
+        debug_assert_eq!(off as usize, bs);
+        #[repr(C)]
+        struct Tb {
+            rows: u32,
+            nb: u32,
+            bs: u32,
+            stride: u32,
+            mb: u64,
+            nseg: u32,
+            even: u32,
+            seg: [[u32; 4]; 8],
+        }
+        let p = Tb {
+            rows: n_out as u32,
+            nb: nb as u32,
+            bs: bs as u32,
+            stride: stride as u32,
+            mb: mb as u64,
+            nseg: nseg as u32,
+            even: seg[..nseg].iter().flatten().all(|v| v % 2 == 0) as u32,
+            seg,
+        };
+        let blocks = n_out * nb;
+        let mut res: Vec<Id> = uses.to_vec();
+        res.push(id);
+        let done = self.submit(
+            Instant::now(),
+            &mut (),
+            |e: &Enc, _: &()| {
+                e.use_resources(&res);
+                e.pipe(pipe);
+                e.buf(src, 0, 0);
+                e.buf(id, 0, 1);
+                e.bytes(&p, 2);
+                e.dispatch((blocks.div_ceil(256), ws.len()), 256);
+            },
+            |_| {},
+        );
+        if !done {
+            let void: MsgVoid = self.o.msg_send();
+            unsafe { void(id, self.sels.release) };
+            return None;
+        }
+        let addr = self.buffer_gpu_address(id);
+        if shared {
+            self.shared_wraps.lock().unwrap().insert(key, (id as usize, addr, 1));
+            self.tiled.lock().unwrap().insert(id as usize, total);
+        }
+        Some((id, addr, mb))
     }
 
     /// [`Self::wrap`] for a caller that releases the buffer itself: (buffer, offset of `ptr`).
@@ -3243,7 +3467,8 @@ fn format_index(w: &WeightRef) -> (usize, usize, usize) {
 
 impl MetalBackend {
     /// `Backend::upload_moe`; `resident` puts the wrapped experts in the queue's residency set
-    /// (else each submission makes them resident: transient state of streamed experts).
+    /// (else each submission makes them resident: transient state of streamed experts); `tiles`
+    /// runs the GEMMs on tiled copies of GGUF experts (`tiled_experts`).
     #[allow(clippy::too_many_arguments)]
     fn moe_state(
         &self,
@@ -3254,6 +3479,7 @@ impl MetalBackend {
         mi: usize,
         act: crate::gpu::MoeAct,
         resident: bool,
+        tiles: bool,
     ) -> Option<DeviceWeight> {
         self.mma()?;
         if !crate::gpu::moe_offload() || gate_up.is_empty() || gate_up.len() != down.len() || up.is_some_and(|u| u.len() != down.len()) {
@@ -3370,6 +3596,31 @@ impl MetalBackend {
                 return None;
             }
             dev.up = Some((pu, row_bytes(&u[0]) as u32, id));
+        }
+        // Tiled copies of the experts (only when asked for: these copies are per layer, outside
+        // the plans' memory budget), made from the address tables, which then point at them.
+        if tiles {
+            let wrapped: Vec<Id> = dev.bufs.iter().map(|b| b.id).collect();
+            let mut projs = vec![
+                (gate_up, g_rows, h, dev.ep.0, &mut dev.row_bytes.0),
+                (down, h, mi, dev.ep.1, &mut dev.row_bytes.1),
+            ];
+            if let (Some(u), Some((_, rb, tab))) = (up, dev.up.as_mut()) {
+                projs.push((u, mi, h, *tab, rb));
+            }
+            let mut copies = Vec::new();
+            for (ws, n_out, n_in, tab, rb) in projs {
+                if let Some((id, addr, mb)) = self.tiled_experts(ws, n_out, n_in, tab, 2, &wrapped, false, Some(true)) {
+                    // SAFETY: the table holds a [data, scales] pair of u64s per expert.
+                    let rows = unsafe { std::slice::from_raw_parts_mut(self.contents(tab) as *mut [u64; 2], ws.len()) };
+                    for (e, r) in rows.iter_mut().enumerate() {
+                        *r = [addr + (e * mb) as u64, 0];
+                    }
+                    *rb |= GG_TILED;
+                    copies.push(Buf { id, offset_bytes: 0 });
+                }
+            }
+            dev.bufs.extend(copies);
         }
         if let Some(r) = self.residency.as_ref().filter(|_| resident) {
             r.update(&dev.bufs.iter().map(|b| b.id).collect::<Vec<_>>(), true);
@@ -3954,7 +4205,7 @@ impl Backend for MetalBackend {
         mi: usize,
         act: crate::gpu::MoeAct,
     ) -> Option<DeviceWeight> {
-        self.moe_state(gate_up, up, down, h, mi, act, true)
+        self.moe_state(gate_up, up, down, h, mi, act, true, crate::gpu::expert_tiles() == Some(true))
     }
 
     fn upload_moe_transient(
@@ -3966,7 +4217,7 @@ impl Backend for MetalBackend {
         mi: usize,
         act: crate::gpu::MoeAct,
     ) -> Option<DeviceWeight> {
-        self.moe_state(gate_up, up, down, h, mi, act, false)
+        self.moe_state(gate_up, up, down, h, mi, act, false, crate::gpu::expert_tiles() == Some(true))
     }
 
     fn moe(&self, x: &[f32], t: usize, h: usize, mi: usize, routes: &[Vec<(usize, f32)>], dev: &DeviceWeight, y: &mut [f32]) -> bool {
@@ -4544,6 +4795,120 @@ mod tests {
         w.chunks(x.len())
             .map(|r| r.iter().zip(x).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() as f32)
             .collect()
+    }
+
+    /// Grouped GEMMs on tiled copies of GGUF experts (`tiled_experts`) give the results of the
+    /// checkpoint's layout bit for bit, for formats of 32- and 256-element blocks, fused and
+    /// separate gate / up projections and tiles of every size (one expert past 128 rows); both
+    /// match the CPU up to the half-precision operands' rounding.
+    #[test]
+    fn tiled_experts_match() {
+        let Some(be) = backend() else { return };
+        let (ne, h, mi, t) = (6, 256, 256, 160);
+        let mut seed = 5;
+        // Routes: expert 0 takes every token (tiles of 128 and 32 rows), the others uneven
+        // shares (16-row tiles), expert 4 none.
+        let routes: Vec<Vec<(usize, f32)>> = (0..t).map(|i| vec![(0, 0.6), ([1, 2, 3, 5, 1, 1][i % 6], 0.4)]).collect();
+        let x = input(t, h, &mut seed);
+        use crate::gpu::MoeAct;
+        for (kind, act, split) in [
+            (GgmlType::Q4_0, MoeAct::GeluTanh, false),
+            (GgmlType::Q8_0, MoeAct::Silu, false),
+            (GgmlType::Q4_K, MoeAct::Silu, true),
+            (GgmlType::Q5_K, MoeAct::Silu, false),
+            (GgmlType::Q6_K, MoeAct::GeluTanh, true),
+            (GgmlType::IQ4_XS, MoeAct::Silu, false),
+            (GgmlType::MXFP4, MoeAct::Silu, true),
+            (GgmlType::F16, MoeAct::Silu, false),
+        ] {
+            // Random blocks with sane f16 scales (MXFP4: a power-of-two exponent byte; F16:
+            // every value).
+            let scales: &[usize] = match kind {
+                GgmlType::Q4_K | GgmlType::Q5_K => &[0, 2],
+                GgmlType::Q6_K => &[208],
+                GgmlType::MXFP4 => &[],
+                GgmlType::F16 => &[0, 2, 4, 6],
+                _ => &[0],
+            };
+            let mut make = |n_out: usize, n_in: usize| -> Vec<crate::quant::PageVec<u8>> {
+                (0..ne)
+                    .map(|_| {
+                        let mut q = crate::quant::PageVec::<u8>::zeroed(n_out * kind.row_bytes(n_in));
+                        for b in q.iter_mut() {
+                            *b = (rnd(&mut seed).to_bits() >> 9) as u8;
+                        }
+                        for blk in q.chunks_mut(if kind == GgmlType::F16 { 8 } else { kind.type_size() }) {
+                            for &o in scales {
+                                let v = match kind {
+                                    GgmlType::F16 => half::f16::from_f32(rnd(&mut seed) * 0.1).to_bits(),
+                                    _ => 0x2000,
+                                };
+                                blk[o..o + 2].copy_from_slice(&v.to_le_bytes());
+                            }
+                            if kind == GgmlType::MXFP4 {
+                                blk[0] = 120 + blk[0] % 8;
+                            }
+                        }
+                        q
+                    })
+                    .collect()
+            };
+            let (gq, uq, dq) = (make(if split { mi } else { 2 * mi }, h), make(mi, h), make(h, mi));
+            let mats = |qs: &[crate::quant::PageVec<u8>], n_out: usize, n_in: usize| -> Vec<crate::ggml::GgufMatrix> {
+                qs.iter()
+                    .map(|q| crate::ggml::GgufMatrix {
+                        kind,
+                        data: unsafe { crate::quant::QBuf::borrowed(&q[..]) },
+                        n_out,
+                        n_in,
+                        block_scales: None,
+                        x4: false,
+                    })
+                    .collect()
+            };
+            let (gm, um, dm) = (mats(&gq, if split { mi } else { 2 * mi }, h), mats(&uq, mi, h), mats(&dq, h, mi));
+            fn refs(m: &[crate::ggml::GgufMatrix]) -> Vec<WeightRef<'_>> {
+                m.iter().map(WeightRef::Gguf).collect()
+            }
+            let (gw, uw, dw) = (refs(&gm), refs(&um), refs(&dm));
+            let up = split.then_some(&uw[..]);
+            let mut y = [vec![0f32; t * h], vec![0f32; t * h]];
+            for (tiles, y) in [false, true].into_iter().zip(y.iter_mut()) {
+                let dev = be.moe_state(&gw, up, &dw, h, mi, act, true, tiles).unwrap();
+                let md = dev.downcast_ref::<MoeDev>().unwrap();
+                assert_eq!(md.row_bytes.0 & GG_TILED != 0, tiles, "{kind:?}: tiled copies");
+                assert!(be.moe(&x, t, h, mi, &routes, &dev, y));
+            }
+            let same = y[0].iter().zip(&y[1]).all(|(a, b)| a.to_bits() == b.to_bits());
+            assert!(same, "{kind:?}: tiled experts differ from the checkpoint's layout");
+            // Against the CPU.
+            let fg: Vec<Vec<f32>> = gw.iter().map(|w| dense(w, if split { mi } else { 2 * mi }, h)).collect();
+            let fu: Vec<Vec<f32>> = uw.iter().map(|w| dense(w, mi, h)).collect();
+            let fd: Vec<Vec<f32>> = dw.iter().map(|w| dense(w, h, mi)).collect();
+            let mut r = vec![0f32; t * h];
+            for (i, rt) in routes.iter().enumerate() {
+                let xi = &x[i * h..(i + 1) * h];
+                for &(e, wt) in rt {
+                    let mut g = matvec(&fg[e], xi);
+                    if split {
+                        g.extend(matvec(&fu[e], xi));
+                    }
+                    let a: Vec<f32> = (0..mi)
+                        .map(|j| match act {
+                            MoeAct::GeluTanh => crate::kernels::gelu_tanh(g[j]) * g[mi + j],
+                            _ => g[j] / (1.0 + (-g[j]).exp()) * g[mi + j],
+                        })
+                        .collect();
+                    let o = matvec(&fd[e], &a);
+                    for (yv, ov) in r[i * h..(i + 1) * h].iter_mut().zip(&o) {
+                        *yv += wt * ov;
+                    }
+                }
+            }
+            // (Random K-quant minimums cancel: Q5_K's half-rounded weights are ~6e-3 off.)
+            let e = row_err(&y[1], &r, h);
+            assert!(e < 1e-2, "{kind:?}: relative error {e} against the CPU");
+        }
     }
 
     #[test]

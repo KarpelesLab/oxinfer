@@ -651,7 +651,11 @@ Where oxinfer is still behind:
   ~2.4x the weights' streaming time: their loads and products barely overlap, and the many
   kernel designs [round 8](#metal-prefill-round-8-the-routed-experts-november-2026) measured
   (producer / consumer SIMD-groups, register operands, other tile shapes, prefetching) did not
-  change that. Qwen3.5 / 3.6 MoE checkpoints (a shared expert) take the prefill plan since round
+  change that. [Round 9](#metal-prefill-round-9-expert-tiles-november-2026) found why: each K
+  step's weights were 64 pieces one row apart; in tiled copies of the experts (each step one
+  run of memory) the loads cost nothing measurable beside the products (-3 to -7% a pass, for
+  the experts' memory again), and the products, at the matrix units' rate with a quarter of
+  their rows padding at 512 tokens, are what is left. Qwen3.5 / 3.6 MoE checkpoints (a shared expert) take the prefill plan since round
   8 (1.16x llama.cpp at 512 tokens, 1.47x at 2048; they ran op by op at 0.26x). In the kernels alone (`mma_gemm_bench`, 512 tokens) the
   dense GEMMs reach 40-50 TFLOP/s on Q8_0 / Q4_0 / Q4_K / Q5_K / Q6_K and wide outputs, less on
   2048-wide outputs (35-40) and the 512-wide key / value projections; with this tiling the matrix
@@ -874,6 +878,109 @@ So the grouped GEMMs stay at the sum of their weights' streaming time and their 
 less ~30%: on this GPU the matrix units and the memory traffic of the dequantizing loads do not
 run at full rate together, in one threadgroup or across threadgroups. What is left is less work:
 fewer padded rows (16-row granularity is the hardware's) or fewer weight bytes.
+
+#### Metal prefill round 9: expert tiles (November 2026)
+
+Round 8 found the routed experts' grouped GEMMs at the sum of their weights' loads and their
+products. Measured again, outside oxinfer first (a Swift harness on the M5 Max, 2816
+threadgroups of 44 K steps, the 26B-A4B's gate / up shape): streaming the weights alone (one
+Q4_0 block a thread a step) took 0.75 ms, the products alone (32 x 64 x 64 a step, weights in
+threadgroup memory) 0.59 ms, both in one kernel as the grouped GEMMs do 1.29 ms, and two
+separate grids of each kind in one concurrent encoder 1.23 ms: no overlap even across kernels.
+But with the next step's blocks loaded before this step's products and each step's 64 x 64
+weights one contiguous run of memory, the fused kernel took 0.81 ms, close to the slower half
+alone (16-row products: 0.74 ms; 128-row: 2.5 against 3.8). With the checkpoint's row-major
+layout (each step 64 pieces of 36 bytes, one row's length apart) no variant came close: a step
+ahead 1.06-1.13 ms, two or three steps ahead 1.0-1.06, four steps' blocks of a row in one load
+1.08, threads reading consecutive halfwords of the rows (each instruction one run) 1.02-1.06;
+the row-major stream alone, with nothing between its loads, ran at 0.62 ms. So the row-major
+loads are fine for DRAM on their own; spread over 64 rows and issued a step at a time between
+products, they are not.
+
+In the grouped GEMMs themselves (`moe_bench`, the 26B-A4B's shapes and recorded 512-token
+routing, wrong results for the probes), the contiguous layout alone did it, and the prefetch
+added nothing (2.47-2.49 ms a layer without, 2.51-2.54 with; the row-major kernel 2.62-2.69,
+and with the prefetch 2.66-2.72). With it, the weights' loads cost nothing measurable beyond the
+other work (no products: 0.72-0.74 ms; neither loads nor products: 0.66-0.74), the products
+alone take 1.8-2.2 ms, all of it 2.5: what is left is the products (at the matrix units' rate,
+24% of their rows padding at 512 tokens), the f32 output stores (~0.25 ms a layer) and the
+gather / activation / combine kernels.
+
+What changed:
+
+- **Tiled expert copies** (`MetalBackend::tiled_experts`). When a model builds its prefill plans,
+  each MoE layer's routed experts (GGUF, any block format the grouped GEMMs take: Q4_0, Q8_0,
+  the K-quants, i-quants, ...) are copied by the GPU (`tile_blocks`) into one private buffer per
+  projection with each band of 64 rows stored block column by block column: block b of row r at
+  block ((r / 64) nb + b) 64 + r % 64. A grouped tile's K step (64 rows, two 32-blocks each)
+  then reads 2 x 64 consecutive blocks. A K-quant super-block covers four steps, each reading a
+  third of it, so Q4_K, Q5_K and Q6_K go further (`kquant_parts`, `kpart`): each band's column
+  of 64 super-blocks is stored part by part, first what every 32-block reads (Q4_K's 16 bytes of
+  scales; Q5_K's 48 with the high bits; Q6_K's scales and d), then what each K step reads (a
+  pair of 32-blocks' 32 quant bytes; Q6_K: a half's 64 low and 32 high bytes), the 64 rows' copies
+  of a part one after another. The GGUF dequantizers find blocks through `gblk` / `kpart`, which
+  take the layout from the row length's top bit (`GG_TILED`): the same values in the same order,
+  so the same results bit for bit. The plans of one model
+  share the copies (`shared_wraps`, released with the last plan). Decoding keeps reading the
+  checkpoint, so the copies take as much memory again as the experts: the 26B-A4B Q4_0's peak
+  footprint goes from 17.0 to 29.8 GB, and its first prompt takes 0.3 s more (the copy). By
+  default (`gpu_expert_tiles=auto`) they are made on GPUs with matrix units while all of them
+  stay within a quarter of the machine's memory, not where the OS limits an app's memory (iOS);
+  `gpu_expert_tiles=0|1` (engine / server / C API), `--gpu-expert-tiles off|on`,
+  `OXINFER_GPU_EXPERT_TILES=0|1` or `gpu::set_expert_tiles` turn them off or on (on: also without
+  matrix units, past the budget, and in the per-layer MoE uploads of models without prefill
+  plans).
+
+`pf_ab` (one process, tiles off and on alternated pass by pass, best (median) of 16-20, load
+averages 4-6, other agents' jobs on the GPU):
+
+| model | 512 tokens: off | on | 2048: off | on |
+|---|---|---|---|---|
+| Gemma 4 26B-A4B Q4_0 | 115.35 (116.15) ms | 109.18 (109.60), -5.3% | 397.2 (464.6) | 385.9 (454.2), -2.8% |
+| Gemma 4 26B-A4B Q8_0 | 136.77 (139.13) | 127.63 (130.38), -6.7% | 450.0 (485.8) | 431.1 (473.7), -4.2% |
+| Qwen3.5-35B-A3B Q4_K_M | 134.70 (135.08) | 126.19 (126.76), -6.3% | 433.7 (483.5) | 419.4 (470.2), -3.3% |
+
+Per op (`OXINFER_PF_PROFILE`, 26B-A4B Q4_0, 512 tokens, ms per pass): gate / up 37.0 -> 32.6,
+down 19.3 -> 17.8. Qwen's K-quant experts as whole super-blocks a row (each step's runs then
+broken by the parts other steps read) gained 2.6% / 1.7%; stored part by part, 6.3% / 3.3%
+(`moe_bench` at its shapes, uniform routing: 3.22 -> 2.93 ms a layer at 1024 tokens, 4.98 ->
+4.56 at 2048). With uniform routing (`moe_bench` without recorded routes) the tiles take 10% off a
+layer at 512 tokens, 9% at 1024, 6% at 2048, 4% at 4096: the more rows an expert has, the more
+rows each step's weights serve.
+
+Measured on 2026-11-26, `llama-bench -p 512,2048 -n 0 -r 4` (llama.cpp master `de30697`) and
+`parity_bench` of master `ba151dd` (before) and this round's build, interleaved model by model
+in one lock window per round, four rounds in two sessions (load averages 3.5-13, other agents'
+jobs on the GPU: single runs moved by up to 30%, so the table keeps each engine's best), tok/s
+pp512 / pp2048 (the 26B-A4B rows with whole-block tiles; Qwen's from the build before its K-quant
+parts, the `pf_ab` row above has those):
+
+| model | llama.cpp | before | after | after / llama.cpp |
+|---|---|---|---|---|
+| Gemma 4 26B-A4B Q4_0 | 4168 / 3996 | 4478 / 5223 | 4712 / 5369 | 1.13 / 1.34 |
+| Gemma 4 26B-A4B Q8_0 | 3707 / 3417 | 3797 / 4711 | 4058 / 4999 | 1.09 / 1.46 |
+| Qwen3.5-35B-A3B Q4_K_M | 3260 / 3137 | 3771 / 4614 | 3931 / 4821 | 1.21 / 1.54 |
+
+Correctness (`pf_check`, raw corpus text, `draft=none lookup=0 mtp=0`): the first step's top-20
+log-probabilities and the 32 greedy tokens identical to the previous build's (master `ba151dd`)
+on Gemma 4 26B-A4B Q4_0 at 1500 and 4000 tokens (two plan steps), Q8_0 at 1500, and
+Qwen3.5-35B-A3B Q4_K_M (Q4_K gate / up, Q5_K down: `mmagq_*`) at 1500 and 4000; the output
+files are the same bytes. `metal::tests::tiled_experts_match`: the grouped GEMMs on tiled
+Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS, MXFP4 and F16 experts (fused and separate gate / up,
+128-, 32- and 16-row tiles) give the row-major ones' results bit for bit. Dense models are unchanged (Llama-3.2-1B
+Q4_K_M 18486-18617 tok/s at 512 tokens against the previous build's 18545-18569, alternated).
+
+Measured and dropped (`moe_bench` unless noted; the matrix units' rates from the Swift harness):
+
+- **128 outputs a threadgroup** for the 16-row tiles or all tiles: the harness puts 16 x 128
+  products at 53-63 TFLOP/s against 30-49 for 16 x 64 on four SIMD-groups, but in the grouped
+  GEMMs (16 KB of weights a threadgroup) 2.64-2.70 ms against 2.49-2.53 for the 16-row tiles,
+  4.0 for all.
+- **16-row tiles on two SIMD-groups** (64 threads, two blocks each a step; the harness: 64
+  TFLOP/s against 49): `moe_bench` 2.42-2.50 against 2.49-2.50, but the pass 118.5 ms against
+  110.5 (pair GEMMs off in both).
+- **The next K step's blocks in registers** with the tiled layout (as in the harness): no
+  better than without (above).
 
 #### Metal decode round (November 2026)
 

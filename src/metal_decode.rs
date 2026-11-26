@@ -3755,36 +3755,20 @@ impl MetalBackend {
                         }
                         None => None,
                     };
+                    let wrapped = indirect.len();
                     let (tabs, fused, _, _, _) = self.expert_tables(ex, &mut owned, &mut shared, &mut indirect, None)?;
                     let n = ex.gate.len();
-                    // Grouped GEMM tables: (data, scales) per expert, from the decode tables.
-                    let copy: MsgNewBufBytes = self.o.msg_send();
-                    let mut t16 = [std::ptr::null_mut(); 3];
-                    for (j, (&src, dst)) in tabs.iter().zip(t16.iter_mut()).enumerate() {
-                        if j == 1 && fused {
-                            continue;
-                        }
-                        let rows = unsafe { std::slice::from_raw_parts(f.contents(src) as *const [u64; 4], n) };
-                        let tab: Vec<[u64; 2]> = rows.iter().map(|r| [r[0], r[1]]).collect();
-                        *dst = unsafe { copy(self.device, self.sels.new_buffer_bytes, tab.as_ptr() as *const c_void, n * 16, 0) };
-                        if dst.is_null() {
-                            return None;
-                        }
-                    }
-                    if fused {
-                        t16[1] = t16[0];
-                    }
+                    let g_rows = if fused { 2 * ex.inter } else { ex.inter };
                     let affine = |w: &WeightRef| matches!(w, WeightRef::Q4(m) if m.offsets.is_some());
-                    let row_bytes = |w: &WeightRef| match w {
+                    let plain_rb = |w: &WeightRef| match w {
                         WeightRef::Gguf(g) if g.block_scales.is_none() => g.row_bytes() as u32,
                         _ => 0,
                     };
-                    let g_rows = if fused { 2 * ex.inter } else { ex.inter };
                     let pg3 = self.grouped_pipes(&ex.gate[0], affine(&ex.gate[0]), g_rows, ex.h)?;
                     let pd3 = self.grouped_pipes(&ex.down[0], affine(&ex.down[0]), ex.h, ex.inter)?;
                     let (pg, pd) = (pg3[0], pd3[0]);
                     let up = match &ex.up {
-                        Some(u) => Some((self.grouped_pipes(&u[0], affine(&u[0]), ex.inter, ex.h)?, row_bytes(&u[0]))),
+                        Some(u) => Some((self.grouped_pipes(&u[0], affine(&u[0]), ex.inter, ex.h)?, plain_rb(&u[0]))),
                         None => None,
                     };
                     // One pipeline per projection: every expert's format must match the first's.
@@ -3806,11 +3790,52 @@ impl MetalBackend {
                     if !ex.h.is_multiple_of(64) || !ex.inter.is_multiple_of(64) {
                         return None;
                     }
+                    // Grouped GEMM tables: (data, scales) per expert, from the decode tables, or
+                    // the experts' tiled copies (`tiled_experts`; their row lengths flagged for
+                    // the kernels).
+                    let copy: MsgNewBufBytes = self.o.msg_send();
+                    let mut t16 = [std::ptr::null_mut(); 3];
+                    let mut tiled = [0u32; 3];
+                    let projs: [(&[WeightRef], usize, usize); 3] = [
+                        (&ex.gate, g_rows, ex.h),
+                        (ex.up.as_deref().unwrap_or(&[]), ex.inter, ex.h),
+                        (&ex.down, ex.h, ex.inter),
+                    ];
+                    for (j, (&src, dst)) in tabs.iter().zip(t16.iter_mut()).enumerate() {
+                        if j == 1 && fused {
+                            continue;
+                        }
+                        let (ws, n_out, n_in) = projs[j];
+                        let tab: Vec<[u64; 2]> =
+                            match self.tiled_experts(ws, n_out, n_in, src, 4, &indirect[wrapped..], true, crate::gpu::expert_tiles()) {
+                                Some((id, addr, mb)) => {
+                                    shared.push(id);
+                                    indirect.push(id);
+                                    tiled[j] = super::GG_TILED;
+                                    (0..n).map(|e| [addr + (e * mb) as u64, 0]).collect()
+                                }
+                                None => {
+                                    let rows = unsafe { std::slice::from_raw_parts(f.contents(src) as *const [u64; 4], n) };
+                                    rows.iter().map(|r| [r[0], r[1]]).collect()
+                                }
+                            };
+                        *dst = unsafe { copy(self.device, self.sels.new_buffer_bytes, tab.as_ptr() as *const c_void, n * 16, 0) };
+                        if dst.is_null() {
+                            return None;
+                        }
+                    }
+                    if fused {
+                        t16[1] = t16[0];
+                        tiled[1] = tiled[0];
+                    }
+                    // `P::s_off` of projection j's GGUF kernels.
+                    let rb_of = |w: &WeightRef, j: usize| plain_rb(w) | tiled[j];
+                    let up = up.map(|(p, rb)| (p, rb | tiled[1]));
                     // The pair GEMMs (gate and up of one format, quantized, no LoRA updates): the
                     // pipelines, then the up rows' byte offset in an expert's fused tensor and in
                     // its scales; with gate and up apart (`mmagq_*`), the up tensors' row bytes.
                     let (mi, h) = (ex.inter as u32, ex.h as u32);
-                    let up_rb = ex.up.as_ref().map(|u| row_bytes(&u[0]));
+                    let up_rb = ex.up.as_ref().map(|u| rb_of(&u[0], 1));
                     let (pre, w_rows) = if fused { ("mmagp", mi) } else { ("mmagq", 0) };
                     let same = ex
                         .up
@@ -3827,7 +3852,7 @@ impl MetalBackend {
                         {
                             Some((
                                 format!("{pre}_{}", gw.kind.name()),
-                                up_rb.unwrap_or(w_rows * row_bytes(&ex.gate[0])),
+                                up_rb.unwrap_or(w_rows * plain_rb(&ex.gate[0])),
                                 0,
                             ))
                         }
@@ -3855,7 +3880,7 @@ impl MetalBackend {
                         pair,
                         up,
                         tabs: t16,
-                        row_bytes: (row_bytes(&ex.gate[0]), row_bytes(&ex.down[0])),
+                        row_bytes: (rb_of(&ex.gate[0], 0), rb_of(&ex.down[0], 2)),
                         x: byte(ex.x),
                         x_stride: ts(ex.x) as u32,
                         sel: byte(ex.sel),
