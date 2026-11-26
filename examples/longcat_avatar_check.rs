@@ -81,13 +81,21 @@ fn check_vae(dir: &Path, case: &Value, base: &Path) -> Result<()> {
         let x = read(&dir.join(format!("{name}.bin")))?;
         let lat = vae.encode(&frames_cl(&x, s[2], s[3], s[4]), s[3], s[4])?;
         cmp(name, &lat, &read(&dir.join(format!("{name}_mode.bin")))?);
+        // (The reference with float32 activations on its bf16-rounded weights, when the case has it.)
+        if let Ok(r) = read(&dir.join(format!("{name}_mode_f32.bin"))) {
+            cmp(&format!("{name} (float32 reference)"), &lat, &r);
+        }
     }
     if !case["vae_dec_latent"].is_null() {
         let s = dims(&case["vae_dec_latent"]);
         let z = read(&dir.join("vae_dec_latent.bin"))?;
         let fr = vae.decode(&z, s[2], s[3], s[4], &mut |_, _| {})?;
         let o = dims(&case["vae_dec_video"]);
-        cmp("vae_dec", &frames_cf(&fr, o[3], o[4]), &read(&dir.join("vae_dec_video.bin"))?);
+        let got = frames_cf(&fr, o[3], o[4]);
+        cmp("vae_dec", &got, &read(&dir.join("vae_dec_video.bin"))?);
+        if let Ok(r) = read(&dir.join("vae_dec_video_f32.bin")) {
+            cmp("vae_dec (float32 reference)", &got, &r);
+        }
     }
     Ok(())
 }
@@ -214,6 +222,9 @@ fn check_text(dir: &Path, case: &Value, base: &Path) -> Result<()> {
             &e,
             &r[..e.len().min(r.len())],
         );
+        if let Ok(r) = read(&dir.join(format!("prompt{i}_embeds_f32.bin"))) {
+            cmp(&format!("prompt{i}_embeds (float32 reference)"), &e, &r[..e.len().min(r.len())]);
+        }
     }
     Ok(())
 }
@@ -283,25 +294,26 @@ fn check_e2e(dir: &Path, case: &Value, avatar: &Path, base: &Path) -> Result<()>
         let want = read(&dir.join(format!("e2e_frames{tag}.bin")))?;
         let want8: Vec<f32> = want.iter().map(|&v| ((v * 255.0) as u8) as f32 / 255.0).collect();
         cmp(&format!("e2e_frames{tag} (8-bit)"), &got, &want8);
-        if !tag.is_empty() {
-            continue;
-        }
-        if !case["avc_noise"].is_null() {
-            let n2 = read(&dir.join("avc_noise.bin"))?;
+        if !case[format!("avc_noise{tag}")].is_null() {
+            let n2 = read(&dir.join(format!("avc_noise{tag}.bin")))?;
             let frame = shape.1 * shape.2;
             let reference: Vec<f32> = (0..pipe.dit.cfg.in_channels)
                 .flat_map(|ch| lat[ch * shape.0 * frame..ch * shape.0 * frame + frame].to_vec())
                 .collect();
             let audio = clip_window(&emb, rows, frames - pipeline::COND_FRAMES, frames, 1, 5);
             let lat2 = pipe.next_clip(&p, &text, None, (w, h), &fr, &reference, &audio, None, n2, 2, &mut prog)?;
-            cmp("avc_latent", &lat2, &read(&dir.join("avc_latent.bin"))?);
+            cmp(
+                &format!("avc_latent{tag}"),
+                &lat2,
+                &read(&dir.join(format!("avc_latent{tag}.bin")))?,
+            );
             let fr2 = pipe.decode(&lat2, shape, 2, &mut prog)?;
             let got: Vec<f32> = fr2.iter().flat_map(|f| f.iter().map(|&v| v as f32 / 255.0)).collect();
-            let want = read(&dir.join("avc_frames.bin"))?;
+            let want = read(&dir.join(format!("avc_frames{tag}.bin")))?;
             let want8: Vec<f32> = want.iter().map(|&v| ((v * 255.0) as u8) as f32 / 255.0).collect();
-            cmp("avc_frames (8-bit)", &got, &want8);
+            cmp(&format!("avc_frames{tag} (8-bit)"), &got, &want8);
         }
-        if !case["cfg_latent"].is_null() {
+        if tag.is_empty() && !case["cfg_latent"].is_null() {
             let neg = pipeline::encode_text(&pipe.text_encoder()?, "blurry", 512)?;
             let pg = AvatarParams {
                 steps: 3,
@@ -342,6 +354,33 @@ fn main() -> Result<()> {
     let opt = |k: &str| args.iter().find_map(|a| a.strip_prefix(k)).map(std::path::PathBuf::from);
     let avatar = opt("--avatar=").unwrap_or_else(|| dir.join("LongCat-Video-Avatar-1.6"));
     let base = opt("--base=").unwrap_or_else(|| dir.join("LongCat-Video"));
+    // `bench-vae` (only when named): the time to decode 5 latent frames of 64 x 96 (17 frames of
+    // 768 x 512) and to encode 13 of them back.
+    if parts.contains(&"bench-vae") {
+        let vae = VideoVae::load(&base.join("vae"), true)?;
+        let (t, h, w) = (5, 64, 96);
+        let z: Vec<f32> = (0..vae.cfg.z_dim * t * h * w)
+            .map(|i| ((i * 2654435761usize) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let t0 = std::time::Instant::now();
+        let fr = vae.decode(&z, t, h, w, &mut |_, _| {})?;
+        println!(
+            "VAE decode: {} frames of {}x{} in {:.1} s",
+            fr.len(),
+            w * 8,
+            h * 8,
+            t0.elapsed().as_secs_f64()
+        );
+        print!("{}", oxinfer::sd::ops::timing::report());
+        let t0 = std::time::Instant::now();
+        let lat = vae.encode(&fr[..13], h * 8, w * 8)?;
+        println!(
+            "VAE encode: 13 frames in {:.1} s ({} values)",
+            t0.elapsed().as_secs_f64(),
+            lat.len()
+        );
+        return Ok(());
+    }
     if on("sched") {
         check_sched(&case);
     }

@@ -26,7 +26,9 @@ What differs from `run_demo_avatar_single_audio_to_video.py --model_type avatar-
   same latents (the demo draws it on the GPU).
 
 The models run in bfloat16 as the demo loads them; `--f32 text,vae` adds float32 runs of those
-stages (`*_f32` cases), which separate bf16 rounding from a real difference.
+stages (`*_f32` cases), which separate bf16 rounding from a real difference: the text encoder
+loaded again in float32, the VAE on the CPU with float32 activations on the weights its bfloat16
+load rounded.
 """
 import argparse, json, math, os, sys, time
 
@@ -199,19 +201,22 @@ if "vae" in stages:
     case["image_pixels"] = save("image_pixels.bin", pixels)
     x = pixels.unsqueeze(2)
     for dt, sfx in [(bf16, "")] + ([(torch.float32, "_f32")] if "vae" in f32 else []):
-        v = vae.to(dt)
+        # The float32 case is meant as the exact one: on the CPU (cuDNN picks float32 convolution
+        # algorithms, TF32 among them, whose results differ by more than rounding).
+        vdev = dev if sfx == "" else "cpu"
+        v = vae.to(vdev, dt)
         with torch.no_grad():
-            mode = v.encode(x.to(dev, dt)).latent_dist.mode()
+            mode = v.encode(x.to(vdev, dt)).latent_dist.mode()
             case["vae_enc_image"] = save("vae_enc_image.bin", x)
             case["vae_enc_image_mode" + sfx] = save("vae_enc_image_mode" + sfx + ".bin", mode)
             g = torch.Generator().manual_seed(7)
             z = mode.float().cpu().repeat(1, 1, 3, 1, 1) + 0.3 * torch.randn(1, 16, 3, height // 8, width // 8, generator=g)
             case["vae_dec_latent"] = save("vae_dec_latent.bin", z)
             t0 = time.time()
-            dec = v.decode(z.to(dev, dt), return_dict=False)[0]
+            dec = v.decode(z.to(vdev, dt), return_dict=False)[0]
             print(f"VAE decode ({dt}) of 3 latent frames: {time.time() - t0:.1f}s")
             case["vae_dec_video" + sfx] = save("vae_dec_video" + sfx + ".bin", dec)
-    vae.to(bf16)
+    vae.to(dev, bf16)
     flush()
 
 # ---- transformer ------------------------------------------------------------------------------------
@@ -288,16 +293,22 @@ if stages & {"e2e", "avc"}:
     print(f"generate_ai2v: {NF} frames in {time.time() - t0:.1f}s")
     case["e2e_latent" + tag] = save("e2e_latent" + tag + ".bin", lat)
     case["e2e_frames" + tag] = save("e2e_frames" + tag + ".bin", frames[0])
-    import imageio  # noqa: E402
-
-    imageio.mimsave(os.path.join(out, "e2e" + tag + ".mp4"), (frames[0] * 255).astype(np.uint8), fps=FPS)
     flush()
-    if "avc" in stages and not args.int8:
+
+    def write_frames(name, fr):
+        # PNGs of a few frames, to look at (no video encoder is assumed).
+        from PIL import Image
+
+        for i in sorted({0, len(fr) // 2, len(fr) - 1}):
+            Image.fromarray((fr[i] * 255).astype(np.uint8)).save(os.path.join(out, f"{name}_{i:03d}.png"))
+
+    write_frames("e2e" + tag, frames[0])
+    if "avc" in stages:
         from PIL import Image  # noqa: E402
 
         video = [Image.fromarray(f) for f in (frames[0] * 255).astype(np.uint8)]
         noise2 = torch.randn(1, 16, tl, height // 8, width // 8, generator=torch.Generator().manual_seed(6))
-        case["avc_noise"] = save("avc_noise.bin", noise2)
+        case["avc_noise" + tag] = save("avc_noise" + tag + ".bin", noise2)
         t0 = time.time()
         with torch.no_grad():
             frames2, lat2 = pipe.generate_avc(
@@ -307,8 +318,8 @@ if stages & {"e2e", "avc"}:
                 mask_frame_range=0,
             )
         print(f"generate_avc: {NF} frames in {time.time() - t0:.1f}s")
-        case["avc_latent"] = save("avc_latent.bin", lat2)
-        case["avc_frames"] = save("avc_frames.bin", frames2[0])
-        imageio.mimsave(os.path.join(out, "avc.mp4"), (frames2[0] * 255).astype(np.uint8), fps=FPS)
+        case["avc_latent" + tag] = save("avc_latent" + tag + ".bin", lat2)
+        case["avc_frames" + tag] = save("avc_frames" + tag + ".bin", frames2[0])
+        write_frames("avc" + tag, frames2[0])
     flush()
 print("wrote", out)

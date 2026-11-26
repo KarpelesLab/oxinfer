@@ -248,12 +248,19 @@ pub fn run(args: &Args) -> Result<()> {
         }),
     };
     let out = args.output.clone().unwrap_or_else(|| PathBuf::from("avatar.mp4"));
+    let secs = clip.secs;
+    let t1 = Instant::now();
     let what = crate::minimax_h3_video_cli::write_video(&video, &out)?;
     eprintln!(
-        "[wrote {what}: {} frames, {:.1}s of video in {:.1}s]",
+        "[wrote {what}: {} frames, {:.1}s of video in {:.1}s (text encoder {:.1}s, audio encoder {:.1}s, denoising {:.1}s, VAE decode {:.1}s, file {:.1}s)]",
         video.frames.len(),
         video.frames.len() as f64 / FPS as f64,
-        t0.elapsed().as_secs_f64()
+        t0.elapsed().as_secs_f64(),
+        secs[0],
+        secs[1],
+        secs[2],
+        secs[3],
+        t1.elapsed().as_secs_f64()
     );
     Ok(())
 }

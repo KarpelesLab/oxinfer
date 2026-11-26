@@ -401,7 +401,8 @@ fn conv111(t: &Tensors, name: &str) -> Result<Conv> {
 
 impl VideoVae {
     /// Loads `vae/` (config and `diffusion_pytorch_model.safetensors`); `encoder` false skips the
-    /// encoder (text to video).
+    /// encoder (text to video). The weights are rounded to bfloat16, which is what the reference
+    /// runs this VAE at (activations included; here they stay float32).
     pub fn load(dir: &Path, encoder: bool) -> Result<Self> {
         let cfg: VaeConfig = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?).context("vae/config.json")?;
         if cfg.latents_mean.len() != cfg.z_dim || cfg.latents_std.len() != cfg.z_dim {

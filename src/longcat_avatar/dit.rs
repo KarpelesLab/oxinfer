@@ -280,6 +280,7 @@ pub(crate) fn norm_affine(x: &[f32], a: &Affine, eps: f64) -> Vec<f32> {
 }
 
 /// `x[row] += gate[frame] * y[row]` (`y` starts at frame `frame0`).
+#[allow(clippy::too_many_arguments)]
 fn add_gated(x: &mut [f32], y: &[f32], h: usize, s: usize, mods: &[f32], stride: usize, gate_at: usize, frame0: usize) {
     let x = &mut x[frame0 * s * h..];
     debug_assert_eq!(x.len(), y.len());

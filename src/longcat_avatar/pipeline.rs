@@ -125,6 +125,9 @@ pub struct Clip {
     pub frames: Vec<Vec<u8>>,
     /// The normalized latents of the last clip (`[16, t, h / 8, w / 8]`).
     pub latents: Vec<f32>,
+    /// Seconds in the text encoder, the audio encoder, the denoising (with the VAE encodes) and the
+    /// VAE decodes.
+    pub secs: [f64; 4],
 }
 
 /// The aspect-ratio buckets of the reference (`ASPECT_RATIO_627` for 480p, `ASPECT_RATIO_960`
@@ -760,6 +763,8 @@ impl AvatarPipeline {
         let guided = p.text_guidance > 1.0 || p.audio_guidance > 1.0;
 
         // Text.
+        let mut secs = [0f64; 4];
+        let mut t0 = Instant::now();
         progress(Stage::Text);
         let (text, neg) = {
             let enc = self.text_encoder()?;
@@ -773,6 +778,8 @@ impl AvatarPipeline {
             (text, neg)
         };
 
+        secs[0] = t0.elapsed().as_secs_f64();
+        t0 = Instant::now();
         // Audio: the speech cut (or zero-padded) to the video's length plus a second.
         let total_frames = p.frames + (p.segments.max(1) - 1) * (p.frames - COND_FRAMES);
         let samples = ((total_frames as f64 / FPS as f64 + 1.0) * SPEECH_RATE as f64).ceil() as usize;
@@ -806,6 +813,8 @@ impl AvatarPipeline {
             |start: usize| -> Vec<f32> { embs.iter().flat_map(|e| clip_window(e, rows, start, p.frames, 1, window)).collect() };
 
         // The reference image and the speakers' regions.
+        secs[1] = t0.elapsed().as_secs_f64();
+        t0 = Instant::now();
         progress(Stage::Encode);
         let image = p.image.as_ref().map(|img| preprocess_image(img, width, height));
         let masks = match (&p.image, humans) {
@@ -832,7 +841,11 @@ impl AvatarPipeline {
             .flat_map(|ch| lat[ch * shape.0 * frame..ch * shape.0 * frame + frame].to_vec())
             .collect();
         self.dit.release_device();
+        secs[2] += t0.elapsed().as_secs_f64();
+        t0 = Instant::now();
         let mut frames = self.decode(&lat, shape, 1, progress)?;
+        secs[3] += t0.elapsed().as_secs_f64();
+        t0 = Instant::now();
         let mut last = frames.clone();
         for seg in 1..p.segments.max(1) {
             let start = seg * (p.frames - COND_FRAMES);
@@ -850,7 +863,11 @@ impl AvatarPipeline {
                 progress,
             )?;
             self.dit.release_device();
+            secs[2] += t0.elapsed().as_secs_f64();
+            t0 = Instant::now();
             last = self.decode(&lat, shape, seg + 1, progress)?;
+            secs[3] += t0.elapsed().as_secs_f64();
+            t0 = Instant::now();
             frames.extend(last[COND_FRAMES..].iter().cloned());
         }
         Ok(Clip {
@@ -858,6 +875,7 @@ impl AvatarPipeline {
             height,
             frames,
             latents: lat,
+            secs,
         })
     }
 }
