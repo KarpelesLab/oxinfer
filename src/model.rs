@@ -954,6 +954,34 @@ pub(crate) fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, 
     }
 }
 
+/// [`linear_multi`], then `post` over the outputs (see [`crate::kernels::Post`]): inside the
+/// matmul's own pool jobs when every job runs on the CPU kernels of bf16 weights (a decode step:
+/// no serial pass over the outputs after the matmul), else after it.
+pub(crate) fn linear_multi_post(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f32], t: usize, post: Post) {
+    let on_cpu = |l: &Lin, n: usize| match crate::gpu::active() {
+        None => true,
+        Some(b) if l.is_transient() => l.fold.is_some() || !b.wants(n, n_in, t),
+        Some(_) => l.device_state(n, n_in, t).is_none(),
+    };
+    if jobs
+        .iter()
+        .all(|(l, n, _)| matches!(l.w, Weight::Bf16(..)) && l.fold.is_none() && l.active_lora().is_none() && on_cpu(l, *n))
+    {
+        let mut v: Vec<(&[u16], usize, &mut [f32])> = jobs
+            .iter_mut()
+            .map(|(l, n, y)| match &l.w {
+                Weight::Bf16(w, _) => (&w[..], *n, &mut **y),
+                _ => unreachable!(),
+            })
+            .collect();
+        matmul_multi_post(&mut v, n_in, x, t, Some(post));
+        return;
+    }
+    linear_multi(jobs, n_in, x, t);
+    let mut ys: Vec<(usize, &mut [f32])> = jobs.iter_mut().map(|(_, n, y)| (*n, &mut **y)).collect();
+    post_all(&mut ys, t, post);
+}
+
 /// [`linear_multi_base`] with Hadamard-folded weights among the jobs (see [`crate::hadamard`]):
 /// the jobs of each transform run on the CPU over the input transformed once; the others as usual.
 fn linear_multi_folded(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f32], t: usize) {

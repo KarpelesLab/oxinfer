@@ -7,6 +7,8 @@
 //! read bandwidth for a given split). `X4=1`: the same ring interleaved four rows at a time
 //! (`oxinfer::ggml::repack`) too, timed alternately with the plain one. `Q8K=ab`: each with the
 //! K-quants' activations per 32 and per 256 (`oxinfer::quant::set_act_q8k`), alternated.
+//! `bf16` as TYPE: bf16 weights through `oxinfer::kernels::matmul_multi` (the kernels of bf16
+//! checkpoints; `ROWS=N` tokens at a time, default 1).
 
 use oxinfer::ggml::{GgmlType, GgufMatrix, random_blocks};
 use oxinfer::kernels::matmul_quant_multi;
@@ -31,6 +33,9 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
     let ring_mb: usize = args.next().map_or(Ok(1024), |s| s.parse())?;
+    if kind_name == "bf16" {
+        return bf16(&threads, &shapes, ring_mb);
+    }
     let kind = GgmlType::ALL
         .into_iter()
         .find(|k| k.name().eq_ignore_ascii_case(&kind_name))
@@ -132,6 +137,49 @@ fn main() -> anyhow::Result<()> {
                     one.bytes() as f64 / b / 1e9
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+/// bf16 matrices through the native bf16 kernels, `ROWS` tokens per call: the best and the
+/// median of six passes over the ring.
+fn bf16(threads: &[usize], shapes: &[(usize, usize)], ring_mb: usize) -> anyhow::Result<()> {
+    let t: usize = std::env::var("ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    for &th in threads {
+        oxinfer::pool::init(th);
+        for &(n_out, n_in) in shapes {
+            let bytes = n_out * n_in * 2;
+            let copies = (ring_mb << 20).div_ceil(bytes).max(2);
+            let ring: Vec<Vec<u16>> = (0..copies)
+                .map(|c| {
+                    (0..n_out * n_in)
+                        .map(|i| half::bf16::from_f32((((i * 7 + c * 131) % 1999) as f32 - 999.0) / 1000.0).to_bits())
+                        .collect()
+                })
+                .collect();
+            let x: Vec<f32> = (0..t * n_in).map(|i| ((i * 7919) % 2001) as f32 / 1000.0 - 1.0).collect();
+            let mut y = vec![0f32; t * n_out];
+            let mut times = Vec::new();
+            for pass in 0..7 {
+                let t0 = Instant::now();
+                for w in &ring {
+                    oxinfer::kernels::matmul(w, n_out, n_in, &x, t, &mut y);
+                }
+                if pass > 0 {
+                    times.push(t0.elapsed().as_secs_f64() / copies as f64);
+                }
+            }
+            times.sort_by(f64::total_cmp);
+            let (best, med) = (times[0], times[times.len() / 2]);
+            println!(
+                "  {th} threads bf16 {n_out}x{n_in} x{t} ({:.1} MB): best {:7.1} us {:6.1} GB/s, median {:7.1} us {:6.1} GB/s",
+                bytes as f64 / 1e6,
+                best * 1e6,
+                bytes as f64 / best / 1e9,
+                med * 1e6,
+                bytes as f64 / med / 1e9
+            );
         }
     }
     Ok(())

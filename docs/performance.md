@@ -3004,6 +3004,69 @@ routed experts' as before, its down projection writing the output first (bit-ide
 unit test, which gained such a shared expert with and without its per-token scale; no Qwen MoE
 checkpoint was on the machine to time).
 
+#### CPU decode round 11: bf16 matvecs (November 2026)
+
+M5 Max, 16 threads (`examples/matvec_bench bf16`, a 1 GB ring of random matrices cycled so every
+call reads from memory; best of six passes, `ROWS=N` tokens; plain streaming reads of the ring
+reach 282-293 GB/s at 12-18 threads, 250-255 GB/s in 13 MB regions). Alone, the one-token bf16
+kernel already streams near that: 263-291 GB/s for 3840x1280 up to 51866x1280, 2048x8192 and
+4096x14336, 216-233 GB/s for 1-3 MB matrices (1024x1024, 1280x1280). In a Whisper large-v3 CPU
+decoder step the same matrices read 222 GB/s, for three reasons:
+
+- **Serial work around the matmuls.** The bias adds, the decoder's exact GELU (`exp` per value
+  over 5120 values) and the residual adds ran on one thread between the regions.
+  `kernels::matmul_multi_post` (`model::linear_multi_post`) takes an epilogue that the pool
+  jobs of a one-to-seven-token product run on each block of rows as it is done (other paths run
+  it after, in parallel); the decoder's qkv, output, cross-attention and MLP projections use it
+  (`whisper::model::project_post`): the same operations in the same order, so the same bits.
+- **The end of each region.** Blocks were equal and at least 128 KiB (25 for a 3.3 MB matrix on
+  18 threads), so the last ones ran with most threads idle. One-pass products (one token; three
+  and four on aarch64, below) now take blocks that shrink as the work runs out, each `1/threads`
+  of what is left down to 16 KiB: alternated in-process, 1280x1280 216 -> 239 GB/s, 5120x1280 275
+  -> 281, 1280x5120 277 -> 284, 51866x1280 291 -> 295 (best of six; medians move alike, within
+  the noise for the big ones). Blocks of other sizes (equal blocks of 1/2 to 1/16 of a thread's
+  share at 8-32 KiB minimum, or shrinking ones from `1/(2 threads)` or `1/(4 threads)`) were no
+  better.
+- **18 threads.** Whisper's steps now run on the decode threads as an LLM's (16 here): ~3%.
+
+Large-v3 per layer, 60 s clip, greedy: the six matmuls 207 -> 180 us a token (255 GB/s), the
+output projection (133 MB) 509 -> 457 us (291 GB/s); decoder 1.88-2.11 -> 1.71-1.74 s, medium
+1.11-1.13 -> 0.99-1.00 s, the same transcripts; the 496 s clip in [Whisper](whisper.md).
+
+**A few tokens** (beam search, batched decoding, speculative verification of bf16 models: 2 to 7
+rows a step) were bound by the kernel: token pairs walk one row at a time with the one-token
+layout (8 accumulators per row and token, so that every token gets a one-token pass's bits), and
+three or four tokens took two passes (pairs, or a pair and a single), reading each row twice (the second time from L2). 4 tokens over 1280x1280
+streamed 128 GB/s, 7 tokens 78. The walked tiles (`simd::kernel_split`) keep the layout and the
+bits but walk each segment of two rows four times, each walk feeding 2 of the 8 accumulators
+(kept in memory between walks): the walks after the first read the segment from L1, and two
+rows of three or four tokens fit the registers. Segments are whole rows up to 2048 wide, else 512
+(so the tokens' inputs of a segment stay in L1; one segment per 4096-14336-wide row was slower
+than the old kernel). GB/s, 16 threads, old -> new (medians):
+
+| Shape | 3 tokens | 4 tokens |
+|---|---|---|
+| 1280x1280 | 149 -> 181 | 126 -> 170 |
+| 5120x1280 | 187 -> 217 | 163 -> 209 |
+| 1280x5120 | 183 -> 208 | 150 -> 192 |
+| 2048x8192 | 196 -> 210 | 156 -> 174 |
+| 8192x2048 | | 168 -> 199 |
+| 14336x4096 | | 171 -> 200 |
+| 4096x14336 | 183 -> 203 | 145 -> 175 |
+
+Two tokens gained nothing (pairs of rows of 2 tokens with 2 or 4 accumulators a walk: -6% to
++9%), so pairs stay. Whisper large-v3 `--beam 5` on the 60 s clip: decoder 4.23-4.33 -> 3.63-3.65
+s, the same transcript. `bf16_multi_token_passes_are_batch_invariant` checks 2-7 tokens against
+one-token passes bit for bit, `matmul_epilogue_matches_a_pass_after` the epilogue.
+
+Measured and left: a matvec after 20 us of serial work takes 1-3 us longer than back to back
+(and keeping memory busy in the gap did not help); reading the next matrix's first part ahead
+from the calling thread made the call slower (lines in another core's cache arrive slower than
+from memory), so prefetching would have to come from the threads that will read the rows. The
+cross-attention (7.7 MB of bf16 keys and values a layer, 45-48 us: ~165 GB/s) did not move with
+4x the tasks nor with rows read in place (~1%). Widening multiply-adds of bf16 pairs (BFMLAL /
+BFDOT) would round the activations to bf16, so not within float rounding of the f32 products.
+
 #### x86-64 CPU prefill (November 2026)
 
 The same machine as above (Threadripper 9970X, 32 threads by default, AVX-512 with VNNI), still
@@ -4426,12 +4489,12 @@ whole file, best of two alternated runs (details and word error rates in
 
 | Model | Metal: oxinfer / whisper.cpp | CPU: oxinfer / whisper.cpp |
 |---|---|---|
-| tiny | 0.71 / 1.62 s (2.29x) | 1.36 / 2.43 s (1.79x) |
-| base | 1.07 / 2.28 s (2.13x) | 2.69 / 4.32 s (1.61x) |
-| small | 2.26 / 4.22 s (1.87x) | 8.25 / 12.02 s (1.46x) |
-| large-v3-turbo | 2.84 / 4.89 s (1.72x) | 29.5 / 42.4 s (1.44x) |
-| medium | 5.45 / 9.71 s (1.78x) | 25.6 / 32.0 s (1.25x) |
-| large-v3 | 8.98 / 14.13 s (1.57x) | 49.7 / 68.8 s (1.38x) |
+| tiny | 0.71 / 1.62 s (2.29x) | 1.39 / 2.67 s (1.92x) |
+| base | 1.07 / 2.28 s (2.13x) | 2.67 / 4.29 s (1.61x) |
+| small | 2.26 / 4.22 s (1.87x) | 8.15 / 12.24 s (1.50x) |
+| large-v3-turbo | 2.84 / 4.89 s (1.72x) | 32.4 / 42.6 s (1.32x) |
+| medium | 5.45 / 9.71 s (1.78x) | 24.7 / 31.9 s (1.29x) |
+| large-v3 | 8.98 / 14.13 s (1.57x) | 45.5 / 68.5 s (1.51x) |
 
 On Metal the encoder and the decoder run as whole device passes (`crate::gpu::whisper`): the
 encoder's GEMMs, attention and row work in one pass per batch of windows with the

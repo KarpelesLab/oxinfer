@@ -24,7 +24,7 @@
   (Euler samplers), `xl.rs` (SDXL: second text encoder, size conditioning, kohya LoRA names), `ops.rs` (channels-last convolution, group/layer norm, multi-head attention on
   the f32 GEMM tiles); `png.rs`: a dependency-free PNG writer.
 - `kernels.rs`: NEON kernels (`kernels_x86.rs`, `kernels_wasm.rs`: the AVX2 and simd128 equivalents, selected by `build.rs` through the `has_simd` cfg). Decode tiles stream 1–2 weight rows with 8 accumulators (the prefetcher
-  prefers few long streams); prefill packs activations into 8-token panels and runs an 8-row x 8-token
+  prefers few long streams; 3 and 4 tokens walk each segment of two rows in four passes of 2 accumulators, the same bits; one pass over the weights takes blocks that shrink as the work runs out, and an optional epilogue runs on each block of outputs inside the pool jobs, `matmul_multi_post`); prefill packs activations into 8-token panels and runs an 8-row x 8-token
   outer-product kernel that broadcasts bf16 weights by lane (x86-64 with AVX-512: 16 rows x 16 tokens,
   cache-blocked by columns, `gemm_blocked`: a pool job of 64 rows x 256 tokens dequantizes 16 rows of a
   512-column block at a time and keeps its partial sums between blocks, so the activations of a block stay in

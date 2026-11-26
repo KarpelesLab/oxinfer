@@ -203,6 +203,63 @@ fn project(ps: &[&Proj], n_in: usize, x: &[f32], t: usize) -> Vec<Vec<f32>> {
     ys
 }
 
+/// What [`project_post`] does with each projection's outputs after its bias.
+enum Epi<'a> {
+    /// Nothing more.
+    Plain,
+    /// The exact GELU.
+    Gelu,
+    /// Added to `res` (`[t, n_out]`, a single projection), which takes the result.
+    Residual(&'a mut [f32]),
+}
+
+/// [`project`] with the bias and `epi` applied by the matmul's own pool jobs to each block of
+/// outputs as it is done (where the kernels allow; else after it): the same operations in the
+/// same order as `project` and then `gelu_inplace` or `add_inplace`, so the same bits.
+fn project_post(ps: &[&Proj], n_in: usize, x: &[f32], t: usize, epi: Epi) -> Vec<Vec<f32>> {
+    #[derive(Clone, Copy)]
+    struct P(*mut f32);
+    unsafe impl Send for P {}
+    unsafe impl Sync for P {}
+    impl P {
+        fn get(self) -> *mut f32 {
+            self.0
+        }
+    }
+    let (gelu, res) = match epi {
+        Epi::Plain => (false, None),
+        Epi::Gelu => (true, None),
+        Epi::Residual(r) => {
+            assert!(ps.len() == 1 && r.len() == t * ps[0].n_out);
+            (false, Some(P(r.as_mut_ptr())))
+        }
+    };
+    let mut ys: Vec<Vec<f32>> = ps.iter().map(|p| vec![0f32; t * p.n_out]).collect();
+    let post = |j: usize, c: usize, r0: usize, y: &mut [f32]| {
+        let p = ps[j];
+        if let Some(b) = &p.b {
+            for (v, &bv) in y.iter_mut().zip(&b[r0..]) {
+                *v += bv;
+            }
+        }
+        if gelu {
+            y.iter_mut().for_each(|v| *v = gelu_erf(*v));
+        }
+        if let Some(rp) = res {
+            // SAFETY: each output of the residual is updated once, by the job owning it.
+            let r = unsafe { std::slice::from_raw_parts_mut(rp.get().add(c * p.n_out + r0), y.len()) };
+            for (a, &v) in r.iter_mut().zip(y.iter()) {
+                *a += v;
+            }
+        }
+    };
+    {
+        let mut jobs: Vec<(&Lin, usize, &mut [f32])> = ps.iter().zip(ys.iter_mut()).map(|(p, y)| (&p.w, p.n_out, &mut y[..])).collect();
+        crate::model::linear_multi_post(&mut jobs, n_in, x, t, &post);
+    }
+    ys
+}
+
 fn gelu_inplace(x: &mut [f32]) {
     for_chunks(x, 4096, x.len() > 65536, |_, c| c.iter_mut().for_each(|v| *v = gelu_erf(*v)));
 }
@@ -389,6 +446,31 @@ impl CrossLayer {
                 return;
             }
             let qv = &q[ti * d + h * dh..ti * d + (h + 1) * dh];
+            if let (Kv::Bf16(k), Kv::Bf16(v)) = (&self.k, &self.v) {
+                // bf16 keys and values (the default): the same operations as below, with the
+                // rows read in place.
+                let span = (h * n + p0) * dh..(h * n + p1) * dh;
+                let mut sc: Vec<f32> = k[span.clone()]
+                    .chunks_exact(dh)
+                    .map(|kr| crate::kernels::dot_bf16(kr, qv))
+                    .collect();
+                let m = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut l = 0f32;
+                for s in sc.iter_mut() {
+                    *s = crate::kernels::fast_exp(*s - m);
+                    l += *s;
+                }
+                let (head, o) = slot.split_at_mut(2);
+                head[0] = m;
+                head[1] = l;
+                o.fill(0.0);
+                for (vr, &w) in v[span].chunks_exact(dh).zip(&sc) {
+                    for (y, &x) in o.iter_mut().zip(vr) {
+                        *y += w * crate::kernels::bf16_to_f32(x);
+                    }
+                }
+                return;
+            }
             let mut sc: Vec<f32> = (p0..p1).map(|p| self.score(h, p, qv)).collect();
             let m = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mut l = 0f32;
@@ -1218,9 +1300,13 @@ impl WhisperModel {
         }
         let mut out = vec![0f32; tokens.len() * v];
         let mut r0 = 0;
+        // A step on the decode threads (`pool::decode_threads`: all but two from 12 on), as an
+        // LLM's: large-v3 on an 18-core M5 Max decoded ~3% faster on 16 than on 18.
+        let _decode = crate::pool::decode_scope();
         for st in sts.chunks_mut(STEP_ROWS) {
             let r1 = r0 + st.len();
             let h = self.decode_rows(&tokens[r0..r1], st, &cross[r0..r1]);
+            let _ph = crate::prof::phase(22, "whisper head");
             linear_multi(&mut [(&self.lm_head, v, &mut out[r0 * v..r1 * v])], d, &h, r1 - r0);
             r0 = r1;
         }
@@ -1259,7 +1345,10 @@ impl WhisperModel {
             hn.copy_from_slice(&x);
             layer.ln1.apply_rows(&mut hn, LN_EPS);
             let a = &layer.self_attn;
-            let mut qkv = project(&[&a.q, &a.k, &a.v], d, &hn, t);
+            let ph = crate::prof::phase(14, "whisper qkv");
+            let mut qkv = project_post(&[&a.q, &a.k, &a.v], d, &hn, t, Epi::Plain);
+            drop(ph);
+            let ph = crate::prof::phase(15, "whisper self-att");
             let (v, k, mut q) = (qkv.pop().unwrap(), qkv.pop().unwrap(), qkv.pop().unwrap());
             crate::kernels::scale_inplace(&mut q, scale);
             for (i, st) in sts.iter_mut().enumerate() {
@@ -1267,27 +1356,36 @@ impl WhisperModel {
                 st.layers[l].push(&k[r.clone()], &v[r.clone()], 1);
                 attention_masked(&q[r.clone()], &st.layers[l], nh, 1, st.pos, None, true, &mut att[r]);
             }
-            let o = project(&[&a.o], d, &att, t).pop().unwrap();
-            crate::kernels::add_inplace(&mut x, &o);
+            drop(ph);
+            let ph = crate::prof::phase(16, "whisper o");
+            project_post(&[&a.o], d, &att, t, Epi::Residual(&mut x));
+            drop(ph);
 
             hn.copy_from_slice(&x);
             layer.ln_cross.apply_rows(&mut hn, LN_EPS);
             let c = &layer.cross;
-            let mut q = project(&[&c.q], d, &hn, t).pop().unwrap();
+            let ph = crate::prof::phase(17, "whisper cross q");
+            let mut q = project_post(&[&c.q], d, &hn, t, Epi::Plain).pop().unwrap();
+            drop(ph);
+            let ph = crate::prof::phase(18, "whisper cross-att");
             crate::kernels::scale_inplace(&mut q, scale);
             for (i, cr) in cross.iter().enumerate() {
                 let r = i * d..(i + 1) * d;
                 cr.layers(self)[l].attend(&q[r.clone()], 1, &mut att[r]);
             }
-            let o = project(&[&c.o], d, &att, t).pop().unwrap();
-            crate::kernels::add_inplace(&mut x, &o);
+            drop(ph);
+            let ph = crate::prof::phase(19, "whisper cross o");
+            project_post(&[&c.o], d, &att, t, Epi::Residual(&mut x));
+            drop(ph);
 
             hn.copy_from_slice(&x);
             layer.ln2.apply_rows(&mut hn, LN_EPS);
-            let mut f = project(&[&layer.fc1], d, &hn, t).pop().unwrap();
-            gelu_inplace(&mut f);
-            let o = project(&[&layer.fc2], cfg.decoder_ffn_dim, &f, t).pop().unwrap();
-            crate::kernels::add_inplace(&mut x, &o);
+            let ph = crate::prof::phase(20, "whisper fc1");
+            let f = project_post(&[&layer.fc1], d, &hn, t, Epi::Gelu).pop().unwrap();
+            drop(ph);
+            let ph = crate::prof::phase(21, "whisper fc2");
+            project_post(&[&layer.fc2], cfg.decoder_ffn_dim, &f, t, Epi::Residual(&mut x));
+            drop(ph);
         }
         for st in sts.iter_mut() {
             st.pos += 1;

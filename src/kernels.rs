@@ -240,8 +240,56 @@ pub fn matmul(w: &[u16], n_out: usize, n_in: usize, x: &[f32], t: usize, y: &mut
 /// Several matmuls sharing the same input `x`, executed as one parallel region.
 /// Each job is `(w [n_out, n_in], n_out, y [t, n_out])`.
 pub fn matmul_multi(jobs: &mut [(&[u16], usize, &mut [f32])], n_in: usize, x: &[f32], t: usize) {
+    matmul_multi_post(jobs, n_in, x, t, None);
+}
+
+/// What a matmul does with its finished outputs, in its own parallel region (an epilogue):
+/// `post(job, token, r0, y)` with `y` the outputs `r0 .. r0 + y.len()` of that token. Each
+/// output goes through it once, in place; what it does to one output must not depend on the
+/// others (rows arrive in blocks of any size).
+pub type Post<'a> = &'a (dyn Fn(usize, usize, usize, &mut [f32]) + Sync);
+
+/// Runs `post` over all of the outputs of `jobs` (`(n_out, y [t, n_out])`), in parallel when
+/// there are many.
+pub(crate) fn post_all(ys: &mut [(usize, &mut [f32])], t: usize, post: Post) {
+    let total: usize = ys.iter().map(|(n, _)| n * t).sum();
+    if total < 1 << 15 {
+        for (j, (n, y)) in ys.iter_mut().enumerate() {
+            for c in 0..t {
+                post(j, c, 0, &mut y[c * *n..(c + 1) * *n]);
+            }
+        }
+        return;
+    }
+    // Blocks of 4096 outputs.
+    let mut items: Vec<(u32, u32, u32, u32, SendPtr)> = Vec::new();
+    for (j, (n, y)) in ys.iter_mut().enumerate() {
+        for c in 0..t {
+            for r in (0..*n).step_by(4096) {
+                let r1 = (r + 4096).min(*n);
+                items.push((j as u32, c as u32, r as u32, r1 as u32, SendPtr(y[c * *n..].as_mut_ptr())));
+            }
+        }
+    }
+    pool::run(items.len(), &|i| {
+        let (j, c, r0, r1, p) = items[i];
+        // SAFETY: the items cover disjoint ranges of the outputs.
+        let y = unsafe { std::slice::from_raw_parts_mut(p.get().add(r0 as usize), (r1 - r0) as usize) };
+        post(j as usize, c as usize, r0 as usize, y);
+    });
+}
+
+/// [`matmul_multi`] followed by `post` over the outputs (see [`Post`]): one-token and few-token
+/// products run it inside their pool jobs, on each block of rows as it is done.
+pub fn matmul_multi_post(jobs: &mut [(&[u16], usize, &mut [f32])], n_in: usize, x: &[f32], t: usize, post: Option<Post>) {
     assert_eq!(x.len(), t * n_in, "input shape mismatch");
     if t == 0 {
+        return;
+    }
+    if let Some(p) = post.filter(|_| !decode_path(n_in, t)) {
+        matmul_multi_post(jobs, n_in, x, t, None);
+        let mut ys: Vec<(usize, &mut [f32])> = jobs.iter_mut().map(|(_, n, y)| (*n, &mut **y)).collect();
+        post_all(&mut ys, t, p);
         return;
     }
     #[cfg(target_arch = "aarch64")]
@@ -287,17 +335,41 @@ pub fn matmul_multi(jobs: &mut [(&[u16], usize, &mut [f32])], n_in: usize, x: &[
     let _timer = prof::start(Cat::Matmul);
     prof::add_bytes(total_bytes);
 
-    // Block size: ~total/(8*threads) bytes of weights, but at least 128 KiB, in multiples of 4 rows.
     let nthreads = pool::threads();
-    let target = (total_bytes / (nthreads * 8)).max(128 * 1024);
-    let rows_per_block = (target / (n_in * 2)).max(16) / 16 * 16;
     let mut blocks: Vec<(u32, u32, u32)> = Vec::new();
-    for (j, job) in refs.iter().enumerate() {
-        let mut r = 0;
-        while r < job.n_out {
-            let r1 = (r + rows_per_block).min(job.n_out);
-            blocks.push((j as u32, r as u32, r1 as u32));
-            r = r1;
+    if one_pass(t) {
+        // The kernels stream the weights once (one pass over the rows for every token): blocks
+        // that shrink as the work runs out, each a share of what is left (from 1/threads of it)
+        // down to 16 KiB, claimed in order. The threads start on long runs and end within a few
+        // microseconds of each other; equal blocks of at least 128 KiB (below) left the last ones
+        // running alone at the end of each region. On an M5 Max (16 threads) this streamed a
+        // one-token 1280x1280 bf16 matrix at 239 GB/s instead of 216, 5120x1280 at 281 instead of
+        // 275, and took a Whisper large-v3 CPU decoder step ~2.5% faster.
+        let row_bytes = n_in * 2;
+        let mut left = total_bytes;
+        for (j, job) in refs.iter().enumerate() {
+            let mut r = 0;
+            while r < job.n_out {
+                let size = (left / nthreads).max(16 << 10);
+                let r1 = (r + (size / row_bytes).div_ceil(16).max(1) * 16).min(job.n_out);
+                blocks.push((j as u32, r as u32, r1 as u32));
+                left -= (r1 - r) * row_bytes;
+                r = r1;
+            }
+        }
+    } else {
+        // Block size: ~total/(8*threads) bytes of weights, but at least 128 KiB, in multiples of
+        // 16 rows: small enough that the passes over the tokens after the first read the block
+        // from the L2 cache.
+        let target = (total_bytes / (nthreads * 8)).max(128 * 1024);
+        let rows_per_block = (target / (n_in * 2)).max(16) / 16 * 16;
+        for (j, job) in refs.iter().enumerate() {
+            let mut r = 0;
+            while r < job.n_out {
+                let r1 = (r + rows_per_block).min(job.n_out);
+                blocks.push((j as u32, r as u32, r1 as u32));
+                r = r1;
+            }
         }
     }
     // Prefill: pack activations as [tile][k][8 tokens] so the GEMM kernel can broadcast weights by lane.
@@ -327,7 +399,40 @@ pub fn matmul_multi(jobs: &mut [(&[u16], usize, &mut [f32])], n_in: usize, x: &[
                 job.y.get().add(c0 * job.n_out),
             )
         }
+        if let Some(p) = post {
+            for c in c0..c1 {
+                // SAFETY: this job owns rows r0..r1 of these tokens.
+                let y = unsafe { std::slice::from_raw_parts_mut(job.y.get().add(c * job.n_out + r0 as usize), (r1 - r0) as usize) };
+                p(j as usize, c, r0 as usize, y);
+            }
+        }
     });
+}
+
+/// Whether the decode kernels ([`simd::block_tc`]) read each weight row once for all `t` tokens
+/// (up to 4 on aarch64), and the matmul takes the shrinking blocks of [`matmul_multi_post`]
+/// (only on aarch64, where they were measured).
+fn one_pass(t: usize) -> bool {
+    cfg!(target_arch = "aarch64") && t <= 4
+}
+
+/// Whether [`matmul_multi`] over `t` tokens takes its own blocked loop (not one of the prefill
+/// GEMMs), where [`matmul_multi_post`] runs the epilogue inside the jobs.
+fn decode_path(n_in: usize, t: usize) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    if t > decode_max_tokens() && prefill_kernel() == PrefillGemm::Sme && sme::fits(n_in) {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if t >= TN && n_in.is_multiple_of(32) && simd::avx512() {
+        return false;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if t >= TN && n_in.is_multiple_of(32) && gemm_tuning().is_some() {
+        return false;
+    }
+    let _ = n_in;
+    t > 0
 }
 
 /// Work items of a grouped matmul: `(job, row0, row1, token0, token1)`, row blocks of about
@@ -709,6 +814,110 @@ pub mod simd {
         let mut r = r0;
         while r + R <= r1 {
             let o = kernel::<W, R, TC, G, A>(w.add(r * n_in), n_in, x.add(c0 * n_in), n_in, n_in);
+            for rr in 0..R {
+                for c in 0..TC {
+                    *y.add((c0 + c) * n_out + r + rr) = o[rr][c];
+                }
+            }
+            r += R;
+        }
+    }
+
+    /// [`kernel`]`::<W, R, TC, 4, 8>` (the one-token layout: accumulator `a` of a row and
+    /// token takes the products of elements `32 k + 4 a .. + 4`, in the order of `k`, and the
+    /// eight are summed from 0 to 7), bit for bit, with fewer registers: each segment of the
+    /// rows is walked `4 / GP` times, each walk feeding only `2 GP` of the accumulators (kept in
+    /// memory between walks and segments, every one in the order of `k`). The walks after the
+    /// first read the segment from the L1 cache, so the weights still stream once, and the
+    /// accumulators of more rows and tokens fit in the registers at once.
+    #[inline(always)]
+    pub unsafe fn kernel_split<W: Load8, const R: usize, const TC: usize, const GP: usize>(
+        w: *const W,
+        ws: usize,
+        x: *const f32,
+        xs: usize,
+        n: usize,
+    ) -> [[f32; TC]; R] {
+        let zero = vdupq_n_f32(0.0);
+        // The eight accumulators of each row and token, between column segments.
+        let mut st = [[[zero; 8]; TC]; R];
+        // Rows of up to 2048 in one segment, longer ones in segments of 512: the tokens' inputs
+        // of a segment then stay in the L1 cache over the walks (measured: one segment for 1280,
+        // 512 for 5120 to 14336 wide rows).
+        let seg = if n <= 2048 { n } else { 512 };
+        let mut k0 = 0;
+        while k0 < n {
+            let k1 = (k0 + seg).min(n);
+            for p in 0..4 / GP {
+                let off = 8 * GP * p;
+                let mut acc = [[[(zero, zero); GP]; TC]; R];
+                for r in 0..R {
+                    for c in 0..TC {
+                        for g in 0..GP {
+                            acc[r][c][g] = (st[r][c][2 * GP * p + 2 * g], st[r][c][2 * GP * p + 2 * g + 1]);
+                        }
+                    }
+                }
+                let mut i = k0;
+                while i < k1 {
+                    let mut wv = [[(zero, zero); GP]; R];
+                    for r in 0..R {
+                        for g in 0..GP {
+                            wv[r][g] = W::load8(w.add(r * ws + i + off + 8 * g));
+                        }
+                    }
+                    for c in 0..TC {
+                        for g in 0..GP {
+                            let xl = vld1q_f32(x.add(c * xs + i + off + 8 * g));
+                            let xh = vld1q_f32(x.add(c * xs + i + off + 8 * g + 4));
+                            for r in 0..R {
+                                acc[r][c][g].0 = vfmaq_f32(acc[r][c][g].0, wv[r][g].0, xl);
+                                acc[r][c][g].1 = vfmaq_f32(acc[r][c][g].1, wv[r][g].1, xh);
+                            }
+                        }
+                    }
+                    i += 32;
+                }
+                for r in 0..R {
+                    for c in 0..TC {
+                        for g in 0..GP {
+                            st[r][c][2 * GP * p + 2 * g] = acc[r][c][g].0;
+                            st[r][c][2 * GP * p + 2 * g + 1] = acc[r][c][g].1;
+                        }
+                    }
+                }
+            }
+            k0 = k1;
+        }
+        let mut out = [[0f32; TC]; R];
+        for r in 0..R {
+            for c in 0..TC {
+                let mut s = st[r][c][0];
+                for a in 1..8 {
+                    s = vaddq_f32(s, st[r][c][a]);
+                }
+                out[r][c] = vaddvq_f32(s);
+            }
+        }
+        out
+    }
+
+    /// [`run_tiles`] on [`kernel_split`].
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn run_tiles_split<W: Load8, const R: usize, const TC: usize, const GP: usize>(
+        w: *const W,
+        n_in: usize,
+        x: *const f32,
+        y: *mut f32,
+        n_out: usize,
+        r0: usize,
+        r1: usize,
+        c0: usize,
+    ) {
+        let mut r = r0;
+        while r + R <= r1 {
+            let o = kernel_split::<W, R, TC, GP>(w.add(r * n_in), n_in, x.add(c0 * n_in), n_in, n_in);
             for rr in 0..R {
                 for c in 0..TC {
                     *y.add((c0 + c) * n_out + r + rr) = o[rr][c];
@@ -1234,19 +1443,23 @@ pub mod simd {
         // the registers), so each output is bit-identical whatever the token count: speculative
         // verification over a few tokens then reproduces plain decoding exactly.
         let pair = |c: usize| run_tiles::<W, 1, 2, 4, 8>(w, n_in, x, y, n_out, r0, r1, c);
+        macro_rules! split {
+            ($R:expr, $TC:expr, $GP:expr) => {{
+                let m = r0 + (r1 - r0) / $R * $R;
+                run_tiles_split::<W, $R, $TC, $GP>(w, n_in, x, y, n_out, r0, m, c0);
+                run_tiles_split::<W, 1, $TC, $GP>(w, n_in, x, y, n_out, m, r1, c0);
+            }};
+        }
+        // Three and four tokens take the same layout walked in four passes ([`kernel_split`]):
+        // two rows for all the tokens at once, each row read once (as two token pairs read it
+        // twice). On an M5 Max (16 threads) four tokens over 5120x1280 bf16 went from 166 to
+        // 209 GB/s, over 14336x4096 from 171 to 200; three over 1280x1280 from 149 to 181.
+        // (Two tokens gained nothing.)
         match tc {
             1 => go!(1, 4, 8),
             2 => pair(c0),
-            3 => {
-                pair(c0);
-                let m = r0 + (r1 - r0) / 2 * 2;
-                run_tiles::<W, 2, 1, 4, 8>(w, n_in, x, y, n_out, r0, m, c0 + 2);
-                run_tiles::<W, 1, 1, 4, 8>(w, n_in, x, y, n_out, m, r1, c0 + 2);
-            }
-            4 => {
-                pair(c0);
-                pair(c0 + 2)
-            }
+            3 => split!(2, 3, 1),
+            4 => split!(2, 4, 1),
             _ => unreachable!("bad tc {tc}"),
         }
     }
@@ -4460,6 +4673,93 @@ mod tests {
             softmax_inplace(&mut got);
             for (a, b) in got.iter().zip(&want) {
                 assert_eq!(a.to_bits(), b.to_bits(), "n {n}");
+            }
+        }
+    }
+
+    /// bf16 decode passes over 2..=7 tokens (token pairs, the walked three- and four-token
+    /// tiles) give every token the bits of a one-token pass: rows of one segment and of several
+    /// with a short last one, an odd row count, f32 weights too.
+    #[test]
+    fn bf16_multi_token_passes_are_batch_invariant() {
+        crate::pool::init(3);
+        let mut seed = 5u64;
+        for (n_out, n_in) in [(37usize, 1280usize), (21, 4096 + 96)] {
+            let w: Vec<u16> = (0..n_out * n_in).map(|_| (lcg(&mut seed).to_bits() >> 16) as u16).collect();
+            let run = |x: &[f32], t: usize| {
+                let mut y = vec![0f32; t * n_out];
+                matmul(&w, n_out, n_in, x, t, &mut y);
+                y.iter().map(|v| v.to_bits()).collect::<Vec<u32>>()
+            };
+            for t in 2..=decode_max_tokens().min(7) {
+                let x: Vec<f32> = (0..t * n_in).map(|_| lcg(&mut seed) * 3.0).collect();
+                let alone: Vec<u32> = (0..t).flat_map(|c| run(&x[c * n_in..(c + 1) * n_in], 1)).collect();
+                assert_eq!(run(&x, t), alone, "{n_out}x{n_in} t={t}");
+            }
+        }
+        #[cfg(has_simd)]
+        {
+            // f32 weights through the same tiles (`scalar_rows_f32`'s kernels).
+            let (n_out, n_in) = (9usize, 4096 + 32);
+            let w: Vec<f32> = (0..n_out * n_in).map(|_| lcg(&mut seed)).collect();
+            let x: Vec<f32> = (0..4 * n_in).map(|_| lcg(&mut seed)).collect();
+            let run = |x: &[f32], t: usize| {
+                let mut y = vec![0f32; t * n_out];
+                unsafe { simd::block_tc::<f32>(w.as_ptr(), n_in, x.as_ptr(), y.as_mut_ptr(), n_out, 0, n_out, 0, t) };
+                y.iter().map(|v| v.to_bits()).collect::<Vec<u32>>()
+            };
+            for t in 2..=4 {
+                let alone: Vec<u32> = (0..t).flat_map(|c| run(&x[c * n_in..(c + 1) * n_in], 1)).collect();
+                assert_eq!(run(&x[..t * n_in], t), alone, "f32 t={t}");
+            }
+        }
+    }
+
+    /// An epilogue run inside the matmul's jobs gives the bits of running it after.
+    #[test]
+    fn matmul_epilogue_matches_a_pass_after() {
+        crate::pool::init(4);
+        let (n_in, outs) = (512usize, [300usize, 77]);
+        let mut seed = 3u64;
+        let ws: Vec<Vec<u16>> = outs
+            .iter()
+            .map(|&n| (0..n * n_in).map(|_| (lcg(&mut seed).to_bits() >> 16) as u16).collect())
+            .collect();
+        let bias: Vec<Vec<f32>> = outs.iter().map(|&n| (0..n).map(|_| lcg(&mut seed)).collect()).collect();
+        let post = |j: usize, _c: usize, r0: usize, y: &mut [f32]| {
+            for (v, &b) in y.iter_mut().zip(&bias[j][r0..]) {
+                *v = (*v + b) * 0.5 + (*v * 3.0).exp().min(9.0);
+            }
+        };
+        for t in [1usize, 3, 5, 9] {
+            let x: Vec<f32> = (0..t * n_in).map(|_| lcg(&mut seed)).collect();
+            let mut a: Vec<Vec<f32>> = outs.iter().map(|&n| vec![0f32; t * n]).collect();
+            let mut b = a.clone();
+            {
+                let mut jobs: Vec<(&[u16], usize, &mut [f32])> = ws
+                    .iter()
+                    .zip(&outs)
+                    .zip(a.iter_mut())
+                    .map(|((w, &n), y)| (&w[..], n, &mut y[..]))
+                    .collect();
+                matmul_multi_post(&mut jobs, n_in, &x, t, Some(&post));
+            }
+            {
+                let mut jobs: Vec<(&[u16], usize, &mut [f32])> = ws
+                    .iter()
+                    .zip(&outs)
+                    .zip(b.iter_mut())
+                    .map(|((w, &n), y)| (&w[..], n, &mut y[..]))
+                    .collect();
+                matmul_multi(&mut jobs, n_in, &x, t);
+            }
+            for (j, (y, &n)) in b.iter_mut().zip(&outs).enumerate() {
+                for c in 0..t {
+                    post(j, c, 0, &mut y[c * n..(c + 1) * n]);
+                }
+            }
+            for (ya, yb) in a.iter().zip(&b) {
+                assert!(ya.iter().zip(yb).all(|(p, q)| p.to_bits() == q.to_bits()), "t={t}");
             }
         }
     }

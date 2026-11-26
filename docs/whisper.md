@@ -236,17 +236,28 @@ the same transcripts. Before the device sessions, oxinfer took 1.66 / 2.54 / 6.2
 / 10.30 s for tiny / base / small / large-v3-turbo on Metal (encoder 0.59 / 1.02 / 2.63 / 7.43 s,
 CPU decoder 1.01 / 1.47 / 3.56 / 2.77 s, in a busier moment of the shared machine).
 
-On the CPU (oxinfer `--device cpu`, 18 threads; whisper.cpp `-ng -t 12`, its fastest thread count
-here, with the Accelerate BLAS backend for the encoder):
+On the CPU (oxinfer `--device cpu`, 18 threads, decoder steps on 16; whisper.cpp `-ng -t 12`,
+its fastest thread count here, with the Accelerate BLAS backend for the encoder):
 
 | Model | oxinfer encoder / decoder | oxinfer total | whisper.cpp encoder / decoder | whisper.cpp total | Speedup |
 |---|---|---|---|---|---|
-| tiny | 0.65 / 0.65 s | **1.36 s** (365x) | 0.95 / 1.39 s | 2.43 s | 1.79x |
-| base | 1.48 / 1.15 s | **2.69 s** (185x) | 2.06 / 2.15 s | 4.32 s | 1.61x |
-| small | 4.85 / 3.34 s | **8.25 s** (60x) | 6.94 / 4.90 s | 12.02 s | 1.46x |
-| large-v3-turbo | 27.0 / 2.43 s | **29.5 s** (17x) | 38.2 / 3.82 s | 42.4 s | 1.44x |
-| medium | 16.2 / 9.28 s | **25.6 s** (19x) | 20.3 / 11.3 s | 32.0 s | 1.25x |
-| large-v3 | 34.8 / 14.7 s | **49.7 s** (10x) | 46.3 / 21.8 s | 68.8 s | 1.38x |
+| tiny | 0.69 / 0.65 s | **1.39 s** (357x) | 1.03 / 1.55 s | 2.67 s | 1.92x |
+| base | 1.48 / 1.13 s | **2.67 s** (186x) | 2.09 / 2.10 s | 4.29 s | 1.61x |
+| small | 4.95 / 3.14 s | **8.15 s** (61x) | 7.07 / 5.00 s | 12.24 s | 1.50x |
+| large-v3-turbo | 29.8 / 2.48 s | **32.4 s** (15x) | 38.4 / 3.81 s | 42.6 s | 1.32x |
+| medium | 16.1 / 8.43 s | **24.7 s** (20x) | 20.2 / 11.4 s | 31.9 s | 1.29x |
+| large-v3 | 32.6 / 12.7 s | **45.5 s** (11x) | 45.9 / 22.0 s | 68.5 s | 1.51x |
+
+The CPU decoder's matmuls run their bias, GELU and residual add inside the matmul's own pool
+jobs, on each block of rows as it is done (the same operations, so the same transcripts), its
+one-token matvecs take blocks that shrink as the work runs out, and a step runs on the decode
+threads (16 of 18): a large-v3 layer's six matmuls went from 207 to 180 us a token (222 to 255
+GB/s of bf16 weights), the output projection from 509 to 457 us (261 to 291 GB/s). Before
+(same transcripts, the earlier session of the table), the decoder took 0.65 / 1.15 / 3.34 / 2.43
+/ 9.28 / 14.7 s from tiny to large-v3; the encoder is unchanged (large-v3-turbo's moved with the
+load of the shared machine: 27.0 s then). Beam search (`--beam 5`, five rows a step, three- and
+four-token tiles: see [Performance](performance.md)) on a 60 s clip with large-v3: decoder
+4.23-4.33 -> 3.63-3.65 s.
 
 The CPU and Metal transcripts are the same from small up (tiny and base differ by 3 and 1 of the
 1109 words; the CPU's tiny scores 6.40% as well). The word error rates match whisper.cpp's within
