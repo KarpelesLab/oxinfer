@@ -3,12 +3,12 @@
 
 use super::activity;
 use super::{ApiError, ApiResult, ModelSpec};
-use crate::engine::{Engine, EngineOptions};
+use crate::engine::{Engine, EngineOptions, EnginePool, Message, PoolGuard};
 use crate::model::Quant;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// What a model does (which endpoints take it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,7 +99,8 @@ pub(crate) struct VideoModel {
 }
 /// A loaded model.
 pub(crate) enum Loaded {
-    Chat(Box<Engine>),
+    /// The model's sessions (`parallel` of them, see [`crate::engine::EnginePool`]).
+    Chat(Arc<EnginePool>),
     Embedding(Box<EmbedModel>),
     Image(Box<ImageModel>),
     Transcription(Box<crate::whisper::Transcriber>),
@@ -119,7 +120,8 @@ impl Loaded {
     /// Stops what the model is running from another thread (the models with a stop flag).
     fn cancel_hook(&self) -> Option<Box<dyn Fn() + Send + Sync>> {
         let h = match self {
-            Loaded::Chat(e) => e.cancel_handle(),
+            // (Per session: [`ChatLease::engine`].)
+            Loaded::Chat(_) => return None,
             Loaded::Speech(s) => s.cancel_handle(),
             Loaded::Zonos(z) => z.cancel_handle(),
             Loaded::Arktts(a) => a.cancel_handle(),
@@ -140,7 +142,8 @@ impl Loaded {
             streamer: None,
             prompt_cache: None,
         };
-        if let Loaded::Chat(e) = self {
+        if let Loaded::Chat(pool) = self {
+            let e = pool.slot(0);
             let i = e.info();
             d.device = Some(i.device.clone());
             d.model_type = Some(i.model_type.clone());
@@ -184,8 +187,12 @@ pub(crate) struct Details {
 /// One model of the whitelist.
 pub(crate) struct Entry {
     pub spec: ModelSpec,
-    /// Held for the whole of a request: requests to one model wait their turn.
+    /// Held for the whole of a request (but chat requests, see `inuse`): requests to one model
+    /// wait their turn.
     slot: Mutex<Option<Loaded>>,
+    /// Chat requests using the model ([`ChatLease`]: they hold the slot only while it loads,
+    /// their sessions are the pool's).
+    inuse: std::sync::atomic::AtomicUsize,
     /// The kind and the local path, once known.
     detected: Mutex<Option<(Kind, Option<ImageKind>)>>,
     /// Registry clock of the last use.
@@ -214,6 +221,7 @@ impl Entry {
         Entry {
             spec: spec.clone(),
             slot: Mutex::new(None),
+            inuse: std::sync::atomic::AtomicUsize::new(0),
             // Models on disk already: their kind for the listing, without fetching anything.
             detected: Mutex::new(
                 local_path(&spec.source, cache_dir)
@@ -254,7 +262,18 @@ impl Entry {
     }
 
     fn busy(&self) -> bool {
-        matches!(self.slot.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+        self.inuse.load(Ordering::SeqCst) > 0 || matches!(self.slot.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+    }
+
+    /// The slot when no request uses the model (never waits).
+    fn try_idle(&self) -> Option<MutexGuard<'_, Option<Loaded>>> {
+        let g = match self.slot.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        // (A chat lease counts itself in before it lets go of the slot.)
+        (self.inuse.load(Ordering::SeqCst) == 0).then_some(g)
     }
 }
 
@@ -288,6 +307,9 @@ pub(crate) struct Registry {
     /// The server-wide prompt cache of chat models (a model's own `prompt_cache` overrides it).
     pub prompt_cache: Option<PathBuf>,
     pub prompt_cache_gb: Option<f64>,
+    /// Sessions of each chat model, the conversations it runs at once (a model's own `parallel`
+    /// option overrides it; see [`super::ServerOptions::parallel`]).
+    pub parallel: usize,
     clock: AtomicU64,
     /// Serializes loads (and the memory accounting around them).
     loading: Mutex<()>,
@@ -341,6 +363,62 @@ impl Drop for Lease<'_> {
     }
 }
 
+/// A chat model in use by a request ([`Registry::acquire_chat`]): the model stays loaded while
+/// it lives; [`ChatLease::engine`] takes one of its sessions.
+pub(crate) struct ChatLease<'a> {
+    pub entry: &'a Entry,
+    pub pool: Arc<EnginePool>,
+}
+
+impl ChatLease<'_> {
+    pub fn spec(&self) -> &ModelSpec {
+        &self.entry.spec
+    }
+
+    /// The idle session best for `messages` ([`EnginePool::acquire`]), waiting for one while
+    /// all are busy (reported to `on` every two seconds, as [`Registry::acquire_with`] does).
+    pub fn engine(&self, messages: &[Message], mut on: Option<OnStage<'_, '_>>) -> ApiResult<PoolGuard<'_>> {
+        let mut gone = false;
+        let mut first = true;
+        let mut wait = || {
+            if activity::cancelled() {
+                return false;
+            }
+            if first {
+                activity::set_stage(activity::Stage::Queued);
+                first = false;
+            }
+            if let Some(on) = on.as_mut()
+                && !on(&Stage::Waiting)
+            {
+                gone = true;
+                return false;
+            }
+            true
+        };
+        let Some(engine) = self.pool.acquire(messages, std::time::Duration::from_secs(2), &mut wait) else {
+            return Err(if gone {
+                ApiError::new(499, "the client closed the request")
+            } else {
+                activity::cancelled_error()
+            });
+        };
+        if let Some(t) = activity::current() {
+            let h = engine.cancel_handle();
+            t.on_cancel(Box::new(move || h.cancel()));
+            activity::set_stage(activity::Stage::Generating);
+        }
+        Ok(engine)
+    }
+}
+
+impl Drop for ChatLease<'_> {
+    fn drop(&mut self) {
+        self.entry.used_at.store(now_ms(), Ordering::Relaxed);
+        self.entry.inuse.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Milliseconds since the first call (the clock of [`Entry::used_at`]).
 fn now_ms() -> u64 {
     static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -369,6 +447,7 @@ impl Registry {
             cache_dir,
             prompt_cache: None,
             prompt_cache_gb: None,
+            parallel: super::DEFAULT_PARALLEL,
             clock: AtomicU64::new(1),
             loading: Mutex::new(()),
             log,
@@ -412,9 +491,8 @@ impl Registry {
             }
             // (try_lock: never waits for a slot while holding the list.)
             let mut g = old
-                .slot
-                .try_lock()
-                .map_err(|_| ApiError::new(409, format!("{} is in use; try again once its request is done", spec.id)))?;
+                .try_idle()
+                .ok_or_else(|| ApiError::new(409, format!("{} is in use; try again once its request is done", spec.id)))?;
             *g = None;
             old.unloaded();
             old.retired.store(true, Ordering::Relaxed);
@@ -490,9 +568,8 @@ impl Registry {
     pub fn unload(&self, id: &str) -> ApiResult<bool> {
         let e = self.find(id)?;
         let mut g = e
-            .slot
-            .try_lock()
-            .map_err(|_| ApiError::new(409, format!("{id} is in use; try again once its request is done")))?;
+            .try_idle()
+            .ok_or_else(|| ApiError::new(409, format!("{id} is in use; try again once its request is done")))?;
         let was = g.take().is_some();
         e.unloaded();
         if was && self.log {
@@ -548,10 +625,12 @@ impl Registry {
     pub fn each_idle_engine<R>(&self, mut f: impl FnMut(&mut Engine) -> R) -> Vec<(String, R)> {
         let mut out = Vec::new();
         for e in self.active() {
-            if let Ok(mut g) = e.slot.try_lock()
-                && let Some(Loaded::Chat(engine)) = g.as_mut()
-            {
-                out.push((e.spec.id.clone(), f(engine)));
+            let pool = match e.slot.try_lock().ok().as_deref() {
+                Some(Some(Loaded::Chat(pool))) => pool.clone(),
+                _ => continue,
+            };
+            for r in pool.each_idle(&mut f) {
+                out.push((e.spec.id.clone(), r));
             }
         }
         out
@@ -726,15 +805,35 @@ impl Registry {
         Ok(Lease { entry, guard })
     }
 
+    /// [`Registry::acquire_with`] for a chat model, returning as soon as it is loaded: the
+    /// sessions of its pool are taken per request ([`ChatLease::engine`]), so that up to
+    /// `parallel` requests run at once.
+    pub fn acquire_chat(&self, id: &str, on: Option<OnStage<'_, '_>>) -> ApiResult<ChatLease<'_>> {
+        let lease = self.acquire_with(id, Kind::Chat, on)?;
+        let entry = lease.entry;
+        let Some(Loaded::Chat(pool)) = lease.guard.as_ref() else {
+            unreachable!()
+        };
+        let pool = pool.clone();
+        // Counted in before the slot is released: the model is not unloaded under the request.
+        entry.inuse.fetch_add(1, Ordering::SeqCst);
+        drop(lease);
+        Ok(ChatLease { entry, pool })
+    }
+
     /// Writes the snapshot a loaded chat model's prompt cache has waiting (see
     /// [`crate::engine::Engine::flush_prompt_cache`]); nothing if the model is not loaded.
     pub fn flush_prompt_cache(&self, id: &str) {
         let Ok(e) = self.find(id) else { return };
-        let mut g = lock(&e.slot);
-        if let Some(Loaded::Chat(engine)) = g.as_mut()
-            && let Err(err) = engine.flush_prompt_cache()
-        {
-            eprintln!("[{id}: prompt cache: {err:#}]");
+        let pool = match lock(&e.slot).as_ref() {
+            Some(Loaded::Chat(pool)) => pool.clone(),
+            _ => return,
+        };
+        // (A busy session flushes its own when its next conversation moves its cache.)
+        for r in pool.each_idle(|engine| engine.flush_prompt_cache()) {
+            if let Err(err) = r {
+                eprintln!("[{id}: prompt cache: {err:#}]");
+            }
         }
     }
 
@@ -831,7 +930,7 @@ impl Registry {
 
     /// Unloads `e` unless a request uses it (true when it did).
     fn drop_model(&self, e: &Entry, why: &str) -> bool {
-        let Ok(mut g) = e.slot.try_lock() else { return false };
+        let Some(mut g) = e.try_idle() else { return false };
         if g.take().is_none() {
             return false;
         }
@@ -956,7 +1055,20 @@ impl Registry {
                 for (k, v) in &opts {
                     o.set(k, v)?;
                 }
-                Loaded::Chat(Box::new(Engine::load(src, &o)?))
+                let n = match spec.option("parallel") {
+                    Some(v) => v
+                        .parse::<usize>()
+                        .map_err(|_| anyhow::anyhow!("parallel: expected a count, got {v:?}"))?,
+                    None => self.parallel,
+                };
+                let mut b = crate::batch::BatchOptions::default();
+                if let Some(v) = spec.option("batch_fast") {
+                    b.fast = matches!(v, "1" | "true" | "yes" | "on");
+                }
+                if let Some(v) = spec.option("max_batch") {
+                    b.max_batch = v.parse().map_err(|_| anyhow::anyhow!("max_batch: expected a count, got {v:?}"))?;
+                }
+                Loaded::Chat(Arc::new(EnginePool::new(Engine::load(src, &o)?, n.max(1), b)))
             }
             Kind::Embedding => {
                 let mut quant = Quant::Bf16;
@@ -1061,7 +1173,8 @@ impl Registry {
         };
         e.vram.store(vram, Ordering::Relaxed);
         *lock(&e.details) = Some(loaded.details(t0.elapsed().as_secs_f64()));
-        if let Loaded::Chat(engine) = &loaded {
+        if let Loaded::Chat(pool) = &loaded {
+            let engine = pool.slot(0);
             *lock(&e.fingerprint) = Some(engine.prompt_cache_fingerprint().to_string());
             *lock(&e.vision) = Some(engine.accepts_images());
             *lock(&e.caps) = Some(engine.capabilities());

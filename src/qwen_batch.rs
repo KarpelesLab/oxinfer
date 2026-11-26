@@ -138,6 +138,110 @@ impl QwenModel<'_> {
     }
 }
 
+impl QwenModel<'_> {
+    /// [`crate::generate::TextLm::forward_batch`]: one decode step of several sessions, the
+    /// logits after each. On the GPU, one multi-token plan step whose rows are the sessions'
+    /// tokens ([`crate::gpu::decode::DecodePlan::step_rows`]: the exact multi-token kernels,
+    /// each session's attention on its own cache); on the CPU, [`Self::forward_hidden_batch`]
+    /// (bit for bit the one-token steps) and the head over all rows. Sessions the batched paths
+    /// do not take (recurrent layers on the GPU, interventions, captures, Qwen4-Exp, streamed
+    /// weights) run one after the other.
+    pub fn forward_batch(&self, sess: &mut [&mut QwenSession], tokens: &[u32]) -> Vec<Vec<f32>> {
+        let b = tokens.len();
+        assert!(b > 0 && sess.len() == b, "one token per session");
+        let one_by_one =
+            |sess: &mut [&mut QwenSession]| -> Vec<Vec<f32>> { sess.iter_mut().zip(tokens).map(|(s, &t)| self.forward(s, &[t])).collect() };
+        if b == 1 {
+            return one_by_one(sess);
+        }
+        if self.gpu_decode_on() {
+            return match self.gpu_step_rows(sess, tokens) {
+                Some(l) => l,
+                None => one_by_one(sess),
+            };
+        }
+        let plain = sess.iter().all(|s| !s.iv.active() && s.capture.is_empty());
+        if !plain || self.exp.is_some() {
+            return one_by_one(sess);
+        }
+        let hs = self.forward_hidden_batch(sess, tokens);
+        let v = self.cfg.vocab_size;
+        self.logits(&hs, b).chunks(v).map(<[f32]>::to_vec).collect()
+    }
+
+    /// The GPU side of [`Self::forward_batch`] (None, nothing changed, when it cannot).
+    fn gpu_step_rows(&self, sess: &mut [&mut QwenSession], tokens: &[u32]) -> Option<Vec<Vec<f32>>> {
+        let b = tokens.len();
+        if !(2..=8).contains(&b)
+            || self.exp.is_some()
+            || self.stream.is_some()
+            || crate::gpu::decode::check()
+            // (The mixture of experts' multi-token kernels round differently from the one-token
+            // ones: exact only one session after the other, unless asked for the fast kernels.)
+            || (self.layers.iter().any(|l| matches!(l.ffn, Ffn::Moe(_))) && !crate::batch::fast())
+            || sess.iter().any(|s| {
+                s.iv.active()
+                    || !s.capture.is_empty()
+                    || s.positions.is_some()
+                    || s.deepstack.is_some()
+                    || s.gdn.iter().any(|g| g.is_some())
+            })
+        {
+            return None;
+        }
+        let plan = self.gpu_multi_plan(&[], 8, crate::batch::fast_for(b))?;
+        let _timer = prof::start(Cat::Matmul);
+        let cfg = &self.cfg;
+        let (h, v) = (cfg.hidden_size, cfg.vocab_size);
+        let mut x = crate::kernels::zeros(b * h);
+        for (j, &tok) in tokens.iter().enumerate() {
+            self.embed.row(tok as usize, &mut x[j * h..(j + 1) * h]);
+        }
+        let cs: Vec<Vec<f32>> = sess
+            .iter()
+            .map(|s| {
+                let (mut c, sn) = self.rope_cs(&s.spans, s.pos, 1);
+                c.extend_from_slice(&sn);
+                c
+            })
+            .collect();
+        let mut hidden = crate::kernels::zeros(b * h);
+        let mut logits = crate::kernels::zeros(b * v);
+        let mut parts: Vec<(&mut crate::gpu::decode::Slot, Vec<&mut LayerCache>, usize)> = sess
+            .iter_mut()
+            .map(|s| {
+                let QwenSession { kv, gpu, pos, .. } = &mut **s;
+                (gpu, kv.iter_mut().flatten().collect(), *pos)
+            })
+            .collect();
+        let mut rows: Vec<crate::gpu::decode::Row> = parts
+            .iter_mut()
+            .zip(&cs)
+            .zip(x.chunks(h))
+            .map(|(((slot, kv, pos), cs), x)| crate::gpu::decode::Row {
+                slot,
+                pos: *pos,
+                rope_cs: cs,
+                x,
+                x2: &[],
+                kv: &mut kv[..],
+            })
+            .collect();
+        let ok = plan.step_rows(&mut rows, &mut hidden, Some(&mut logits));
+        drop(rows);
+        drop(parts);
+        if !ok {
+            return None;
+        }
+        for s in sess.iter_mut() {
+            s.gpu_states_kept = true;
+            s.rec_span = None;
+            s.pos += 1;
+        }
+        Some(logits.chunks(v).map(<[f32]>::to_vec).collect())
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -273,6 +377,39 @@ pub(crate) mod tests {
                 assert_eq!(a.pos, b.pos);
                 let (ca, cb) = (a.kv[0].as_ref().unwrap(), b.kv[0].as_ref().unwrap());
                 assert_eq!(bits(ca.data().0), bits(cb.data().0));
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The logits of a batched step (the server's concurrent requests, `crate::batch`) are those
+    /// of each session's own one-token step, bit for bit, the head included.
+    #[test]
+    fn forward_batch_logits_match_one_token_steps() {
+        crate::pool::init(3);
+        let dir = tiny_llama("fbatch", 300, 64, 2, 9, &[]);
+        let cfg = QwenConfig::load(&dir).unwrap();
+        let files = ModelFiles::open(&dir, true).unwrap();
+        for quant in [Quant::Bf16, Quant::Q8] {
+            let model = QwenModel::load(cfg.clone(), &files, quant).unwrap();
+            let prompts: Vec<Vec<u32>> = (0..5)
+                .map(|i| (0..4 + 3 * i).map(|j| ((i * 31 + j * 7) % 300) as u32).collect())
+                .collect();
+            let prefill = |p: &[u32]| {
+                let mut s = model.new_session();
+                model.forward_hidden_mm(&mut s, p, &[]);
+                s
+            };
+            let mut alone: Vec<QwenSession> = prompts.iter().map(|p| prefill(p)).collect();
+            let mut batch: Vec<QwenSession> = prompts.iter().map(|p| prefill(p)).collect();
+            for step in 0..4u32 {
+                let toks: Vec<u32> = (0..5).map(|i| (i * 17 + step * 23) % 300).collect();
+                let want: Vec<Vec<f32>> = alone.iter_mut().zip(&toks).map(|(s, &t)| model.forward(s, &[t])).collect();
+                let mut refs: Vec<&mut QwenSession> = batch.iter_mut().collect();
+                let got = model.forward_batch(&mut refs, &toks);
+                for (g, w) in got.iter().zip(&want) {
+                    assert_eq!(bits(g), bits(w), "{quant:?} step {step}");
+                }
             }
         }
         std::fs::remove_dir_all(&dir).unwrap();

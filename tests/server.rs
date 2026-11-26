@@ -2427,3 +2427,49 @@ fn cancel_chat_and_clear_prompt_cache_with_a_model() {
     s.stop().unwrap();
     std::fs::remove_dir_all(&pc).ok();
 }
+
+/// Concurrent chat requests on one model (`parallel`, `crate::batch`): each streamed reply equals
+/// the one its request gets alone (greedy), with the decode steps batched.
+#[test]
+#[ignore = "fetches Qwen/Qwen3-0.6B"]
+fn concurrent_chats_match_alone() {
+    let chat = env("OXINFER_E2E_CHAT", "Qwen/Qwen3-0.6B");
+    let prompts: Vec<String> = (0..4)
+        .map(|i| {
+            format!(
+                "Request {i}. {} Write a short story about it.",
+                "The river and the lantern. ".repeat(20 * i + 3)
+            )
+        })
+        .collect();
+    let replies = |s: &http::Running, at_once: bool| -> Vec<String> {
+        let addr = s.addr();
+        let ask = move |p: String| {
+            let req =
+                json!({"model": "chat", "messages": [{"role": "user", "content": p}], "temperature": 0, "max_tokens": 48, "stream": true});
+            let (st, body) = request(addr, "POST", "/v1/chat/completions", &req.to_string());
+            assert_eq!(st, 200, "{body}");
+            body.lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+                .filter_map(|c| c["choices"][0]["delta"]["content"].as_str().map(str::to_string))
+                .collect::<String>()
+        };
+        if at_once {
+            let hs: Vec<_> = prompts.iter().cloned().map(|p| std::thread::spawn(move || ask(p))).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        } else {
+            prompts.iter().cloned().map(ask).collect()
+        }
+    };
+    let s = serve(&format!("model=chat={chat},parallel=4"));
+    let together = replies(&s, true);
+    s.stop().unwrap();
+    let s = serve(&format!("model=chat={chat},parallel=1"));
+    let alone = replies(&s, false);
+    s.stop().unwrap();
+    for (i, (a, b)) in together.iter().zip(&alone).enumerate() {
+        assert!(!a.is_empty(), "request {i}: empty reply");
+        assert_eq!(a, b, "request {i}");
+    }
+}

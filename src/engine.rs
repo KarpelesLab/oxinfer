@@ -1350,6 +1350,10 @@ mod coreml_lm;
 mod conversation;
 pub use conversation::{Message, Role};
 
+#[path = "engine_pool.rs"]
+mod pool_slots;
+pub use pool_slots::{EnginePool, PoolGuard};
+
 impl Lm {
     /// Writes the decoding state to a snapshot ([`crate::snapshot`]).
     fn write_state<W: std::io::Write>(&self, w: &mut crate::snapshot::SnapWriter<W>) -> Result<()> {
@@ -1616,6 +1620,119 @@ impl Lm {
     }
 }
 
+impl Lm {
+    /// A new conversation on the same model (and draft), for another session of it
+    /// ([`Engine::fork`]); None for the families that cannot have two.
+    fn fork(&self) -> Option<Lm> {
+        let lk = |l: &Option<crate::lookup::Lookup>| reset_lookup(l.clone());
+        Some(match self {
+            Lm::Gemma { model, drafter, .. } => Lm::Gemma {
+                model,
+                sess: model.new_session(),
+                drafter: *drafter,
+            },
+            Lm::Qwen { model, .. } => Lm::Qwen {
+                model,
+                sess: model.new_session(),
+            },
+            Lm::QwenMtp { dec } => {
+                let mut d = MtpDecoder::new(dec.model(), dec.mtp(), dec.opts.clone());
+                d.lookup = lk(&dec.lookup);
+                Lm::QwenMtp { dec: Box::new(d) }
+            }
+            Lm::Mistral4 { model, .. } => Lm::Mistral4 {
+                model,
+                sess: model.new_session(),
+            },
+            Lm::DeepSeek4 { model, .. } => Lm::DeepSeek4 {
+                model,
+                sess: model.new_session(),
+            },
+            Lm::Glm5 { model, .. } => Lm::Glm5 {
+                model,
+                sess: model.new_session(),
+            },
+            Lm::Longcat { model, .. } => Lm::Longcat {
+                model,
+                sess: model.new_session(),
+            },
+            Lm::Kimi { model, .. } => Lm::Kimi {
+                model,
+                sess: model.new_session(),
+            },
+            Lm::Nemotron { model, .. } => Lm::Nemotron {
+                model,
+                sess: model.new_session(),
+            },
+            Lm::Inkling2 { model, .. } => Lm::Inkling2 {
+                model,
+                sess: model.new_session(),
+            },
+            Lm::Ripple { model, .. } => Lm::Ripple {
+                model,
+                sess: model.new_session(),
+            },
+            Lm::Raon { model, .. } => Lm::Raon {
+                model,
+                sess: model.new_session(),
+            },
+            Lm::Mistral4Dspark { dec } => {
+                let mut d = DsparkDecoder::new(dec.model(), dec.draft(), dec.opts.clone());
+                d.lookup = lk(&dec.lookup);
+                Lm::Mistral4Dspark { dec: Box::new(d) }
+            }
+            Lm::DeepSeek4Dspark { dec } => {
+                let mut d = DsparkDecoder::new(dec.model(), dec.draft(), dec.opts.clone());
+                d.lookup = lk(&dec.lookup);
+                Lm::DeepSeek4Dspark { dec: Box::new(d) }
+            }
+            Lm::Inkling2Dspark { dec } => {
+                let mut d = DsparkDecoder::new(dec.model(), dec.draft(), dec.opts.clone());
+                d.lookup = lk(&dec.lookup);
+                Lm::Inkling2Dspark { dec: Box::new(d) }
+            }
+            Lm::QwenDspark { dec } => {
+                let mut d = DsparkDecoder::new(dec.model(), dec.draft(), dec.opts.clone());
+                d.lookup = lk(&dec.lookup);
+                Lm::QwenDspark { dec: Box::new(d) }
+            }
+            Lm::GemmaDspark { dec } => {
+                let mut d = DsparkDecoder::new(dec.model(), dec.draft(), dec.opts.clone());
+                d.lookup = lk(&dec.lookup);
+                Lm::GemmaDspark { dec: Box::new(d) }
+            }
+            Lm::UnlimitedOcr { .. } => return None,
+            #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+            Lm::CoreMl(_) => return None,
+        })
+    }
+}
+
+/// A DSpark reply's rounds, then (`yielded`: other requests started decoding on the model) plain
+/// steps from its last token, which join theirs; the draft catches up on those at the next prompt
+/// ([`DsparkDecoder::plain_turn`]).
+#[allow(clippy::too_many_arguments)]
+fn dspark_then_plain<M: crate::dspark::Target>(
+    dec: &mut DsparkDecoder<'_, M>,
+    d: Decoded,
+    yielded: bool,
+    sampler: &mut Sampler,
+    stop: &[u32],
+    max: usize,
+    cb: &mut dyn FnMut(&[u32]) -> generate::Flow,
+) -> Decoded {
+    let Some(&last) = d.tokens.last().filter(|_| yielded) else {
+        return d;
+    };
+    let at = dec.plain_turn();
+    let toks = d.tokens.clone();
+    let n = toks.len();
+    let rest = generate::decode_from(dec.model(), &mut dec.sess, toks, generate::Start::Run(last), sampler, stop, max, cb);
+    let fed = dec.model().session_len(&dec.sess) - at;
+    dec.end_plain_turn(at, &rest.tokens[n - 1..][..fed]);
+    d.then(rest)
+}
+
 /// A prompt-lookup drafter for a new conversation.
 fn reset_lookup(lk: Option<crate::lookup::Lookup>) -> Option<crate::lookup::Lookup> {
     lk.map(|mut l| {
@@ -1665,6 +1782,16 @@ fn load_dspark(arena: &mut Arena, path: &Path, hidden: usize, vocab: usize, quan
 /// Serializes forward passes across engines (the thread pool runs one region at a time), and
 /// with [`crate::whisper::Transcriber`] runs.
 pub(crate) static RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`RUN`], unless this thread holds a [`crate::batch`] group's turn (which holds it already).
+pub(crate) fn run_lock() -> Option<std::sync::MutexGuard<'static, ()>> {
+    (!crate::batch::holding()).then(run_lock_static)
+}
+
+/// [`RUN`] (for the batch groups' turns).
+pub(crate) fn run_lock_static() -> std::sync::MutexGuard<'static, ()> {
+    RUN.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 /// The engine's intervention settings ([`Engine::set_interventions`]).
 #[derive(Default)]
@@ -1739,8 +1866,11 @@ pub struct Engine {
     loras: Vec<crate::lora::Attached>,
     /// LFM3-Omni's speech head and codec, loaded on the first [`Engine::speak_omni`].
     omni_voice: Option<Box<crate::lfm3_omni::voice::Voice>>,
-    /// Must stay last: the model, sessions and references above point into it.
-    _arena: Arena,
+    /// The scheduler shared with the other sessions of the model ([`EnginePool`]).
+    group: Option<Arc<crate::batch::Group>>,
+    /// Must stay last: the model, sessions and references above point into it (shared with the
+    /// engine's forks, [`Engine::fork`]).
+    _arena: Arc<Arena>,
 }
 
 impl Drop for Engine {
@@ -2660,7 +2790,8 @@ impl Engine {
             fingerprint: String::new(),
             fingerprint_source: String::new(),
             loras,
-            _arena: arena,
+            group: None,
+            _arena: Arc::new(arena),
         })
         .map(|mut e| {
             e.fingerprint_source = fingerprint_source(&e.info, opts);
@@ -2739,7 +2870,8 @@ impl Engine {
             fingerprint: String::new(),
             fingerprint_source: String::new(),
             loras: Vec::new(),
-            _arena: arena,
+            group: None,
+            _arena: Arc::new(arena),
         })
     }
 
@@ -2855,7 +2987,7 @@ impl Engine {
     /// [`Engine::load_session`] on this model with the same options, in this process or another.
     /// Returns the file size. Families: see [`EngineOptions::prompt_cache`].
     pub fn save_session(&mut self, path: &Path) -> Result<u64> {
-        let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+        let _run = run_lock();
         if !self.lm.snapshots() {
             bail!("session snapshots are not supported for this model");
         }
@@ -2873,7 +3005,7 @@ impl Engine {
     /// starts with its tokens). The file must come from the same model and options. Returns the
     /// tokens restored.
     pub fn load_session(&mut self, path: &Path) -> Result<usize> {
-        let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+        let _run = run_lock();
         self.read_snapshot(path)
     }
 
@@ -2884,7 +3016,7 @@ impl Engine {
         if !std::mem::take(&mut self.pcache_pending) || self.pcache.is_none() {
             return Ok(false);
         }
-        let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+        let _run = run_lock();
         self.store_snapshot()
     }
 
@@ -3107,7 +3239,7 @@ impl Engine {
     pub fn calibrate(&mut self, text: &str) -> Result<crate::intervene::Calibration> {
         let ids = self.tok.encode(text, false).map_err(|e| anyhow!("encode: {e}"))?.get_ids().to_vec();
         let c = {
-            let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+            let _run = run_lock();
             self.calibrate_ids(&ids)?
         };
         self.iv.calibration = Some(c.clone());
@@ -3152,7 +3284,7 @@ impl Engine {
             };
             ids.push(self.tok.encode(text, false).map_err(|e| anyhow!("encode: {e}"))?.get_ids().to_vec());
         }
-        let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+        let _run = run_lock();
         let chunk = self.prefill_chunk;
         match &self.lm {
             Lm::Gemma { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
@@ -3292,7 +3424,7 @@ impl Engine {
             && self.iv.compiled.is_none()
         {
             let c = {
-                let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+                let _run = run_lock();
                 self.calibrate_ids(ids)?
             };
             self.iv.calibration = Some(c);
@@ -3400,7 +3532,7 @@ impl Engine {
         }
         let (mm_text, feats) = self.prepare_media(media)?;
         let voice = self.omni_voice.as_deref().expect("loaded above");
-        let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+        let _run = run_lock();
         let chunk = if self.prefill_chunk == 0 { 256 } else { self.prefill_chunk };
         voice.reply(model, &self.tok, user, &mm_text, &feats, o, chunk, on_text)
     }
@@ -3493,7 +3625,7 @@ impl Engine {
                 dump_mm: None,
                 mmproj: self.mmproj.clone(),
             };
-            let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+            let _run = run_lock();
             #[cfg(feature = "oxideav")]
             let prepared = mm::prepare_frames(&req, media.frames(), self.files, self.info.hidden_size)?;
             #[cfg(not(feature = "oxideav"))]
@@ -3561,7 +3693,7 @@ impl Engine {
             }
             let images = crate::decide::ImageSource::to_rgb_all(&plan.images)?;
             let enc = {
-                let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+                let _run = run_lock();
                 mm::encode_rgb_images(
                     &self.info.path,
                     self.files,
@@ -3593,7 +3725,7 @@ impl Engine {
         let chunk = self.prefill_chunk;
         let t1 = Instant::now();
         let (hidden, logits) = {
-            let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+            let _run = run_lock();
             let _on = d.switch.as_ref().map(crate::lora::Active::new);
             type Out = Result<(Vec<f32>, Option<Vec<f32>>)>;
             fn run<M: generate::TextLm + ?Sized>(m: &M, ids: &[u32], feats: &[mm::MmFeature], chunk: usize, need_logits: bool) -> Out {
@@ -3796,8 +3928,10 @@ struct PendingTurn {
 
 impl PendingTurn {
     fn finish(self, e: &mut Engine, on_delta: &mut dyn FnMut(&Delta) -> Flow) -> Result<Reply> {
-        // Core ML models do not use the thread pool.
-        let _run = e.info.coreml.is_none().then(|| RUN.lock().unwrap_or_else(|p| p.into_inner()));
+        // Core ML models do not use the thread pool. With other sessions of the model, the
+        // group's turn (which holds the lock).
+        let _member = e.group.as_ref().map(crate::batch::enter);
+        let _run = e.info.coreml.is_none().then(run_lock).flatten();
         let PendingTurn {
             ids,
             overrides,
@@ -3910,14 +4044,36 @@ impl PendingTurn {
         macro_rules! plain {
             ($model:expr, $sess:expr, $base:expr, $logits:expr, $max:expr) => {
                 match lookup.as_mut() {
+                    // Other requests decoding on the model ([`crate::batch`]): plain steps, which
+                    // join theirs in batched steps (the drafter's context is set again from the
+                    // history at the next turn).
+                    Some(_) if crate::batch::contended() => generate::decode($model, $sess, $logits, sampler, stop, $max, &mut cb),
                     Some(lk) => {
                         lk.truncate($base);
                         lk.extend(&ids);
                         let mut dec = crate::lookup::LookupRounds::new($model, $sess, lk);
-                        let d = generate::decode_rounds(&mut dec, &$logits, sampler, stop, $max, &mut cb);
+                        // Until another request decodes on the model: then plain steps, batched.
+                        let (d, yielded) =
+                            generate::decode_rounds_until(&mut dec, &$logits, sampler, stop, $max, &mut cb, &crate::batch::contended);
                         st.drafted = dec.stats.drafted;
                         st.accepted = dec.stats.accepted;
-                        d
+                        drop(dec);
+                        match (yielded, d.tokens.last()) {
+                            (true, Some(&last)) => {
+                                let toks = d.tokens.clone();
+                                d.then(generate::decode_from(
+                                    $model,
+                                    $sess,
+                                    toks,
+                                    generate::Start::Run(last),
+                                    sampler,
+                                    stop,
+                                    $max,
+                                    &mut cb,
+                                ))
+                            }
+                            _ => d,
+                        }
                     }
                     None => generate::decode($model, $sess, $logits, sampler, stop, $max, &mut cb),
                 }
@@ -4021,12 +4177,22 @@ impl PendingTurn {
                 let max = limit(dec.sess.pos);
                 if max == 0 {
                     empty(0.0)
+                } else if crate::batch::contended() && crate::snapshot::SessionState::truncatable(&dec.sess) {
+                    // Other requests decoding on the model: plain steps, batched with theirs.
+                    let at = dec.plain_turn();
+                    let d = generate::decode(dec.model(), &mut dec.sess, logits, sampler, stop, max, &mut cb);
+                    let fed = dec.sess.pos - at;
+                    dec.end_plain_turn(at, &d.tokens[..fed]);
+                    d
                 } else {
                     let before = dec.stats.clone();
-                    let d = generate::decode_rounds(&mut **dec, &logits, sampler, stop, max, &mut cb);
+                    let plain_ok = crate::snapshot::SessionState::truncatable(&dec.sess);
+                    let (d, yielded) = generate::decode_rounds_until(&mut **dec, &logits, sampler, stop, max, &mut cb, &|| {
+                        plain_ok && crate::batch::contended()
+                    });
                     st.drafted = dec.stats.drafted - before.drafted;
                     st.accepted = dec.stats.accepted - before.accepted;
-                    d
+                    dspark_then_plain(dec, d, yielded, sampler, stop, max, &mut cb)
                 }
             }
             Lm::GemmaDspark { dec } => {
@@ -4036,12 +4202,20 @@ impl PendingTurn {
                 let max = limit(dec.sess.pos);
                 if max == 0 {
                     empty(0.0)
+                } else if crate::batch::contended() {
+                    // As Qwen's above.
+                    let at = dec.plain_turn();
+                    let d = generate::decode(dec.model(), &mut dec.sess, logits, sampler, stop, max, &mut cb);
+                    let fed = dec.sess.pos - at;
+                    dec.end_plain_turn(at, &d.tokens[..fed]);
+                    d
                 } else {
                     let before = dec.stats.clone();
-                    let d = generate::decode_rounds(&mut **dec, &logits, sampler, stop, max, &mut cb);
+                    let (d, yielded) =
+                        generate::decode_rounds_until(&mut **dec, &logits, sampler, stop, max, &mut cb, &crate::batch::contended);
                     st.drafted = dec.stats.drafted - before.drafted;
                     st.accepted = dec.stats.accepted - before.accepted;
-                    d
+                    dspark_then_plain(dec, d, yielded, sampler, stop, max, &mut cb)
                 }
             }
             Lm::Inkling2Dspark { dec } => {

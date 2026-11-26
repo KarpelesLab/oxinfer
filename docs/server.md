@@ -255,8 +255,10 @@ loading or running fails, 507 when a model named on request does not fit on the 
 
 The kind of each model (chat, embedding, image, transcription, speech) comes from its files
 (fetching only the small configuration files of a repo id that is not in the cache yet), or the
-`kind` option. Models load on their first request, or all at start with `--preload`. Each model
-runs one request at a time; the others wait for it. When a model to load would not fit in the
+`kind` option. Models load on their first request, or all at start with `--preload`. A chat
+model runs up to `--parallel` requests at once (default 4, see [Concurrent
+requests](#concurrent-requests)); other models run one request at a time, the others waiting for
+it. When a model to load would not fit in the
 memory budget (`--memory-gb`, default 80% of RAM; each model counts the size of its weight files,
 scaled for `quant`, or its `memory_gb` option) next to the loaded ones, the least recently used
 idle models are unloaded first; so are those that took GPU memory when a chat model to load
@@ -271,6 +273,71 @@ fed again. Models without recurrent state also keep the prefix a new conversatio
 previous one. With `--prompt-cache DIR` (or `auto`; per model `prompt_cache=`), conversations are
 also kept on disk across requests, conversations and restarts and restored when a prompt starts
 with one (see [Session snapshots and the prompt cache](sessions.md#session-snapshots-and-the-prompt-cache)).
+
+### Concurrent requests
+
+Several clients on one chat model (opencode sessions, agents, API clients) run at the same time:
+each model has `--parallel N` sessions (default 4; per model `parallel=N`; `1` for one request
+at a time), each with its own caches over the same weights (`EnginePool`, `src/engine_pool.rs`).
+A request takes the idle session whose last conversation shares the most of its beginning (the
+same leading messages, then the common start of the first that differs), else the least recently
+used one, so each client's conversation keeps its cache from one turn to the next, and a new
+conversation with the same system prompt reuses that prefix of a session's cache (models without
+recurrent state; with a prompt cache, `--prompt-cache`, sessions also restore each other's
+snapshots from disk). With every session busy, a request waits (`: waiting: ... is busy` while
+streamed).
+
+The requests of a model share its device in turns (`src/batch.rs`):
+
+- **Prompts are read in chunks** (the prefill chunk, 1024 tokens on the GPU) and between two
+  chunks the other requests run, so a long prompt does not stall the replies being decoded; when
+  several prompts wait they take chunks in turn, first come first served.
+- **Plain decode steps are batched**: the next tokens of every request decoding at that moment run
+  as one pass (`TextLm::forward_batch`; on Metal one multi-token plan step whose rows are the
+  sessions' tokens, each attending over its own caches at its own position; on the CPU
+  `QwenModel::forward_hidden_batch`), the weights read once for all of them. A step waits for
+  every decoding request's token (each samples and streams its own outside the turn), at most 3
+  ms. Batched steps and prompt chunks alternate when both wait. Up to `max_batch=N` rows a step
+  (default 8).
+- **Alone on its model a request runs as before**: speculative decoding (DSpark, MTP, prompt
+  lookup), greedy passes chained on the device. A chain stops queuing passes when another
+  request arrives; a turn that starts while others are decoding decodes plainly (DSpark: the
+  draft catches up on those tokens at the next turn's prompt).
+
+**Each reply equals the reply its request would get alone** (greedy, or with its own seed): a
+batched row computes exactly what a one-token step of its session would. On the CPU and with the
+exact multi-token Metal kernels (the default) the logits are bit for bit those of one-token steps
+(`qwen_batch::tests::forward_batch_logits_match_one_token_steps`, `tests/gpu_chain.rs`). Not
+covered: Gemma 4 26B-A4B, whose greedy passes chained on the device (`decode_greedy`, what a
+request alone runs) do not give the bits of its one-token steps (what it runs beside others):
+4 concurrent Q4_0 requests give 3 of 4 replies equal to their chained ones alone and all 4 equal
+with `OXINFER_GPU_CHAIN=0` (the dense models' chains are exact); and after a plain turn of a DSpark model, the next turn reads that reply as prompt (prefill
+kernels) where alone it would have been verified tokens, so later turns may round differently,
+as a restored snapshot does. `batch_fast=1` runs batched steps of 5 rows or more on the
+fast-verification kernels (as `fast_verify` does for speculative rounds: logits within ~1e-4 of
+one-token steps, so a reply may then depend on the requests decoded with it), about twice the
+throughput at 8 concurrent requests.
+
+Batched on the GPU: dense models whose decode plan has no recurrent state (Qwen3, Llama, Gemma
+3 / 4 dense). Mixtures of experts (Gemma 4 26B-A4B, Qwen MoE) only with `batch_fast=1`: their
+multi-token expert kernels do not give the one-token kernels' bits, and each row reads its own
+experts anyway (Gemma 4 26B-A4B Q4_0: 4 batched rows decode about as fast as 4 one-token steps).
+Those, Qwen3.5 / 3.6 (Gated DeltaNet), Inkling-2, DeepSeek V4, streamed models and sessions with
+interventions run their decode steps one after the other, in turns (still interleaved with the
+other requests' prompts). Each session's caches grow with its
+conversation, so `parallel` sessions with long conversations take that much more memory.
+
+| key | where | |
+|---|---|---|
+| `parallel` | `--parallel`, server option, model option | sessions of each chat model (default 4) |
+| `max_batch` | model option | most rows of a batched step (default 8) |
+| `batch_fast` | model option | batched steps of 5+ rows on the fast kernels (default off) |
+
+The library has them as `ServerOptions::parallel` and `EnginePool::new(engine, slots,
+BatchOptions)` (`Engine::fork` for one more session of a loaded engine); the C API through
+`oxi_server_new`'s options (`parallel=N`, model options `parallel=`, `max_batch=`,
+`batch_fast=`). `OXINFER_BATCH_TRACE=1` prints a line per batched step (rows, gather and run
+times).
 
 ### Status, cancelling and the caches
 

@@ -813,6 +813,18 @@ pub struct Step<'s, 'c> {
     pub states_kept: bool,
 }
 
+/// One sequence's token of a batched step ([`DecodePlan::step_rows`]): its session's slot, its
+/// position, and its inputs as a one-token [`Step`] takes them.
+pub struct Row<'s, 'c> {
+    pub slot: &'s mut Slot,
+    pub pos: usize,
+    pub rope_cs: &'s [f32],
+    pub x: &'s [f32],
+    pub x2: &'s [f32],
+    /// The session's host KV caches, holding exactly `pos` positions each.
+    pub kv: &'s mut [&'c mut LayerCache],
+}
+
 /// Greedy decoding chained on the device ([`DecodePlan::greedy`]).
 pub struct Greedy<'s, 'c> {
     /// Tokens already in the caches (the position of the first pass).
@@ -858,6 +870,15 @@ pub trait DecodePlan: Send + Sync {
     /// The passes kept, or None (nothing run, nothing changed) when the plan cannot.
     fn greedy(&self, _slot: &mut Slot, _g: Greedy) -> Option<usize> {
         None
+    }
+    /// Multi-token plans: one token of each of several independent sequences (`rows`, each with
+    /// its own slot, caches and position) in one step, the weights read once for all: their
+    /// final hidden states (`[rows, hidden]`) and, with `logits`, their logits. Each row gets
+    /// what a one-token step of its sequence would give where the plan's multi-token kernels
+    /// are exact (not on fast-verification plans). False (nothing changed) when the plan cannot
+    /// (recurrent states, interventions, streamed weights, more rows than its tokens).
+    fn step_rows(&self, _rows: &mut [Row], _hidden: &mut [f32], _logits: Option<&mut [f32]>) -> bool {
+        false
     }
 }
 

@@ -8165,9 +8165,241 @@ impl MetalPlan<'_> {
     }
 }
 
+impl MetalPlan<'_> {
+    /// [`DecodePlan::step_rows`]: the ops of a multi-token step over `rows.len()` tokens, but for
+    /// those that touch a KV cache (the attention inputs and the attention), encoded per row on
+    /// the row's own caches at its own position, as a one-token step of it at that position
+    /// would split them.
+    fn step_rows_impl(&self, rows: &mut [crate::gpu::decode::Row], hidden: &mut [f32], logits: Option<&mut [f32]>) -> bool {
+        let b = rows.len();
+        let halves: usize = self.rope_halves.iter().sum();
+        if b == 0
+            || b > self.tokens
+            || self.tokens < 2
+            || self.pf.is_some()
+            || self.gate.is_some()
+            || !self.states.is_empty()
+            || self.params.is_some()
+            || hidden.len() < b * self.hidden.1
+            || logits.as_ref().is_some_and(|l| self.logits.is_none_or(|(_, n)| l.len() < b * n))
+            || rows.iter().any(|r| {
+                r.kv.len() != self.kv.len()
+                    || r.rope_cs.len() != 2 * halves
+                    || r.x.len() != self.n_input
+                    || self.input2.is_some_and(|(_, n)| r.x2.len() != n)
+                    || r.pos + 1 > self.max_len
+            })
+        {
+            return false;
+        }
+        // Ops tying a step's tokens together, or of other kinds of plans: not batched.
+        if self.ops.iter().any(|op| {
+            matches!(
+                op,
+                MOp::GdnConv { .. }
+                    | MOp::GdnRule { .. }
+                    | MOp::QsaKey { .. }
+                    | MOp::QsaScore { .. }
+                    | MOp::QsaTopk { .. }
+                    | MOp::Attn { block: Some(_), .. }
+                    | MOp::Attn { sel: Some(_), .. }
+                    | MOp::QkRope { half: Some(_), .. }
+            )
+        }) {
+            return false;
+        }
+        let _g = self.lock.lock().unwrap();
+        // The rows' device slots (distinct sessions), their caches brought up to date.
+        let mut mss: Vec<*mut MetalSlot> = Vec::with_capacity(b);
+        for r in rows.iter_mut() {
+            let ms: *mut MetalSlot = self.slot_of(r.slot);
+            if mss.contains(&ms) {
+                return false;
+            }
+            // SAFETY: each pointer is a distinct slot, borrowed from its row for this call.
+            if !self.sync_kv(unsafe { &mut *ms }, r.kv, r.pos, 1) {
+                return false;
+            }
+            mss.push(ms);
+        }
+        let arena = self.arena;
+        let base = self.f.contents(arena);
+        for (j, r) in rows.iter().enumerate() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(r.x.as_ptr(), base.add(self.input + j * self.strides[0]) as *mut f32, self.n_input);
+                if let Some((off, n)) = self.input2 {
+                    std::ptr::copy_nonoverlapping(r.x2.as_ptr(), base.add(off + j * self.strides[3]) as *mut f32, n);
+                }
+            }
+            // Row j of each RoPE table (`tokens` rows reserved per table).
+            let (mut src, mut dst) = (0, self.rope_off);
+            for &half in &self.rope_halves {
+                unsafe { std::ptr::copy_nonoverlapping(r.rope_cs[src..].as_ptr(), base.add(dst + j * 2 * half * 4) as *mut f32, 2 * half) };
+                src += 2 * half;
+                dst += self.tokens * 2 * half * 4;
+            }
+        }
+        for (i, st) in self.strengths.1.iter().enumerate() {
+            // SAFETY: the plan reserved one float per strength at this offset of the arena.
+            unsafe { *(base.add(self.strengths.0) as *mut f32).add(i) = st.get() };
+        }
+        let want_logits = logits.is_some() && self.logits.is_some();
+        let end = if want_logits { self.ops.len() } else { self.head_from };
+        let kvbs: Vec<Vec<(Id, Id)>> = mss
+            .iter()
+            .map(|&m| unsafe { &*m }.kv.iter().map(|k| (k.k, k.v)).collect())
+            .collect();
+        let poss: Vec<usize> = rows.iter().map(|r| r.pos).collect();
+        let consts = self.consts;
+        let indirect = if self.be.residency.is_some() { &[][..] } else { &self.indirect[..] };
+        let encode = |e: &FastEnc, range: std::ops::Range<usize>| {
+            e.use_resources(indirect);
+            for op in &self.ops[range] {
+                if !dec_only(op) {
+                    continue;
+                }
+                match op {
+                    MOp::QkRope { .. } | MOp::Attn { .. } => {
+                        for (j, (kvb, &pos)) in kvbs.iter().zip(&poss).enumerate() {
+                            self.encode_row(e, op, arena, consts, kvb, pos, j);
+                        }
+                    }
+                    _ => self.encode_multi(e, op, arena, consts, &[], &[], 0, b),
+                }
+            }
+        };
+        // A small first command buffer, so that the GPU starts while the rest is encoded.
+        let at = |from: usize| (from..end).find(|&i| matches!(self.ops[i], MOp::Barrier)).unwrap_or(end);
+        let cut = at(end / 16);
+        let parts = [0..cut, cut..end];
+        let (ok, _) = run_concurrent(self.be, &self.f, &parts, encode);
+        if !ok {
+            return false;
+        }
+        let h = self.hidden.1;
+        unsafe {
+            for j in 0..b {
+                std::ptr::copy_nonoverlapping(
+                    base.add(self.hidden.0 + j * self.strides[1]) as *const f32,
+                    hidden[j * h..].as_mut_ptr(),
+                    h,
+                );
+            }
+            if let (Some(l), Some((off, n))) = (logits, self.logits)
+                && want_logits
+            {
+                for j in 0..b {
+                    super::par_copy(l[j * n..].as_mut_ptr(), base.add(off + j * self.strides[2]) as *const f32, n);
+                }
+            }
+        }
+        // Each row's new keys and values back to its host caches.
+        for (j, r) in rows.iter_mut().enumerate() {
+            // SAFETY: as above.
+            let ms = unsafe { &mut *mss[j] };
+            for (i, (m, c)) in ms.kv.iter_mut().zip(r.kv.iter_mut()).enumerate() {
+                let row = self.kv[i].0 * self.kv[i].1;
+                unsafe { m.push_to(&self.f, c, r.pos, 1, row) };
+                m.synced = r.pos + 1;
+                c.kept = c.len;
+            }
+        }
+        true
+    }
+
+    /// An op of [`Self::step_rows_impl`] that touches a KV cache, for row `j` alone: its caches
+    /// `kvb`, its position `pos`.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_row(&self, e: &FastEnc, op: &MOp, arena: Id, consts: Id, kvb: &[(Id, Id)], pos: usize, j: usize) {
+        match op {
+            MOp::QkRope {
+                qkv,
+                qo,
+                kv,
+                qn,
+                kn,
+                p,
+                t: tk,
+                ..
+            } => {
+                let (pipe, sq, so, cs) = tk.expect("multi-token rope");
+                let mut p = *p;
+                p.pos = pos as u32;
+                p._p[0] = 0;
+                e.pipe(pipe);
+                e.buf(arena, *qkv + j * sq as usize * 4, 0);
+                e.buf(arena, *qo + j * so as usize * 4, 1);
+                e.buf(kvb[*kv].0, 0, 2);
+                e.buf(kvb[*kv].1, 0, 3);
+                e.buf(consts, qn.unwrap_or(0), 4);
+                e.buf(consts, kn.unwrap_or(0), 5);
+                e.bytes(&p, 6);
+                e.buf(arena, cs + j * 2 * p.half_rot as usize * 4, 7);
+                e.bytes(&[sq, so, 2 * p.half_rot, 0u32], 8);
+                e.dispatch(((p.nh + 2 * p.nkv) as usize, 1), p.hd as usize);
+            }
+            MOp::Attn {
+                grp,
+                pipe,
+                narrow,
+                combine,
+                q,
+                out,
+                kv,
+                gate,
+                window,
+                p,
+                threads,
+                hd,
+                t: tk,
+                ..
+            } => {
+                let (sq, so, sg) = tk.expect("multi-token attention");
+                // As a one-token step at `pos` splits it.
+                let len = pos + 1;
+                let lo = window.map_or(0, |w| len.saturating_sub(w));
+                let mut p = *p;
+                p.len = len as u32;
+                p.lo = lo as u32;
+                let n = len - lo;
+                let chunk = n.div_ceil(ATTN_MAX_SPLIT).next_multiple_of(256).max(256);
+                p.nsplit = n.div_ceil(chunk) as u32;
+                p.chunk = chunk as u32;
+                let part = self.part + j * self.part_stride;
+                let gt = gate.map_or(0, |g| g + j * sg);
+                let (pipe, grp) = attn_narrow(*pipe, *grp, narrow, n);
+                e.pipe(pipe);
+                e.buf(arena, *q + j * sq, 0);
+                e.buf(kvb[*kv].0, 0, 1);
+                e.buf(kvb[*kv].1, 0, 2);
+                e.buf(arena, *out + j * so, 3);
+                e.buf(arena, gt, 4);
+                e.bytes(&p, 5);
+                e.buf(arena, part, 6);
+                e.dispatch((p.nh as usize / grp, p.nsplit as usize), *threads);
+                if p.nsplit > 1 {
+                    e.barrier();
+                    e.pipe(*combine);
+                    e.buf(arena, part, 0);
+                    e.buf(arena, *out + j * so, 1);
+                    e.buf(arena, gt, 2);
+                    e.bytes(&p, 3);
+                    e.bytes(hd, 4);
+                    e.dispatch((p.nh as usize, 1), 256);
+                }
+            }
+            _ => unreachable!("not a KV op"),
+        }
+    }
+}
+
 impl DecodePlan for MetalPlan<'_> {
     fn greedy(&self, slot: &mut Slot, g: crate::gpu::decode::Greedy) -> Option<usize> {
         self.greedy_impl(slot, g)
+    }
+
+    fn step_rows(&self, rows: &mut [crate::gpu::decode::Row], hidden: &mut [f32], logits: Option<&mut [f32]>) -> bool {
+        self.step_rows_impl(rows, hidden, logits)
     }
 
     fn tokens(&self) -> usize {

@@ -227,8 +227,9 @@ pub(super) fn spoken_chat(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
     let run = move |on_text: &mut dyn FnMut(&str), on_audio: &mut dyn FnMut(&[f32]) -> bool| -> ApiResult<Spoken> {
         let _temp = &temp;
         if kind == Kind::Chat {
-            let mut lease = api2.models.acquire(&input.model, Kind::Chat)?;
-            let Loaded::Chat(engine) = lease.model() else { unreachable!() };
+            let lease = api2.models.acquire_chat(&input.model, None)?;
+            // (The first session: the one whose speech head is loaded.)
+            let mut engine = lease.pool.slot(0);
             let dir = api2.models.local_path(&input.model).unwrap_or_default();
             let mut sp = crate::lfm3_omni::SpeechOptions::load(&dir);
             if let Some(t) = input.temperature {
@@ -431,11 +432,12 @@ pub(super) fn omni_speech(api: &Arc<Api>, body: &Value, model: &str, input: &str
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     o.speech = Some(sp);
-    let mut lease = api.models.acquire(model, Kind::Chat)?;
-    let Loaded::Chat(engine) = lease.model() else { unreachable!() };
+    let lease = api.models.acquire_chat(model, None)?;
+    let mut engine = lease.pool.slot(0);
     let r = engine
         .speak_omni(input, &Default::default(), &o, &mut |_| {})
         .map_err(|e| ApiError::new(500, format!("{e:#}")))?;
+    drop(engine);
     drop(lease);
     let (bytes, ct) = if format == "pcm" {
         (crate::tts::pcm16_bytes(&r.samples), "audio/pcm")

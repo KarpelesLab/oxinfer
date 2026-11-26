@@ -47,6 +47,7 @@ pub mod audio;
 pub mod av;
 mod b64;
 pub mod bagel;
+pub mod batch;
 pub mod bert;
 #[cfg(feature = "capi")]
 pub mod capi;

@@ -845,6 +845,11 @@ impl<'m> MtpDecoder<'m> {
         let mut last = Vec::new();
         let mut start = 0;
         for c in tokens.chunks(self.model.prefill_chunk(chunk).max(1)) {
+            // Other requests on the model ([`crate::batch`]) go between the chunks.
+            if start > 0 {
+                crate::batch::set_remaining(tokens.len() - start);
+                crate::batch::yield_now();
+            }
             if self.pend_h.len() > self.pend_t.len() * w {
                 self.pend_t.push(c[0]);
             }

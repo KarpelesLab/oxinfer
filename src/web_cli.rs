@@ -51,6 +51,9 @@ options:\n\
 \x20                       ~/.cache/oxinfer/prompt-cache) across requests and restarts\n\
 \x20 --prompt-cache-gb F   size cap of the prompt cache (default 20; least recently used go)\n\
 \x20 --threads N           CPU threads (default: all cores)\n\
+\x20 --parallel N          conversations each chat model runs at once, each with its own caches\n\
+\x20                       (default 4; prompts interleaved with the others' decoding, decode\n\
+\x20                       steps batched; 1: one request at a time). Per model: parallel=N\n\
 \x20 --no-remote-media     do not fetch http(s) image / audio / video URLs (data: URLs only)\n\
 \x20 --local-media         also accept local paths and file:// URLs as media (trusted clients only)\n\
 \x20 --tls-cert FILE --tls-key FILE  HTTPS with this certificate chain and key (PEM)\n\

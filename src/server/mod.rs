@@ -80,7 +80,13 @@ impl ModelSpec {
     /// - `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`: sampling defaults
     ///   (OpenAI's: temperature 1, top-p 1, no top-k, no min-p);
     /// - `prompt_name`: embedding models, the named prompt used when a request names none;
-    /// - `memory_gb`: the memory the model is counted for (default: estimated from its files).
+    /// - `memory_gb`: the memory the model is counted for (default: estimated from its files);
+    /// - `parallel`: chat models, the conversations run at once (default
+    ///   [`ServerOptions::parallel`]);
+    /// - `max_batch`: chat models, the most decode steps of those run as one batched step
+    ///   (default 8; see [`crate::batch`]);
+    /// - `batch_fast`: chat models, batched steps on the fast-verification kernels (`1`; see
+    ///   [`crate::batch::BatchOptions::fast`]).
     pub const KEYS: &'static [&'static str] = &[
         "kind",
         "system",
@@ -93,6 +99,9 @@ impl ModelSpec {
         "repetition_penalty",
         "prompt_name",
         "memory_gb",
+        "parallel",
+        "max_batch",
+        "batch_fast",
     ];
 
     /// Parses `[ID=]SOURCE[,KEY=VALUE...]`.
@@ -242,6 +251,15 @@ pub struct ServerOptions {
     pub tls_key: Option<PathBuf>,
     /// HTTPS with a generated self-signed certificate (key `self_signed`).
     pub self_signed: bool,
+    /// Conversations each chat model runs at once (key `parallel`, default 4; a model's own
+    /// `parallel` option overrides it): its sessions, each with its own caches over the same
+    /// weights ([`crate::engine::EnginePool`]). A request takes the idle session whose last
+    /// conversation shares the most with its own (so that concurrent clients keep their caches);
+    /// prompts of concurrent requests are read in chunks between the others' decode steps, and
+    /// plain decode steps of the requests decoding at once run as one batched step
+    /// ([`crate::batch`]). Each session's caches take memory as its conversation grows. `1`:
+    /// one request at a time per model, as before.
+    pub parallel: usize,
     /// HTTP worker threads, the most connections served at once (key `workers`, default 32).
     pub workers: usize,
     /// Log one line per request to stderr (key `log`, default on).
@@ -291,6 +309,9 @@ pub struct ServerOptions {
     pub idle_unload: Option<std::time::Duration>,
 }
 
+/// [`ServerOptions::parallel`]'s default.
+pub const DEFAULT_PARALLEL: usize = 4;
+
 impl Default for ServerOptions {
     fn default() -> Self {
         Self {
@@ -310,6 +331,7 @@ impl Default for ServerOptions {
             tls_key: None,
             self_signed: false,
             workers: 32,
+            parallel: DEFAULT_PARALLEL,
             log: true,
             prompt_cache: None,
             prompt_cache_gb: None,
@@ -350,6 +372,7 @@ impl ServerOptions {
         "tls_key",
         "self_signed",
         "workers",
+        "parallel",
         "log",
         "prompt_cache",
         "prompt_cache_gb",
@@ -384,6 +407,7 @@ impl ServerOptions {
             "tls_key" => self.tls_key = opt_str(value).map(PathBuf::from),
             "self_signed" => self.self_signed = parse_bool(key, value)?,
             "workers" => self.workers = value.parse().context("workers")?,
+            "parallel" => self.parallel = value.parse::<usize>().context("parallel")?.max(1),
             "log" => self.log = parse_bool(key, value)?,
             "prompt_cache" => {
                 self.prompt_cache = match value {
@@ -712,6 +736,7 @@ impl Api {
         let mut models = registry::Registry::new(&opts.models, budget, opts.cache_dir.clone(), opts.log);
         models.prompt_cache = opts.prompt_cache.clone();
         models.prompt_cache_gb = opts.prompt_cache_gb;
+        models.parallel = opts.parallel;
         let api = Arc::new(Api {
             models,
             web: opts.web.then(|| web::WebState::new(&opts)),

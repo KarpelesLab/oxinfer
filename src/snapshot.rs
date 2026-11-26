@@ -649,6 +649,11 @@ impl PromptCache {
         &self.dir
     }
 
+    /// The size cap in bytes.
+    pub fn cap(&self) -> u64 {
+        self.cap
+    }
+
     pub fn entries(&self) -> &[CacheEntry] {
         &self.entries
     }

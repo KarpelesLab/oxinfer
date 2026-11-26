@@ -706,7 +706,8 @@ fn run_chat(api: &Api, req: &ChatRequest, emit: Emit, on: Option<OnStage<'_, '_>
     let mut temp = TempFiles::default();
     let messages = req.messages(api, &mut temp)?;
     let mut on = on;
-    let mut lease = api.models.acquire_with(&req.model, Kind::Chat, on.as_deref_mut())?;
+    let lease = api.models.acquire_chat(&req.model, on.as_deref_mut())?;
+    let mut session = lease.engine(&messages, on.as_deref_mut())?;
     let mut prompt = |done: usize, total: usize| {
         super::activity::prompt(done, total);
         if let Some(on) = on.as_deref_mut() {
@@ -714,7 +715,7 @@ fn run_chat(api: &Api, req: &ChatRequest, emit: Emit, on: Option<OnStage<'_, '_>
         }
     };
     let spec = lease.spec().clone();
-    let Loaded::Chat(engine) = lease.model() else { unreachable!() };
+    let engine = &mut *session;
     configure(engine, &spec, req.think, &req.tools, req.params.max_tokens);
     let c = engine.config_mut();
     c.response_format = req.response_format.clone();
@@ -768,6 +769,7 @@ fn run_chat(api: &Api, req: &ChatRequest, emit: Emit, on: Option<OnStage<'_, '_>
             generated_chars: 0,
         });
     }
+    session.remember(&messages);
     Ok(out)
 }
 
@@ -1472,9 +1474,13 @@ pub(super) fn count_tokens(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
         if let Some(t) = oa.get("tools") {
             text.push_str(&t.to_string());
         }
-        let mut lease = api.models.acquire(model, Kind::Chat)?;
-        let Loaded::Chat(engine) = lease.model() else { unreachable!() };
-        let n = engine.tokenizer().encode(text.as_str(), false).map_err(ApiError::internal)?.len();
+        let lease = api.models.acquire_chat(model, None)?;
+        let n = lease
+            .pool
+            .tokenizer()
+            .encode(text.as_str(), false)
+            .map_err(ApiError::internal)?
+            .len();
         Ok(json!({ "input_tokens": n + 4 * n_msgs }))
     })();
     Ok(Output::Full(match r {
@@ -1612,7 +1618,10 @@ impl Completion {
         on: Option<OnStage<'_, '_>>,
     ) -> ApiResult<Vec<Choice>> {
         let mut on = on;
-        let mut lease = api.models.acquire_with(&self.model, Kind::Chat, on.as_deref_mut())?;
+        let lease = api.models.acquire_chat(&self.model, on.as_deref_mut())?;
+        // (Matched as a one-message conversation.)
+        let first = self.prompts.first().and_then(Value::as_str).unwrap_or_default();
+        let mut engine = lease.engine(&[crate::engine::Message::user(first)], on.as_deref_mut())?;
         let mut reading = |done: usize, total: usize| {
             super::activity::prompt(done, total);
             if let Some(on) = on.as_deref_mut() {
@@ -1620,7 +1629,7 @@ impl Completion {
             }
         };
         let spec = lease.spec().clone();
-        let Loaded::Chat(engine) = lease.model() else { unreachable!() };
+        let engine = &mut *engine;
         let c = engine.config_mut();
         c.max_tokens = self.params.max_tokens.unwrap_or(16);
         // A raw continuation: nothing of the last chat request constrains it.

@@ -24,8 +24,9 @@ pub const CPU_PREFILL_CHUNK: usize = 512;
 
 /// Common surface of the model families (Gemma 4 / Gemma 3, Qwen 3.5/3.8 and Qwen3) used by the
 /// generation loops.
-pub trait TextLm {
-    type Sess;
+pub trait TextLm: Sync {
+    /// (Sent: a batched step of [`crate::batch`] may run a session on another request's thread.)
+    type Sess: Send;
     fn new_session(&self) -> Self::Sess;
     fn hidden_size(&self) -> usize;
     /// Decoder layers.
@@ -88,6 +89,14 @@ pub trait TextLm {
         _on: &mut dyn FnMut(u32) -> Chain,
     ) -> Option<usize> {
         None
+    }
+    /// One decode step of several independent sessions (`tokens[i]` appended to `sess[i]`):
+    /// the logits after each, as [`Self::forward`] of the one token would give them. Families
+    /// with a batched pass read the weights once for all of them ([`crate::batch`]); by default
+    /// the sessions run one after the other. A batched pass is exact where the family's batched
+    /// kernels are (each row the bits of its one-token step; see the implementations).
+    fn forward_batch(&self, sess: &mut [&mut Self::Sess], tokens: &[u32]) -> Vec<Vec<f32>> {
+        sess.iter_mut().zip(tokens).map(|(s, &t)| self.forward(s, &[t])).collect()
     }
 }
 
@@ -200,6 +209,9 @@ impl TextLm for Model<'_> {
     fn decode_greedy(&self, sess: &mut Session, first: u32, max: usize, on: &mut dyn FnMut(u32) -> Chain) -> Option<usize> {
         Model::decode_greedy(self, sess, first, max, on)
     }
+    fn forward_batch(&self, sess: &mut [&mut Session], tokens: &[u32]) -> Vec<Vec<f32>> {
+        Model::forward_batch(self, sess, tokens)
+    }
     fn prefill_chunk(&self, chunk: usize) -> usize {
         Model::prefill_chunk(self, chunk)
     }
@@ -239,6 +251,9 @@ impl TextLm for QwenModel<'_> {
     }
     fn decode_greedy(&self, sess: &mut QwenSession, first: u32, max: usize, on: &mut dyn FnMut(u32) -> Chain) -> Option<usize> {
         QwenModel::decode_greedy(self, sess, first, max, on)
+    }
+    fn forward_batch(&self, sess: &mut [&mut QwenSession], tokens: &[u32]) -> Vec<Vec<f32>> {
+        QwenModel::forward_batch(self, sess, tokens)
     }
 }
 
@@ -314,6 +329,12 @@ fn prefill_inner<M: TextLm + ?Sized>(
         report_prefill(0, ids.len());
     }
     while start < ids.len() {
+        // Other requests on the model ([`crate::batch`]) go between the chunks, the shortest
+        // prompt left first.
+        if start > 0 {
+            crate::batch::set_remaining(ids.len() - start);
+            crate::batch::yield_now();
+        }
         let mut end = (start + chunk.max(1)).min(ids.len());
         if whole {
             while end < ids.len() && is_mm(end - 1) && is_mm(end) {
@@ -328,6 +349,9 @@ fn prefill_inner<M: TextLm + ?Sized>(
             .collect();
         hs = model.prefill_hidden(sess, c, &local, end == ids.len());
         start = end;
+        if start == ids.len() {
+            crate::batch::set_remaining(0);
+        }
         if report {
             report_prefill(end, ids.len());
         }
@@ -373,21 +397,55 @@ pub struct Decoded {
 /// run), `max_tokens` tokens (all run, as the CLI always has), or when `on_token` says so (the
 /// last token is then not run: see [`Decoded::unfed`]).
 #[allow(clippy::too_many_arguments)]
-pub fn decode<M: TextLm + ?Sized>(
+pub fn decode<M: TextLm>(
     model: &M,
     sess: &mut M::Sess,
-    mut logits: Vec<f32>,
+    logits: Vec<f32>,
+    sampler: &mut Sampler,
+    stop: &[u32],
+    max_tokens: usize,
+    on_token: &mut dyn FnMut(&[u32]) -> Flow,
+) -> Decoded {
+    decode_from(model, sess, Vec::new(), Start::Logits(logits), sampler, stop, max_tokens, on_token)
+}
+
+/// Where [`decode_from`] starts.
+pub enum Start {
+    /// The logits to sample the next token from.
+    Logits(Vec<f32>),
+    /// A token to run first (the last of the reply so far, which the model has not run).
+    Run(u32),
+}
+
+/// [`decode`] continuing a reply: `out` holds its tokens so far (`on_token` gets them all, the
+/// new ones after them; `max_tokens` counts them too). Speculative rounds hand over to it when
+/// other requests start decoding on the model ([`decode_rounds_until`]).
+#[allow(clippy::too_many_arguments)]
+pub fn decode_from<M: TextLm>(
+    model: &M,
+    sess: &mut M::Sess,
+    mut out: Vec<u32>,
+    start: Start,
     sampler: &mut Sampler,
     stop: &[u32],
     max_tokens: usize,
     on_token: &mut dyn FnMut(&[u32]) -> Flow,
 ) -> Decoded {
     let t0 = Instant::now();
-    let mut out: Vec<u32> = Vec::new();
     let mut forwards = 0usize;
     let mut reason = StopReason::Length;
     let mut unfed = None;
-    for i in 0..max_tokens {
+    // With other requests on the model, the steps join theirs ([`crate::batch::decode_step`]).
+    let _batched = crate::batch::decoding();
+    let mut logits = match start {
+        Start::Logits(l) => l,
+        Start::Run(t) => {
+            forwards += 1;
+            let _decode = crate::pool::decode_scope();
+            crate::batch::decode_step(model, sess, t)
+        }
+    };
+    while out.len() < max_tokens {
         let id = sampler.sample(&logits);
         out.push(id);
         if stop.contains(&id) {
@@ -399,11 +457,16 @@ pub fn decode<M: TextLm + ?Sized>(
             unfed = Some(id);
             break;
         }
-        // Decoding the device chains (the rest of the reply in one call).
-        if sampler.chainable() {
+        // The token to run next.
+        let mut run = id;
+        // Decoding the device chains (the rest of the reply in one call), alone on the model:
+        // the chain ends when another request comes, its last token not run.
+        if sampler.chainable() && !crate::batch::contended() {
             let n0 = out.len();
+            let budget = max_tokens - (n0 - 1);
             let taken = std::cell::Cell::new(0usize);
             let mut stopped = None;
+            let mut yielded = false;
             let mut on = |t: u32| -> Chain {
                 if out.len() >= max_tokens {
                     // (The last pass: its token is not one of the reply's.)
@@ -415,20 +478,26 @@ pub fn decode<M: TextLm + ?Sized>(
                     stopped = Some((StopReason::Stop, None));
                 } else if on_token(&out) == Flow::Stop {
                     stopped = Some((StopReason::Cancelled, Some(t)));
+                } else if crate::batch::contended() {
+                    yielded = true;
                 }
-                if stopped.is_none() { Chain::Go } else { Chain::Stop }
+                if stopped.is_none() && !yielded { Chain::Go } else { Chain::Stop }
             };
-            if let Some(n) = decode_chain(model, sess, sampler, id, max_tokens - i, &mut on, &|| taken.get()) {
+            if let Some(n) = decode_chain(model, sess, sampler, id, budget, &mut on, &|| taken.get()) {
                 forwards += n;
                 if let Some((r, u)) = stopped {
                     (reason, unfed) = (r, u);
+                    break;
                 }
-                break;
+                if !yielded {
+                    break;
+                }
+                run = *out.last().unwrap();
             }
         }
         // A one-token step: on fewer threads where that leaves cores to the rest of the system.
         let _decode = crate::pool::decode_scope();
-        logits = model.forward(sess, &[id]);
+        logits = crate::batch::decode_step(model, sess, run);
         forwards += 1;
     }
     Decoded {
@@ -496,6 +565,25 @@ pub fn decode_rounds<D: RoundDecoder + ?Sized>(
     max_tokens: usize,
     on_token: &mut dyn FnMut(&[u32]) -> Flow,
 ) -> Decoded {
+    decode_rounds_until(dec, logits, sampler, stop, max_tokens, on_token, &|| false).0
+}
+
+/// [`decode_rounds`] that ends between two rounds once `yield_if` says so (true with the
+/// result: its last token was committed but not run, [`Decoded::unfed`]), for the caller to go
+/// on with plain steps ([`decode_from`] with [`Start::Run`]): what speculative decoders do when
+/// other requests start decoding on the model ([`crate::batch::contended`]), so that their steps
+/// join the batched ones.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_rounds_until<D: RoundDecoder + ?Sized>(
+    dec: &mut D,
+    logits: &[f32],
+    sampler: &mut Sampler,
+    stop: &[u32],
+    max_tokens: usize,
+    on_token: &mut dyn FnMut(&[u32]) -> Flow,
+    yield_if: &dyn Fn() -> bool,
+) -> (Decoded, bool) {
+    let mut yielded = false;
     let t0 = Instant::now();
     let rounds0 = dec.rounds();
     let first = sampler.sample(logits);
@@ -503,6 +591,12 @@ pub fn decode_rounds<D: RoundDecoder + ?Sized>(
     dec.push(first);
     let mut cancelled = !stop.contains(&first) && on_token(&out) == Flow::Stop;
     while !cancelled && !stop.contains(out.last().unwrap()) && out.len() < max_tokens {
+        if yield_if() {
+            yielded = true;
+            break;
+        }
+        // Other requests on the model ([`crate::batch`]) go between the rounds.
+        crate::batch::yield_now();
         dec.step_emit(sampler, max_tokens - out.len(), &mut |id| {
             out.push(id);
             if !cancelled && !stop.contains(&id) && on_token(&out) == Flow::Stop {
@@ -519,13 +613,27 @@ pub fn decode_rounds<D: RoundDecoder + ?Sized>(
     } else {
         StopReason::Length
     };
-    Decoded {
-        tokens: out,
-        forwards: dec.rounds() - rounds0,
-        secs: t0.elapsed().as_secs_f64(),
-        reason,
-        // The decoder never runs the last committed token until the next round or prefill.
-        unfed: (reason != StopReason::Stop).then_some(last),
+    (
+        Decoded {
+            tokens: out,
+            forwards: dec.rounds() - rounds0,
+            secs: t0.elapsed().as_secs_f64(),
+            reason,
+            // The decoder never runs the last committed token until the next round or prefill.
+            unfed: (reason != StopReason::Stop).then_some(last),
+        },
+        yielded,
+    )
+}
+
+impl Decoded {
+    /// This reply's first part followed by `rest`, which went on from it ([`decode_from`]).
+    pub fn then(self, rest: Decoded) -> Decoded {
+        Decoded {
+            forwards: self.forwards + rest.forwards,
+            secs: self.secs + rest.secs,
+            ..rest
+        }
     }
 }
 

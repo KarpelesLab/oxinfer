@@ -3121,6 +3121,10 @@ pub struct DsparkDecoder<'m, M: Target> {
     /// A lookup draft chosen for the round at a position (by [`Self::step_emit`] before it
     /// leaves the round to [`Self::step`]).
     planned: Option<(usize, LookupPick)>,
+    /// A plain turn ([`Self::plain_turn`]): the position it started at and the tokens it ran on
+    /// the target, which the draft has not seen; the next prefill runs them again (from there)
+    /// with the draft's features.
+    stale: Option<(usize, Vec<u32>)>,
 }
 
 /// A prompt-lookup draft chosen for a round: its tokens and their calibration classes.
@@ -3462,6 +3466,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
             lookup: None,
             marks: Vec::new(),
             planned: None,
+            stale: None,
         }
     }
 
@@ -3555,6 +3560,15 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
 
     fn prefill_mm_inner(&mut self, tokens: &[u32], chunk: usize, overrides: &[(usize, Vec<f32>)]) -> Vec<f32> {
         assert!(!tokens.is_empty());
+        // After a plain turn: its tokens again, from where it started, for the draft's features.
+        if let Some((at, mut again)) = self.stale.take() {
+            self.model.truncate(&mut self.sess, at);
+            self.next = None;
+            let shift = again.len();
+            again.extend_from_slice(tokens);
+            let over: Vec<(usize, Vec<f32>)> = overrides.iter().map(|(p, e)| (p + shift, e.clone())).collect();
+            return self.prefill_mm_inner(&again, chunk, &over);
+        }
         self.next = None;
         if let Some(lk) = &mut self.lookup {
             lk.truncate(self.model.session_len(&self.sess));
@@ -3564,6 +3578,11 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         let mut last = Vec::new();
         let mut start = 0;
         for c in tokens.chunks(self.model.prefill_chunk(chunk).max(1)) {
+            // Other requests on the model ([`crate::batch`]) go between the chunks.
+            if start > 0 {
+                crate::batch::set_remaining(tokens.len() - start);
+                crate::batch::yield_now();
+            }
             let end = start + c.len();
             let local: Vec<(usize, &[f32])> = overrides
                 .iter()
@@ -3774,6 +3793,9 @@ where
 {
     pub fn write_state<W: std::io::Write>(&self, w: &mut crate::snapshot::SnapWriter<W>) -> Result<()> {
         use crate::snapshot::SessionState;
+        if self.stale.is_some() {
+            bail!("DSpark: no snapshot right after a plain turn (the draft has not seen its tokens)");
+        }
         self.sess.write_state(w)?;
         let d = &self.dsess;
         w.u64s("dspark.pos", &[d.start as u64, d.len as u64, self.pending.1 as u64])?;
@@ -3846,6 +3868,11 @@ where
         if len >= n {
             return;
         }
+        if cut_stale(&mut self.stale, len) {
+            self.next = None;
+            self.model.truncate(&mut self.sess, len);
+            return;
+        }
         self.model.truncate(&mut self.sess, len);
         let dl = self.dsess.len;
         if len >= dl {
@@ -3857,6 +3884,45 @@ where
             self.dsess.truncate(len);
         }
         self.next = None;
+    }
+}
+
+impl<M: Target> DsparkDecoder<'_, M> {
+    /// Starts a turn decoded without the draft (plain steps on [`Self::sess`] by the caller,
+    /// right after [`Self::prefill`]; the server's concurrent requests decode so, in batched
+    /// steps, see [`crate::batch`]); [`Self::end_plain_turn`] gives the tokens it ran. The
+    /// position it starts at.
+    pub fn plain_turn(&mut self) -> usize {
+        self.next = None;
+        self.planned = None;
+        self.model.session_len(&self.sess)
+    }
+
+    /// Ends a plain turn started at `at` that ran `fed` on the target: the next prefill runs them
+    /// again with the draft's features (a cut back into them keeps the part before the cut).
+    pub fn end_plain_turn(&mut self, at: usize, fed: &[u32]) {
+        if !fed.is_empty() {
+            self.stale = Some((at, fed.to_vec()));
+        }
+    }
+}
+
+/// A cut back to `len` within a plain turn's tokens (`stale`, see [`DsparkDecoder::plain_turn`]:
+/// true, the part before the cut kept, the target still to cut), or before them (the turn is
+/// forgotten; false).
+fn cut_stale(stale: &mut Option<(usize, Vec<u32>)>, len: usize) -> bool {
+    match stale {
+        Some((at, toks)) if len >= *at => {
+            toks.truncate(len - *at);
+            if toks.is_empty() {
+                *stale = None;
+            }
+            true
+        }
+        _ => {
+            *stale = None;
+            false
+        }
     }
 }
 
@@ -3938,6 +4004,10 @@ impl<M: CheckpointTarget> DsparkDecoder<'_, M> {
         let mark = self.marks.iter().find(|m| m.pos == len).cloned();
         if mark.is_none() && !self.draft_keeps(len) {
             bail!("DSpark: the draft cannot go back to position {len} (at {n})");
+        }
+        if cut_stale(&mut self.stale, len) {
+            self.next = None;
+            return self.model.cut_to(&mut self.sess, len);
         }
         if let Some(m) = &mark
             && (self.dsess.len < m.dlen || (m.lo == m.dlen && self.dsess.start > m.lo))

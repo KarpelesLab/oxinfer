@@ -1061,3 +1061,98 @@ impl<'a> Model<'a> {
         Some((hidden, logits))
     }
 }
+
+impl Model<'_> {
+    /// [`crate::generate::TextLm::forward_batch`]: one decode step of several sessions. On the
+    /// GPU, one multi-token plan step whose rows are the sessions' tokens (the exact
+    /// multi-token kernels, each session's attention on its own caches,
+    /// [`crate::gpu::decode::DecodePlan::step_rows`]); otherwise (the CPU, interventions,
+    /// streamed weights) the sessions one after the other.
+    pub fn forward_batch(&self, sess: &mut [&mut Session], tokens: &[u32]) -> Vec<Vec<f32>> {
+        let b = tokens.len();
+        assert!(b > 0 && sess.len() == b, "one token per session");
+        if b > 1
+            && let Some(l) = self.gpu_step_rows(sess, tokens)
+        {
+            return l;
+        }
+        sess.iter_mut().zip(tokens).map(|(s, &t)| self.forward(s, &[t])).collect()
+    }
+
+    fn gpu_step_rows(&self, sess: &mut [&mut Session], tokens: &[u32]) -> Option<Vec<Vec<f32>>> {
+        let b = tokens.len();
+        if b > 8
+            // (The mixture of experts' multi-token kernels round differently from the one-token
+            // ones: exact only one session after the other, unless asked for the fast kernels.)
+            || (self.layers.iter().any(|l| l.moe.is_some()) && !crate::batch::fast())
+            || !self.gpu_decode_on()
+            || self.stream.is_some()
+            || crate::gpu::decode::check()
+            || self.cfg.bidirectional()
+            || sess.iter().any(|s| s.iv.active() || !s.capture.is_empty())
+        {
+            return None;
+        }
+        let plan = self.gpu_multi_plan(&[], 8, crate::batch::fast_for(b))?;
+        let _timer = crate::prof::start(crate::prof::Cat::Matmul);
+        let cfg = &self.cfg;
+        let (h, v) = (cfg.hidden_size, cfg.vocab_size);
+        let mut x = Vec::with_capacity(b * h);
+        let mut x2: Vec<Vec<f32>> = Vec::with_capacity(b);
+        for &tok in tokens {
+            x.extend_from_slice(&self.embed_scaled(tok));
+            x2.push(match &self.ple {
+                Some(ple) => {
+                    let mut e = vec![0f32; cfg.num_hidden_layers * cfg.hidden_size_per_layer_input];
+                    ple.embed.row(tok as usize, &mut e);
+                    e
+                }
+                None => Vec::new(),
+            });
+        }
+        let cs: Vec<Vec<f32>> = sess
+            .iter()
+            .map(|s| {
+                let mut cs = Vec::new();
+                for f in [&self.inv_freq_sliding, &self.inv_freq_full] {
+                    let (c, sn) = crate::kernels::rope_tables(&[s.pos], f);
+                    cs.extend_from_slice(&c);
+                    cs.extend_from_slice(&sn);
+                }
+                cs
+            })
+            .collect();
+        let mut hidden = vec![0f32; b * h];
+        let mut logits = vec![0f32; b * v];
+        let mut parts: Vec<(&mut crate::gpu::decode::Slot, Vec<&mut LayerCache>, usize)> = sess
+            .iter_mut()
+            .map(|s| {
+                let Session { caches, gpu, pos, .. } = &mut **s;
+                (gpu, caches.iter_mut().flatten().collect(), *pos)
+            })
+            .collect();
+        let mut rows: Vec<crate::gpu::decode::Row> = parts
+            .iter_mut()
+            .zip(&cs)
+            .zip(x.chunks(h).zip(&x2))
+            .map(|(((slot, kv, pos), cs), (x, x2))| crate::gpu::decode::Row {
+                slot,
+                pos: *pos,
+                rope_cs: cs,
+                x,
+                x2,
+                kv: &mut kv[..],
+            })
+            .collect();
+        let ok = plan.step_rows(&mut rows, &mut hidden, Some(&mut logits));
+        drop(rows);
+        drop(parts);
+        if !ok {
+            return None;
+        }
+        for s in sess.iter_mut() {
+            s.pos += 1;
+        }
+        Some(logits.chunks(v).map(<[f32]>::to_vec).collect())
+    }
+}

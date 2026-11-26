@@ -120,6 +120,15 @@ impl Engine {
         if ids.is_empty() {
             bail!("empty prompt");
         }
+        // With other sessions of the model: what follows runs in the group's turns.
+        // (Waiting turns go to the shortest prompts first: what this one has left, as far as
+        // the cache in memory goes.)
+        let fresh = ids.len()
+            - self
+                .chat_ids
+                .as_ref()
+                .map_or(0, |c| c.iter().zip(&ids).take_while(|(a, b)| a == b).count());
+        let _member = self.group.as_ref().map(|g| crate::batch::enter_with(g, fresh));
         let media = if feats.is_empty() {
             TurnMedia::default()
         } else {
@@ -241,7 +250,7 @@ impl Engine {
                 if !store && !checkpoint {
                     continue;
                 }
-                let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+                let _run = run_lock();
                 if b > skip {
                     let over: Vec<(usize, Vec<f32>)> = media
                         .overrides

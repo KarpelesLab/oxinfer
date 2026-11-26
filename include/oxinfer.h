@@ -1159,6 +1159,9 @@ typedef int (*oxi_bytes_fn)(void *user, const char *data, size_t len);
  *   listen=ADDR          HTTP listener (default 127.0.0.1:8080; port 0 picks a free one)
  *   tls_cert=PATH, tls_key=PATH, self_signed=0|1   HTTPS
  *   workers=N            connections served at once (default 32)
+ *   parallel=N           conversations each chat model runs at once, each with its own caches
+ *                        (default 4; model options parallel=N, max_batch=N, batch_fast=1; see
+ *                        docs/server.md#concurrent-requests)
  *   log=0|1              one stderr line per request (default 1)
  *   web=0|1              also serve the web GUI at / and its management API under /api/web/
  *                        (catalog, downloads, cache, loading models; see docs/web.md)

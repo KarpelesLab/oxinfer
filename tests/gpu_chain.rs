@@ -595,3 +595,87 @@ fn inkling_cut_sampling_chain_matches_host_steps() {
     oxinfer::inkling::set_device_sample_cap(None);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A batched step of several sessions (`TextLm::forward_batch`, Metal's `DecodePlan::step_rows`:
+/// the server's concurrent requests) against each session's own one-token steps: the same
+/// greedy tokens, logits within rounding (bit for bit where the multi-token kernels are exact,
+/// which this prints but does not require, as that depends on the chip's kernels).
+fn check_rows<M: TextLm>(name: &str, model: &M, steps: usize)
+where
+    M::Sess: Clone,
+{
+    let lens = [3usize, 9, 17, 40, 250];
+    let mut alone: Vec<M::Sess> = Vec::new();
+    let mut toks: Vec<u32> = Vec::new();
+    for (i, &n) in lens.iter().enumerate() {
+        let prompt: Vec<u32> = (0..n as u32).map(|j| (j * 97 + 13 * i as u32 + 5) % VOCAB as u32).collect();
+        let mut s = model.new_session();
+        let l = model.forward(&mut s, &prompt);
+        toks.push(oxinfer::sampler::argmax(&l));
+        alone.push(s);
+    }
+    let mut batch: Vec<M::Sess> = alone.clone();
+    let (mut exact, mut worst) = (true, 0f32);
+    for step in 0..steps {
+        let want: Vec<Vec<f32>> = alone.iter_mut().zip(&toks).map(|(s, &t)| model.forward(s, &[t])).collect();
+        let mut refs: Vec<&mut M::Sess> = batch.iter_mut().collect();
+        let got = model.forward_batch(&mut refs, &toks);
+        for (j, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g.len(), w.len());
+            exact &= bits(g) == bits(w);
+            let scale = w.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+            let d = g.iter().zip(w).fold(0f32, |m, (a, b)| m.max((a - b).abs())) / scale;
+            worst = worst.max(d);
+            assert!(d < 1e-3, "{name} step {step} row {j}: logits differ by {d}");
+            assert_eq!(
+                oxinfer::sampler::argmax(g),
+                oxinfer::sampler::argmax(w),
+                "{name} step {step} row {j}"
+            );
+        }
+        for (j, s) in alone.iter().enumerate() {
+            assert_eq!(model.session_len(s), model.session_len(&batch[j]));
+        }
+        toks = want.iter().map(|l| oxinfer::sampler::argmax(l)).collect();
+    }
+    eprintln!(
+        "{name}: batched rows {} (worst relative difference {worst:e})",
+        if exact { "bit-identical" } else { "within rounding" }
+    );
+}
+
+#[test]
+fn batched_rows_match_one_token_steps() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+    let plat = oxinfer::platform::detect();
+    let Ok(Some(_)) = oxinfer::gpu::init(&plat, oxinfer::platform::DevicePref::Auto) else {
+        eprintln!("no GPU: skipped");
+        return;
+    };
+    let dir = tiny_llama();
+    let files = ModelFiles::open(&dir, true).unwrap();
+    for quant in [Quant::Bf16, Quant::Q8, Quant::Q4] {
+        let cfg = oxinfer::config::QwenConfig::load(&dir).unwrap();
+        let model = oxinfer::qwen::QwenModel::load(cfg, &files, quant).unwrap();
+        // (The longest prompt's device copies grow past 256 positions on the way.)
+        check_rows(&format!("llama {quant:?}"), &model, 12);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let dir = tiny_gemma();
+    let files = ModelFiles::open(&dir, true).unwrap();
+    for quant in [Quant::Bf16, Quant::Q8] {
+        let cfg = oxinfer::config::TextConfig::load(&dir).unwrap();
+        let model = oxinfer::model::Model::load(cfg, &files, quant).unwrap();
+        check_rows(&format!("gemma {quant:?}"), &model, 12);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // Recurrent layers: one session after the other (the same results).
+    let dir = tiny_qwen35();
+    let files = ModelFiles::open(&dir, true).unwrap();
+    let cfg = oxinfer::config::QwenConfig::load(&dir).unwrap();
+    let model = oxinfer::qwen::QwenModel::load(cfg, &files, Quant::Bf16).unwrap();
+    check_rows("qwen3.5", &model, 6);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
