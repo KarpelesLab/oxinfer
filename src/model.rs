@@ -1594,6 +1594,18 @@ impl LayerCache {
             kept: 0,
         }
     }
+    /// A cache holding `k` and `v` (`[len, n_kv, hd]` each).
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn from_kv(k: Vec<f32>, v: Vec<f32>, n_kv: usize, hd: usize) -> Self {
+        assert!(k.len() == v.len() && k.len().is_multiple_of(n_kv * hd));
+        let len = k.len() / (n_kv * hd);
+        Self {
+            k,
+            v,
+            len,
+            ..Self::new(n_kv, hd)
+        }
+    }
     /// Appends rows of `aux_dim` (fixing it on first use).
     pub(crate) fn aux_push(&mut self, rows: &[f32], dim: usize) {
         debug_assert!(self.aux_dim == 0 || self.aux_dim == dim);

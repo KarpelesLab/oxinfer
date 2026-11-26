@@ -112,6 +112,17 @@ impl Precision {
     }
 }
 
+static ENC_ATTENTION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// For benchmarks (`examples/whisper_enc_bench.rs`): the CPU kernel of the encoder's
+/// self-attention. 0: the default (SME where present, else the NEON prompt-attention kernel on
+/// aarch64, else the blocked attention); 1: the blocked attention of `sd::ops` (the kernel
+/// before November 2026); 2: the NEON prompt-attention kernel (aarch64).
+#[doc(hidden)]
+pub fn set_encoder_attention(v: u32) {
+    ENC_ATTENTION.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// An owned `[n_out, n_in]` matrix of f32 values stored in `p`.
 fn make_lin(w: &[f32], n_out: usize, n_in: usize, p: Precision) -> Result<Lin<'static>> {
     debug_assert_eq!(w.len(), n_out * n_in);
@@ -258,6 +269,32 @@ fn project_post(ps: &[&Proj], n_in: usize, x: &[f32], t: usize, epi: Epi) -> Vec
         crate::model::linear_multi_post(&mut jobs, n_in, x, t, &post);
     }
     ys
+}
+
+/// The encoder's bidirectional self-attention of one window (`[n, nh * dh]` each), on the CPU:
+/// with SME (Apple M4 and later), the scores and the weighted values as products on its tiles
+/// and the softmax on the NEON units ([`crate::kernels::sme::attention`]); else on aarch64 the
+/// NEON prompt-attention kernel with every key visible to every query; else (and with a GPU
+/// backend, which takes it when large enough) [`crate::sd::ops::attention`].
+fn enc_attention(mut q: Vec<f32>, k: Vec<f32>, v: Vec<f32>, n: usize, nh: usize, dh: usize) -> Vec<f32> {
+    let choice = ENC_ATTENTION.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(target_arch = "aarch64")]
+    if crate::gpu::active().is_none() && choice != 1 {
+        let scale = 1.0 / (dh as f32).sqrt();
+        let mut out = vec![0f32; n * nh * dh];
+        if choice == 0 && crate::kernels::sme_available() && crate::kernels::sme::attention_fits(dh) {
+            crate::kernels::sme::attention(&q, &k, &v, n, nh, dh, scale, &mut out);
+            return out;
+        }
+        if crate::attn_prefill::supported(dh) {
+            q.iter_mut().for_each(|x| *x *= scale);
+            let cache = crate::model::LayerCache::from_kv(k, v, nh, dh);
+            crate::attn_prefill::attention(&q, &cache, nh, n, &|_| 0, &|_| n, &mut out);
+            return out;
+        }
+    }
+    let _ = (&mut q, choice);
+    crate::sd::ops::attention(&q, &k, &v, n, n, nh, dh, false)
 }
 
 fn gelu_inplace(x: &mut [f32]) {
@@ -806,6 +843,7 @@ impl WhisperModel {
             assert_eq!(mel.len(), t * nm, "encoder input must be {t} frames of {nm} mels");
         }
         // conv1: kernel 3, padding 1, then GELU.
+        let ph = crate::prof::phase(0, "enc conv");
         let k1 = self.conv1_in;
         let mut cols = vec![0f32; nb * t * k1];
         for_chunks(&mut cols, k1, true, |row, r| {
@@ -818,8 +856,7 @@ impl WhisperModel {
                 }
             }
         });
-        let mut h = project(&[&self.conv1], k1, &cols, nb * t).pop().unwrap();
-        gelu_inplace(&mut h);
+        let h = project_post(&[&self.conv1], k1, &cols, nb * t, Epi::Gelu).pop().unwrap();
         // conv2: kernel 3, stride 2, padding 1, then GELU and the positions.
         let n = cfg.max_source_positions;
         let mut cols = vec![0f32; nb * n * 3 * d];
@@ -843,31 +880,55 @@ impl WhisperModel {
                 *v = gelu_erf(*v) + p;
             }
         });
+        drop(ph);
 
         let nh = cfg.encoder_attention_heads;
         let dh = d / nh;
         let w = n * d;
         let mut hn = vec![0f32; nb * w];
         for layer in &self.enc_layers {
+            let ph = crate::prof::phase(1, "enc ln");
             hn.copy_from_slice(&x);
             layer.ln1.apply_rows(&mut hn, LN_EPS);
+            drop(ph);
             let a = &layer.attn;
-            let mut qkv = project(&[&a.q, &a.k, &a.v], d, &hn, nb * n);
+            let ph = crate::prof::phase(2, "enc qkv");
+            let mut qkv = project_post(&[&a.q, &a.k, &a.v], d, &hn, nb * n, Epi::Plain);
+            drop(ph);
             let (v, k, q) = (qkv.pop().unwrap(), qkv.pop().unwrap(), qkv.pop().unwrap());
-            let mut att = Vec::with_capacity(nb * w);
-            for b in 0..nb {
-                let r = b * w..(b + 1) * w;
-                att.extend(crate::sd::ops::attention(&q[r.clone()], &k[r.clone()], &v[r], n, n, nh, dh, false));
-            }
-            let o = project(&[&a.o], d, &att, nb * n).pop().unwrap();
-            crate::kernels::add_inplace(&mut x, &o);
+            let ph = crate::prof::phase(3, "enc attn");
+            let att = if nb == 1 {
+                enc_attention(q, k, v, n, nh, dh)
+            } else {
+                let mut att = Vec::with_capacity(nb * w);
+                for b in 0..nb {
+                    let r = b * w..(b + 1) * w;
+                    att.extend(enc_attention(
+                        q[r.clone()].to_vec(),
+                        k[r.clone()].to_vec(),
+                        v[r].to_vec(),
+                        n,
+                        nh,
+                        dh,
+                    ));
+                }
+                att
+            };
+            drop(ph);
+            let ph = crate::prof::phase(4, "enc o");
+            project_post(&[&a.o], d, &att, nb * n, Epi::Residual(&mut x));
+            drop(ph);
 
+            let ph = crate::prof::phase(1, "enc ln");
             hn.copy_from_slice(&x);
             layer.ln2.apply_rows(&mut hn, LN_EPS);
-            let mut f = project(&[&layer.fc1], d, &hn, nb * n).pop().unwrap();
-            gelu_inplace(&mut f);
-            let o = project(&[&layer.fc2], cfg.encoder_ffn_dim, &f, nb * n).pop().unwrap();
-            crate::kernels::add_inplace(&mut x, &o);
+            drop(ph);
+            let ph = crate::prof::phase(6, "enc fc1");
+            let f = project_post(&[&layer.fc1], d, &hn, nb * n, Epi::Gelu).pop().unwrap();
+            drop(ph);
+            let ph = crate::prof::phase(8, "enc fc2");
+            project_post(&[&layer.fc2], cfg.encoder_ffn_dim, &f, nb * n, Epi::Residual(&mut x));
+            drop(ph);
         }
         self.enc_ln.apply_rows(&mut x, LN_EPS);
         x.chunks(w).map(<[f32]>::to_vec).collect()
@@ -890,7 +951,10 @@ impl WhisperModel {
         let n = enc.len() / d;
         let nh = self.cfg.decoder_attention_heads;
         let ps: Vec<&Proj> = self.dec_layers.iter().flat_map(|l| [&l.cross.k, &l.cross.v]).collect();
-        let ys = project(&ps, d, enc, n);
+        let ph = crate::prof::phase(9, "enc cross kv");
+        let ys = project_post(&ps, d, enc, n, Epi::Plain);
+        drop(ph);
+        let _ph = crate::prof::phase(10, "enc cross pack");
         ys.chunks(2)
             .map(|kv| CrossLayer::new(&kv[0], &kv[1], n, nh, d / nh, self.cross_bf16))
             .collect()

@@ -45,8 +45,10 @@ What runs, following transformers' `WhisperFeatureExtractor` and
   (a mixed-radix FFT of 400) and the filterbank run in f64.
 - **Encoder**: two convolutions (kernel 3, the second with stride 2) with GELU, sinusoidal
   positions, pre-LayerNorm transformer layers, all through the shared matmul (SIMD kernels, GPU
-  backends for the big products). On Metal with matrix units (M5, A19) the whole encoder is one
-  device pass per batch of windows (see "On Metal" below).
+  backends for the big products; biases, GELU and residual adds run in the matmul's own jobs).
+  On the CPU the self-attention over the 1500 positions is a kernel of its own (see "On the
+  CPU" below). On Metal with matrix units (M5, A19) the whole encoder is one device pass per
+  batch of windows (see "On Metal" below).
 - **Decoder**: learned positions, causal self-attention over a KV cache, cross-attention over the
   window's encoder output (keys and values computed once per window, kept head-major and attended
   with the keys split across threads), the output projection tied to the token embedding. On
@@ -241,12 +243,43 @@ its fastest thread count here, with the Accelerate BLAS backend for the encoder)
 
 | Model | oxinfer encoder / decoder | oxinfer total | whisper.cpp encoder / decoder | whisper.cpp total | Speedup |
 |---|---|---|---|---|---|
-| tiny | 0.69 / 0.65 s | **1.39 s** (357x) | 1.03 / 1.55 s | 2.67 s | 1.92x |
-| base | 1.48 / 1.13 s | **2.67 s** (186x) | 2.09 / 2.10 s | 4.29 s | 1.61x |
-| small | 4.95 / 3.14 s | **8.15 s** (61x) | 7.07 / 5.00 s | 12.24 s | 1.50x |
-| large-v3-turbo | 29.8 / 2.48 s | **32.4 s** (15x) | 38.4 / 3.81 s | 42.6 s | 1.32x |
-| medium | 16.1 / 8.43 s | **24.7 s** (20x) | 20.2 / 11.4 s | 31.9 s | 1.29x |
-| large-v3 | 32.6 / 12.7 s | **45.5 s** (11x) | 45.9 / 22.0 s | 68.5 s | 1.51x |
+| tiny | 0.48 / 0.64 s | **1.18 s** (421x) | 1.03 / 1.55 s | 2.67 s | 2.26x |
+| base | 1.09 / 1.09 s | **2.24 s** (222x) | 2.09 / 2.10 s | 4.29 s | 1.92x |
+| small | 3.80 / 3.03 s | **6.88 s** (72x) | 7.07 / 5.00 s | 12.24 s | 1.78x |
+| large-v3-turbo | 22.5 / 2.31 s | **24.9 s** (20x) | 38.4 / 3.81 s | 42.6 s | 1.71x |
+| medium | 12.6 / 8.24 s | **21.0 s** (24x) | 20.2 / 11.4 s | 31.9 s | 1.52x |
+| large-v3 | 28.8 / 13.2 s | **42.2 s** (12x) | 45.9 / 22.0 s | 68.5 s | 1.62x |
+
+**On the CPU** the encoder's self-attention (1500 queries against 1500 keys, 64-wide heads) has
+a kernel of its own. With SME (Apple M4 and later; `kernels::sme::attention`) each task takes a
+head and 32 queries: the scores of all the keys as 32 x 32 outer-product tiles in one streaming
+session, laid out key by key so that they are already the panel the values' product takes, the
+softmax of the 32 queries at once on the NEON units (maximum, exponentials and sums along the
+keys), then the values times those weights on the SME tiles over all 1500 keys in one product.
+Without SME, on aarch64, the NEON prompt-attention kernel of the language models
+(`attn_prefill`) runs with every key visible to every query; elsewhere the blocked attention of
+before. It replaced the blocked flash attention on the NEON GEMM micro-kernel (scores and
+values 8 x 8 tiles over blocks of 64 keys, a scalar `exp` per score), which took a third of a
+large-v3-turbo window: 445 -> 197 ms of a 1.34 s window (369 GFLOP of attention, 0.83 -> 1.9
+TFLOP/s), one window 1.34 -> 1.09 s (`examples/whisper_enc_bench.rs`, alternated in one
+process; the NEON prompt-attention kernel there: 1.34 s). The rest of a window is the GEMMs on
+the SME tiles at 2.1-2.9 TFLOP/s (qkv 189 ms, output 76, fc1 244-283, fc2 330), the LayerNorms
+(20 ms), the convolutions (10 ms) and, from the decoder's cross-attention keys and values, 15 ms
+(large-v3-turbo's 4 decoder layers; 32 for large-v3). The encoder output moves by up to 1.3e-3
+(the softmax's exponentials are the vectorized ones, the sums in another order), within the
+2.5e-2 it already differs from transformers by; the transcripts of the table are the same,
+word for word and timestamp for timestamp, for all six models. Before (same session, alternated
+with these runs): encoder 0.67 / 1.47 / 4.78 / 28.8 / 15.3 / 35.4 s from tiny to large-v3, total
+1.37 / 2.63 / 7.90 / 31.4 / 23.4 / 48.9 s.
+
+Measured and left for these shapes (1500 tokens; M5 Max, 18 threads): splitting the SME GEMMs'
+jobs along the tokens as well (2 to 16 jobs a thread, in row-major or token-major order), 64 to
+256 rows a job, 0.5 to 4 MB of weight panels a job, and the NEON f32 GEMM taking a share of the
+row blocks beside the SME units (the same bits, but 4-6 tasks on SME and the rest on NEON were
+slower at every share, as NEON and SME share the clusters' caches): all within the noise or
+slower. The f16 / bf16 outer products (`FMOPA` widening, `BFMOPA`) run at the f32 rate in
+FLOP/s here (2.2 TFLOP/s on one thread, 3.3-4 on all), so lower-precision activations would not
+pay.
 
 The CPU decoder's matmuls run their bias, GELU and residual add inside the matmul's own pool
 jobs, on each block of rows as it is done (the same operations, so the same transcripts), its

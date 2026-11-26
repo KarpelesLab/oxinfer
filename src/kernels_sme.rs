@@ -175,6 +175,60 @@ pub(crate) unsafe fn kern32(a: *const f32, b: *const f32, k: usize, c: *mut f32)
     );
 }
 
+/// [`kern32`] for `n` panels `b` in a row (`b + i * 32 * k`, `n > 0`) against one panel `a`, into
+/// `c + i * 32 * 32`, in one streaming-mode session.
+pub(crate) unsafe fn kern32_seq(a: *const f32, b: *const f32, k: usize, n: usize, c: *mut f32) {
+    debug_assert!(k > 0 && n > 0);
+    sme_asm!(
+        ".arch_extension sme",
+        "smstart",
+        "ptrue p0.s",
+        "5:",
+        "zero {{za}}",
+        "mov {ap}, {a}",
+        "mov {kk}, {k}",
+        "1:",
+        "ld1w {{z0.s}}, p0/z, [{ap}]",
+        "ld1w {{z1.s}}, p0/z, [{ap}, #1, mul vl]",
+        "ld1w {{z2.s}}, p0/z, [{b}]",
+        "ld1w {{z3.s}}, p0/z, [{b}, #1, mul vl]",
+        "fmopa za0.s, p0/m, p0/m, z0.s, z2.s",
+        "fmopa za1.s, p0/m, p0/m, z0.s, z3.s",
+        "fmopa za2.s, p0/m, p0/m, z1.s, z2.s",
+        "fmopa za3.s, p0/m, p0/m, z1.s, z3.s",
+        "add {ap}, {ap}, #128",
+        "add {b}, {b}, #128",
+        "subs {kk}, {kk}, #1",
+        "b.ne 1b",
+        "mov w12, #0",
+        "2:",
+        "st1w {{za0v.s[w12, 0]}}, p0, [{c}]",
+        "add {c2}, {c}, #64",
+        "st1w {{za2v.s[w12, 0]}}, p0, [{c2}]",
+        "add {c2}, {c}, #2048",
+        "st1w {{za1v.s[w12, 0]}}, p0, [{c2}]",
+        "add {c2}, {c}, #2112",
+        "st1w {{za3v.s[w12, 0]}}, p0, [{c2}]",
+        "add {c}, {c}, #128",
+        "add w12, w12, #1",
+        "cmp w12, #16",
+        "b.ne 2b",
+        "add {c}, {c}, #2048",
+        "subs {n}, {n}, #1",
+        "b.ne 5b",
+        "smstop",
+        a = in(reg) a,
+        b = inout(reg) b => _,
+        k = in(reg) k,
+        n = inout(reg) n => _,
+        c = inout(reg) c => _,
+        ap = out(reg) _,
+        kk = out(reg) _,
+        c2 = out(reg) _,
+        out("w12") _
+    );
+}
+
 /// The activations `x` (`[t, n_in]`) as panels of 32 tokens (`[tile][n_in][32]`, zero padded).
 pub(crate) fn pack_x(x: &[f32], t: usize, n_in: usize) -> Vec<f32> {
     let tiles = t.div_ceil(32);
@@ -268,10 +322,185 @@ pub(crate) unsafe fn gemm_rows<M: QMat + ?Sized>(m: &M, xt: &[f32], c0: usize, c
     });
 }
 
+/// Per-thread buffers of [`attention`]: the query panel, the scores, a 32 x 32 tile.
+struct AttnScratch {
+    qp: Vec<f32>,
+    s: Vec<f32>,
+    c: Vec<f32>,
+}
+
+#[allow(clippy::missing_const_for_thread_local)]
+mod attn_scratch {
+    use std::cell::RefCell;
+    thread_local! {
+        pub(super) static SCRATCH: RefCell<super::AttnScratch> =
+            const { RefCell::new(super::AttnScratch { qp: Vec::new(), s: Vec::new(), c: Vec::new() }) };
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Ptr(*mut f32);
+unsafe impl Send for Ptr {}
+unsafe impl Sync for Ptr {}
+
+/// Whether [`attention`] takes heads of `dh` values.
+pub(crate) fn attention_fits(dh: usize) -> bool {
+    dh > 0 && dh.is_multiple_of(32)
+}
+
+/// Bidirectional attention: `out` (`[n, nh * dh]`) = softmax(scale q k^T) v per head, for `q`,
+/// `k`, `v` (`[n, nh * dh]`), with `dh` a multiple of 32. One task per head and block of 32
+/// queries: the scores of every key as 32 x 32 tiles on the SME array (queries scaled first,
+/// keys as `[dh][32]` panels, all tiles in one streaming session), laid out key by key
+/// (`[key][32 queries]`, the panel the values' product takes); the softmax of each query over
+/// all keys on the NEON units (the maximum, the exponentials and their sums run along the keys
+/// for the 32 queries at once); then the values, `[key][32 dims]` panels, times those weights
+/// on the SME array over all the keys, and each output divided by its query's sum.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention(q: &[f32], k: &[f32], v: &[f32], n: usize, nh: usize, dh: usize, scale: f32, out: &mut [f32]) {
+    let d = nh * dh;
+    assert!(attention_fits(dh) && q.len() == n * d && k.len() == n * d && v.len() == n * d && out.len() == n * d);
+    if n == 0 {
+        return;
+    }
+    let tiles = n.div_ceil(32);
+    let np = tiles * 32;
+    let ng = dh / 32;
+    // Keys: `[head][tile][dh][32]`.
+    let mut kp = vec![0f32; nh * tiles * dh * 32];
+    let kpp = Ptr(kp.as_mut_ptr());
+    crate::pool::run(nh * tiles, &|i| {
+        let kpp = &kpp;
+        let (h, j) = (i / tiles, i % tiles);
+        // SAFETY: each task writes its own panel; rows past `n` are not read.
+        unsafe {
+            pack32(
+                k.as_ptr().add(32 * j * d + h * dh),
+                d,
+                (n - 32 * j).min(32),
+                dh,
+                kpp.0.add(i * dh * 32),
+            )
+        }
+    });
+    // Values: `[head][group of 32 dims][np keys][32]` (zero rows past `n`).
+    let mut vp = vec![0f32; nh * ng * np * 32];
+    let vpp = Ptr(vp.as_mut_ptr());
+    crate::pool::run(nh * ng, &|i| {
+        let vpp = &vpp;
+        let (h, g) = (i / ng, i % ng);
+        for key in 0..n {
+            // SAFETY: each task writes its own panel.
+            unsafe {
+                std::ptr::copy_nonoverlapping(v.as_ptr().add(key * d + h * dh + 32 * g), vpp.0.add((i * np + key) * 32), 32);
+            }
+        }
+    });
+    let op = Ptr(out.as_mut_ptr());
+    crate::pool::run(nh * tiles, &|task| {
+        let op = &op;
+        let (h, qt) = (task / tiles, task % tiles);
+        let rows = (n - 32 * qt).min(32);
+        attn_scratch::SCRATCH.with(|sc| {
+            let mut sc = sc.borrow_mut();
+            let AttnScratch { qp, s, c } = &mut *sc;
+            if qp.len() < dh * 32 {
+                qp.resize(dh * 32, 0.0);
+            }
+            if s.len() < np * 32 {
+                s.resize(np * 32, 0.0);
+            }
+            c.resize(32 * 32, 0.0);
+            // SAFETY: the panels hold whole tiles.
+            unsafe {
+                pack32(q.as_ptr().add(32 * qt * d + h * dh), d, rows, dh, qp.as_mut_ptr());
+                qp[..dh * 32].iter_mut().for_each(|x| *x *= scale);
+                kern32_seq(qp.as_ptr(), kp.as_ptr().add(h * tiles * dh * 32), dh, tiles, s.as_mut_ptr());
+            }
+            let (live, pad) = s[..np * 32].split_at_mut(n * 32);
+            let (rows_s, _) = live.as_chunks_mut::<32>();
+            let mut m = [f32::NEG_INFINITY; 32];
+            for r in rows_s.iter() {
+                for (a, &x) in m.iter_mut().zip(r) {
+                    *a = a.max(x);
+                }
+            }
+            let mut l = [0f32; 32];
+            for r in rows_s.iter_mut() {
+                for i in 0..32 {
+                    let e = crate::kernels::fast_exp(r[i] - m[i]);
+                    r[i] = e;
+                    l[i] += e;
+                }
+            }
+            pad.fill(0.0);
+            for g in 0..ng {
+                // SAFETY: as above; the task writes its own rows of this head's outputs.
+                unsafe {
+                    kern32(vp.as_ptr().add((h * ng + g) * np * 32), s.as_ptr(), np, c.as_mut_ptr());
+                    for qi in 0..rows {
+                        let inv = 1.0 / l[qi];
+                        let o = op.0.add((32 * qt + qi) * d + h * dh + 32 * g);
+                        for r in 0..32 {
+                            *o.add(r) = c[qi * 32 + r] * inv;
+                        }
+                    }
+                }
+            }
+        });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
+
+    #[test]
+    fn attention_matches_f64_reference() {
+        if !available() {
+            eprintln!("no SME: skipped");
+            return;
+        }
+        // Partial last tiles of queries and keys, one and two groups of 32 dimensions, heads.
+        for (n, nh, dh) in [(70usize, 3usize, 64usize), (32, 1, 32), (5, 2, 32)] {
+            let d = nh * dh;
+            let mut s = 1u64;
+            let mut r = || {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((s >> 40) % 2001) as f32 / 500.0 - 2.0
+            };
+            let q: Vec<f32> = (0..n * d).map(|_| r()).collect();
+            let k: Vec<f32> = (0..n * d).map(|_| r()).collect();
+            let v: Vec<f32> = (0..n * d).map(|_| r()).collect();
+            let scale = 1.0 / (dh as f32).sqrt();
+            let mut out = vec![f32::NAN; n * d];
+            attention(&q, &k, &v, n, nh, dh, scale, &mut out);
+            for h in 0..nh {
+                for i in 0..n {
+                    let sc: Vec<f64> = (0..n)
+                        .map(|j| {
+                            (0..dh)
+                                .map(|c| q[i * d + h * dh + c] as f64 * k[j * d + h * dh + c] as f64)
+                                .sum::<f64>()
+                                * scale as f64
+                        })
+                        .collect();
+                    let m = sc.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let e: Vec<f64> = sc.iter().map(|x| (x - m).exp()).collect();
+                    let l: f64 = e.iter().sum();
+                    for c in 0..dh {
+                        let want: f64 = (0..n).map(|j| e[j] * v[j * d + h * dh + c] as f64).sum::<f64>() / l;
+                        let got = out[i * d + h * dh + c] as f64;
+                        assert!(
+                            (got - want).abs() <= 1e-5 * (1.0 + want.abs()),
+                            "n={n} head {h} query {i} dim {c}: {got} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn matches_f64_reference() {

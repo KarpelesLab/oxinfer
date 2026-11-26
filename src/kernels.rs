@@ -279,17 +279,11 @@ pub(crate) fn post_all(ys: &mut [(usize, &mut [f32])], t: usize, post: Post) {
     });
 }
 
-/// [`matmul_multi`] followed by `post` over the outputs (see [`Post`]): one-token and few-token
-/// products run it inside their pool jobs, on each block of rows as it is done.
+/// [`matmul_multi`] followed by `post` over the outputs (see [`Post`]), run inside the matmul's
+/// pool jobs on each block of outputs as it is done.
 pub fn matmul_multi_post(jobs: &mut [(&[u16], usize, &mut [f32])], n_in: usize, x: &[f32], t: usize, post: Option<Post>) {
     assert_eq!(x.len(), t * n_in, "input shape mismatch");
     if t == 0 {
-        return;
-    }
-    if let Some(p) = post.filter(|_| !decode_path(n_in, t)) {
-        matmul_multi_post(jobs, n_in, x, t, None);
-        let mut ys: Vec<(usize, &mut [f32])> = jobs.iter_mut().map(|(_, n, y)| (*n, &mut **y)).collect();
-        post_all(&mut ys, t, p);
         return;
     }
     #[cfg(target_arch = "aarch64")]
@@ -297,7 +291,7 @@ pub fn matmul_multi_post(jobs: &mut [(&[u16], usize, &mut [f32])], n_in: usize, 
         // Prefill on the SME tiles, through the quantized driver (bf16 rows widen exactly).
         let mats: Vec<Bf16Mat> = jobs.iter().map(|(w, n_out, _)| Bf16Mat { w, n_out: *n_out, n_in }).collect();
         let mut qj: Vec<(&Bf16Mat, &mut [f32])> = mats.iter().zip(jobs.iter_mut()).map(|(m, (_, _, y))| (m, &mut **y)).collect();
-        matmul_quant_multi(&mut qj, x, t);
+        matmul_quant_multi_post_at(&mut qj, x, t, decode_max_tokens(), post);
         return;
     }
     #[cfg(target_arch = "x86_64")]
@@ -306,7 +300,7 @@ pub fn matmul_multi_post(jobs: &mut [(&[u16], usize, &mut [f32])], n_in: usize, 
         // widen exactly, and the GEMM below takes these shapes too: the same bits).
         let mats: Vec<Bf16Mat> = jobs.iter().map(|(w, n_out, _)| Bf16Mat { w, n_out: *n_out, n_in }).collect();
         let mut qj: Vec<(&Bf16Mat, &mut [f32])> = mats.iter().zip(jobs.iter_mut()).map(|(m, (_, _, y))| (m, &mut **y)).collect();
-        matmul_quant_multi_at(&mut qj, x, t, TN - 1);
+        matmul_quant_multi_post_at(&mut qj, x, t, TN - 1, post);
         return;
     }
     #[cfg(target_arch = "aarch64")]
@@ -315,7 +309,7 @@ pub fn matmul_multi_post(jobs: &mut [(&[u16], usize, &mut [f32])], n_in: usize, 
         // (the same bits).
         let mats: Vec<Bf16Mat> = jobs.iter().map(|(w, n_out, _)| Bf16Mat { w, n_out: *n_out, n_in }).collect();
         let mut qj: Vec<(&Bf16Mat, &mut [f32])> = mats.iter().zip(jobs.iter_mut()).map(|(m, (_, _, y))| (m, &mut **y)).collect();
-        matmul_quant_multi_at(&mut qj, x, t, TN - 1);
+        matmul_quant_multi_post_at(&mut qj, x, t, TN - 1, post);
         return;
     }
     let mut total_bytes = 0usize;
@@ -414,25 +408,6 @@ pub fn matmul_multi_post(jobs: &mut [(&[u16], usize, &mut [f32])], n_in: usize, 
 /// (only on aarch64, where they were measured).
 fn one_pass(t: usize) -> bool {
     cfg!(target_arch = "aarch64") && t <= 4
-}
-
-/// Whether [`matmul_multi`] over `t` tokens takes its own blocked loop (not one of the prefill
-/// GEMMs), where [`matmul_multi_post`] runs the epilogue inside the jobs.
-fn decode_path(n_in: usize, t: usize) -> bool {
-    #[cfg(target_arch = "aarch64")]
-    if t > decode_max_tokens() && prefill_kernel() == PrefillGemm::Sme && sme::fits(n_in) {
-        return false;
-    }
-    #[cfg(target_arch = "x86_64")]
-    if t >= TN && n_in.is_multiple_of(32) && simd::avx512() {
-        return false;
-    }
-    #[cfg(target_arch = "aarch64")]
-    if t >= TN && n_in.is_multiple_of(32) && gemm_tuning().is_some() {
-        return false;
-    }
-    let _ = n_in;
-    t > 0
 }
 
 /// Work items of a grouped matmul: `(job, row0, row1, token0, token1)`, row blocks of about
@@ -2713,6 +2688,18 @@ pub fn matmul_quant_multi<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &[f32], t: 
 
 /// [`matmul_quant_multi`] with the decode kernels up to `decode_max` tokens.
 pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &[f32], t: usize, decode_max: usize) {
+    matmul_quant_multi_post_at(jobs, x, t, decode_max, None)
+}
+
+/// [`matmul_quant_multi_at`] with `post` (see [`Post`]) run by the pool job of each block of
+/// outputs as soon as it is computed.
+pub(crate) fn matmul_quant_multi_post_at<M: QMat>(
+    jobs: &mut [(&M, &mut [f32])],
+    x: &[f32],
+    t: usize,
+    decode_max: usize,
+    post: Option<Post>,
+) {
     if t == 0 || jobs.is_empty() {
         return;
     }
@@ -2867,6 +2854,14 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
             Path::Decode => unsafe { decode_rows(job.m, xa.as_ref().unwrap(), pairs.as_ref(), multi, job.y.get(), r0, r1) },
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
+        }
+        if let Some(p) = post {
+            let n_out = job.m.n_out();
+            for c in c0..c1 {
+                // SAFETY: this job owns rows r0..r1 of these tokens.
+                let y = unsafe { std::slice::from_raw_parts_mut(job.y.get().add(c * n_out + r0), r1 - r0) };
+                p(j as usize, c, r0, y);
+            }
         }
     };
     if !hybrid {

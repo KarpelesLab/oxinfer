@@ -4596,12 +4596,17 @@ whole file, best of two alternated runs (details and word error rates in
 
 | Model | Metal: oxinfer / whisper.cpp | CPU: oxinfer / whisper.cpp |
 |---|---|---|
-| tiny | 0.71 / 1.62 s (2.29x) | 1.39 / 2.67 s (1.92x) |
-| base | 1.07 / 2.28 s (2.13x) | 2.67 / 4.29 s (1.61x) |
-| small | 2.26 / 4.22 s (1.87x) | 8.15 / 12.24 s (1.50x) |
-| large-v3-turbo | 2.84 / 4.89 s (1.72x) | 32.4 / 42.6 s (1.32x) |
-| medium | 5.45 / 9.71 s (1.78x) | 24.7 / 31.9 s (1.29x) |
-| large-v3 | 8.98 / 14.13 s (1.57x) | 45.5 / 68.5 s (1.51x) |
+| tiny | 0.71 / 1.62 s (2.29x) | 1.18 / 2.67 s (2.26x) |
+| base | 1.07 / 2.28 s (2.13x) | 2.24 / 4.29 s (1.92x) |
+| small | 2.26 / 4.22 s (1.87x) | 6.88 / 12.24 s (1.78x) |
+| large-v3-turbo | 2.84 / 4.89 s (1.72x) | 24.9 / 42.6 s (1.71x) |
+| medium | 5.45 / 9.71 s (1.78x) | 21.0 / 31.9 s (1.52x) |
+| large-v3 | 8.98 / 14.13 s (1.57x) | 42.2 / 68.5 s (1.62x) |
+
+On the CPU the encoder's self-attention runs on the SME tiles where present (scores and
+weighted values as outer products, the softmax on NEON): a large-v3-turbo window 1.34 -> 1.09 s,
+the CPU column 1.39 / 2.67 / 8.15 / 32.4 / 24.7 / 45.5 s before from tiny to large-v3, with the
+same transcripts (see [Whisper](whisper.md), "On the CPU").
 
 On Metal the encoder and the decoder run as whole device passes (`crate::gpu::whisper`): the
 encoder's GEMMs, attention and row work in one pass per batch of windows with the
