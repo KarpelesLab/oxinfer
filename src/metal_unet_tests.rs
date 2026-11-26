@@ -199,11 +199,14 @@ fn pass_matches_reference() {
     let bias_img: Vec<f32> = (0..nb * c).map(|_| rnd(s)).collect();
     let lat: Vec<Vec<f32>> = (0..nb).map(|_| (0..h * w * c0).map(|_| rnd(s) * 4.0).collect()).collect();
     let ctx: Vec<Vec<f32>> = (0..nb).map(|_| (0..m * cd).map(|_| rnd(s)).collect()).collect();
-    fn attn(ws: &[W], heads: usize) -> crate::gpu::unet::Attn<'_> {
+    // Self-attention: 4 heads of 32 (padded to 48 for the flash kernels, with biases);
+    // cross-attention: 2 heads of 64 without.
+    fn attn(ws: &[W], heads: usize, bias: bool) -> crate::gpu::unet::Attn<'_> {
+        let l = |i: usize| if bias { ws[i].lin() } else { Lin { bias: None, ..ws[i].lin() } };
         crate::gpu::unet::Attn {
-            q: Lin { bias: None, ..ws[0].lin() },
-            k: Lin { bias: None, ..ws[1].lin() },
-            v: Lin { bias: None, ..ws[2].lin() },
+            q: l(0),
+            k: l(1),
+            v: l(2),
             o: ws[3].lin(),
             heads,
         }
@@ -260,9 +263,9 @@ fn pass_matches_reference() {
                     proj_in: pin.lin(),
                     blocks: vec![Block {
                         n1: lns[0].norm(0),
-                        a1: attn(&a1, 2),
+                        a1: attn(&a1, 4, true),
                         n2: lns[1].norm(0),
-                        a2: attn(&a2, 2),
+                        a2: attn(&a2, 2, false),
                         n3: lns[2].norm(0),
                         ff1: ff1.lin(),
                         ff2: ff2.lin(),
@@ -328,7 +331,7 @@ fn pass_matches_reference() {
         }
         let mut hs = pin.apply(&nt.apply(&t5, ct, 32, false), true);
         let hn = lns[0].apply(&hs, ct, 0, false);
-        let o = attention(&a1[0].apply(&hn, false), &a1[1].apply(&hn, false), &a1[2].apply(&hn, false), 2, ct);
+        let o = attention(&a1[0].apply(&hn, true), &a1[1].apply(&hn, true), &a1[2].apply(&hn, true), 4, ct);
         add(&mut hs, &a1[3].apply(&o, true));
         let hn = lns[1].apply(&hs, ct, 0, false);
         let o = attention(
@@ -424,8 +427,6 @@ fn un_gemm_bench() {
             bstride: 0,
             add: 0,
             nimg: rows as u32,
-            dh: 0,
-            dhp: 0,
             g: Geo::default(),
             scaled: 0,
             full: 0,

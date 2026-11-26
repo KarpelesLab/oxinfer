@@ -80,8 +80,8 @@ inline float un_scale(uint bits) {
     frexp(min(m, 3.0e38f), e);
     return ldexp(1.0f, 14 - e);
 }
-kernel void un_amax_clear(device uint* m [[buffer(0)]], uint i [[thread_position_in_grid]]) { if (i == 0) m[0] = 0; }
-// The largest magnitude over the interior pixels of a padded f32 tensor, as float bits (atomic max).
+// The largest magnitude over the interior pixels of a padded f32 tensor, as float bits (atomic
+// max into a slot the host zeroed).
 struct UAM { UGEO g; uint c; uint nimg; uint rows; uint _p; };
 kernel void un_amax(device const float* x [[buffer(0)]], device atomic_uint* m [[buffer(1)]], constant UAM& p [[buffer(2)]],
                     uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
@@ -97,6 +97,25 @@ kernel void un_amax(device const float* x [[buffer(0)]], device atomic_uint* m [
     if (lane == 0 && a > 16384.0f) atomic_fetch_max_explicit(m, as_type<uint>(a), memory_order_relaxed);
 }
 struct UPR { UGEO d; UGEO s; uint c; uint nimg; uint norm; uint silu; uint up; uint compact; uint groups; uint rows; };
+// Channels ch .. ch + 4 of f32 row sr of x (c channels, image b) as half: normalized (norm 1, st
+// and gb as un_prep's) and SiLU'd, or scaled (norm 2), or as they are.
+inline half4 un_prep4(device const float* x, uint sr, uint ch, uint b, uint c, uint norm, uint silu, uint groups,
+                      device const float2* st, device const float* gb) {
+    float4 v = *(device const float4*)(x + (ulong)sr * c + ch);
+    if (norm == 2) {
+        v *= un_scale(((device const uint*)st)[0]);
+    } else if (norm != 0) {
+        uint cpg = c / groups;
+        float r[4] = { v.x, v.y, v.z, v.w };
+        for (uint k = 0; k < 4; k++) {
+            float2 m = st[b * groups + (ch + k) / cpg];
+            float t = (r[k] - m.x) * m.y * gb[ch + k] + gb[c + ch + k];
+            r[k] = silu != 0 ? t / (1.0f + exp(-t)) : t;
+        }
+        v = float4(r[0], r[1], r[2], r[3]);
+    }
+    return half4(v);
+}
 kernel void un_prep(device const float* x [[buffer(0)]], device half* out [[buffer(1)]], device const float2* st [[buffer(2)]],
                     device const float* gb [[buffer(3)]], constant UPR& p [[buffer(4)]],
                     uint i [[thread_position_in_grid]]) {
@@ -115,21 +134,7 @@ kernel void un_prep(device const float* x [[buffer(0)]], device half* out [[buff
     device half4* o = (device half4*)(out + (ulong)row * p.c) + j;
     if (!in) { *o = half4(0.h); return; }
     uint sr = un_prow(p.s, b, y >> p.up, xx >> p.up);
-    float4 v = *((device const float4*)(x + (ulong)sr * p.c) + j);
-    if (p.norm == 2) {
-        v *= un_scale(((device const uint*)st)[0]);
-    } else if (p.norm != 0) {
-        uint cpg = p.c / p.groups;
-        float r[4] = { v.x, v.y, v.z, v.w };
-        for (uint k = 0; k < 4; k++) {
-            uint ch = j * 4 + k;
-            float2 m = st[b * p.groups + ch / cpg];
-            float t = (r[k] - m.x) * m.y * gb[ch] + gb[p.c + ch];
-            r[k] = p.silu != 0 ? t / (1.0f + exp(-t)) : t;
-        }
-        v = float4(r[0], r[1], r[2], r[3]);
-    }
-    *o = half4(v);
+    *o = un_prep4(x, sr, j * 4, b, p.c, p.norm, p.silu, p.groups, st, gb);
 }
 
 // Unfolded 3x3 (or k x k) neighbourhoods of padded half rows, for strided convolutions (and
@@ -159,8 +164,7 @@ kernel void un_im2col(device const half* x [[buffer(0)]], device half* out [[buf
 // r_end, tile i at output columns (i % nct) 64 and rows r0 + (i / nct) TMR. Stores (omode):
 //   0 f32 rows ldy wide, row r (compact: image r / nimg);
 //   1 f32 padded rows of geometry g from compact rows (image b's pixel q);
-//   2 f32 padded rows from padded rows (the borders get finite values that no reader takes);
-//   3 half rows of heads: output o to column (o / dh) dhp + o % dh of rows ldy wide.
+//   2 f32 padded rows from padded rows (the borders get finite values that no reader takes).
 // With bias: + bias[b * bstride + o]; with add: + addb at the destination's index (addb may be y).
 //
 // The GPU runs a fixed number of threadgroups at once (4 per core), and a tile takes about as
@@ -170,7 +174,7 @@ kernel void un_im2col(device const half* x [[buffer(0)]], device half* out [[buf
 // inputs (of the taps x cin), threadgroups full + j rs + z, which store f32 blocks of TMR x 64
 // to `part`; un_gemm_red sums them and stores the outputs.
 struct UG { uint n_out; uint ldw; uint cin; uint taps; int off[9]; uint a_rows; uint r0; uint r_end; uint omode; uint ldy;
-            uint has_bias; uint bstride; uint add; uint nimg; uint dh; uint dhp; UGEO g; uint scaled;
+            uint has_bias; uint bstride; uint add; uint nimg; UGEO g; uint scaled;
             uint full; uint rs; uint kper; uint nct; uint tm; uint nrem; uint _p; };
 // Output o of row r (v: the products) as omode says, with its bias and residual.
 inline void un_store(constant UG& p, uint o, uint r, float v, device float* y, device const float* bias, device const float* addb) {
@@ -180,14 +184,6 @@ inline void un_store(constant UG& p, uint o, uint r, float v, device float* y, d
     } else {
         b = r / p.nimg;
         if (p.omode == 1) { uint q = r - b * p.nimg; dst = un_prow(p.g, b, q / p.g.w, q % p.g.w); }
-    }
-    if (p.omode == 3) {
-        if (p.has_bias != 0) v += bias[o];
-        device half* hr = (device half*)y + (ulong)dst * p.ldy + (o / p.dh) * p.dhp;
-        uint d = o % p.dh;
-        hr[d] = half(v);
-        if (d < p.dhp - p.dh) hr[p.dh + d] = 0.h;   // the head's padding: zeros
-        return;
     }
     if (p.has_bias != 0) v += bias[b * p.bstride + o];
     if (p.add != 0) v += addb[(ulong)dst * p.ldy + o];
@@ -299,6 +295,77 @@ kernel void un_gemm_red(device float* y [[buffer(2)]], device const float* bias 
     un_store(p, o, r, v * inv, y, bias, addb);
 }
 
+// The 1x1 GEMMs of the transformers and attention (one tap, whole tiles, no scaling, one bias
+// for all rows) with nothing else in their tiles: un_gemm_body's general epilogue (split parts,
+// per-image biases, the scale, a residual's registers kept whether or not it is read) costs
+// these short GEMMs (320 to 1280 inputs) a third of their time. HO: half rows out (the q / k / v
+// heads, padded by their weights, and the GEMM input after a transformer's last block), else
+// f32 rows; ADD: + addb (f32 rows ldy wide; may be y). Grid y picks one of up to three GEMMs
+// over the same input (q, k and v in one dispatch): weights w / w1 / w2, outputs y / y1 / y2,
+// biases bias / b1 / b2. PAD: into the f32 padded rows of geometry g (addb in the same layout)
+// from compact rows, an image row of w a multiple of TMR (each tile inside one image row).
+template <int TMR, bool HO, bool ADD, bool PAD = false>
+inline void un_gemm_lean_body(device const bfloat* w, device const half* xh, device void* y, device const float* bias,
+                              device const float* addb, constant UG& p, uint g) {
+    constexpr int TN = 64;
+    uint o0 = (g % p.nct) * TN, t0 = p.r0 + (g / p.nct) * TMR;
+    int nop = int(p.n_out + TN - 1) / TN * TN;
+    XT X((device half*)xh, dextents<int32_t, 2>(p.cin, p.a_rows));
+    constexpr auto desc = matmul2d_descriptor(TMR, TN, static_cast<int>(dynamic_extent), false, true, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    array<int32_t, 2> ws = { 1, int32_t(p.ldw) };
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> W0((device bfloat*)w, dextents<int32_t, 2>(p.cin, nop), ws);
+    auto a0 = X.slice(0, int(t0));
+    auto b0 = W0.slice(0, o0);
+    auto c = op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
+    zero(c);
+    op.run(a0, b0, c);
+    array<int32_t, 2> ys = { 1, int32_t(p.ldy) };
+    // The destination's first row and row count.
+    uint d0 = t0, dn = p.r_end;
+    if (PAD) {
+        uint n = p.g.h * p.g.w, b = t0 / n, q = t0 - b * n;
+        d0 = un_prow(p.g, b, q / p.g.w, q % p.g.w);
+        dn = d0 + TMR;
+    }
+    if (ADD) {
+        tensor<device float, dextents<int32_t, 2>, tensor_inline> A((device float*)addb, dextents<int32_t, 2>(int(p.n_out), int(dn)), ys);
+        auto ca = op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
+        ca.load(A.slice(o0, d0));
+#pragma unroll
+        for (uint16_t i = 0; i < c.get_capacity(); ++i) c[i] += ca[i];
+    }
+    if (p.has_bias != 0) {
+#pragma unroll
+        for (uint16_t i = 0; i < c.get_capacity(); ++i)
+            if (c.is_valid_element(i)) c[i] += bias[o0 + c.get_multidimensional_index(i)[0]];
+    }
+    if (HO) {
+        auto ch = op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), half>();
+#pragma unroll
+        for (uint16_t i = 0; i < c.get_capacity(); ++i) ch[i] = half(c[i]);
+        tensor<device half, dextents<int32_t, 2>, tensor_inline> Y((device half*)y, dextents<int32_t, 2>(int(p.n_out), int(dn)), ys);
+        ch.store(Y.slice(o0, d0));
+    } else {
+        tensor<device float, dextents<int32_t, 2>, tensor_inline> Y((device float*)y, dextents<int32_t, 2>(int(p.n_out), int(dn)), ys);
+        c.store(Y.slice(o0, d0));
+    }
+}
+#define UN_GEMM_LEAN(NAME, TMR, HO, ADD, ...) \
+kernel void NAME(device const bfloat* w [[buffer(0)]], device const half* xh [[buffer(1)]], device void* y [[buffer(2)]], \
+                 device const float* bias [[buffer(3)]], constant UG& p [[buffer(4)]], device const float* addb [[buffer(5)]], \
+                 device const bfloat* w1 [[buffer(8)]], device const bfloat* w2 [[buffer(9)]], device void* y1 [[buffer(10)]], \
+                 device void* y2 [[buffer(11)]], device const float* b1 [[buffer(12)]], device const float* b2 [[buffer(13)]], \
+                 uint2 tg [[threadgroup_position_in_grid]]) { \
+    un_gemm_lean_body<TMR, HO, ADD, ##__VA_ARGS__>(tg.y == 0 ? w : tg.y == 1 ? w1 : w2, xh, tg.y == 0 ? y : tg.y == 1 ? y1 : y2, \
+                                    tg.y == 0 ? bias : tg.y == 1 ? b1 : b2, addb, p, tg.x); }
+UN_GEMM_LEAN(un_gemm_lf, 128, false, false) UN_GEMM_LEAN(un_gemm_lf_m64, 64, false, false)
+UN_GEMM_LEAN(un_gemm_lfa, 128, false, true) UN_GEMM_LEAN(un_gemm_lfa_m64, 64, false, true)
+UN_GEMM_LEAN(un_gemm_lh, 128, true, false) UN_GEMM_LEAN(un_gemm_lh_m64, 64, true, false)
+UN_GEMM_LEAN(un_gemm_lha, 128, true, true) UN_GEMM_LEAN(un_gemm_lha_m64, 64, true, true)
+UN_GEMM_LEAN(un_gemm_lpa_m64, 64, false, true, true)
+
 // Layer norm of f32 rows of c (c % 4 == 0, c <= 2048) into half rows. One SIMD-group per row.
 struct ULN { uint c; uint rows; float eps; uint _p; };
 kernel void un_ln(device const float* x [[buffer(0)]], device half* out [[buffer(1)]], device const float* gb [[buffer(2)]],
@@ -363,16 +430,21 @@ kernel void un_gemm_geglu(device const bfloat* w [[buffer(0)]], device const hal
     zero(cg);
     op.run(a0, bv, cv);
     op.run(a0, bg, cg);
+    // The products into a half tile, stored at once (10% faster than element by element).
+    auto ch = op.template get_destination_cooperative_tensor<decltype(a0), decltype(bv), half>();
 #pragma unroll
     for (uint16_t i = 0; i < cv.get_capacity(); ++i) {
-        if (!cv.is_valid_element(i)) continue;
-        auto idx = cv.get_multidimensional_index(i);
-        uint o = o0 + idx[0], r = t0 + idx[1];
-        if (o >= p.n_out || r >= p.r_end) continue;
         float v = cv[i], g = cg[i];
-        if (p.has_bias != 0) { v += bias[o]; g += bias[p.n_out + o]; }
-        y[(ulong)r * p.ldy + o] = half(v * (0.5f * g * (1.0f + un_erf(g * M_SQRT1_2_F))));
+        if (p.has_bias != 0 && cv.is_valid_element(i)) {
+            uint o = o0 + cv.get_multidimensional_index(i)[0];
+            v += bias[o];
+            g += bias[p.n_out + o];
+        }
+        ch[i] = half(v * (0.5f * g * (1.0f + un_erf(g * M_SQRT1_2_F))));
     }
+    array<int32_t, 2> ys = { 1, int32_t(p.ldy) };
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> Y(y, dextents<int32_t, 2>(int(p.n_out), int(p.r_end)), ys);
+    ch.store(Y.slice(o0, t0));
 }
 
 // Concatenation of the channels of two padded f32 tensors of one geometry.

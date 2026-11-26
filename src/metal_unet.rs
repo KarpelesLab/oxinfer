@@ -29,7 +29,7 @@ fn gn_part_bytes(nb: usize, n: usize, c: usize) -> usize {
 /// GEMM rows per threadgroup.
 const TM: usize = 128;
 
-/// Profiling (`OXINFER_UNET_SKIP=conv3,conv1,unfold,qkv,lin,flash,gn,prep,ln,concat`): kinds
+/// Profiling (`OXINFER_UNET_SKIP=conv3,conv1,unfold,im2col,qkv,lin,flash,gn,prep,amax,ln,concat`): kinds
 /// of dispatches left out of the passes (the results are then wrong; the time saved is theirs).
 fn skip(kind: &str) -> bool {
     static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -62,13 +62,16 @@ struct Pipes {
     gemm_m64: Id,
     /// The split tiles' sums (see [`plan`]).
     gemm_red: Id,
+    /// The transformers' 1x1 GEMMs ([`Cx::lean`]), by [half out][residual][64-row tiles].
+    lean: [[[Id; 2]; 2]; 2],
+    /// Its f32 padded-row stores, with a residual (64-row tiles).
+    lean_pad: Id,
     ln: Id,
     /// The feed-forward's first GEMM with its GEGLU.
     gemm_geglu: Id,
     concat: Id,
     half: Id,
     amax: Id,
-    amax_clear: Id,
     /// Flash attention per head width: (width, the kernel over many keys, over few).
     flash: [(usize, Id, Id); 7],
 }
@@ -94,7 +97,8 @@ enum S {
     Gh,
     /// Text contexts as half rows (each padded to a multiple of 64 with zeros).
     Ctx,
-    /// The largest magnitude of a convolution's raw input (float bits).
+    /// The largest magnitude of a convolution's raw input (float bits), a slot per op (zeroed
+    /// by the host before each pass).
     Amax,
     /// The products of split GEMM tiles (f32 blocks of 128 x 64 at most, [`plan`]).
     Sk,
@@ -159,8 +163,6 @@ struct Ug {
     bstride: u32,
     add: u32,
     nimg: u32,
-    dh: u32,
-    dhp: u32,
     g: Geo,
     scaled: u32,
     full: u32,
@@ -215,6 +217,10 @@ pub(crate) struct MetalUnet {
     /// The contexts (half bits, every image of the batch, `ctx_len` and the batch size
     /// first) that `kv` holds; empty when it holds nothing valid.
     kv_key: Vec<u16>,
+    /// Attention weights whose heads are padded (`head_pad`): rows of each head then zero rows
+    /// up to the padded width, so the GEMM writes the flash kernels' layout with whole-tile
+    /// stores. Keyed by the bf16 weights' address.
+    padw: HashMap<usize, DBuf>,
 }
 
 // SAFETY: the session is used by one thread at a time (`&mut self`); the Objective-C objects
@@ -234,12 +240,22 @@ impl MetalBackend {
             gemm: pipe("un_gemm")?,
             gemm_m64: pipe("un_gemm_m64")?,
             gemm_red: pipe("un_gemm_red")?,
+            lean: [
+                [
+                    [pipe("un_gemm_lf")?, pipe("un_gemm_lf_m64")?],
+                    [pipe("un_gemm_lfa")?, pipe("un_gemm_lfa_m64")?],
+                ],
+                [
+                    [pipe("un_gemm_lh")?, pipe("un_gemm_lh_m64")?],
+                    [pipe("un_gemm_lha")?, pipe("un_gemm_lha_m64")?],
+                ],
+            ],
+            lean_pad: pipe("un_gemm_lpa_m64")?,
             ln: pipe("un_ln")?,
             gemm_geglu: pipe("un_gemm_geglu")?,
             concat: pipe("un_concat")?,
             half: pipe("un_half")?,
             amax: pipe("un_amax")?,
-            amax_clear: pipe("un_amax_clear")?,
             flash: [
                 (48, pipe("un_flash48")?, pipe("un_flash48_m16")?),
                 (64, pipe("un_flash64")?, pipe("un_flash64_m16")?),
@@ -258,6 +274,7 @@ impl MetalBackend {
             slots: Vec::new(),
             kv: Vec::new(),
             kv_key: Vec::new(),
+            padw: HashMap::new(),
         }))
     }
 }
@@ -265,7 +282,7 @@ impl MetalBackend {
 impl Drop for MetalUnet {
     fn drop(&mut self) {
         let void: MsgVoid = self.be.o.msg_send();
-        for b in self.scratch.iter().chain(&self.slots).chain(&self.kv) {
+        for b in self.scratch.iter().chain(&self.slots).chain(&self.kv).chain(self.padw.values()) {
             if !b.id.is_null() {
                 unsafe { void(b.id, self.be.sels.release) };
             }
@@ -358,6 +375,30 @@ fn metal_w<'a>(l: &'a Lin) -> Option<&'a MetalWeight> {
         return None;
     }
     l.dev.downcast_ref::<MetalWeight>()
+}
+
+/// The address of a Lin's bf16 weights (the key of [`MetalUnet::padw`]).
+fn wkey(l: &Lin) -> usize {
+    match l.w {
+        WeightRef::Bf16(w) => w.as_ptr() as usize,
+        _ => 0,
+    }
+}
+
+/// The key of a padded bias in [`Consts`] (its address plus one byte: f32 addresses are aligned).
+fn pad_bias_key(b: &[f32]) -> *const f32 {
+    b.as_ptr().wrapping_byte_add(1)
+}
+
+/// Rows (or biases) of `x` for `heads` heads of `dh` values padded to `dhp`: each head's
+/// rows, then zero rows; `n` values a row, `rows` rows in all (at least `heads dhp`).
+fn pad_heads<T: Copy + Default>(x: &[T], n: usize, heads: usize, dh: usize, dhp: usize, rows: usize) -> Vec<T> {
+    let mut out = vec![T::default(); rows * n];
+    for h in 0..heads {
+        let (src, dst) = (h * dh * n, h * dhp * n);
+        out[dst..dst + dh * n].copy_from_slice(&x[src..src + dh * n]);
+    }
+    out
 }
 
 /// How a convolution over an `h x w` input runs: nine (or one) shifted GEMMs over padded rows,
@@ -625,7 +666,8 @@ impl Session for MetalUnet {
                     }
                     let li = lay(sh, sw, nb);
                     need.at_least(S::Xh, li.rows * c * 2);
-                    need.at_least(S::Amax, 256);
+                    // A slot (16 bytes) per convolution for its input's largest magnitude.
+                    need.at_least(S::Amax, 16 * g.ops.len());
                     need.at_least(S::Sk, 4 * gpu_cores() * 128 * 64 * 4);
                     if !shifted(*k, *stride, *pad, c, w.n_in, sh, sw) {
                         if w.n_in < k * k * c {
@@ -729,6 +771,39 @@ impl Session for MetalUnet {
                         }
                         need.at_least(S::Gh, rows * inner * 2);
                     }
+                }
+            }
+        }
+        // Attention weights over padded heads (made by the first pass that needs them).
+        for op in &g.ops {
+            let attns: Vec<&Attn> = match op {
+                Op::Attention { a, .. } => vec![a],
+                Op::Transformer { t, .. } => t.blocks.iter().flat_map(|b| [&b.a1, &b.a2]).collect(),
+                Op::Conv { .. } | Op::Concat { .. } => continue,
+            };
+            for a in attns {
+                let dh = a.q.n_out / a.heads;
+                let dhp = head_pad(dh).unwrap();
+                if dh == dhp {
+                    continue;
+                }
+                for l in [&a.q, &a.k, &a.v] {
+                    if let Some(b) = l.bias {
+                        consts.put(pad_bias_key(b), &[&pad_heads(b, 1, a.heads, dh, dhp, a.heads * dhp)]);
+                    }
+                    let key = wkey(l);
+                    if self.padw.contains_key(&key) {
+                        continue;
+                    }
+                    let WeightRef::Bf16(w) = l.w else { return false };
+                    let rows = pad_heads(w, l.n_in, a.heads, dh, dhp, (a.heads * dhp).next_multiple_of(64));
+                    let mut d = DBuf::empty();
+                    if !ensure(be, &mut d, rows.len() * 2) {
+                        return false;
+                    }
+                    // SAFETY: the new buffer holds rows.len() halves (shared storage, unused by the GPU yet).
+                    unsafe { std::ptr::copy_nonoverlapping(rows.as_ptr(), self.f.contents(d.id) as *mut u16, rows.len()) };
+                    self.padw.insert(key, d);
                 }
             }
         }
@@ -851,6 +926,9 @@ impl Session for MetalUnet {
         let li = lay(ih, iw, nb);
         // SAFETY: the buffers were sized above; the device is idle (the last pass was waited for).
         unsafe {
+            if need.0[S::Amax as usize] > 0 {
+                std::ptr::write_bytes(self.f.contents(self.scratch[S::Amax as usize].id), 0, need.0[S::Amax as usize]);
+            }
             let cp = self.f.contents(self.scratch[S::Consts as usize].id) as *mut f32;
             par_copy(cp, consts.v.as_ptr(), consts.v.len());
             let xp = self.f.contents(self.slots[slot_of[g.input]].id) as *mut f32;
@@ -893,8 +971,11 @@ impl Session for MetalUnet {
             mp,
             consts: &consts,
             nobar: std::cell::Cell::new(false),
+            amax_n: std::cell::Cell::new(0),
+            amax_off: std::cell::Cell::new(0),
             kv: self.kv.iter().map(|b| b.id).collect(),
             kv_cached,
+            padw: self.padw.iter().map(|(&k, b)| (k, b.id)).collect(),
         };
         let nops = g.ops.len();
         let parts: Vec<std::ops::Range<usize>> = (0..nops.div_ceil(OPS_PER_CB).max(1))
@@ -943,23 +1024,36 @@ struct Cx<'c, 'g> {
     consts: &'c Consts,
     /// The next GEMM needs no barrier after it (independent GEMMs reading the same input).
     nobar: std::cell::Cell<bool>,
+    /// `S::Amax` slots taken so far, and the byte offset of the last one (read by the
+    /// convolution's GEMM).
+    amax_n: std::cell::Cell<usize>,
+    amax_off: std::cell::Cell<usize>,
     /// Every cross-attention block's keys and values ([`MetalUnet::kv`]), and whether they
     /// already hold this batch's (else the pass computes them).
     kv: Vec<Id>,
     kv_cached: bool,
+    /// [`MetalUnet::padw`]'s buffers.
+    padw: HashMap<usize, Id>,
 }
 
-/// The store of a GEMM.
+/// A GEMM's weights: the buffer and byte offset of bf16 rows of `ldw`, `n_out` of them, and the
+/// bias's offset in the constants.
+#[derive(Clone, Copy)]
+struct Wt {
+    id: Id,
+    off: usize,
+    ldw: usize,
+    n_out: usize,
+    bias: Option<usize>,
+}
+
+/// The store of a GEMM ([`Cx::lean`] writes the compact rows).
 #[derive(Clone, Copy)]
 enum Out {
-    /// f32 rows `ld` wide, compact (`nimg` rows per image for per-image biases).
-    Rows { y: Id, ld: usize, nimg: usize },
     /// f32 padded rows of `l` from compact rows.
     ToPadded { y: Id, l: Lay },
     /// f32 padded rows of `l` from padded rows.
     Padded { y: Id, l: Lay },
-    /// Half rows of heads padded to `dhp`.
-    Heads { y: Id, dh: usize, dhp: usize, ld: usize },
 }
 
 impl Cx<'_, '_> {
@@ -991,7 +1085,6 @@ impl Cx<'_, '_> {
         let kind = match out {
             _ if offs.len() > 1 => "conv3",
             Out::Padded { .. } => "conv1",
-            Out::Heads { .. } => "qkv",
             _ if cin > 2048 || w.n_in != cin => "unfold",
             _ => "lin",
         };
@@ -1007,11 +1100,9 @@ impl Cx<'_, '_> {
         let pipe = if pl.tm == 128 { self.p.gemm } else { self.p.gemm_m64 };
         let mut off = [0i32; 9];
         off[..offs.len()].copy_from_slice(offs);
-        let (y, omode, ldy, nimg, dh, dhp, geo) = match out {
-            Out::Rows { y, ld, nimg } => (y, 0, ld, nimg, 0, 0, Geo::default()),
-            Out::ToPadded { y, l } => (y, 1, n_real, l.h * l.w, 0, 0, l.geo()),
-            Out::Padded { y, l } => (y, 2, n_real, self.nb, 0, 0, l.geo()),
-            Out::Heads { y, dh, dhp, ld } => (y, 3, ld, usize::MAX >> 1, dh, dhp, Geo::default()),
+        let (y, omode, ldy, nimg, geo) = match out {
+            Out::ToPadded { y, l } => (y, 1, n_real, l.h * l.w, l.geo()),
+            Out::Padded { y, l } => (y, 2, n_real, self.nb, l.geo()),
         };
         let bias = bias.or_else(|| w.bias.map(|b| (self.consts.get(b.as_ptr()), 0)));
         let p = Ug {
@@ -1029,8 +1120,6 @@ impl Cx<'_, '_> {
             bstride: bias.map_or(0, |b| b.1) as u32,
             add: add.is_some() as u32,
             nimg: nimg.min(u32::MAX as usize) as u32,
-            dh: dh as u32,
-            dhp: dhp as u32,
             g: geo,
             scaled: scaled as u32,
             full: pl.full as u32,
@@ -1048,7 +1137,7 @@ impl Cx<'_, '_> {
         e.buf(self.cst(), bias.map_or(0, |b| b.0), 3);
         e.bytes(&p, 4);
         e.buf(add.unwrap_or(y), 0, 5);
-        e.buf(self.sc(S::Amax), 0, 6);
+        e.buf(self.sc(S::Amax), self.amax_off.get(), 6);
         e.buf(self.sc(S::Sk), 0, 7);
         e.dispatch((pl.threadgroups(), 1), 128);
         if pl.nrem > 0 {
@@ -1058,13 +1147,152 @@ impl Cx<'_, '_> {
             e.buf(self.cst(), bias.map_or(0, |b| b.0), 3);
             e.bytes(&p, 4);
             e.buf(add.unwrap_or(y), 0, 5);
-            e.buf(self.sc(S::Amax), 0, 6);
+            e.buf(self.sc(S::Amax), self.amax_off.get(), 6);
             e.buf(self.sc(S::Sk), 0, 7);
             e.dispatch(((pl.nrem * pl.tm * 64).div_ceil(256), 1), 256);
         }
         if !self.nobar.replace(false) {
             e.barrier();
         }
+    }
+
+    /// The weights of `l`; with `heads`, its outputs as heads padded for the flash kernels
+    /// (`head_pad`: [`MetalUnet::padw`] when they need padding).
+    fn wt(&self, l: &Lin, heads: usize) -> Wt {
+        let mw = metal_w(l).unwrap();
+        let bias = l.bias.map(|b| self.consts.get(b.as_ptr()));
+        let w = Wt {
+            id: mw.data.id,
+            off: mw.data.offset_bytes,
+            ldw: l.n_in,
+            n_out: l.n_out,
+            bias,
+        };
+        if heads == 0 {
+            return w;
+        }
+        let dh = l.n_out / heads;
+        let dhp = head_pad(dh).unwrap();
+        if dh == dhp {
+            return w;
+        }
+        Wt {
+            id: self.padw[&wkey(l)],
+            off: 0,
+            n_out: heads * dhp,
+            bias: l.bias.map(|b| self.consts.get(pad_bias_key(b))),
+            ..w
+        }
+    }
+
+    /// `y_i = A W_i^T (+ bias_i) (+ add)` for each `(W_i, y_i)` of `ws` (at most three, as many
+    /// outputs each), one dispatch: rows `0..rows` of half rows of `cin` in `a` (`a_rows`
+    /// allocated), into rows `ldy` wide of half (`half`) or f32. `add`: f32 rows `ldy` wide.
+    #[allow(clippy::too_many_arguments)]
+    fn lean(
+        &self,
+        e: &FastEnc,
+        kind: &str,
+        ws: &[(Wt, Id)],
+        a: Id,
+        a_rows: usize,
+        cin: usize,
+        rows: usize,
+        half: bool,
+        add: Option<Id>,
+        ldy: usize,
+    ) {
+        self.lean_to(e, kind, ws, a, a_rows, cin, rows, half, add, ldy, None)
+    }
+
+    /// [`Cx::lean`]; with `pad`, into the f32 padded rows of that layout (`add` there too), its
+    /// width a multiple of 64.
+    #[allow(clippy::too_many_arguments)]
+    fn lean_to(
+        &self,
+        e: &FastEnc,
+        kind: &str,
+        ws: &[(Wt, Id)],
+        a: Id,
+        a_rows: usize,
+        cin: usize,
+        rows: usize,
+        half: bool,
+        add: Option<Id>,
+        ldy: usize,
+        pad: Option<Lay>,
+    ) {
+        if skip(kind) {
+            return;
+        }
+        let w0 = ws[0].0;
+        debug_assert!(ws.len() <= 3 && ws.iter().all(|w| w.0.n_out == w0.n_out && w.0.bias.is_some() == w0.bias.is_some()));
+        let nct = w0.n_out.div_ceil(64);
+        // 64-row tiles over the short products (measured faster up to 1280 inputs).
+        let tm = if cin <= 1280 || pad.is_some() {
+            64
+        } else {
+            plan(rows, w0.n_out * ws.len(), cin, 4 * gpu_cores(), false).tm
+        };
+        let p = Ug {
+            n_out: w0.n_out as u32,
+            ldw: w0.ldw as u32,
+            cin: cin as u32,
+            taps: 1,
+            off: [0; 9],
+            a_rows: a_rows as u32,
+            r0: 0,
+            r_end: rows as u32,
+            omode: 0,
+            ldy: ldy as u32,
+            has_bias: w0.bias.is_some() as u32,
+            bstride: 0,
+            add: add.is_some() as u32,
+            nimg: 0,
+            g: pad.map_or(Geo::default(), |l| l.geo()),
+            scaled: 0,
+            full: 0,
+            rs: 1,
+            kper: cin as u32,
+            nct: nct as u32,
+            tm: tm as u32,
+            nrem: 0,
+            _p: 0,
+        };
+        e.pipe(match pad {
+            Some(_) => {
+                debug_assert!(!half && add.is_some() && pad.is_some_and(|l| l.w.is_multiple_of(64)));
+                self.p.lean_pad
+            }
+            None => self.p.lean[half as usize][add.is_some() as usize][(tm == 64) as usize],
+        });
+        let at = |i: usize| ws[i.min(ws.len() - 1)];
+        for (i, (wslot, yslot, bslot)) in [(0, 2, 3), (8, 10, 12), (9, 11, 13)].into_iter().enumerate() {
+            let (w, y) = at(i);
+            e.buf(w.id, w.off, wslot);
+            e.buf(y, 0, yslot);
+            e.buf(self.cst(), w.bias.unwrap_or(0), bslot);
+        }
+        e.buf(a, 0, 1);
+        e.bytes(&p, 4);
+        e.buf(add.unwrap_or(ws[0].1), 0, 5);
+        e.dispatch((nct * rows.div_ceil(tm), ws.len()), 128);
+        if !self.nobar.replace(false) {
+            e.barrier();
+        }
+    }
+
+    /// `y = A W^T (+ bias) + add` into the f32 padded rows of `l` (`add` in that layout) from
+    /// `rows` compact half rows of `cin` in `a` (an attention's output projection, proj_out).
+    #[allow(clippy::too_many_arguments)]
+    fn out_proj(&self, e: &FastEnc, w: &Lin, a: Id, cin: usize, rows: usize, y: Id, l: Lay, add: Id) {
+        let a_rows = compact_rows(rows);
+        if l.w.is_multiple_of(64) && cin <= 2048 {
+            let ws = [(self.wt(w, 0), y)];
+            return self.lean_to(e, "lin", &ws, a, a_rows, cin, rows, false, Some(add), w.n_out, Some(l));
+        }
+        let o = Out::ToPadded { y, l };
+        self.gemm(e, w, a, a_rows, cin, &[0], (0, rows), o, None, Some(add), w.n_out, false);
     }
 
     /// `S::Gh = value * gelu(gate)` (half rows of `inner`) of `[value | gate] = A W^T + bias`
@@ -1091,8 +1319,6 @@ impl Cx<'_, '_> {
             bstride: 0,
             add: 0,
             nimg: 0,
-            dh: 0,
-            dhp: 0,
             g: Geo::default(),
             scaled: 0,
             full: 0,
@@ -1166,27 +1392,8 @@ impl Cx<'_, '_> {
         out: Id,
         scaled: bool,
     ) {
-        if scaled && norm.is_none() && !skip("prep") {
-            e.pipe(self.p.amax_clear);
-            e.buf(self.sc(S::Amax), 0, 0);
-            e.dispatch((1, 1), 32);
-            e.barrier();
-            let rows = src.rows;
-            e.pipe(self.p.amax);
-            e.buf(x, 0, 0);
-            e.buf(self.sc(S::Amax), 0, 1);
-            e.bytes(
-                &Uam {
-                    g: src.geo(),
-                    c: c as u32,
-                    nimg: self.nb as u32,
-                    rows: rows as u32,
-                    _p: 0,
-                },
-                2,
-            );
-            e.dispatch(((rows * c / 4).div_ceil(256), 1), 256);
-            e.barrier();
+        if scaled && norm.is_none() {
+            self.amax(e, x, src, c);
         }
         if skip("prep") {
             return;
@@ -1213,19 +1420,46 @@ impl Cx<'_, '_> {
         e.pipe(self.p.prep);
         e.buf(x, 0, 0);
         e.buf(out, 0, 1);
-        e.buf(
-            if norm.is_none() && scaled {
-                self.sc(S::Amax)
-            } else {
-                self.sc(S::Stats)
-            },
-            0,
-            2,
-        );
-        e.buf(self.cst(), norm.map_or(0, |n| self.consts.get(n.0.gamma.as_ptr())), 3);
+        self.prep_consts(e, norm, scaled, 2, 3);
         e.bytes(&p, 4);
         e.dispatch(((rows * c / 4).div_ceil(256), 1), 256);
         e.barrier();
+    }
+
+    /// Binds what a preparation reads at buffers `st` and `gb`: the statistics and the norm's
+    /// weights, or the scale's slot of `S::Amax`.
+    fn prep_consts(&self, e: &FastEnc, norm: Option<(&Norm, bool)>, scaled: bool, st: usize, gb: usize) {
+        if norm.is_none() && scaled {
+            e.buf(self.sc(S::Amax), self.amax_off.get(), st);
+        } else {
+            e.buf(self.sc(S::Stats), 0, st);
+        }
+        e.buf(self.cst(), norm.map_or(0, |n| self.consts.get(n.0.gamma.as_ptr())), gb);
+    }
+
+    /// The largest magnitude of the interior of `x` (layout `src`, `c` channels) into the next
+    /// slot of `S::Amax` (then [`Cx::amax_off`]).
+    fn amax(&self, e: &FastEnc, x: Id, src: Lay, c: usize) {
+        let off = self.amax_n.replace(self.amax_n.get() + 1) * 16;
+        self.amax_off.set(off);
+        if !skip("amax") {
+            let rows = src.rows;
+            e.pipe(self.p.amax);
+            e.buf(x, 0, 0);
+            e.buf(self.sc(S::Amax), off, 1);
+            e.bytes(
+                &Uam {
+                    g: src.geo(),
+                    c: c as u32,
+                    nimg: self.nb as u32,
+                    rows: rows as u32,
+                    _p: 0,
+                },
+                2,
+            );
+            e.dispatch(((rows * c / 4).div_ceil(256), 1), 256);
+            e.barrier();
+        }
     }
 
     /// Layer norm of `rows` f32 rows of `c` (`S::H`) into half rows (`S::Hn`).
@@ -1311,7 +1545,8 @@ impl Cx<'_, '_> {
                     self.gn_stats(e, xb, ls, c, n);
                 }
                 let xh = self.sc(S::Xh);
-                self.prep_scaled(e, xb, ls, li, c, pre.as_ref().map(|(n, s)| (n, *s)), false, xh, pre.is_none());
+                let norm = pre.as_ref().map(|(n, s)| (n, *s));
+                self.prep_scaled(e, xb, ls, li, c, norm, false, xh, pre.is_none());
                 let bias = bias
                     .as_ref()
                     .map(|b| (self.consts.get(b.as_ptr()), if *bias_per_image { oc } else { 0 }));
@@ -1331,7 +1566,8 @@ impl Cx<'_, '_> {
                         li.rows,
                         c,
                         &offs,
-                        (lo.g, lo.g + nb * lo.p),
+                        // Not the first image's first row nor the last one's last (borders).
+                        (lo.g + lo.w + 2, lo.g + nb * lo.p - (lo.w + 2)),
                         out,
                         bias,
                         addb,
@@ -1341,25 +1577,27 @@ impl Cx<'_, '_> {
                 } else {
                     let rows = nb * oh * ow;
                     let kp = w.n_in;
-                    e.pipe(self.p.im2col);
-                    e.buf(xh, 0, 0);
-                    e.buf(self.sc(S::Xc), 0, 1);
-                    e.bytes(
-                        &Uic {
-                            s: li.geo(),
-                            c: c as u32,
-                            k: *k as u32,
-                            stride: *stride as u32,
-                            pad: *pad as u32,
-                            oh: oh as u32,
-                            ow: ow as u32,
-                            kp: kp as u32,
-                            rows: rows as u32,
-                        },
-                        2,
-                    );
-                    e.dispatch(((rows * kp / 4).div_ceil(256), 1), 256);
-                    e.barrier();
+                    if !skip("im2col") {
+                        e.pipe(self.p.im2col);
+                        e.buf(xh, 0, 0);
+                        e.buf(self.sc(S::Xc), 0, 1);
+                        e.bytes(
+                            &Uic {
+                                s: li.geo(),
+                                c: c as u32,
+                                k: *k as u32,
+                                stride: *stride as u32,
+                                pad: *pad as u32,
+                                oh: oh as u32,
+                                ow: ow as u32,
+                                kp: kp as u32,
+                                rows: rows as u32,
+                            },
+                            2,
+                        );
+                        e.dispatch(((rows * kp / 4).div_ceil(256), 1), 256);
+                        e.barrier();
+                    }
                     let out = Out::ToPadded { y: yb, l: lo };
                     self.gemm(
                         e,
@@ -1399,30 +1637,15 @@ impl Cx<'_, '_> {
                 self.gn_stats(e, xb, l, c, norm);
                 let xh = self.sc(S::Xh);
                 self.prep(e, xb, l, l, c, Some((norm, false)), true, xh);
-                let dh = c / a.heads;
-                let dhp = head_pad(dh).unwrap();
-                let ld = a.heads * dhp;
                 let (qb, kb, vb) = (self.sc(S::Q), self.sc(S::K), self.sc(S::V));
-                for (lin, dst) in [(&a.q, qb), (&a.k, kb), (&a.v, vb)] {
-                    let o = Out::Heads { y: dst, dh, dhp, ld };
-                    self.gemm(e, lin, xh, crow, c, &[0], (0, rows), o, None, None, lin.n_out, false);
-                }
+                let ws = [
+                    (self.wt(&a.q, a.heads), qb),
+                    (self.wt(&a.k, a.heads), kb),
+                    (self.wt(&a.v, a.heads), vb),
+                ];
+                self.lean(e, "qkv", &ws, xh, crow, c, rows, true, None, ws[0].0.n_out);
                 self.flash(e, a, c, qb, kb, vb, n, n, n);
-                let o = Out::ToPadded { y: self.tid[*out], l };
-                self.gemm(
-                    e,
-                    &a.o,
-                    self.sc(S::Ah),
-                    crow,
-                    c,
-                    &[0],
-                    (0, rows),
-                    o,
-                    None,
-                    Some(xb),
-                    a.o.n_out,
-                    false,
-                );
+                self.out_proj(e, &a.o, self.sc(S::Ah), c, rows, self.tid[*out], l, xb);
             }
         }
     }
@@ -1439,100 +1662,63 @@ impl Cx<'_, '_> {
         let xh = self.sc(S::Xh);
         self.prep(e, xb, l, l, c, Some((&t.norm, false)), true, xh);
         let hb = self.sc(S::H);
-        let hrows = Out::Rows { y: hb, ld: c, nimg: n };
-        self.gemm(
-            e,
-            &t.proj_in,
-            xh,
-            crow,
-            c,
-            &[0],
-            (0, rows),
-            hrows,
-            None,
-            None,
-            t.proj_in.n_out,
-            false,
-        );
+        self.lean(e, "lin", &[(self.wt(&t.proj_in, 0), hb)], xh, crow, c, rows, false, None, c);
         let (hn, qb, kb, vb, ah) = (self.sc(S::Hn), self.sc(S::Q), self.sc(S::K), self.sc(S::V), self.sc(S::Ah));
         let cd = self.g.ctx_dim;
         let crows = nb * self.mp;
         for (bi, b) in t.blocks.iter().enumerate() {
             let (ck, cv) = (self.kv[2 * (kv_base + bi)], self.kv[2 * (kv_base + bi) + 1]);
-            // Self-attention.
-            let dh = c / b.a1.heads;
-            let dhp = head_pad(dh).unwrap();
-            let ld = b.a1.heads * dhp;
+            // Self-attention: q, k and v in one dispatch.
             self.ln(e, rows, c, &b.n1);
-            for (j, (l, dst)) in [(&b.a1.q, qb), (&b.a1.k, kb), (&b.a1.v, vb)].into_iter().enumerate() {
-                let o = Out::Heads { y: dst, dh, dhp, ld };
-                self.nobar.set(j < 2);
-                self.gemm(e, l, hn, crow, c, &[0], (0, rows), o, None, None, l.n_out, false);
-            }
+            let h1 = b.a1.heads;
+            let ws = [(self.wt(&b.a1.q, h1), qb), (self.wt(&b.a1.k, h1), kb), (self.wt(&b.a1.v, h1), vb)];
+            self.lean(e, "qkv", &ws, hn, crow, c, rows, true, None, ws[0].0.n_out);
             self.flash(e, &b.a1, c, qb, kb, vb, n, n, n);
-            self.gemm(e, &b.a1.o, ah, crow, c, &[0], (0, rows), hrows, None, Some(hb), b.a1.o.n_out, false);
+            self.lean(e, "lin", &[(self.wt(&b.a1.o, 0), hb)], ah, crow, c, rows, false, Some(hb), c);
             // Cross-attention.
-            let dh = c / b.a2.heads;
-            let dhp = head_pad(dh).unwrap();
-            let ld = b.a2.heads * dhp;
             self.ln(e, rows, c, &b.n2);
-            let o = Out::Heads { y: qb, dh, dhp, ld };
+            let h2 = b.a2.heads;
+            let wq = self.wt(&b.a2.q, h2);
             // The keys and values of the text: computed by the first pass over these contexts
-            // (beside the query, without barriers between them), read as they are after it.
+            // (beside the query, without a barrier between them), read as they are after it.
             self.nobar.set(!self.kv_cached);
-            self.gemm(e, &b.a2.q, hn, crow, c, &[0], (0, rows), o, None, None, b.a2.q.n_out, false);
+            self.lean(e, "qkv", &[(wq, qb)], hn, crow, c, rows, true, None, wq.n_out);
             if !self.kv_cached {
-                let ctx = self.sc(S::Ctx);
-                for (j, (l, dst)) in [(&b.a2.k, ck), (&b.a2.v, cv)].into_iter().enumerate() {
-                    let o = Out::Heads { y: dst, dh, dhp, ld };
-                    self.nobar.set(j == 0);
-                    self.gemm(e, l, ctx, crows + 64, cd, &[0], (0, crows), o, None, None, l.n_out, false);
-                }
+                let ws = [(self.wt(&b.a2.k, h2), ck), (self.wt(&b.a2.v, h2), cv)];
+                self.lean(e, "qkv", &ws, self.sc(S::Ctx), crows + 64, cd, crows, true, None, wq.n_out);
             }
             self.flash(e, &b.a2, c, qb, ck, cv, n, self.m, self.mp);
-            self.gemm(e, &b.a2.o, ah, crow, c, &[0], (0, rows), hrows, None, Some(hb), b.a2.o.n_out, false);
-            // GEGLU feed-forward.
+            self.lean(e, "lin", &[(self.wt(&b.a2.o, 0), hb)], ah, crow, c, rows, false, Some(hb), c);
+            // GEGLU feed-forward; the last block's output as the half input of proj_out.
             self.ln(e, rows, c, &b.n3);
             let inner = b.ff2.n_in;
             self.gemm_geglu(e, &b.ff1, hn, crow, c, rows, inner);
-            self.gemm(
+            let last = bi + 1 == t.blocks.len();
+            let dst = if last { hn } else { hb };
+            self.lean(
                 e,
-                &b.ff2,
+                "lin",
+                &[(self.wt(&b.ff2, 0), dst)],
                 self.sc(S::Gh),
                 crow,
                 inner,
-                &[0],
-                (0, rows),
-                hrows,
-                None,
+                rows,
+                last,
                 Some(hb),
-                b.ff2.n_out,
-                false,
+                c,
             );
         }
+        if t.blocks.is_empty() {
+            let n4 = (rows * c / 4) as u32;
+            e.pipe(self.p.half);
+            e.buf(hb, 0, 0);
+            e.buf(hn, 0, 1);
+            e.bytes(&n4, 2);
+            e.dispatch(((n4 as usize).div_ceil(256), 1), 256);
+            e.barrier();
+        }
         // proj_out, added to the input, back into padded rows.
-        let n4 = (rows * c / 4) as u32;
-        e.pipe(self.p.half);
-        e.buf(hb, 0, 0);
-        e.buf(hn, 0, 1);
-        e.bytes(&n4, 2);
-        e.dispatch(((n4 as usize).div_ceil(256), 1), 256);
-        e.barrier();
-        let o = Out::ToPadded { y: self.tid[out], l };
-        self.gemm(
-            e,
-            &t.proj_out,
-            hn,
-            crow,
-            c,
-            &[0],
-            (0, rows),
-            o,
-            None,
-            Some(xb),
-            t.proj_out.n_out,
-            false,
-        );
+        self.out_proj(e, &t.proj_out, hn, c, rows, self.tid[out], l, xb);
     }
 }
 

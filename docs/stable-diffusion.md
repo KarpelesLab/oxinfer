@@ -250,6 +250,44 @@ guidance 7.5): 36.8 dB (36.7 before); SDXL base 45.2 dB (44.8). Left per SD 1.5 
 convolutions over padded rows 10.5 ms, unfolded ones 6.9 ms (plus their copies), 1x1 convolutions
 1.3 ms, the projections and feed-forward 9.1 ms, attention 7.6 ms, q / k / v 3.5 ms.
 
+A sixth round, on the transformers' short GEMMs (November 2026, same measure): **43.1 -> 39.4
+ms** per guided SD 1.5 512x512 step (min 39.2), SDXL at 1024x1024 276-292 -> 260-264 ms, the
+SD 1.5 VAE decoder 60.1-60.3 -> 59.4-59.9 ms.
+
+- **Lean 1x1 GEMMs** (`un_gemm_lean_body`, `Cx::lean`): the projections, q / k / v and the
+  feed-forward's second GEMM ran through the convolutions' kernel, whose general epilogue (split
+  parts, per-image biases, the input scale, a residual's registers held whether or not one is
+  added) cost these short products (320 to 1280 inputs) a third of their time: 8192 x 320 ->
+  320 took 0.067 ms, 0.041 ms without it (`un_gemm_bench`, warm GPU). They now run a kernel with
+  only a bias and, as a template choice, a residual, in 64-row tiles up to 1280 inputs.
+- **q / k / v in one dispatch, stored whole:** the three projections of a self-attention run as
+  one grid (its y picks the weights and the destination), and their half heads are stored with
+  one cooperative store per tile instead of element by element. Heads that the flash kernels
+  pad (SD 1.5's 40 -> 48) take padded copies of their weights (each head's rows then zero rows,
+  made once per session, 0.25 MB a matrix; SDXL's heads of 64 need none), so the padding comes
+  out of the GEMM. 8192 x 320 -> 3 x 384 in 0.109 ms against about 0.2 for three. q / k / v
+  3.5 -> 2.3 ms a step; the cross-attention's text keys and values (once per generation) go the
+  same way.
+- **Fewer passes:** the GEGLU's half tile is stored at once (0.29 -> 0.255 ms at 8192 x 320 ->
+  2 x 1280); the last block's feed-forward writes proj_out's half input directly (the f32 to half
+  pass is gone); proj_out and the output projection of an attention store their padded rows with
+  one cooperative store when an image row is a multiple of 64 pixels (a 64-row tile is one image
+  row); the convolutions over padded rows skip the first image's top border row and the last
+  one's bottom one (fewer tiles: 0.3 ms a step); a convolution's input scale (`un_amax`) goes to
+  a slot of its own, zeroed by the host before the pass, instead of a clearing dispatch.
+
+Tried and dropped: unfolding straight from the f32 input with the norm applied on the way (no
+`un_prep` pass for the unfolded convolutions: no faster, each input is normalized for each of the
+nine taps), flash attention over heads of 40 (the matrix units want products over multiples of
+16; a dynamic one ran 6% slower than the padding to 48), unfolding the 32x32 level too (0.1 ms,
+within noise). The SD 1.5 image against diffusers in float32: 36.3 dB (36.8 before; the first
+guided UNet output 6.71e-4 -> 6.74e-4 from the reference, so the difference is the trajectory's:
+the intermediate builds gave 36.8 and 37.4 dB for changes of rounding order only); SDXL base 45.1
+dB (44.9-45.2). Left per SD 1.5 step: 3x3 convolutions over padded rows 10.2 ms, unfolded ones
+5.4 ms plus 0.8 ms of unfolding copies, the projections and feed-forward 9 ms, attention 7.4 ms,
+q / k / v 2.3 ms, the norms' preparation passes 1.7 ms, group-norm statistics 1.3 ms, layer norms
+0.8 ms.
+
 Op by op (other GPUs, or `gpu_pass=0`), convolutions, attention and the group and layer norms run on the GPU: each norm is fused
 into the convolution or projection that consumes it (a statistics kernel, then normalization and
 SiLU applied while the input is loaded), and attention runs its two products as GPU matmuls with a
