@@ -176,7 +176,8 @@ no scaling), merged at load. ComfyUI's recipe has no skip-layer trick, so the pr
 Presets are listed by `oxinfer --models` (the catalog), as JSON from `oxinfer::advisor::presets_json()`
 / `oxi_presets_json()`, and taken by `--preset ID` or `--model ID`, the server (`--model kromoss-famegrid`
 serves the base with `preset=kromoss-famegrid`; requests can override every setting) and the C API
-(`oxi_moss_image_load("kromoss-famegrid", ...)`).
+(`oxi_moss_image_load("kromoss-famegrid", ...)`). The same list holds the presets of other pipelines
+(`longcat-avatar`, `longcat-avatar-int8`: [avatar video](longcat-avatar.md#presets), command line only).
 
 ## Library, C API, server
 

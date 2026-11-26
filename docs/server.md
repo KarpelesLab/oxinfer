@@ -483,7 +483,8 @@ the server checks that the missing files fit on the cache's disk, keeping 1% of 
 1 GB) free, and that the model fits in `--memory-gb`; otherwise the request fails with a 507
 (`insufficient_storage` or `insufficient_memory`) and nothing is fetched. A name the hub does not
 have is a 404 (`model_not_found`). Local paths are never taken this way (give them with
-`--model`).
+`--model`). [LongCat-Video-Avatar](longcat-avatar.md) is refused by name (its repository id and
+its presets): no route serves it.
 
 ```sh
 curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \

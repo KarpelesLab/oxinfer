@@ -143,6 +143,7 @@ optional.
 | [Qwen-Image, Qwen-Image-Edit and Qwen-Image-2.1](docs/qwen-image.md) | editing, text to image, ControlNet, layers; Qwen-Image-2.1 / 2.1-Turbo |
 | [MOSS-Image and Kromoss](docs/moss-image.md) | text to image with Qwen3.5-9B conditioning; LoRA / LoKr, DMD turbo LoRAs, curated presets (`--preset kromoss-famegrid`) |
 | [MiniMax-H3 video](docs/video.md) | text to video, first / last frame to video, with the stereo soundtrack |
+| [LongCat-Video-Avatar](docs/longcat-avatar.md) | a character speaking a recording: image + audio + text to video, long videos, two speakers; curated presets (`--preset longcat-avatar-int8`) |
 | [OmniGen2](docs/omnigen2.md), [BAGEL](docs/bagel.md), [Step1X-Edit](docs/step1x-edit.md), [Janus-Pro](docs/janus.md) | instruction editing, unified generation and understanding |
 | [Whisper](docs/whisper.md) | speech to text |
 | [Nemotron 3.5 Transcribe](docs/nemotron.md#speech-to-text-nemotron-35-transcribe) | speech to text and speech translation with a speech LM |
