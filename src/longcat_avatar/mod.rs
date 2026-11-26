@@ -23,7 +23,7 @@
 //!   position `ref_img_index`.
 //!
 //! Not ported: the vocal separator (`vocal_separator/Kim_Vocal_2.onnx`, an MDX-Net run by ONNX
-//! Runtime in the reference: the speech goes to Whisper as given), `ftfy` on the prompt, the
+//! Runtime in the reference: the speech goes to Whisper as given), `ftfy`'s mojibake repair of the prompt, the
 //! key / value cache of the undistilled continuation (`use_kv_cache`, which the mixed-LoRA
 //! setting turns off), `enhance_hf`, block-sparse attention, FP8 feed-forwards and the 1.0
 //! checkpoints (wav2vec2 features).
