@@ -630,12 +630,14 @@ fn base_of(spec: &str) -> &str {
 }
 
 /// The catalog's presets ([`crate::advisor::PRESETS`]) with whether their base model is
-/// downloaded and whether one is listed under the preset's id.
+/// downloaded and whether one is listed under the preset's id. The ones the
+/// server has no route for (LongCat-Video-Avatar's) are left out.
 fn presets(api: &Api) -> Value {
     let entries = crate::model_cache::list(api.models.cache_dir()).unwrap_or_default();
     let listed: Vec<String> = api.models.status().into_iter().map(|s| s.spec.id).collect();
     let mut v = crate::advisor::presets_json();
     if let Some(list) = v.as_array_mut() {
+        list.retain(|p| p["pipeline"] != crate::longcat_avatar::PIPELINE);
         for p in list {
             let base = p["base"].as_str().unwrap_or_default().to_string();
             p["base_cached"] = json!(entries.iter().any(|e| e.usable && e.repo.as_deref() == Some(base.as_str())));
@@ -956,8 +958,11 @@ fn catalog(api: &Arc<Api>, w: &WebState) -> Value {
             });
             m["cached"] = json!(cached);
             m["cache_bytes"] = json!(e.map(|e| e.bytes));
-            m["servable"] = json!(true);
+            // (LongCat-Video-Avatar is in the catalog but has no route here.)
+            let served = row.model.repo != crate::longcat_avatar::AVATAR_REPO;
+            m["servable"] = json!(served);
             m["server_kind"] = json!(match row.model.kind {
+                _ if !served => None,
                 crate::advisor::Kind::Chat => Some("chat"),
                 crate::advisor::Kind::Embedding => Some("embedding"),
                 crate::advisor::Kind::Image => Some("image"),

@@ -851,6 +851,12 @@ pub const CATALOG: &[Model] = &[
              Comfy-Org/MiniMax-H3's single files, the turbo LoRAs and a GGUF text encoder load too (48 GB, 4 or 8 \
              forwards; not run on the real files: docs/video.md)",
         ),
+    Model::new("meituan-longcat/LongCat-Video-Avatar-1.6", Kind::Video, 22.2, 47.3, &[TextToVideo, ImageToVideo])
+        .note(
+            "audio-driven avatar video (--audio, --init-image), 25 fps, 93 frames a clip; the int8 transformer, the two LoRAs \
+             and Whisper of the repository with umT5 and the VAE of meituan-longcat/LongCat-Video; presets \
+             longcat-avatar-int8, longcat-avatar; CUDA or the CPU; not in the server: docs/longcat-avatar.md",
+        ),
 ];
 
 /// A curated stack: a base model of the catalog with LoRA files at set strengths, a trigger word

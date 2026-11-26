@@ -151,6 +151,15 @@ fn web_gui_and_management_api() {
         (dmd2["base"].as_str(), dmd2["base_cached"].as_bool(), dmd2["listed"].as_bool()),
         (Some("lodestones/Kromoss"), Some(false), Some(false))
     );
+    // (The avatar presets are not listed: the server has no route for that pipeline.)
+    assert!(
+        presets["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["pipeline"] != "longcat-avatar"),
+        "{body}"
+    );
     let (st, body) = request_with(a, "GET", "/api/web/info", &local, "");
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(

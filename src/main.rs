@@ -1485,10 +1485,10 @@ fn main() -> Result<()> {
         } else {
             for p in oxinfer::advisor::PRESETS {
                 let set = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ");
-                println!("{:<18} {}  {}", p.id, p.base, p.note);
-                println!("{:<18} load: {}", "", if p.load.is_empty() { "-".into() } else { set(p.load) });
+                println!("{:<20} {}  {}", p.id, p.base, p.note);
+                println!("{:<20} load: {}", "", if p.load.is_empty() { "-".into() } else { set(p.load) });
                 println!(
-                    "{:<18} defaults: {}{}",
+                    "{:<20} defaults: {}{}",
                     "",
                     set(p.defaults),
                     if p.trigger.is_empty() {

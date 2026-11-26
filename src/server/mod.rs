@@ -136,6 +136,13 @@ impl ModelSpec {
         if source.is_empty() {
             bail!("empty model source");
         }
+        // LongCat-Video-Avatar (its presets or its repository) has no route here.
+        if !std::path::Path::new(source).exists()
+            && (source == crate::longcat_avatar::AVATAR_REPO
+                || crate::advisor::preset(source).is_some_and(|p| p.pipeline == crate::longcat_avatar::PIPELINE))
+        {
+            bail!("{source}: LongCat-Video-Avatar is not served (the command line and the library run it: docs/longcat-avatar.md)");
+        }
         // A preset of the catalog (`kromoss-famegrid`): its base model with `preset=ID`, which the
         // pipeline expands into its LoRAs and generation defaults.
         if let Some(p) = crate::advisor::preset(source)
@@ -1173,6 +1180,16 @@ pub(crate) fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The avatar pipeline has no route: its presets and its repository are refused by name.
+    #[test]
+    fn avatar_presets_are_not_served() {
+        for id in ["longcat-avatar", "longcat-avatar-int8", crate::longcat_avatar::AVATAR_REPO] {
+            let e = ModelSpec::new(id).err().expect(id).to_string();
+            assert!(e.contains("not served"), "{e}");
+        }
+        assert!(ModelSpec::new("kromoss-dmd2").is_ok());
+    }
 
     #[test]
     fn model_spec_syntax() {
