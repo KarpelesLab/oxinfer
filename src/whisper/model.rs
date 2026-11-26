@@ -833,8 +833,25 @@ impl WhisperModel {
             .all(|&(n_out, n_in, t)| be.wants(n_out, n_in, t) == be.wants(n_out, n_in, b * t))
     }
 
+    /// Every hidden state of the encoder for one window, as transformers' `output_hidden_states`:
+    /// the embeddings (convolution stem plus positions), the residual stream after each layer but
+    /// the last, and the last layer's output after the final layer norm (`encoder_layers + 1`
+    /// states of `[max_source_positions, d_model]`). On the CPU kernels (or the backend's
+    /// per-product offload), not the whole-pass device session.
+    pub fn encode_hidden_states(&self, mel: &[f32]) -> Vec<Vec<f32>> {
+        let mut states = Vec::with_capacity(self.enc_layers.len() + 1);
+        let last = self.encode_stack_states(&[mel], Some(&mut states)).pop().unwrap();
+        states.push(last);
+        states
+    }
+
     /// The encoder over `mels.len()` windows with their rows stacked in every matmul.
     fn encode_stack(&self, mels: &[&[f32]]) -> Vec<Vec<f32>> {
+        self.encode_stack_states(mels, None)
+    }
+
+    /// [`Self::encode_stack`], also keeping the residual stream in front of every layer.
+    fn encode_stack_states(&self, mels: &[&[f32]], mut states: Option<&mut Vec<Vec<f32>>>) -> Vec<Vec<f32>> {
         let cfg = &self.cfg;
         let (d, nm) = (cfg.d_model, cfg.num_mel_bins);
         let t = self.window_frames();
@@ -887,6 +904,9 @@ impl WhisperModel {
         let w = n * d;
         let mut hn = vec![0f32; nb * w];
         for layer in &self.enc_layers {
+            if let Some(st) = states.as_deref_mut() {
+                st.push(x.clone());
+            }
             let ph = crate::prof::phase(1, "enc ln");
             hn.copy_from_slice(&x);
             layer.ln1.apply_rows(&mut hn, LN_EPS);
