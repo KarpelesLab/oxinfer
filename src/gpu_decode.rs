@@ -823,6 +823,9 @@ pub struct Row<'s, 'c> {
     pub x2: &'s [f32],
     /// The session's host KV caches, holding exactly `pos` positions each.
     pub kv: &'s mut [&'c mut LayerCache],
+    /// The session's recurrent states, as [`Step::states`] (each row its own; empty for plans
+    /// without recurrent layers).
+    pub states: &'s mut [&'c mut [f32]],
 }
 
 /// Greedy decoding chained on the device ([`DecodePlan::greedy`]).
@@ -876,7 +879,7 @@ pub trait DecodePlan: Send + Sync {
     /// final hidden states (`[rows, hidden]`) and, with `logits`, their logits. Each row gets
     /// what a one-token step of its sequence would give where the plan's multi-token kernels
     /// are exact (not on fast-verification plans). False (nothing changed) when the plan cannot
-    /// (recurrent states, interventions, streamed weights, more rows than its tokens).
+    /// (interventions, streamed weights, more rows than its tokens).
     fn step_rows(&self, _rows: &mut [Row], _hidden: &mut [f32], _logits: Option<&mut [f32]>) -> bool {
         false
     }

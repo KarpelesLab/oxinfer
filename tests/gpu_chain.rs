@@ -671,11 +671,13 @@ fn batched_rows_match_one_token_steps() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 
-    // Recurrent layers: one session after the other (the same results).
+    // Gated DeltaNet layers: each row on its own recurrent states.
     let dir = tiny_qwen35();
     let files = ModelFiles::open(&dir, true).unwrap();
-    let cfg = oxinfer::config::QwenConfig::load(&dir).unwrap();
-    let model = oxinfer::qwen::QwenModel::load(cfg, &files, Quant::Bf16).unwrap();
-    check_rows("qwen3.5", &model, 6);
+    for quant in [Quant::Bf16, Quant::Q8, Quant::Q4] {
+        let cfg = oxinfer::config::QwenConfig::load(&dir).unwrap();
+        let model = oxinfer::qwen::QwenModel::load(cfg, &files, quant).unwrap();
+        check_rows(&format!("qwen3.5 {quant:?}"), &model, 12);
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }

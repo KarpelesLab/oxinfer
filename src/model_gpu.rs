@@ -1158,6 +1158,7 @@ impl Model<'_> {
                 x,
                 x2,
                 kv: &mut kv[..],
+                states: &mut [],
             })
             .collect();
         let ok = plan.step_rows(&mut rows, &mut hidden, Some(&mut logits));

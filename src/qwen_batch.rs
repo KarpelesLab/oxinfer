@@ -144,8 +144,8 @@ impl QwenModel<'_> {
     /// tokens ([`crate::gpu::decode::DecodePlan::step_rows`]: the exact multi-token kernels,
     /// each session's attention on its own cache); on the CPU, [`Self::forward_hidden_batch`]
     /// (bit for bit the one-token steps) and the head over all rows. Sessions the batched paths
-    /// do not take (recurrent layers on the GPU, interventions, captures, Qwen4-Exp, streamed
-    /// weights) run one after the other.
+    /// do not take (interventions, captures, Qwen4-Exp, streamed weights, lightning attention)
+    /// run one after the other. Gated DeltaNet layers run on each row's own recurrent states.
     pub fn forward_batch(&self, sess: &mut [&mut QwenSession], tokens: &[u32]) -> Vec<Vec<f32>> {
         let b = tokens.len();
         assert!(b > 0 && sess.len() == b, "one token per session");
@@ -184,8 +184,9 @@ impl QwenModel<'_> {
                     || !s.capture.is_empty()
                     || s.positions.is_some()
                     || s.deepstack.is_some()
-                    || s.gdn.iter().any(|g| g.is_some())
             })
+            // (Lightning attention and LFM3 convs have no batched device step.)
+            || self.layers.iter().any(|l| matches!(l.mixer, Mixer::Lightning(_) | Mixer::Conv(_)))
         {
             return None;
         }
@@ -207,34 +208,42 @@ impl QwenModel<'_> {
             .collect();
         let mut hidden = crate::kernels::zeros(b * h);
         let mut logits = crate::kernels::zeros(b * v);
-        let mut parts: Vec<(&mut crate::gpu::decode::Slot, Vec<&mut LayerCache>, usize)> = sess
+        type Part<'a> = (&'a mut crate::gpu::decode::Slot, Vec<&'a mut LayerCache>, Vec<&'a mut [f32]>, usize);
+        let mut parts: Vec<Part> = sess
             .iter_mut()
             .map(|s| {
-                let QwenSession { kv, gpu, pos, .. } = &mut **s;
-                (gpu, kv.iter_mut().flatten().collect(), *pos)
+                let QwenSession { kv, gdn, gpu, pos, .. } = &mut **s;
+                // The recurrent states in the plan's order, as a one-token step passes them.
+                let states = gdn.iter_mut().flatten().flat_map(|g| [&mut g.s[..], &mut g.conv[..]]).collect();
+                (gpu, kv.iter_mut().flatten().collect(), states, *pos)
             })
             .collect();
         let mut rows: Vec<crate::gpu::decode::Row> = parts
             .iter_mut()
             .zip(&cs)
             .zip(x.chunks(h))
-            .map(|(((slot, kv, pos), cs), x)| crate::gpu::decode::Row {
+            .map(|(((slot, kv, states, pos), cs), x)| crate::gpu::decode::Row {
                 slot,
                 pos: *pos,
                 rope_cs: cs,
                 x,
                 x2: &[],
                 kv: &mut kv[..],
+                states: &mut states[..],
             })
             .collect();
         let ok = plan.step_rows(&mut rows, &mut hidden, Some(&mut logits));
         drop(rows);
         drop(parts);
         if !ok {
+            if crate::batch::trace() {
+                eprintln!("batch: the device plan did not take {b} rows: one after the other");
+            }
             return None;
         }
         for s in sess.iter_mut() {
             s.gpu_states_kept = true;
+            s.gpu_rec = None;
             s.rec_span = None;
             s.pos += 1;
         }

@@ -300,7 +300,7 @@ impl Group {
 }
 
 /// `OXINFER_BATCH_TRACE=1`: a line per batched step on stderr.
-fn trace() -> bool {
+pub(crate) fn trace() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *T.get_or_init(|| std::env::var_os("OXINFER_BATCH_TRACE").is_some())
 }

@@ -197,6 +197,29 @@ TTFT p50 / p95 in seconds):
 | | 4 | 126.3 (32.2) | 212.5 (55.1) | 254.6 (67.1) |
 | | 8 | 127.5 (16.3) | 316.1 (41.5) | 357.8 (47.1) |
 
+**Gated DeltaNet models** (Qwen3.5 / 3.6 / 3.8): batched like the dense models, each row's conv
+and delta rule run by the one-token kernels on its session's own recurrent states (before, their
+decode steps ran one after the other, in turns). Aggregate tok/s (per stream), the same harness,
+`parallel=8`:
+
+| model | prompts | N | before (in turns) | batched (exact) | llama-server |
+|---|---|---|---|---|---|
+| Qwen3.5-9B BF16 | decode-bound | 1 | 33.2 | 33.8 | 31.9 |
+| | | 4 | 33.2 (8.5) | 107.7 (28.8) | 107.9 (28.2) |
+| | | 8 | 33.5 (4.3) | 130.2 (17.1) | 190.0 (25.4) |
+| | mixed | 4 | 27.8, TTFT p50 3.31 | 63.8, 3.11 | 60.1, 5.89 |
+| | | 8 | 29.3, 3.50 | 79.4, 3.53 | 116.1, 5.93 |
+| Qwen3.8-27B Q4_K_P | decode-bound | 1 | 17.8 | 18.5 | 21.0 |
+| | | 4 | 21.1 (5.5) | 33.7 (8.9) | 47.2 (12.8) |
+| | | 8 | 21.3 (2.7) | 31.2 (4.0) | 83.6 (11.4) |
+| | mixed | 4 | 14.3, 9.86 | 19.6, 9.10 | 22.5, 20.1 |
+| | | 8 | 15.1, 11.6 | 20.3, 7.40 | 44.7, 20.0 |
+
+4 concurrent requests on each give the replies each gets alone on a fresh server (also
+`concurrent_chats_match_alone` with Qwen3.5-0.8B, and `tests/gpu_chain.rs` on a tiny Qwen3.5 in
+bf16, Q8 and Q4: rows bit for bit their one-token steps). The gap at 8 rows is the exact
+multi-token matvecs' (as for Qwen3-8B below; the 27B's K-quants scale worst).
+
 Before, the decode-bound runs gave the single-stream rate in aggregate with the TTFT growing by
 a reply per queued request (Gemma 4 26B-A4B: 127.9 tok/s at N=8, TTFT p50 8.06 s against 0.40).
 On the CPU (Qwen3-8B Q4_K_M, `device=cpu`, 64 tokens): 4 requests 34.6 tok/s, TTFT p50 1.71 s

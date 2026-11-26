@@ -8242,7 +8242,6 @@ impl MetalPlan<'_> {
             || self.tokens < 2
             || self.pf.is_some()
             || self.gate.is_some()
-            || !self.states.is_empty()
             || self.params.is_some()
             || hidden.len() < b * self.hidden.1
             || logits.as_ref().is_some_and(|l| self.logits.is_none_or(|(_, n)| l.len() < b * n))
@@ -8251,6 +8250,8 @@ impl MetalPlan<'_> {
                     || r.rope_cs.len() != 2 * halves
                     || r.x.len() != self.n_input
                     || self.input2.is_some_and(|(_, n)| r.x2.len() != n)
+                    || r.states.len() != self.states.len()
+                    || r.states.iter().zip(&self.states).any(|(a, &n)| a.len() != n)
                     || r.pos + 1 > self.max_len
             })
         {
@@ -8260,8 +8261,8 @@ impl MetalPlan<'_> {
         if self.ops.iter().any(|op| {
             matches!(
                 op,
-                MOp::GdnConv { .. }
-                    | MOp::GdnRule { .. }
+                MOp::GdnConv { t: None, .. }
+                    | MOp::GdnRule { t: None, .. }
                     | MOp::QsaKey { .. }
                     | MOp::QsaScore { .. }
                     | MOp::QsaTopk { .. }
@@ -8281,11 +8282,22 @@ impl MetalPlan<'_> {
                 return false;
             }
             // SAFETY: each pointer is a distinct slot, borrowed from its row for this call.
-            if !self.sync_kv(unsafe { &mut *ms }, r.kv, r.pos, 1) {
+            if !self.sync_kv(unsafe { &mut *ms }, r.kv, r.pos, 1) || !self.wrap_states(unsafe { &mut *ms }, r.states) {
                 return false;
             }
             mss.push(ms);
         }
+        // Each row's recurrent states (wrapped in place: the device updates the host's).
+        let stbs: Vec<Vec<(Id, usize)>> = mss
+            .iter()
+            .map(|&m| {
+                unsafe { &*m }
+                    .states
+                    .iter()
+                    .map(|(_, _, b)| b.as_ref().map_or((std::ptr::null_mut(), 0), |b| (b.id, b.offset_bytes)))
+                    .collect()
+            })
+            .collect();
         let arena = self.arena;
         let base = self.f.contents(arena);
         for (j, r) in rows.iter().enumerate() {
@@ -8326,6 +8338,11 @@ impl MetalPlan<'_> {
                     MOp::QkRope { .. } | MOp::Attn { .. } => {
                         for (j, (kvb, &pos)) in kvbs.iter().zip(&poss).enumerate() {
                             self.encode_row(e, op, arena, consts, kvb, pos, j);
+                        }
+                    }
+                    MOp::GdnConv { .. } | MOp::GdnRule { .. } => {
+                        for (j, stb) in stbs.iter().enumerate() {
+                            self.encode_row_rec(e, op, arena, consts, stb, j);
                         }
                     }
                     _ => self.encode_multi(e, op, arena, consts, &[], &[], 0, b),
@@ -8369,6 +8386,66 @@ impl MetalPlan<'_> {
             }
         }
         true
+    }
+
+    /// A recurrent op of [`Self::step_rows_impl`] for row `j` alone: the one-token kernel (that of
+    /// a one-token step, so the row gets its bits) on row `j` of the plan's token rows and on the
+    /// row's own states `stb`, read and written in place.
+    fn encode_row_rec(&self, e: &FastEnc, op: &MOp, arena: Id, consts: Id, stb: &[(Id, usize)], j: usize) {
+        match op {
+            MOp::GdnConv {
+                pipe,
+                x,
+                out,
+                state,
+                w,
+                dim,
+                kc,
+                t: tk,
+            } => {
+                let (_, sx, so) = tk.expect("multi-token conv");
+                #[repr(C)]
+                struct Gc {
+                    dim: u32,
+                    kc: u32,
+                }
+                e.pipe(*pipe);
+                e.buf(arena, *x + j * sx as usize * 4, 0);
+                e.buf(arena, *out + j * so as usize * 4, 1);
+                e.buf(stb[*state].0, stb[*state].1, 2);
+                e.buf(consts, *w, 3);
+                e.bytes(&Gc { dim: *dim, kc: *kc }, 4);
+                e.buf(stb[*state].0, stb[*state].1, 5);
+                e.dispatch(((*dim as usize).div_ceil(256), 1), 256);
+            }
+            MOp::GdnRule {
+                pipe,
+                c,
+                z,
+                b,
+                a,
+                out,
+                state,
+                cst,
+                p,
+                t: tk,
+            } => {
+                let (_, sc, sp, so) = tk.expect("multi-token delta rule");
+                let (sc, sp, so) = (j * sc as usize * 4, j * sp as usize * 4, j * so as usize * 4);
+                e.pipe(*pipe);
+                e.buf(arena, *c + sc, 0);
+                e.buf(arena, *z + sp, 1);
+                e.buf(arena, *b + sp, 2);
+                e.buf(arena, *a + sp, 3);
+                e.buf(arena, *out + so, 4);
+                e.buf(stb[*state].0, stb[*state].1, 5);
+                e.buf(consts, *cst, 6);
+                e.bytes(p, 7);
+                e.buf(stb[*state].0, stb[*state].1, 8);
+                e.dispatch((p.nv as usize, 1), (p.hdk / 32 * p.hdv) as usize);
+            }
+            _ => unreachable!("not a recurrent op"),
+        }
     }
 
     /// An op of [`Self::step_rows_impl`] that touches a KV cache, for row `j` alone: its caches

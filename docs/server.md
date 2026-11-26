@@ -322,11 +322,12 @@ fast-verification kernels (as `fast_verify` does for speculative rounds: logits 
 one-token steps, so a reply may then depend on the requests decoded with it), about twice the
 throughput at 8 concurrent requests.
 
-Batched on the GPU: dense models whose decode plan has no recurrent state (Qwen3, Llama, Gemma
-3 / 4 dense). Mixtures of experts (Gemma 4 26B-A4B, Qwen MoE) only with `batch_fast=1`: their
+Batched on the GPU: dense models (Qwen3, Llama, Gemma 3 / 4 dense, and Qwen3.5 / 3.6 / 3.8,
+whose Gated DeltaNet layers run each row's one-token conv and delta-rule kernels on that
+session's own recurrent states). Mixtures of experts (Gemma 4 26B-A4B, Qwen MoE) only with `batch_fast=1`: their
 multi-token expert kernels do not give the one-token kernels' bits, and each row reads its own
 experts anyway (Gemma 4 26B-A4B Q4_0: 4 batched rows decode about as fast as 4 one-token steps).
-Those, Qwen3.5 / 3.6 (Gated DeltaNet), Inkling-2, DeepSeek V4, streamed models and sessions with
+Those, Inkling-2, DeepSeek V4, streamed models and sessions with
 interventions run their decode steps one after the other, in turns (still interleaved with the
 other requests' prompts).
 
