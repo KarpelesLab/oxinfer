@@ -575,11 +575,13 @@ impl VideoFormat {
     }
 }
 
-/// Generated frames (RGB8, row-major) at [`FPS`] and their soundtrack.
+/// Generated frames (RGB8, row-major) and their soundtrack.
 pub struct Video {
     pub width: usize,
     pub height: usize,
     pub frames: Vec<Vec<u8>>,
+    /// Frames per second ([`FPS`] for MiniMax-H3; LongCat-Video-Avatar writes 25).
+    pub fps: usize,
     /// `None` without an audio VAE (no `audio_vae/` in the release folder and none named).
     pub audio: Option<Soundtrack>,
 }
@@ -1050,6 +1052,7 @@ impl VideoPipeline {
             width: w,
             height: h,
             frames,
+            fps: FPS,
             audio: None,
         })
     }

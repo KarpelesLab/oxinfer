@@ -128,7 +128,7 @@ fn write_wav(v: &Video, stem: &Path) -> Result<String> {
 }
 
 /// Writes `v` as `out` says (see the module docs); returns what was written.
-fn write_video(v: &Video, out: &Path) -> Result<String> {
+pub(crate) fn write_video(v: &Video, out: &Path) -> Result<String> {
     let ext = out.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         #[cfg(feature = "media")]
@@ -144,7 +144,7 @@ fn write_video(v: &Video, out: &Path) -> Result<String> {
                 Some(a) => format!(", {ac} {} channels", a.channels.len()),
                 None => String::new(),
             };
-            Ok(format!("{} ({vc}, {FPS} fps{audio})", out.display()))
+            Ok(format!("{} ({vc}, {} fps{audio})", out.display(), v.fps))
         }
         #[cfg(feature = "media")]
         "webp" => {

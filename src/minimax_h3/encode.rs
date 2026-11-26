@@ -4,7 +4,9 @@
 //! [`load_reference`] for ref2va (an image, an audio clip or a video with its soundtrack).
 
 use super::ref2va::RefInput;
-use super::video::{FPS, Soundtrack, Video};
+#[cfg(test)]
+use super::video::FPS;
+use super::video::{Soundtrack, Video};
 use crate::sd::Image;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
@@ -85,8 +87,12 @@ pub fn avi_mjpeg(v: &Video) -> Result<Vec<u8>> {
     let audio = v.audio.as_ref().filter(|a| !a.is_empty() && n > 0);
     let (rate, block) = audio.map_or((0, 0), |a| (a.sample_rate as usize, 2 * a.channels.len()));
     let span = |a: &Soundtrack, i: usize| {
-        let end = if i + 1 == n { a.len() } else { ((i + 1) * rate / FPS).min(a.len()) };
-        (i * rate / FPS).min(end)..end
+        let end = if i + 1 == n {
+            a.len()
+        } else {
+            ((i + 1) * rate / v.fps).min(a.len())
+        };
+        (i * rate / v.fps).min(end)..end
     };
     let max_audio = audio.map_or(0, |a| (0..n).map(|i| span(a, i).len() * block).max().unwrap_or(0));
     // avih: microseconds per frame, max bytes / s, padding, flags (has index), frames, initial
@@ -94,13 +100,13 @@ pub fn avi_mjpeg(v: &Video) -> Result<Vec<u8>> {
     let mut avih = Vec::new();
     let streams = 1 + audio.is_some() as usize;
     let rest = [0, 0x10, n, 0, streams, max.max(max_audio), v.width, v.height, 0, 0, 0, 0];
-    for x in [1_000_000 / FPS, max * FPS + rate * block].into_iter().chain(rest) {
+    for x in [1_000_000 / v.fps, max * v.fps + rate * block].into_iter().chain(rest) {
         avih.extend_from_slice(&u(x));
     }
     // strh: type, handler, flags, priority + language, initial frames, scale, rate, start, length,
     // buffer size, quality, sample size, frame rectangle.
     let mut strh = b"vidsMJPG".to_vec();
-    for x in [0, 0, 0, 1, FPS, 0, n, max, 0xFFFF_FFFF, 0] {
+    for x in [0, 0, 0, 1, v.fps, 0, n, max, 0xFFFF_FFFF, 0] {
         strh.extend_from_slice(&u(x));
     }
     for x in [0, 0, v.width, v.height] {
@@ -249,19 +255,25 @@ fn av(e: oxideav_core::Error) -> anyhow::Error {
 /// encoded in parallel, by one encoder each, and their packets concatenated. VP9's encoder codes
 /// only its first frame as a keyframe (no interval option), so this is also what gives a WebM a
 /// seek point every second (about 2 % more bytes than one keyframe in all).
+#[cfg(test)]
 const CHUNK: usize = FPS;
+
+/// Frames per chunk of `v`: one second at its frame rate.
+fn chunk_of(v: &Video) -> usize {
+    v.fps.max(1)
+}
 
 /// The H.264 encoder's options: CABAC, so Main profile (every browser plays it; about 3x faster
 /// than oxideav-h264's CAVLC path, whose P macroblocks are slower to decide), constant QP 19
 /// (with CABAC, about the size of CAVLC at QP 20 for more quality), an IDR picture every chunk.
 /// The packets are AVCC samples and the parameter sets the encoder's extradata (`avcC`).
-fn h264_options() -> oxideav_core::CodecOptions {
+fn h264_options(gop: usize) -> oxideav_core::CodecOptions {
     oxideav_core::CodecOptions::new()
         .set("format", "avcc")
         .set("cabac", "true")
         .set("rc", "cqp")
         .set("qp", "19")
-        .set("gop", CHUNK.to_string())
+        .set("gop", gop.to_string())
 }
 
 /// H.264 (Main profile, CABAC, constant QP 19, an IDR picture every second, 4:2:0) and AAC-LC
@@ -284,18 +296,18 @@ pub fn mp4_or_webm(v: &Video, format: VideoFormat) -> Result<Vec<u8>> {
     };
     let media = crate::media::Media::new();
     let ctx = media.context();
-    let fps = FPS as i64;
+    let fps = v.fps as i64;
     let mut vp = CodecParameters::video(CodecId::new(vcodec));
     vp.width = Some(v.width as u32);
     vp.height = Some(v.height as u32);
     vp.pixel_format = Some(PixelFormat::Yuv420P);
     vp.frame_rate = Some(Rational::new(fps, 1));
     if format == VideoFormat::Mp4 {
-        vp.options = h264_options();
+        vp.options = h264_options(chunk_of(v));
     }
     let vtb = TimeBase::new(1, fps);
     // One encoder per chunk, each run on a thread of the pool.
-    let starts: Vec<usize> = (0..v.frames.len()).step_by(CHUNK).collect();
+    let starts: Vec<usize> = (0..v.frames.len()).step_by(chunk_of(v)).collect();
     let mut encoders = Vec::with_capacity(starts.len());
     for _ in &starts {
         let e = ctx
@@ -309,7 +321,7 @@ pub fn mp4_or_webm(v: &Video, format: VideoFormat) -> Result<Vec<u8>> {
     let encode_chunk = |enc: &mut Box<dyn Encoder>, start: usize| -> Result<Vec<Packet>> {
         let mut out = Vec::new();
         let cw = v.width.div_ceil(2);
-        for (i, f) in v.frames.iter().enumerate().skip(start).take(CHUNK) {
+        for (i, f) in v.frames.iter().enumerate().skip(start).take(chunk_of(v)) {
             let [y, u, w2] = rgb_to_yuv420(f, v.width, v.height);
             let frame = VideoFrame {
                 pts: Some(i as i64),
@@ -441,7 +453,7 @@ pub fn mp4_or_webm(v: &Video, format: VideoFormat) -> Result<Vec<u8>> {
         VideoFormat::Webm => {
             let mut m = oxideav_mkv::mux::MkvMuxer::new_webm(Box::new(buf.clone()), &streams).map_err(av)?;
             let secs = audio.map_or(0.0, |a| a.len() as f64 / a.sample_rate as f64);
-            let secs = secs.max(v.frames.len() as f64 / FPS as f64);
+            let secs = secs.max(v.frames.len() as f64 / v.fps as f64);
             m.set_duration(std::time::Duration::from_secs_f64(secs)).map_err(av)?;
             Box::new(m) as Box<dyn oxideav_core::Muxer>
         }
@@ -486,7 +498,7 @@ pub fn animated_webp(v: &Video) -> Result<Vec<u8>> {
         .map(|(i, f)| {
             let rgba: Vec<u8> = f.chunks(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
             // 41.67 ms on average.
-            let d = ((i + 1) * 1000 / FPS - i * 1000 / FPS) as u32;
+            let d = ((i + 1) * 1000 / v.fps - i * 1000 / v.fps) as u32;
             AnimFrame::new(v.width as u32, v.height as u32, rgba, d)
         })
         .collect();
@@ -526,6 +538,7 @@ mod tests {
             width: w,
             height: h,
             frames,
+            fps: FPS,
             audio: Some(Soundtrack {
                 sample_rate: 32000,
                 channels: vec![tone(440.0), tone(660.0)],
@@ -744,6 +757,7 @@ mod tests {
             width: w,
             height: h,
             frames,
+            fps: FPS,
             audio: Some(audio),
         };
         let avi = avi_mjpeg(&v).unwrap();
