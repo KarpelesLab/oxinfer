@@ -372,6 +372,25 @@ const SK_NORM: u32 = 16384;
 /// Tokens of a pass at most (the decode library's multi-token matvecs take 16).
 pub(crate) const MAX_T: usize = 16;
 
+/// Whether a float32 matrix of `n_out` rows (the loop's message-gate down projections, 64 rows;
+/// the router, one row per expert) runs on the matvecs in a prefill pass of `t` tokens rather
+/// than on the f32 GEMM, whose grid has a threadgroup per 32 rows and 32 tokens: 2 to 4 of them
+/// for a short prompt chunk, each through the whole row. `OXINFER_INKLING_F32MV_T=N`: up to N
+/// tokens (128 measured best: a 17-token chunk of Inkling-2-Mini 57 against 67.5 ms); default 0,
+/// the GEMM, whose rounding the prompts have had (the matvecs route some tokens' experts
+/// otherwise: over five 40-token prompts the last logits' KL to the host's 2.4e-3 on average
+/// against 8.4e-4).
+fn f32_mv(n_out: usize, t: usize) -> bool {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let most = *T.get_or_init(|| {
+        std::env::var("OXINFER_INKLING_F32MV_T")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    n_out <= 256 && t <= most
+}
+
 /// Splits of a token's keys at most (`ink_chunk` in the shader).
 const MAX_SPLIT: usize = 64;
 /// The epsilon of the attention residual's norms (`inkling::MIX_EPS`).
@@ -2644,7 +2663,7 @@ impl InkMetal {
                 self.gemm(e, c, g, pf, pp, d.w.n_out, d.w.n_in, x, y, t, mode == MvMode::Add);
                 return;
             }
-            if let (Some((buf, off)), Some(pp), MvMode::Store) = (d.f32g, &self.pfp, mode) {
+            if let (Some((buf, off)), Some(pp), MvMode::Store, false) = (d.f32g, &self.pfp, mode, f32_mv(d.w.n_out, t)) {
                 // (Rows padded to 32 tokens: the arena's rows beyond `t` are scratch.)
                 e.pipe(pp.gemm_f32);
                 e.buf(buf, 0, 0);
@@ -2918,7 +2937,8 @@ impl InkMetal {
                 t,
                 MvMode::Store,
             );
-            if c.b.pf.is_some() {
+            // (The matrix-unit GEMM's input goes through one scratch: one after the other.)
+            if c.b.pf.is_some() && t > MAX_T && g[i].down.g.is_some() {
                 e.barrier();
             }
         }
@@ -4014,7 +4034,7 @@ impl InkMetal {
         let (h, b) = (self.h, c.b);
         let ld = &self.layers[self.plan[si].layer];
         match &self.pfp {
-            Some(pp) if t > MAX_T => {
+            Some(pp) if t > MAX_T && !f32_mv(self.ne, t) => {
                 // (32 x 32 tiles; the rows are padded to 32.)
                 e.pipe(pp.gemm_f32);
                 e.buf(self.consts, 0, 0);

@@ -399,6 +399,40 @@ What is measured and where the gap to llama-server comes from:
   (N=1's spread is the machine's: the change does not touch a request alone with a 497-token
   prompt.)
 
+  **Inkling-2's short prompt chunks** (Inkling-2-Mini UD-IQ3_XXS, a 512-token prompt read in
+  chunks of N, ms per chunk). Up to 16 tokens a chunk is a pass of the decode plan, the cost of a
+  verification pass of that size: 1, 2, 8, 16 tokens 8.0, 12.0, 35.9, 72.5 ms. It grows with
+  the experts the tokens touch, not with the tokens themselves: at 16 tokens about 80 of the
+  128 experts a layer, 41 of 64 ms of GPU time in the routed experts' kernels, at the
+  one-token kernels' cost per expert. So routing those chunks elsewhere gains nothing.
+  From 17 tokens on a chunk is a prefill pass, which had a floor of ~73 ms: 49 steps, each a
+  command buffer the host waits on (~10 ms in all), and 41 ms of GPU time outside the experts
+  at 17 tokens as at 64 (44 ms). Most of that was the loop's message gates. Their down
+  projections (64 x 4608 floats) and the router (128 x 2304) ran on the f32 GEMM, whose grid has
+  a threadgroup per 32 rows and 32 tokens (2 to 4 of them for a short chunk), with a barrier
+  after each gate's down projection. The barriers are needed only on the matrix-unit GEMM, whose
+  input shares one scratch, so they are now kept only there: the same arithmetic, so the same
+  logits. `OXINFER_INKLING_F32MV_T=128` also runs those matrices on the matvecs for chunks of
+  up to 128 tokens. That is faster still, but rounds the router otherwise and so routes some
+  tokens to other experts. Over five 40-token prompts, the last logits' KL to the host's was
+  2.4e-3 on average against 8.4e-4 for the GEMM, better on two prompts and worse on three (the
+  host's own chunking moves them by as much: 16 against 40 tokens, 0.26 at most). So it is off
+  by default. Interleaved A/B, ms per chunk:
+
+  | chunk | before | now (default) | `OXINFER_INKLING_F32MV_T=128` |
+  |---|---|---|---|
+  | 17 | 75.8 | 67.5 | 56.8 |
+  | 32 | 82.9 | 74.9 | 66.1 |
+  | 64 | 101.2 | 94.6 | 94.3 |
+  | 128 | 141.3 | 136.0 | 134.5 |
+
+  Chunks of 256 and more are within the noise (the GEMM's grid fills the GPU there). On the
+  server, a two-turn chat's 51- and 89-token turns went from 108 to 90 ms and from 122 to 107 ms
+  with the matvecs. What is left at 17 tokens is the routed experts (21 ms), the dense matrices
+  on the backend's matrix-unit GEMM (~16 ms: 32-token tiles, few threadgroups for 2304-3072
+  outputs; a split over the rows' length would serve them, in the shared prefill kernels) and
+  the host's waits for each step's routing (~10 ms).
+
   Smaller chunks while others decode (`decode_chunk=512`, model option; default off) change
   little: Inkling-2-Mini UD-IQ3_XXS (its 2048-token chunks read 2-3x faster than 256-token ones)
   N=8 94.3 -> 94.1 tok/s, TTFT p50 2.74 -> 1.66 s but p95 8.66 -> 9.26; N=4 76.1 -> 77.6, p50
