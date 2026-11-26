@@ -1,10 +1,11 @@
 //! Whole UNet passes on Metal ([`crate::gpu::unet`]): every op of a pass for every image of the
 //! batch in a few command buffers, the activations in device buffers that live as long as the
 //! session. Convolutions run as shifted GEMMs on the matrix units (`metal_unet.metal`: padded
-//! activations, nine taps accumulated into one tile; strided ones and narrow inputs through an
-//! unfolded copy), attention as fused flash kernels over heads padded to 64 / 96 / 128 / 160, the
-//! norms and the GEGLU as row kernels writing the GEMMs' half inputs. Without matrix units there
-//! is no session (the per-op path runs instead).
+//! activations, nine taps accumulated into one tile; strided ones, narrow inputs and the small
+//! levels through an unfolded copy; tiles past the last full wave split, [`plan`]), attention as
+//! fused flash kernels over heads padded to 64 / 96 / 128 / 160, the norms and the GEGLU as row
+//! kernels writing the GEMMs' half inputs. Without matrix units there is no session (the per-op
+//! path runs instead).
 
 use super::decode::{FastEnc, Fns, run_concurrent};
 use super::*;
@@ -59,6 +60,8 @@ struct Pipes {
     /// GEMMs over 128-row and 64-row tiles (64 outputs wide).
     gemm: Id,
     gemm_m64: Id,
+    /// The split tiles' sums (see [`plan`]).
+    gemm_red: Id,
     ln: Id,
     /// The feed-forward's first GEMM with its GEGLU.
     gemm_geglu: Id,
@@ -93,8 +96,10 @@ enum S {
     Ctx,
     /// The largest magnitude of a convolution's raw input (float bits).
     Amax,
+    /// The products of split GEMM tiles (f32 blocks of 128 x 64 at most, [`plan`]).
+    Sk,
 }
-const NS: usize = 14;
+const NS: usize = 15;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -138,6 +143,7 @@ struct Uic {
     rows: u32,
 }
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Ug {
     n_out: u32,
     ldw: u32,
@@ -157,7 +163,13 @@ struct Ug {
     dhp: u32,
     g: Geo,
     scaled: u32,
-    _p: [u32; 3],
+    full: u32,
+    rs: u32,
+    kper: u32,
+    nct: u32,
+    tm: u32,
+    nrem: u32,
+    _p: u32,
 }
 #[repr(C)]
 struct Uam {
@@ -221,6 +233,7 @@ impl MetalBackend {
             im2col: pipe("un_im2col")?,
             gemm: pipe("un_gemm")?,
             gemm_m64: pipe("un_gemm_m64")?,
+            gemm_red: pipe("un_gemm_red")?,
             ln: pipe("un_ln")?,
             gemm_geglu: pipe("un_gemm_geglu")?,
             concat: pipe("un_concat")?,
@@ -347,10 +360,152 @@ fn metal_w<'a>(l: &'a Lin) -> Option<&'a MetalWeight> {
     l.dev.downcast_ref::<MetalWeight>()
 }
 
-/// How a convolution runs: nine (or one) shifted GEMMs over padded rows, or unfolded rows.
-fn shifted(k: usize, stride: usize, pad: usize, up: bool, cin: usize, n_in: usize) -> bool {
-    let _ = up;
-    stride == 1 && pad == k / 2 && (k == 1 || k == 3) && cin.is_multiple_of(32) && n_in == k * k * cin
+/// How a convolution over an `h x w` input runs: nine (or one) shifted GEMMs over padded rows,
+/// or unfolded rows. 3x3 ones over inputs whose borders would be more than 30% of the padded
+/// rows (8x8: 200 rows for 128 pixels of 2 images) are unfolded too: the copy costs less than
+/// the products of the border rows (`OXINFER_UNET_UNFOLD=N`: the 3x3 ones over at most N pixels
+/// instead).
+fn shifted(k: usize, stride: usize, pad: usize, cin: usize, n_in: usize, h: usize, w: usize) -> bool {
+    static U: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let small = match *U.get_or_init(|| std::env::var("OXINFER_UNET_UNFOLD").ok().and_then(|v| v.parse().ok())) {
+        Some(n) => h * w <= n,
+        None => h * w * 5 < (h + 2) * (w + 2) * 4,
+    };
+    stride == 1 && pad == k / 2 && (k == 1 || k == 3 && !small) && cin.is_multiple_of(32) && n_in == k * k * cin
+}
+
+/// GPU cores (IOKit's `gpu-core-count` of the AGX accelerator; `OXINFER_GPU_CORES` overrides;
+/// 40 when unknown).
+fn gpu_cores() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        if let Some(n) = std::env::var("OXINFER_GPU_CORES").ok().and_then(|v| v.parse().ok()) {
+            return n;
+        }
+        io_gpu_cores().filter(|&n| (1..=1024).contains(&n)).unwrap_or(40)
+    })
+}
+
+fn io_gpu_cores() -> Option<usize> {
+    type CfRef = *const std::ffi::c_void;
+    // SAFETY: C calls into IOKit / CoreFoundation with their documented signatures; every object
+    // created here is released.
+    unsafe {
+        let iokit = dlsym::Library::open("/System/Library/Frameworks/IOKit.framework/IOKit").ok()?;
+        let cf = dlsym::Library::open("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation").ok()?;
+        let matching: unsafe extern "C" fn(*const std::ffi::c_char) -> CfRef = iokit.get(c"IOServiceMatching").ok()?.into_inner();
+        let get_service: unsafe extern "C" fn(u32, CfRef) -> u32 = iokit.get(c"IOServiceGetMatchingService").ok()?.into_inner();
+        let search: unsafe extern "C" fn(u32, *const std::ffi::c_char, CfRef, CfRef, u32) -> CfRef =
+            iokit.get(c"IORegistryEntrySearchCFProperty").ok()?.into_inner();
+        let release_obj: unsafe extern "C" fn(u32) -> i32 = iokit.get(c"IOObjectRelease").ok()?.into_inner();
+        let cfstr: unsafe extern "C" fn(CfRef, *const std::ffi::c_char, u32) -> CfRef =
+            cf.get(c"CFStringCreateWithCString").ok()?.into_inner();
+        let type_id: unsafe extern "C" fn(CfRef) -> usize = cf.get(c"CFGetTypeID").ok()?.into_inner();
+        let number_type: unsafe extern "C" fn() -> usize = cf.get(c"CFNumberGetTypeID").ok()?.into_inner();
+        let number_value: unsafe extern "C" fn(CfRef, isize, *mut i64) -> u8 = cf.get(c"CFNumberGetValue").ok()?.into_inner();
+        let release: unsafe extern "C" fn(CfRef) = cf.get(c"CFRelease").ok()?.into_inner();
+        let m = matching(c"AGXAccelerator".as_ptr());
+        if m.is_null() {
+            return None;
+        }
+        // (Consumes the matching dictionary.)
+        let svc = get_service(0, m);
+        if svc == 0 {
+            return None;
+        }
+        // kCFStringEncodingUTF8
+        let key = cfstr(std::ptr::null(), c"gpu-core-count".as_ptr(), 0x0800_0100);
+        let mut n = None;
+        if !key.is_null() {
+            // kIORegistryIterateRecursively
+            let v = search(svc, c"IOService".as_ptr(), key, std::ptr::null(), 1);
+            if !v.is_null() {
+                let mut x = 0i64;
+                // kCFNumberSInt64Type
+                if type_id(v) == number_type() && number_value(v, 4, &mut x) != 0 {
+                    n = usize::try_from(x).ok();
+                }
+                release(v);
+            }
+            release(key);
+        }
+        release_obj(svc);
+        n
+    }
+}
+
+/// How a GEMM's tiles run ([`plan`]): `tm` rows by 64 outputs a tile, `nct` tiles across, the
+/// first `full` tiles whole, the `nrem` after them in `rs` parts of `kper` inputs each.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Plan {
+    tm: usize,
+    nct: usize,
+    full: usize,
+    nrem: usize,
+    rs: usize,
+    kper: usize,
+}
+
+impl Plan {
+    fn threadgroups(&self) -> usize {
+        self.full + self.nrem * self.rs
+    }
+}
+
+/// The tiles of a GEMM of `n_rows` x `k` inputs into `n_out` on a GPU that runs `conc`
+/// threadgroups at once (`split`: the last tiles may be split). A tile takes about as long
+/// alone as beside others, so a last, partial wave of tiles costs a whole one: the tiles past
+/// the last full wave are split along their inputs, to fill it at a fraction of the time (the
+/// parts then summed by un_gemm_red). Of 128-row and 64-row tiles, the shorter estimate.
+fn plan(n_rows: usize, n_out: usize, k: usize, conc: usize, split: bool) -> Plan {
+    let nct = n_out.div_ceil(64);
+    let mut best: Option<(f64, Plan)> = None;
+    for tm in [128usize, 64] {
+        let tiles = n_rows.div_ceil(tm) * nct;
+        let (waves, rem) = (tiles / conc, tiles % conc);
+        // A wave's time in us: a 128-row tile's products at ~0.38 TFLOP/s a threadgroup; a
+        // 64-row tile takes 2/3 of its time (measured: 1280 outputs over 11520 inputs, 160
+        // threadgroups of 64 rows in 0.25 ms, 120 of 128 in 0.37).
+        let wave = (128 * 64 * k * 2) as f64 / 0.38e6 * if tm == 128 { 1.0 } else { 0.67 };
+        let mut p = Plan {
+            tm,
+            nct,
+            full: tiles,
+            nrem: 0,
+            rs: 1,
+            kper: k,
+        };
+        let mut cost = (waves + (rem > 0) as usize) as f64 * wave;
+        // Parts of at least 256 inputs.
+        let rs = if rem > 0 && split { (conc / rem).min(k / 256).min(16) } else { 1 };
+        if rs >= 2 {
+            let kper = k.div_ceil(rs).next_multiple_of(64);
+            let rs = k.div_ceil(kper);
+            // The reduction: a dispatch, and the parts written and read at ~400 GB/s.
+            let red = 8.0 + (rem * rs * tm * 64 * 8) as f64 / 400e3;
+            let c2 = waves as f64 * wave + wave / rs as f64 + red;
+            if c2 < cost {
+                cost = c2;
+                p = Plan {
+                    full: tiles - rem,
+                    nrem: rem,
+                    rs,
+                    kper,
+                    ..p
+                };
+            }
+        }
+        if best.is_none_or(|b| cost < b.0) {
+            best = Some((cost, p));
+        }
+    }
+    best.unwrap().1
+}
+
+/// Whether GEMMs may split tiles ([`plan`]; `OXINFER_UNET_SPLIT=0`: never).
+fn split_ok() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("OXINFER_UNET_SPLIT").map_or(true, |v| v != "0"))
 }
 
 /// Constants of a pass (norm weights, biases) and their offsets in bytes.
@@ -471,7 +626,8 @@ impl Session for MetalUnet {
                     let li = lay(sh, sw, nb);
                     need.at_least(S::Xh, li.rows * c * 2);
                     need.at_least(S::Amax, 256);
-                    if !shifted(*k, *stride, *pad, *up, c, w.n_in) {
+                    need.at_least(S::Sk, 4 * gpu_cores() * 128 * 64 * 4);
+                    if !shifted(*k, *stride, *pad, c, w.n_in, sh, sw) {
                         if w.n_in < k * k * c {
                             return false;
                         }
@@ -843,14 +999,12 @@ impl Cx<'_, '_> {
             return;
         }
         let mw = metal_w(w).unwrap();
-        // 128-row tiles, or 64-row ones where those would leave the GPU's cores with too few
-        // threadgroups (fewer than 128: the lowest UNet levels, the text's keys and values).
         let n_rows = rows.1 - rows.0;
-        let (tn, tm, pipe) = if n_rows.div_ceil(TM) * w.n_out.div_ceil(64) < 128 {
-            (64, 64, self.p.gemm_m64)
-        } else {
-            (64, TM, self.p.gemm)
-        };
+        // Convolutions may split tiles (the scratch for their parts is sized by them), unless
+        // independent GEMMs run beside this one (they would share it).
+        let split = split_ok() && matches!(kind, "conv3" | "conv1" | "unfold") && !self.nobar.get();
+        let pl = plan(n_rows, w.n_out, offs.len() * cin, 4 * gpu_cores(), split);
+        let pipe = if pl.tm == 128 { self.p.gemm } else { self.p.gemm_m64 };
         let mut off = [0i32; 9];
         off[..offs.len()].copy_from_slice(offs);
         let (y, omode, ldy, nimg, dh, dhp, geo) = match out {
@@ -879,7 +1033,13 @@ impl Cx<'_, '_> {
             dhp: dhp as u32,
             g: geo,
             scaled: scaled as u32,
-            _p: [0; 3],
+            full: pl.full as u32,
+            rs: pl.rs as u32,
+            kper: pl.kper as u32,
+            nct: pl.nct as u32,
+            tm: pl.tm as u32,
+            nrem: pl.nrem as u32,
+            _p: 0,
         };
         e.pipe(pipe);
         e.buf(mw.data.id, mw.data.offset_bytes, 0);
@@ -889,7 +1049,19 @@ impl Cx<'_, '_> {
         e.bytes(&p, 4);
         e.buf(add.unwrap_or(y), 0, 5);
         e.buf(self.sc(S::Amax), 0, 6);
-        e.dispatch((w.n_out.div_ceil(tn), n_rows.div_ceil(tm)), 128);
+        e.buf(self.sc(S::Sk), 0, 7);
+        e.dispatch((pl.threadgroups(), 1), 128);
+        if pl.nrem > 0 {
+            e.barrier();
+            e.pipe(self.p.gemm_red);
+            e.buf(y, 0, 2);
+            e.buf(self.cst(), bias.map_or(0, |b| b.0), 3);
+            e.bytes(&p, 4);
+            e.buf(add.unwrap_or(y), 0, 5);
+            e.buf(self.sc(S::Amax), 0, 6);
+            e.buf(self.sc(S::Sk), 0, 7);
+            e.dispatch(((pl.nrem * pl.tm * 64).div_ceil(256), 1), 256);
+        }
         if !self.nobar.replace(false) {
             e.barrier();
         }
@@ -923,7 +1095,13 @@ impl Cx<'_, '_> {
             dhp: 0,
             g: Geo::default(),
             scaled: 0,
-            _p: [0; 3],
+            full: 0,
+            rs: 0,
+            kper: 0,
+            nct: 0,
+            tm: 0,
+            nrem: 0,
+            _p: 0,
         };
         e.pipe(self.p.gemm_geglu);
         e.buf(mw.data.id, mw.data.offset_bytes, 0);
@@ -1138,7 +1316,7 @@ impl Cx<'_, '_> {
                     .as_ref()
                     .map(|b| (self.consts.get(b.as_ptr()), if *bias_per_image { oc } else { 0 }));
                 let addb = add.map(|a| self.tid[a]);
-                if shifted(*k, *stride, *pad, *up, c, w.n_in) {
+                if shifted(*k, *stride, *pad, c, w.n_in, li.h, li.w) {
                     let r = (li.w + 2) as i32;
                     let offs: Vec<i32> = if *k == 1 {
                         vec![0]
@@ -1180,7 +1358,7 @@ impl Cx<'_, '_> {
                         },
                         2,
                     );
-                    e.dispatch(((rows * kp).div_ceil(256), 1), 256);
+                    e.dispatch(((rows * kp / 4).div_ceil(256), 1), 256);
                     e.barrier();
                     let out = Out::ToPadded { y: yb, l: lo };
                     self.gemm(

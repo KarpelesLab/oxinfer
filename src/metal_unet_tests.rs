@@ -356,7 +356,9 @@ fn pass_matches_reference() {
     }
 }
 
-/// GEMM kernel timings over UNet shapes (`cargo test --release --lib un_gemm_bench -- --ignored --nocapture`).
+/// GEMM kernel timings over UNet shapes (`cargo test --release --lib un_gemm_bench -- --ignored --nocapture`;
+/// `un_gemm` / `un_gemm_m64`: whole tiles only, `plan`: as the passes run them (split last
+/// tiles included), other names: kernels of OXINFER_MMA_EXTRA on a grid of (outputs / 64, rows / tm)).
 #[test]
 #[ignore]
 fn un_gemm_bench() {
@@ -367,7 +369,7 @@ fn un_gemm_bench() {
     let be: &'static MetalBackend = Box::leak(Box::new(b));
     let f = Fns::new(be);
     let pipe = |n: &str| be.named_pipeline(n).unwrap();
-    let names = std::env::var("UN_BENCH_KERNELS").unwrap_or("un_gemm,un_gemm_m64".into());
+    let names = std::env::var("UN_BENCH_KERNELS").unwrap_or("un_gemm,un_gemm_m64,plan".into());
     // UN_BENCH_SHAPES=rows:cin:n_out:taps,...
     let shapes: Vec<(usize, usize, usize, usize)> = match std::env::var("UN_BENCH_SHAPES") {
         Ok(v) => v
@@ -395,12 +397,14 @@ fn un_gemm_bench() {
         let mut bw = DBuf::empty();
         let mut by = DBuf::empty();
         let mut bz = DBuf::empty();
+        let mut bp = DBuf::empty();
         let a_rows = rows + 256;
         assert!(ensure(be, &mut bx, a_rows * cin * 2));
         // Twice the outputs: GEMMs with a gate (GEGLU) read the rows past n_out.
         assert!(ensure(be, &mut bw, 2 * nout * cin * taps * 2 + 4096));
         assert!(ensure(be, &mut by, rows * nout * 4));
         assert!(ensure(be, &mut bz, 4096));
+        assert!(ensure(be, &mut bp, 4 * gpu_cores() * 128 * 64 * 4));
         let mut off = [0i32; 9];
         for (t, o) in off.iter_mut().enumerate().take(taps) {
             *o = t as i32 * 3;
@@ -424,11 +428,40 @@ fn un_gemm_bench() {
             dhp: 0,
             g: Geo::default(),
             scaled: 0,
-            _p: [0; 3],
+            full: 0,
+            rs: 1,
+            kper: 0,
+            nct: nout.div_ceil(64) as u32,
+            tm: 0,
+            nrem: 0,
+            _p: 0,
         };
         let flop = 2.0 * rows as f64 * cin as f64 * taps as f64 * nout as f64;
         for name in names.split(',') {
-            let pp = pipe(name);
+            let whole = |tm: usize| Plan {
+                tm,
+                nct: nout.div_ceil(64),
+                full: rows.div_ceil(tm) * nout.div_ceil(64),
+                nrem: 0,
+                rs: 1,
+                kper: cin * taps,
+            };
+            let pl = match name {
+                "un_gemm" => Some(whole(128)),
+                "un_gemm_m64" => Some(whole(64)),
+                "plan" => Some(plan(rows, nout, cin * taps, 4 * gpu_cores(), true)),
+                _ => None,
+            };
+            let pp = match pl {
+                Some(pl) if pl.tm == 128 => pipe("un_gemm"),
+                Some(_) => pipe("un_gemm_m64"),
+                None => pipe(name),
+            };
+            let red = pipe("un_gemm_red");
+            let mut p = p;
+            if let Some(pl) = pl {
+                (p.full, p.rs, p.kper, p.tm, p.nrem) = (pl.full as u32, pl.rs as u32, pl.kper as u32, pl.tm as u32, pl.nrem as u32);
+            }
             let tn = if name.contains("_n128") {
                 128
             } else if name.contains("_n32") {
@@ -458,17 +491,33 @@ fn un_gemm_bench() {
                         e.bytes(&p, 4);
                         e.buf(by.id, 0, 5);
                         e.buf(bz.id, 0, 6);
-                        e.dispatch((nout.div_ceil(tn), rows.div_ceil(tmr)), 128);
+                        e.buf(bp.id, 0, 7);
+                        match pl {
+                            Some(pl) => e.dispatch((pl.threadgroups(), 1), 128),
+                            None => e.dispatch((nout.div_ceil(tn), rows.div_ceil(tmr)), 128),
+                        }
                         e.barrier();
+                        if let Some(pl) = pl.filter(|pl| pl.nrem > 0) {
+                            e.pipe(red);
+                            e.buf(by.id, 0, 2);
+                            e.buf(bz.id, 0, 3);
+                            e.bytes(&p, 4);
+                            e.buf(by.id, 0, 5);
+                            e.buf(bz.id, 0, 6);
+                            e.buf(bp.id, 0, 7);
+                            e.dispatch(((pl.nrem * pl.tm * 64).div_ceil(256), 1), 256);
+                            e.barrier();
+                        }
                     }
                 });
                 assert!(ok);
                 best = best.min(t.elapsed().as_secs_f64() / reps as f64);
             }
             eprintln!(
-                "{rows:6} x {cin:5} x{taps} -> {nout:5}: {name:14} {:7.3} ms {:6.1} TFLOP/s",
+                "{rows:6} x {cin:5} x{taps} -> {nout:5}: {name:14} {:7.3} ms {:6.1} TFLOP/s {}",
                 best * 1e3,
-                flop / best / 1e12
+                flop / best / 1e12,
+                pl.map_or(String::new(), |p| format!("{p:?}"))
             );
         }
     }

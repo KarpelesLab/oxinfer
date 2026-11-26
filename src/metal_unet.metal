@@ -138,37 +138,73 @@ kernel void un_prep(device const float* x [[buffer(0)]], device half* out [[buff
 struct UIC { UGEO s; uint c; uint k; uint stride; uint pad; uint oh; uint ow; uint kp; uint rows; };
 kernel void un_im2col(device const half* x [[buffer(0)]], device half* out [[buffer(1)]], constant UIC& p [[buffer(2)]],
                       uint i [[thread_position_in_grid]]) {
-    uint row = i / p.kp, kk = i - row * p.kp;
+    // 4 halves a thread (c and kp are multiples of 4: a tap's channels never straddle them).
+    uint k4 = p.kp / 4, row = i / k4, kk = (i - row * k4) * 4;
     if (row >= p.rows) return;
     uint n = p.oh * p.ow, b = row / n, q = row - b * n, oy = q / p.ow, ox = q - oy * p.ow;
-    half v = 0.h;
+    half4 v = half4(0.h);
     if (kk < p.k * p.k * p.c) {
         uint tap = kk / p.c, ci = kk - tap * p.c, ky = tap / p.k, kx = tap - ky * p.k;
         // Padded coordinates: input y = oy s + ky - pad sits at padded y + 1.
         int py = int(oy * p.stride + ky) - int(p.pad) + 1, px = int(ox * p.stride + kx) - int(p.pad) + 1;
         if (py >= 0 && px >= 0 && py <= int(p.s.h) + 1 && px <= int(p.s.w) + 1)
-            v = x[((ulong)p.s.G + b * p.s.P + uint(py) * (p.s.w + 2) + uint(px)) * p.c + ci];
+            v = *(device const half4*)(x + ((ulong)p.s.G + b * p.s.P + uint(py) * (p.s.w + 2) + uint(px)) * p.c + ci);
     }
-    out[(ulong)row * p.kp + kk] = v;
+    *(device half4*)(out + (ulong)row * p.kp + kk) = v;
 }
 
 // y = sum over taps of A[r + off[tap]] W_tap^T: half rows of `cin` (A), bf16 weights [n_out][ldw]
-// whose tap t is columns t cin .. (t + 1) cin. TMR rows x 64 outputs per threadgroup (4
-// SIMD-groups; 128 x 128 tiles ran at 60-75% of this speed on every UNet shape measured, 64-row
-// ones gain where 128-row tiles leave the GPU's cores short of threadgroups), rows r0 + ... <
-// r_end. Stores (omode):
+// whose tap t is columns t cin .. (t + 1) cin. TMR rows x 64 outputs per tile (4 SIMD-groups;
+// 128 x 128 tiles ran at 60-75% of this speed on every UNet shape measured), rows r0 + ... <
+// r_end, tile i at output columns (i % nct) 64 and rows r0 + (i / nct) TMR. Stores (omode):
 //   0 f32 rows ldy wide, row r (compact: image r / nimg);
 //   1 f32 padded rows of geometry g from compact rows (image b's pixel q);
-//   2 f32 padded rows from padded rows (borders stored as zeros);
+//   2 f32 padded rows from padded rows (the borders get finite values that no reader takes);
 //   3 half rows of heads: output o to column (o / dh) dhp + o % dh of rows ldy wide.
 // With bias: + bias[b * bstride + o]; with add: + addb at the destination's index (addb may be y).
+//
+// The GPU runs a fixed number of threadgroups at once (4 per core), and a tile takes about as
+// long alone as beside others: tiles that would leave a last, partial wave (a 3x3 convolution
+// over 8712 rows in 345 tiles: 2.16 waves) cost a whole one. So the tiles past the last full
+// wave (from `full` on, nrem of them) are split along their products into `rs` parts of `kper`
+// inputs (of the taps x cin), threadgroups full + j rs + z, which store f32 blocks of TMR x 64
+// to `part`; un_gemm_red sums them and stores the outputs.
 struct UG { uint n_out; uint ldw; uint cin; uint taps; int off[9]; uint a_rows; uint r0; uint r_end; uint omode; uint ldy;
-            uint has_bias; uint bstride; uint add; uint nimg; uint dh; uint dhp; UGEO g; uint scaled; uint _p0; uint _p1; uint _p2; };
+            uint has_bias; uint bstride; uint add; uint nimg; uint dh; uint dhp; UGEO g; uint scaled;
+            uint full; uint rs; uint kper; uint nct; uint tm; uint nrem; uint _p; };
+// Output o of row r (v: the products) as omode says, with its bias and residual.
+inline void un_store(constant UG& p, uint o, uint r, float v, device float* y, device const float* bias, device const float* addb) {
+    uint b, dst = r;
+    if (p.omode == 2) {
+        b = min((max(r, p.g.G) - p.g.G) / p.g.P, p.nimg - 1);
+    } else {
+        b = r / p.nimg;
+        if (p.omode == 1) { uint q = r - b * p.nimg; dst = un_prow(p.g, b, q / p.g.w, q % p.g.w); }
+    }
+    if (p.omode == 3) {
+        if (p.has_bias != 0) v += bias[o];
+        device half* hr = (device half*)y + (ulong)dst * p.ldy + (o / p.dh) * p.dhp;
+        uint d = o % p.dh;
+        hr[d] = half(v);
+        if (d < p.dhp - p.dh) hr[p.dh + d] = 0.h;   // the head's padding: zeros
+        return;
+    }
+    if (p.has_bias != 0) v += bias[b * p.bstride + o];
+    if (p.add != 0) v += addb[(ulong)dst * p.ldy + o];
+    y[(ulong)dst * p.ldy + o] = v;
+}
 template <int TMR, int TN = 64>
 inline void un_gemm_body(device const bfloat* w, device const half* xh, device float* y, device const float* bias, device const float* addb,
-                         device const uint* amax, constant UG& p, uint2 tg) {
+                         device const uint* amax, device float* part, constant UG& p, uint g) {
     float inv = p.scaled != 0 ? 1.0f / un_scale(amax[0]) : 1.0f;
-    uint o0 = tg.x * TN, t0 = p.r0 + tg.y * TMR;
+    uint tile = g, z = 0;
+    bool split = g >= p.full;
+    if (split) {
+        uint j = g - p.full;
+        tile = p.full + j / p.rs;
+        z = j % p.rs;
+    }
+    uint o0 = (tile % p.nct) * TN, t0 = p.r0 + (tile / p.nct) * TMR;
     int nop = int(p.n_out + TN - 1) / TN * TN;
     XT X((device half*)xh, dextents<int32_t, 2>(p.cin, p.a_rows));
     constexpr auto desc = matmul2d_descriptor(TMR, TN, static_cast<int>(dynamic_extent), false, true, false,
@@ -180,6 +216,23 @@ inline void un_gemm_body(device const bfloat* w, device const half* xh, device f
     auto b0 = W0.slice(0, o0);
     auto c = op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
     zero(c);
+    if (split) {
+        // Part z: inputs k_lo .. k_hi of the taps x cin, the products as a block of `part`.
+        uint k_lo = z * p.kper, k_hi = min(p.taps * p.cin, k_lo + p.kper);
+        array<int32_t, 2> xs = { 1, int32_t(p.cin) };
+        for (uint t = k_lo / p.cin; t < p.taps && t * p.cin < k_hi; t++) {
+            uint a = max(k_lo, t * p.cin) - t * p.cin, e = min(k_hi, (t + 1) * p.cin) - t * p.cin;
+            tensor<device half, dextents<int32_t, 2>, tensor_inline> Xs((device half*)xh + a, dextents<int32_t, 2>(int(e - a), p.a_rows), xs);
+            tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Ws((device bfloat*)w + t * p.cin + a, dextents<int32_t, 2>(int(e - a), nop), ws);
+            auto as = Xs.slice(0, int(t0) + p.off[t]);
+            auto bs = Ws.slice(0, o0);
+            op.run(as, bs, c);
+        }
+        tensor<device float, dextents<int32_t, 2>, tensor_inline> P(part + ((ulong)(tile - p.full) * p.rs + z) * (TMR * TN),
+                                                                   dextents<int32_t, 2>(TN, TMR));
+        c.store(P);
+        return;
+    }
     op.run(a0, b0, c);
     for (uint t = 1; t < p.taps; t++) {
         tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Wt((device bfloat*)w + t * p.cin, dextents<int32_t, 2>(p.cin, nop), ws);
@@ -187,43 +240,64 @@ inline void un_gemm_body(device const bfloat* w, device const half* xh, device f
         auto bt = Wt.slice(0, o0);
         op.run(a, bt, c);
     }
+    if (p.omode == 0 || p.omode == 2) {
+        // Row-major f32 destinations: the tile's biases and residuals in its registers, then one
+        // cooperative store (per-element stores ran at half the speed of the products on the
+        // 1x1 shapes).
+        array<int32_t, 2> ys = { 1, int32_t(p.ldy) };
+        tensor<device float, dextents<int32_t, 2>, tensor_inline> Y(y, dextents<int32_t, 2>(int(p.n_out), int(p.r_end)), ys);
+        auto ca = op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
+        if (p.add != 0) {
+            tensor<device float, dextents<int32_t, 2>, tensor_inline> A((device float*)addb, dextents<int32_t, 2>(int(p.n_out), int(p.r_end)), ys);
+            ca.load(A.slice(o0, t0));
+        }
+#pragma unroll
+        for (uint16_t i = 0; i < c.get_capacity(); ++i) {
+            if (!c.is_valid_element(i)) continue;
+            float v = c[i] * inv;
+            if (p.has_bias != 0) {
+                auto idx = c.get_multidimensional_index(i);
+                uint o = o0 + idx[0], b = 0;
+                if (p.bstride != 0) {
+                    uint r = t0 + idx[1];
+                    b = p.omode == 0 ? r / p.nimg : min((max(r, p.g.G) - p.g.G) / p.g.P, p.nimg - 1);
+                }
+                v += bias[b * p.bstride + o];
+            }
+            if (p.add != 0) v += ca[i];
+            c[i] = v;
+        }
+        c.store(Y.slice(o0, t0));
+        return;
+    }
 #pragma unroll
     for (uint16_t i = 0; i < c.get_capacity(); ++i) {
         if (!c.is_valid_element(i)) continue;
         auto idx = c.get_multidimensional_index(i);
         uint o = o0 + idx[0], r = t0 + idx[1];
-        if (o >= p.n_out || r >= p.r_end) continue;
-        float v = c[i] * inv;
-        uint b = 0, dst = r;
-        bool border = false;
-        if (p.omode == 2) {
-            uint yy, xx;
-            border = !un_interior(p.g, p.nimg, r, b, yy, xx);
-        } else {
-            b = r / p.nimg;
-            if (p.omode == 1) { uint q = r - b * p.nimg; dst = un_prow(p.g, b, q / p.g.w, q % p.g.w); }
-        }
-        if (p.omode == 3) {
-            if (p.has_bias != 0) v += bias[o];
-            device half* hr = (device half*)y + (ulong)dst * p.ldy + (o / p.dh) * p.dhp;
-            uint d = o % p.dh;
-            hr[d] = half(v);
-            if (d < p.dhp - p.dh) hr[p.dh + d] = 0.h;   // the head's padding: zeros
-            continue;
-        }
-        device float* d = y + (ulong)dst * p.ldy + o;
-        if (border) { *d = 0.f; continue; }
-        if (p.has_bias != 0) v += bias[b * p.bstride + o];
-        if (p.add != 0) v += addb[(ulong)dst * p.ldy + o];
-        *d = v;
+        if (o < p.n_out && r < p.r_end) un_store(p, o, r, c[i] * inv, y, bias, addb);
     }
 }
 #define UN_GEMM(NAME, TMR) \
 kernel void NAME(device const bfloat* w [[buffer(0)]], device const half* xh [[buffer(1)]], device float* y [[buffer(2)]], \
                  device const float* bias [[buffer(3)]], constant UG& p [[buffer(4)]], device const float* addb [[buffer(5)]], \
-                 device const uint* amax [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]]) { \
-    un_gemm_body<TMR>(w, xh, y, bias, addb, amax, p, tg); }
+                 device const uint* amax [[buffer(6)]], device float* part [[buffer(7)]], uint tg [[threadgroup_position_in_grid]]) { \
+    un_gemm_body<TMR>(w, xh, y, bias, addb, amax, part, p, tg); }
 UN_GEMM(un_gemm, 128) UN_GEMM(un_gemm_m64, 64)
+// The split tiles' parts (un_gemm_body) summed and stored. One thread per output of those tiles.
+kernel void un_gemm_red(device float* y [[buffer(2)]], device const float* bias [[buffer(3)]], constant UG& p [[buffer(4)]],
+                        device const float* addb [[buffer(5)]], device const uint* amax [[buffer(6)]], device const float* part [[buffer(7)]],
+                        uint i [[thread_position_in_grid]]) {
+    uint per = p.tm * 64, j = i / per, e = i - j * per;
+    if (j >= p.nrem) return;
+    uint tile = p.full + j, o = (tile % p.nct) * 64 + e % 64, r = p.r0 + (tile / p.nct) * p.tm + e / 64;
+    if (o >= p.n_out || r >= p.r_end) return;
+    device const float* q = part + (ulong)j * p.rs * per + e;
+    float v = 0.f;
+    for (uint z = 0; z < p.rs; z++) v += q[(ulong)z * per];
+    float inv = p.scaled != 0 ? 1.0f / un_scale(amax[0]) : 1.0f;
+    un_store(p, o, r, v * inv, y, bias, addb);
+}
 
 // Layer norm of f32 rows of c (c % 4 == 0, c <= 2048) into half rows. One SIMD-group per row.
 struct ULN { uint c; uint rows; float eps; uint _p; };

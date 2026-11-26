@@ -213,6 +213,43 @@ TFLOP/s on the shapes above 8x8, 29 TFLOP/s at 8x8, where 1280-channel 3x3 convo
 padded rows give 80 threadgroups), the projections and feed-forward 9 ms, attention 7.6 ms, the
 q / k / v projections 3.5 ms, group norms 1.3 ms.
 
+A fifth round, on the convolutions (November 2026, same measure): **47.7 -> 43.1 ms** per guided
+SD 1.5 512x512 step (min 42.9), SDXL at 1024x1024 286-288 -> 276-281 ms, the SD 1.5 VAE decoder
+62.0 -> 60.0 ms.
+
+- **Tiles by waves** (`plan` in `src/metal_unet.rs`): the M5 Max GPU runs 160 GEMM threadgroups
+  at once (4 per core, either tile size), and a tile takes about as long alone as beside others
+  (1280 outputs over 11520 inputs: 20-160 threadgroups of 64 rows all take 0.19-0.25 ms, 180 take
+  0.32, 200 take 0.41). A convolution over padded rows leaves a last, partial wave that costs a
+  whole one: 8712 rows x 320 outputs at the 64x64 level are 345 tiles of 128 rows (2.16 waves run
+  as 3), 2312 x 640 at 32x32 are 190 (1.19 as 2), and the 8x8 level's 80 tiles filled half a
+  wave. Now the tiles past the last full wave are split along their inputs (taps x channels) into
+  parts that fill it (6 parts of 512 inputs for the 25 left at 64x64), each part stores an f32
+  block, and `un_gemm_red` sums them and applies the store (bias, residual, layout); the choice
+  between 128-row and 64-row tiles and the split come from a wave count estimate (the GPU's core
+  count from IOKit's `gpu-core-count`; `OXINFER_GPU_CORES` overrides it, `OXINFER_UNET_SPLIT=0`
+  turns splitting off). Measured (`un_gemm_bench`, kernel `plan`): 8712 x 320 x 9 -> 320 0.307 ->
+  0.289 ms, 2312 x 640 x 9 -> 640 0.330 -> 0.312 ms, 200 x 1280 x 9 -> 1280 0.193 -> 0.142 ms.
+- **Small levels unfolded:** 3x3 convolutions over inputs whose borders would be more than a fifth
+  of the padded rows (16x16 and 8x8 in SD 1.5: 648 rows for 512 pixels, 200 for 128) run on
+  unfolded rows instead (`un_im2col`, now 4 halves a thread), so no products are spent on
+  borders and the split tiles fill the waves: 128 x 11520 -> 1280 in 0.088 ms (0.19 ms on the
+  padded rows), 512 x 11520 -> 1280 in 0.25 ms (160 tiles of 64 rows, one wave; 0.37-0.41 ms on
+  the 648 padded rows). `OXINFER_UNET_UNFOLD=N` unfolds the 3x3 convolutions of at most N pixels
+  instead (unfolding 32x32 too gave nothing measurable on SDXL).
+- **Cooperative stores** for f32 row destinations (projections, residual adds, the padded rows of
+  convolutions): the tile's bias and residual (loaded as a cooperative tensor) are added in its
+  registers and the tile stored with one `store` instead of element by element. 8192 x 320 ->
+  2560 ran at 29 TFLOP/s with the per-element stores, 58 with the cooperative one; in the pass
+  47.7 -> 47.2 ms. The padded outputs' border rows now hold the products of zero rows instead of
+  zeros: every reader of a padded tensor (the half prep, the norms' statistics, the unfold, the
+  output copy) takes only its interior.
+
+The SD 1.5 image against diffusers in float32 (`tools/ref_sd.py`, same noise, 20 Euler steps at
+guidance 7.5): 36.8 dB (36.7 before); SDXL base 45.2 dB (44.8). Left per SD 1.5 step: 3x3
+convolutions over padded rows 10.5 ms, unfolded ones 6.9 ms (plus their copies), 1x1 convolutions
+1.3 ms, the projections and feed-forward 9.1 ms, attention 7.6 ms, q / k / v 3.5 ms.
+
 Op by op (other GPUs, or `gpu_pass=0`), convolutions, attention and the group and layer norms run on the GPU: each norm is fused
 into the convolution or projection that consumes it (a statistics kernel, then normalization and
 SiLU applied while the input is loaded), and attention runs its two products as GPU matmuls with a
