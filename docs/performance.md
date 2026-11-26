@@ -164,38 +164,62 @@ N streaming chat requests at once, greedy, 256 tokens each (`tools`-less harness
 `/v1/chat/completions`, aggregate = all generated tokens / wall time; TTFT from the request to
 its first token; per-stream decode from the first token to the last).
 
+**Current tables** (master 2739799, 2026-11-27: the batched dense, Gated DeltaNet, Inkling-2 and
+expert steps, the session choice and the short prompt chunks below, every row exact; llama-server
+in the same window, one server at a time under the bench lock). "One at a time" is the server
+before concurrent requests (05a89fe's parent), from the first measurements.
+
 **Mixed prompts** (497, 3647, 947, 7247, 1847, 5447, 1398, 2747 tokens, one each; aggregate tok/s,
 TTFT p50 / p95 in seconds):
 
-| model | N | before | `parallel` (exact) | llama-server |
+| model | N | one at a time | `parallel=8` (exact) | llama-server |
 |---|---|---|---|---|
-| Qwen3-8B Q8_0 | 1 | 82.5, 0.23 | 79.1, 0.23 | 60.8, 0.18 |
-| | 2 | 72.6, 0.06 / 4.18 | 84.5, 0.07 / 1.49 | 78.9, 0.02 / 1.55 |
-| | 4 | 59.3, 10.8 / 14.6 | 84.2, 2.01 / 5.21 | 104.4, 0.89 / 4.09 |
-| | 8 | 56.3, 19.8 / 33.6 | 82.7, 2.90 / 10.3 (`batch_fast=1`: 115.8, 2.32 / 8.63) | 167.5, 2.94 / 5.21 |
-| Qwen3-8B Q4_K_M | 1 | 74.9, 0.23 | 88.5, 0.22 | 81.2, 0.22 |
-| | 4 | 47.7, 9.88 / 17.3 | 85.4, 0.55 / 4.22 | 88.2, 1.21 / 5.38 |
-| | 8 | 50.1, 17.8 / 37.1 | 83.3, 2.17 / 8.03 | 141.6, 3.74 / 6.69 |
-| Gemma 4 26B-A4B Q4_0 | 1 | 133.9, 0.15 | 133.7, 0.14 | 117.2, 0.18 |
-| | 4 | 85.9, 5.41 / 9.75 | 85.1, 1.41 / 3.81 | 135.8, 2.41 / 3.30 |
-| | 8 | 88.5, 13.9 / 21.1 | 86.3, 2.06 / 7.36 (`batch_fast=1`: 183.0, 0.72 / 3.80) | 183.3, 3.49 / 4.60 |
-| Inkling-2-Mini UD-IQ3_XXS | 1 | 84.9, 0.34 | 98.1, 0.29 | 40.4, 0.79 |
-| | 8 | 57.4, 18.6 / 33.1 | 58.0, 4.13 / 13.4 | 56.9, 19.2 / 19.4 |
+| Qwen3-8B Q8_0 | 1 | 82.5, 0.23 | 72.0, 0.22 | 60.9, 0.18 |
+| | 2 | 72.6, 0.06 / 4.18 | 82.0, 0.06 / 1.67 | 70.2, 0.02 / 1.92 |
+| | 4 | 59.3, 10.8 / 14.6 | 92.2, 0.53 / 4.19 | 90.5, 1.19 / 4.94 |
+| | 8 | 56.3, 19.8 / 33.6 | 111.1, 0.79 / 5.73 | 142.5, 3.52 / 6.20 |
+| Qwen3-8B Q4_K_M | 1 | 74.9, 0.23 | 80.9, 0.22 | 85.7, 0.21 |
+| | 2 | | 77.4, 0.04 / 1.99 | 76.5, 0.02 / 2.21 |
+| | 4 | 47.7, 9.88 / 17.3 | 81.9, 0.56 / 4.42 | 92.7, 1.15 / 5.13 |
+| | 8 | 50.1, 17.8 / 37.1 | 98.6, 0.83 / 5.97 | 148.4, 3.61 / 6.41 |
+| Gemma 4 26B-A4B Q4_0 | 1 | 133.9, 0.15 | 138.6, 0.16 | 117.6, 0.18 |
+| | 2 | | 136.5, 0.02 / 0.82 | 126.7, 0.06 / 1.18 |
+| | 4 | 85.9, 5.41 / 9.75 | 135.2, 0.31 / 2.62 | 139.6, 2.34 / 3.22 |
+| | 8 | 88.5, 13.9 / 21.1 | 162.6, 0.46 / 3.45 | 191.9, 3.36 / 4.35 |
+| Inkling-2-Mini UD-IQ3_XXS | 1 | 84.9, 0.34 | 115.1, 0.41 | 40.2, 0.80 |
+| | 2 | | 75.5, 1.39 / 2.59 | 37.4, 3.10 / 6.16 |
+| | 4 | | 76.6, 2.39 / 6.07 | 40.2, 14.5 / 14.7 |
+| | 8 | 57.4, 18.6 / 33.1 | 93.0, 2.76 / 8.73 | 56.6, 19.8 / 20.1 |
 
 **Decode-bound** (8 equal 137-token prompts, 256 tokens each): aggregate tok/s (per stream):
 
-| model | N | `parallel` (exact) | `batch_fast=1` | llama-server |
-|---|---|---|---|---|
-| Qwen3-8B Q8_0 | 1 | 101.7 | 101.5 | 60.0 |
-| | 2 | 106.3 (54.8) | 111.4 (57.1) | 100.6 (51.5) |
-| | 4 | 147.4 (38.2) | 147.8 (38.3) | 185.5 (47.8) |
-| | 8 | 145.2 (18.9) | 295.5 (39.4) | 328.6 (43.7) |
-| Qwen3-8B Q4_K_M | 1 | 88.4 | 85.2 | 93.2 |
-| | 4 | 144.2 (37.0) | 140.7 (36.3) | 223.4 (59.5) |
-| | 8 | 128.3 (16.6) | 269.5 (35.7) | 380.0 (50.8) |
-| Gemma 4 26B-A4B Q4_0 | 1 | 149.6 | 147.2 | 124.3 |
-| | 4 | 126.3 (32.2) | 212.5 (55.1) | 254.6 (67.1) |
-| | 8 | 127.5 (16.3) | 316.1 (41.5) | 357.8 (47.1) |
+| model | N | `parallel=8` (exact) | llama-server |
+|---|---|---|---|
+| Qwen3-8B Q8_0 | 1 | 89.7 | 61.4 |
+| | 2 | 120.0 (62.4) | 104.6 (53.5) |
+| | 4 | 174.6 (44.8) | 195.3 (50.4) |
+| | 8 | 187.3 (24.2) | 351.8 (46.9) |
+| Qwen3-8B Q4_K_M | 1 | 85.5 | 88.8 |
+| | 2 | 107.9 (56.1) | 110.3 (57.3) |
+| | 4 | 137.4 (35.5) | 193.6 (50.6) |
+| | 8 | 151.9 (19.5) | 351.1 (47.2) |
+| Gemma 4 26B-A4B Q4_0 | 1 | 151.1 | 123.2 |
+| | 2 | 179.9 (92.3) | 191.9 (100.3) |
+| | 4 | 225.1 (57.9) | 261.5 (69.2) |
+| | 8 | 245.0 (31.6) | 369.3 (49.2) |
+| Inkling-2-Mini UD-IQ3_XXS | 1 | 91.9 | 43.1 |
+| | 2 | 116.5 (63.6) | 67.7 (36.5) |
+| | 4 | 142.1 (38.3) | 99.7 (27.0) |
+| | 8 | 157.6 (20.8) | 131.4 (18.1) |
+
+At one request the speculative decoding a request alone keeps (DSpark, prompt lookup, chained
+passes) sets the rate; from 4 rows on the exact batched step does (Qwen3-8B Q8_0 at 8 rows 34 ms,
+Q4_K_M 39; see below): llama-server's batched kernels scale further, its rows not being their
+one-token steps. Gemma 4 26B-A4B decode-bound at 8 rows here is below the 294.8 measured when its
+experts' batching landed (the same build family, another window: the machine is shared). The
+`batch_fast=1` columns of the first measurements (fast-verification kernels from 5 rows, not
+exact): Qwen3-8B Q8_0 decode-bound 8 rows 295.5, Q4_K_M 269.5, Gemma 4 316.1; mixed 8 Qwen3-8B
+Q8_0 115.8, Gemma 4 183.0.
 
 **Gated DeltaNet models** (Qwen3.5 / 3.6 / 3.8): batched like the dense models, each row's conv
 and delta rule run by the one-token kernels on its session's own recurrent states (before, their
