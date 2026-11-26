@@ -894,6 +894,13 @@ impl Dit {
         add_gated(x, &o, h, s, &mods, 6 * h, 5 * h, 0);
     }
 
+    /// The block stack over the tokens `x` (`[n, hidden]`) on the CPU.
+    pub(crate) fn blocks_cpu(&self, x: &mut [f32], ctx: &Ctx) {
+        for i in 0..self.blocks.len() {
+            self.block(i, x, ctx);
+        }
+    }
+
     /// The velocity for latents `x` (`[C, n_t, h, w]`) at `timesteps` (one per latent frame, 0
     /// to 1000): `[C, n_t, h, w]`.
     pub fn forward(&self, x: &[f32], shape: (usize, usize, usize), timesteps: &[f32], c: &Cond) -> Result<Vec<f32>> {
@@ -925,9 +932,7 @@ impl Dit {
         let mut tok = self.x_embed.forward(&patches, n);
         drop(patches);
         if !self.device.run(self, &mut tok, &ctx) {
-            for i in 0..self.blocks.len() {
-                self.block(i, &mut tok, &ctx);
-            }
+            self.blocks_cpu(&mut tok, &ctx);
         }
         // Final layer.
         let st: Vec<f32> = ctx.temb.iter().map(|&v| silu(v)).collect();

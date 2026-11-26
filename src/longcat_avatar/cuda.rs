@@ -1252,3 +1252,82 @@ impl Engine {
         st.arena = Arena::default();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::dit::Cond;
+    use super::super::lora::Active;
+    use super::*;
+
+    fn backend() -> Option<&'static CudaBackend> {
+        static B: std::sync::OnceLock<Option<CudaBackend>> = std::sync::OnceLock::new();
+        B.get_or_init(|| CudaBackend::new(0).ok()).as_ref()
+    }
+
+    /// The device's block stack against the CPU's on the tiny release (skipped without an NVIDIA
+    /// GPU): text only, a reference image, a continuation with a masked reference; float and
+    /// int8 weights; without LoRAs and with a mix of the two.
+    #[test]
+    fn stack_matches_cpu() {
+        let Some(be) = backend() else { return };
+        let dir = std::env::temp_dir().join(format!("oxinfer-longcat-avatar-cuda-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (avatar, _) = super::super::tiny::write_tiny_release(&dir).unwrap();
+        let nets = [
+            LoraNet::load(&avatar.join("loraA/lora.safetensors")).unwrap(),
+            LoraNet::load(&avatar.join("loraB/lora.safetensors")).unwrap(),
+        ];
+        let mut seed = 7u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        };
+        for sub in ["base_model", "base_model_int8"] {
+            let dit = Dit::load(&avatar.join(sub)).unwrap();
+            let e = Engine::build(be, &dit).unwrap();
+            let c = &dit.cfg;
+            let (lh, lw) = (8, 12);
+            for (n_t, num_cond, num_ref, mask) in [(4usize, 0usize, 0usize, 0usize), (4, 1, 0, 0), (6, 3, 1, 1)] {
+                for mix in [None, Some((0.3f32, 0.7f32))] {
+                    let frames = 1 + c.vae_scale * (n_t - num_ref - 1);
+                    let audio: Vec<f32> = (0..frames * c.audio_window * c.audio_block * c.audio_channel)
+                        .map(|_| rnd())
+                        .collect();
+                    let text: Vec<f32> = (0..5 * c.caption_channels).map(|_| rnd()).collect();
+                    let ts: Vec<f32> = (0..n_t).map(|f| if f < num_cond { 0.0 } else { 640.0 }).collect();
+                    let active: Vec<(&LoraNet, f32)> = match mix {
+                        Some((a, b)) => vec![(&nets[0], a), (&nets[1], b)],
+                        None => Vec::new(),
+                    };
+                    let cond = Cond {
+                        text: &text,
+                        text_len: 16,
+                        audio: &audio,
+                        humans: 1,
+                        num_cond,
+                        num_ref,
+                        ref_img_index: 2,
+                        mask_frame_range: mask,
+                        ref_masks: None,
+                        lora: Active { nets: &active },
+                    };
+                    let ctx = dit.context((n_t, lh, lw), &ts, &cond).unwrap();
+                    let n = n_t * ctx.s;
+                    let x: Vec<f32> = (0..n * c.hidden_size).map(|_| rnd()).collect();
+                    let (mut dev, mut cpu) = (x.clone(), x);
+                    assert!(e.run(&dit, &mut dev, &ctx), "{sub}: the engine declined");
+                    dit.blocks_cpu(&mut cpu, &ctx);
+                    let scale = cpu.iter().map(|v| v.abs()).sum::<f32>() / cpu.len() as f32;
+                    let max = dev.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                    // The side paths' factors are float16 on the device.
+                    let tol = if mix.is_some() { 2e-3 } else { 2e-5 };
+                    assert!(
+                        max < tol * scale.max(1.0),
+                        "{sub} cond {num_cond} ref {num_ref} mix {mix:?}: {max:.3e} (mean |v| {scale:.3e})"
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

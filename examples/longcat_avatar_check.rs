@@ -172,6 +172,9 @@ fn check_dit(dir: &Path, case: &Value, avatar: &Path) -> Result<()> {
             )?;
             let secs = t0.elapsed().as_secs_f64();
             cmp(&name, &y, &read(&dir.join(format!("{name}_out.bin")))?);
+            if let Ok(r) = read(&dir.join(format!("{name}_out_f32.bin"))) {
+                cmp(&format!("{name} (float32 reference)"), &y, &r);
+            }
             if secs > 1.0 {
                 println!("  ({secs:.1} s)");
             }

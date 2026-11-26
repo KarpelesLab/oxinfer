@@ -143,6 +143,11 @@ pub fn run(args: &Args) -> Result<()> {
         Some(p) if !args.model.is_dir() => p.base.to_string(),
         _ => args.model.to_string_lossy().to_string(),
     };
+    if args.download_only {
+        let src = oxinfer::longcat_avatar::resolve(&spec, a.base.as_deref(), int8, args.quant, args.cache_dir.as_deref())?;
+        println!("{}\n{}", src.avatar.display(), src.base.display());
+        return Ok(());
+    }
     if args.audios.is_empty() || args.audios.len() > 2 {
         bail!("--audio FILE is required: the speech that drives the character (twice for two speakers)");
     }

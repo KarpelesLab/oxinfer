@@ -5,7 +5,7 @@
 //!
 //! [`write_tiny_release`] writes, under one folder:
 //!
-//! - `LongCat-Video-Avatar-1.6/`: `base_model/` (the transformer in float32: 2 blocks of 64
+//! - `LongCat-Video-Avatar-1.6/`: `base_model/` (the transformer in bfloat16: 2 blocks of 64
 //!   wide, one head of 64, 4 latent channels, text width 16, audio width 16), `base_model_int8/`
 //!   (the same weights as the release's quantizer writes them: int8 rows with a scale each,
 //!   `final_layer.linear` and the patch embedding left in float), `loraA/` and `loraB/` (rank 4
@@ -176,6 +176,15 @@ fn transformer(dir: &Path, seed: u64) -> Result<()> {
     }
     t.lin("final_layer.adaLN_modulation.1", 2 * HIDDEN, T_EMBED, 0.3, true);
     t.lin("final_layer.linear", 4 * LATENT, HIDDEN, 1.0, true);
+    // The release is bfloat16: the values rounded to it (the int8 copy is made from them).
+    for e in t.list.iter_mut() {
+        e.3 =
+            e.3.as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|c| half::bf16::from_f32(f32::from_le_bytes(*c)).to_f32().to_le_bytes())
+                .collect();
+    }
 
     // The int8 copy: every matrix but the patch embedding and `final_layer.linear`, as
     // `QuantizedLinear.from_linear` (scale = max |row| / 127, round, clamp).
@@ -198,6 +207,15 @@ fn transformer(dir: &Path, seed: u64) -> Result<()> {
         let base = name.strip_suffix(".weight").unwrap();
         q.list.push((format!("{base}.weight_int8"), "I8", shape.clone(), ints));
         q.put(&format!("{base}.weight_scale"), &[o], &scales);
+    }
+    for e in t.list.iter_mut() {
+        e.1 = "BF16";
+        e.3 =
+            e.3.as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|c| half::bf16::from_f32(f32::from_le_bytes(*c)).to_bits().to_le_bytes())
+                .collect();
     }
     write_json(&dir.join("base_model/config.json"), &cfg)?;
     t.write(&dir.join("base_model/diffusion_pytorch_model.safetensors"))?;

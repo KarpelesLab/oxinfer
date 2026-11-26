@@ -1551,6 +1551,10 @@ fn main() -> Result<()> {
         l.path = oxinfer::lora::resolve(&l.path.to_string_lossy(), args.cache_dir.as_deref())?;
     }
     if args.download_only {
+        // (LongCat-Video-Avatar fetches its parts itself: two repositories.)
+        if longcat_avatar_cli::wants(&args) {
+            return longcat_avatar_cli::run(&args);
+        }
         eprintln!("[model at {}]", args.model.display());
         return Ok(());
     }

@@ -248,30 +248,67 @@ if "dit" in stages:
     x[:, :, :1] = cond
     audio = clip_audio(0, DF)
 
-    def one(name, sigma):
-        ts = torch.full((1, tl), sigma * 1000.0, device=dev, dtype=bf16)
+    def one(name, sigma, dt=bf16):
+        ts = torch.full((1, tl), sigma * 1000.0, device=dev, dtype=dt)
         ts[:, :1] = 0
         t0 = time.time()
         with torch.no_grad():
-            y = dit(hidden_states=x.to(bf16), timestep=ts, encoder_hidden_states=te.to(dev, bf16), encoder_attention_mask=tm.to(dev), num_cond_latents=1, audio_embs=audio)
+            y = dit(hidden_states=x.to(dt), timestep=ts, encoder_hidden_states=te.to(dev, dt), encoder_attention_mask=tm.to(dev), num_cond_latents=1, audio_embs=audio)
         torch.cuda.synchronize()
-        print(f"{name}: forward of {tl} latent frames in {time.time() - t0:.1f}s")
-        case[name] = {
-            "x": save(name + "_x.bin", x), "text": save(name + "_text.bin", te), "mask": [int(v) for v in tm[0]],
-            "audio": save(name + "_audio.bin", audio), "t": [float(v) for v in ts[0].float()], "out": save(name + "_out.bin", y),
-            "kw": {"num_cond_latents": 1},
-        }
+        print(f"{name} ({dt}): forward of {tl} latent frames in {time.time() - t0:.1f}s")
+        if dt != bf16:
+            # Same inputs as the bfloat16 case: only another output.
+            case[name]["out_f32"] = save(name + "_out_f32.bin", y)
+        else:
+            case[name] = {
+                "x": save(name + "_x.bin", x), "text": save(name + "_text.bin", te), "mask": [int(v) for v in tm[0]],
+                "audio": save(name + "_audio.bin", audio), "t": [float(v) for v in ts[0].float()], "out": save(name + "_out.bin", y),
+                "kw": {"num_cond_latents": 1},
+            }
         flush()
 
-    one("dit_i2v" + tag, 0.9)
-    dit.load_lora(os.path.join(args.avatar, "loraA", "lora.safetensors"), "dmd", multiplier=1.0, lora_network_dim=128, lora_network_alpha=64)
-    dit.load_lora(os.path.join(args.avatar, "loraB", "lora.safetensors"), "opsd", multiplier=1.0, lora_network_dim=128, lora_network_alpha=64)
-    dit.enable_lora_mix("dmd", "opsd", 1.0, 4)
-    dit.set_lora_mix_step(0)
-    one("dit_lora_a" + tag, 0.9)
-    dit.set_lora_mix_step(4)
-    one("dit_lora_b" + tag, 0.5)
-    dit.set_lora_mix_step(0)
+    def three(dt):
+        one("dit_i2v" + tag, 0.9, dt)
+        dit.load_lora(os.path.join(args.avatar, "loraA", "lora.safetensors"), "dmd", multiplier=1.0, lora_network_dim=128, lora_network_alpha=64)
+        dit.load_lora(os.path.join(args.avatar, "loraB", "lora.safetensors"), "opsd", multiplier=1.0, lora_network_dim=128, lora_network_alpha=64)
+        dit.enable_lora_mix("dmd", "opsd", 1.0, 4)
+        dit.set_lora_mix_step(0)
+        one("dit_lora_a" + tag, 0.9, dt)
+        dit.set_lora_mix_step(4)
+        one("dit_lora_b" + tag, 0.5, dt)
+        dit.set_lora_mix_step(0)
+
+    three(bf16)
+    if "dit" in f32:
+        # The same three forwards with float32 activations on the weights as stored: the LoRAs read
+        # again (enabling them cast their factors to bfloat16 in place) and the transformer's float
+        # tensors read again from the files (the loaders cast them to bfloat16).
+        from safetensors.torch import load_file  # noqa: E402
+
+        dit.disable_all_loras()
+        dit.lora_dict.clear()
+        dit.lora_mix_config = None
+        dit._lora_mix_active = None
+        dit.float()
+        sub = os.path.join(args.avatar, "base_model_int8" if args.int8 else "base_model")
+        sd = {}
+        for fn in sorted(os.listdir(sub)):
+            if fn.endswith(".safetensors"):
+                sd.update(load_file(os.path.join(sub, fn), device="cpu"))
+        dit.load_state_dict({k: (v.float() if v.is_floating_point() else v) for k, v in sd.items()}, strict=True)
+        del sd
+        three(torch.float32)
+        # Back to what the demo runs for the stages after this one.
+        dit.disable_all_loras()
+        dit.lora_dict.clear()
+        dit.lora_mix_config = None
+        dit._lora_mix_active = None
+        for n_, p_ in dit.named_parameters():
+            if p_.dtype == torch.float32:
+                p_.data = p_.data.to(bf16)
+        for m_ in dit.modules():
+            if m_.__class__.__name__ == "QuantizedLinear" and m_.bias is not None:
+                m_.bias = m_.bias.to(bf16)
 
 if stages & {"e2e", "avc"}:
     if not dit.lora_dict:
