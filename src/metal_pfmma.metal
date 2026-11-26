@@ -6,7 +6,9 @@
 // any length). A threadgroup of NSG SIMD-groups takes Q queries of one
 // head and walks the keys C at a time: S = Q K^T (f32 sums) goes to threadgroup memory for an
 // online softmax (Q / NSG rows per SIMD-group, C / 32 columns per lane), the probabilities come
-// back as half for O += P V, O held in a cooperative tensor. The queries are converted to QT
+// back as half over the first half of their scores' rows (each SIMD-group writes a row's
+// probabilities once it has read its scores) for O += P V, O held in a cooperative tensor; key
+// tiles every query sees whole skip the masks. The queries are converted to QT
 // with the scale (times log2 e) folded in. The running maximum moves lazily, only when a row's
 // grows by more than 8 (2^8 fits half), as llama.cpp's.
 // QT = half: the keys from the half rows. QT = float (`pfmq_*`, for unscaled scores, as Gemma's,
@@ -14,8 +16,8 @@
 // half operands.
 template <int HD, int Q, int C, int NSG, typename QT>
 inline void pfm_body(device const float* q, device const float* kc, device const half* kh, device const half* vh, device float* out,
-                     device const float* gate, constant PFF& a, uint2 tg, ushort sg, ushort lane,
-                     threadgroup QT* sq, threadgroup float* ss, threadgroup half* sp, threadgroup float* sr, threadgroup int* sf) {
+                      device const float* gate, constant PFF& a, uint2 tg, ushort sg, ushort lane,
+                      threadgroup QT* sq, threadgroup float* ss, threadgroup float* sr, threadgroup int* sf) {
     typedef vec<QT, 4> QT4;
     constexpr int NT = NSG * 32;
     constexpr int NQ = Q / NSG;
@@ -33,8 +35,11 @@ inline void pfm_body(device const float* q, device const float* kc, device const
         ((threadgroup QT4*)sq)[i] = QT4(v * sc);
     }
     const uint pfirst = a.start + i0;
-    const uint kend = a.start + min(i0 + Q, a.t);
+    const uint plast = a.start + min(i0 + Q, a.t) - 1;
+    const uint kend = plast + 1;
     const uint kbeg = a.window != 0 && pfirst + 1 > a.window ? pfirst + 1 - a.window : 0;
+    // (Keys before kwin are outside the last query's window.)
+    const uint kwin = a.window != 0 && plast + 1 > a.window ? plast + 1 - a.window : 0;
     float M[NQ], L[NQ];
     uint pi[NQ], lo[NQ];
 #pragma unroll
@@ -46,7 +51,8 @@ inline void pfm_body(device const float* q, device const float* kc, device const
     }
     auto tq = tensor<threadgroup QT, extents<int32_t, HD, Q>, tensor_inline>(sq, extents<int32_t, HD, Q>());
     auto ts = tensor<threadgroup float, extents<int32_t, C, Q>, tensor_inline>(ss, extents<int32_t, C, Q>());
-    auto tp = tensor<threadgroup half, extents<int32_t, C, Q>, tensor_inline>(sp, extents<int32_t, C, Q>());
+    threadgroup half* sp = (threadgroup half*)ss;
+    auto tp = tensor<threadgroup half, extents<int32_t, C, Q>, tensor_inline>(sp, extents<int32_t, C, Q>(), array<int, 2>({1, 2 * C}));
     matmul2d<matmul2d_descriptor(Q, C, HD, false, true, false, matmul2d_descriptor::mode::multiply), execution_simdgroups<NSG>> mm_qk;
     matmul2d<matmul2d_descriptor(Q, HD, C, false, false, false, matmul2d_descriptor::mode::multiply_accumulate),
              execution_simdgroups<NSG>> mm_pv;
@@ -61,24 +67,31 @@ inline void pfm_body(device const float* q, device const float* kc, device const
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint it = 0;
     for (uint kb = kbeg; kb < kend; kb += C, it++) {
-        // A last partial block: rows past kend are clipped by the tensors' bounds (their scores
-        // masked, their values zeros).
         int nk = min((int)C, (int)(kend - kb));
         auto tk = tensor((device QT*)(kq + (ulong)kb * rs), dextents<int32_t, 2>(HD, nk), array<int, 2>({1, rs}));
         mm_qk.run(tq, tk, ts);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        const bool fast = nk == C && kb + C <= pfirst + 1 && kb >= kwin;
 #pragma unroll
         for (int jj = 0; jj < NQ; jj++) {
             const int j = jj * NSG + sg;
             float s[NC];
-            float m = M[jj];
+            float m = -INFINITY;
+            if (fast) {
 #pragma unroll
-            for (int ii = 0; ii < NC; ii++) {
-                uint c = ii * 32 + lane;
-                uint key = kb + c;
-                float x = ss[j * C + c];
-                s[ii] = (int)c < nk && key <= pi[jj] && key >= lo[jj] ? x : -INFINITY;
-                m = max(m, s[ii]);
+                for (int ii = 0; ii < NC; ii++) {
+                    s[ii] = ss[j * C + ii * 32 + lane];
+                    m = max(m, s[ii]);
+                }
+            } else {
+#pragma unroll
+                for (int ii = 0; ii < NC; ii++) {
+                    uint c = ii * 32 + lane;
+                    uint key = kb + c;
+                    float x = ss[j * C + c];
+                    s[ii] = (int)c < nk && key <= pi[jj] && key >= lo[jj] ? x : -INFINITY;
+                    m = max(m, s[ii]);
+                }
             }
             m = simd_max(m);
             float ms = 1.f;
@@ -91,10 +104,10 @@ inline void pfm_body(device const float* q, device const float* kc, device const
 #pragma unroll
             for (int ii = 0; ii < NC; ii++) {
                 half p = half(exp2(s[ii] - M[jj]));
-                sp[j * C + ii * 32 + lane] = p;
+                sp[j * 2 * C + ii * 32 + lane] = p;
                 sum += float(p);
             }
-            L[jj] = L[jj] * ms + simd_sum(sum);
+            L[jj] = L[jj] * ms + sum;
             if (lane == 0) sr[j] = ms;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -108,8 +121,10 @@ inline void pfm_body(device const float* q, device const float* kc, device const
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 #pragma unroll
-    for (int jj = 0; jj < NQ; jj++)
-        if (lane == 0) sr[jj * NSG + sg] = L[jj] == 0.f ? 0.f : 1.f / L[jj];
+    for (int jj = 0; jj < NQ; jj++) {
+        float l = simd_sum(L[jj]);
+        if (lane == 0) sr[jj * NSG + sg] = l == 0.f ? 0.f : 1.f / l;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
     for (uint16_t i = 0; i < co.get_capacity(); ++i)
@@ -132,12 +147,13 @@ kernel void NAME(device const float* q [[buffer(0)]], device const float* kc [[b
                  ushort lane [[thread_index_in_simdgroup]]) { \
     threadgroup QT sq[Q * HD]; \
     threadgroup float ss[Q * C]; \
-    threadgroup half sp[Q * C]; \
     threadgroup float sr[Q]; \
     threadgroup int sf[1]; \
-    pfm_body<HD, Q, C, NSG, QT>(q, kc, kh, vh, out, gate, a, tg, sg, lane, sq, ss, sp, sr, sf); }
+    pfm_body<HD, Q, C, NSG, QT>(q, kc, kh, vh, out, gate, a, tg, sg, lane, sq, ss, sr, sf); }
 PFM_INST(pfm_64, 64, 32, 64, 4, half)
-PFM_INST(pfm_128, 128, 16, 128, 4, half)
+// (Heads of 128: 32 queries, measured by `pf_attn_bench` at 2048 queries after 30000 positions,
+// 32 x 128 heads on 8: 30.3 -> 22.4 ms; for 256 32 queries need 64-key tiles, slower.)
+PFM_INST(pfm_128, 128, 32, 128, 4, half)
 // Heads of 256 and 512 walk 128 keys at a time (`pf_attn_bench`, 2048 queries after 30000
 // positions: 8 x 256 heads 15.8 -> 13.7 ms, 8 x 512 48.1 -> 30.5 ms; 512 queries from 0: level or
 // faster). 64 keys at a time, 4 or 16 SIMD-groups for 512, 8 for 256, and for heads of 64 16

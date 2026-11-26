@@ -261,16 +261,18 @@ fn gfold_on() -> bool {
     *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_GFOLD").is_ok_and(|v| v == "0"))
 }
 
-/// Whether passes of up to [`MAX_T`] tokens merge a token's key splits in the attention kernel (the
-/// last split to finish) rather than in `ink_attn_merge` (`OXINFER_INKLING_MFOLD=0`).
+/// Whether prefill passes attend with the flash kernels `ink_fa_*` on the matrix units, full and
+/// sliding-window layers alike (`OXINFER_INKLING_FA=0`: `ink_attn`'s splits and the merge).
 fn fa_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_FA").is_ok_and(|v| v == "0"))
 }
 
-/// Queries per threadgroup of `ink_fa_*`.
-const FA_Q: usize = 16;
+/// Queries per threadgroup of `ink_fa_f`, `ink_fa_h` and `ink_fa_q` (128 threads each).
+const FA_Q: [usize; 3] = [16, 32, 16];
 
+/// Whether passes of up to [`MAX_T`] tokens merge a token's key splits in the attention kernel (the
+/// last split to finish) rather than in `ink_attn_merge` (`OXINFER_INKLING_MFOLD=0`).
 fn mfold_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_MFOLD").is_ok_and(|v| v == "0"))
@@ -456,7 +458,12 @@ pub(crate) fn shader_src(mma: bool) -> String {
         }
     }
     if mma {
-        s.push_str(PF_SRC);
+        // (`OXINFER_INKLING_PF_METAL=FILE`: that source in place of metal_inkling_pf.metal, for
+        // kernel experiments, as `OXINFER_INKLING_METAL` for metal_inkling.metal.)
+        match std::env::var_os("OXINFER_INKLING_PF_METAL").and_then(|f| std::fs::read_to_string(f).ok()) {
+            Some(src) => s.push_str(&src),
+            None => s.push_str(PF_SRC),
+        }
     }
     s
 }
@@ -1003,8 +1010,7 @@ struct PfPipes {
     kv_ring: Id,
     situ_half: Id,
     combine: Id,
-    /// `ink_fa_f` / `ink_fa_h` / `ink_fa_q`: prefill attention of the full-attention layers (f32 /
-    /// f16 / q8 caches).
+    /// `ink_fa_f` / `ink_fa_h` / `ink_fa_q`: prefill attention (f32 / f16 / q8 caches).
     fa: [Id; 3],
 }
 
@@ -3434,10 +3440,10 @@ impl InkMetal {
             mcnt: if mfold { b.mcnt as u32 } else { 0 },
             ..ap
         };
-        // Prefill passes over a full-attention cache: flash attention on the matrix units, the
-        // merge, sink and gate in it (`ink_fa_*`).
+        // Prefill passes: flash attention on the matrix units, the merge, sink and gate in it
+        // (`ink_fa_*`; a sliding window's keys from its ring and the pass's rows apart).
         let fa = match &self.pfp {
-            Some(pp) if t > MAX_T && sd.ring == 0 && !tmp && hd == 128 && fa_on() => Some(pp.fa[fi]),
+            Some(pp) if t > MAX_T && (!tmp || pfb.is_some()) && hd == 128 && fa_on() => Some(pp.fa[fi]),
             _ => None,
         };
         if let Some(pipe) = fa {
@@ -3447,8 +3453,22 @@ impl InkMetal {
             e.buf(sd.v.0, 0, 4);
             e.buf(sd.ks.0, 0, 5);
             e.buf(sd.vs.0, 0, 6);
+            match (tmp, pfb) {
+                (true, Some(pb)) => {
+                    e.buf(c.a, pb.kt * 4, 7);
+                    e.buf(c.a, pb.vt * 4, 8);
+                    e.buf(c.a, pb.kts * 4, 9);
+                    e.buf(c.a, pb.vts * 4, 10);
+                }
+                _ => {
+                    e.buf(sd.k.0, 0, 7);
+                    e.buf(sd.v.0, 0, 8);
+                    e.buf(sd.ks.0, 0, 9);
+                    e.buf(sd.vs.0, 0, 10);
+                }
+            }
             if !self.skip(SK_ATTN | SK_ATTK) {
-                e.dispatch((t.div_ceil(FA_Q), nh), 128);
+                e.dispatch((t.div_ceil(FA_Q[fi]), nh), 128);
             }
             self.prefetch(e, ld, PF_O, t);
             e.barrier();
@@ -3508,41 +3528,41 @@ impl InkMetal {
             }
             self.prefetch(e, ld, PF_O, t);
             e.barrier();
-            if let (true, Some(pb), Some(pp)) = (tmp, pfb, &self.pfp) {
-                // The pass's last rows to the window's ring.
-                #[repr(C)]
-                struct P {
-                    rb: u32,
-                    sb: u32,
-                    base: u32,
-                    ntok: u32,
-                    cap: u32,
-                    _p: [u32; 3],
-                }
-                let rb = row_bytes(sd.fmt, kw);
-                let sb = if sd.fmt == KvCache::Q8 { kw / 32 * 4 } else { 0 };
-                e.pipe(pp.kv_ring);
-                e.bytes(
-                    &P {
-                        rb: rb as u32,
-                        sb: sb as u32,
-                        base: pos as u32,
-                        ntok: t as u32,
-                        cap: sd.ring as u32,
-                        _p: [0; 3],
-                    },
-                    0,
-                );
-                e.buf(c.a, pb.kt * 4, 1);
-                e.buf(c.a, pb.vt * 4, 2);
-                e.buf(c.a, pb.kts * 4, 3);
-                e.buf(c.a, pb.vts * 4, 4);
-                e.buf(sd.k.0, 0, 5);
-                e.buf(sd.v.0, 0, 6);
-                e.buf(sd.ks.0, 0, 7);
-                e.buf(sd.vs.0, 0, 8);
-                e.dispatch((rb.max(sb).div_ceil(4).div_ceil(256), t), 256);
+        }
+        if let (true, Some(pb), Some(pp)) = (tmp, pfb, &self.pfp) {
+            // The pass's last rows to the window's ring.
+            #[repr(C)]
+            struct P {
+                rb: u32,
+                sb: u32,
+                base: u32,
+                ntok: u32,
+                cap: u32,
+                _p: [u32; 3],
             }
+            let rb = row_bytes(sd.fmt, kw);
+            let sb = if sd.fmt == KvCache::Q8 { kw / 32 * 4 } else { 0 };
+            e.pipe(pp.kv_ring);
+            e.bytes(
+                &P {
+                    rb: rb as u32,
+                    sb: sb as u32,
+                    base: pos as u32,
+                    ntok: t as u32,
+                    cap: sd.ring as u32,
+                    _p: [0; 3],
+                },
+                0,
+            );
+            e.buf(c.a, pb.kt * 4, 1);
+            e.buf(c.a, pb.vt * 4, 2);
+            e.buf(c.a, pb.kts * 4, 3);
+            e.buf(c.a, pb.vts * 4, 4);
+            e.buf(sd.k.0, 0, 5);
+            e.buf(sd.v.0, 0, 6);
+            e.buf(sd.ks.0, 0, 7);
+            e.buf(sd.vs.0, 0, 8);
+            e.dispatch((rb.max(sb).div_ceil(4).div_ceil(256), t), 256);
         }
         let mp = MergeP {
             nh: nh as u32,
@@ -5012,9 +5032,10 @@ mod fa_tests {
         (*s >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
     }
 
-    /// The prefill passes' flash attention of the full-attention layers (`ink_fa_*`, on the matrix
-    /// units) against `ink_attn`'s splits and `ink_attn_merge` on the same caches (f32 and f16
-    /// rows; relative bias, sink and gate; passes from position 0 and after 1800 positions).
+    /// The prefill passes' flash attention (`ink_fa_*`, on the matrix units) against `ink_attn`'s
+    /// splits and `ink_attn_merge` on the same caches (f32, f16 and q8 rows; relative bias, sink
+    /// and gate): full attention over rows by position from position 0, after 1800 and 4097
+    /// positions, and a sliding window of 1024 over a ring of 1088 rows with the pass's rows apart.
     #[test]
     fn flash_attention_matches_splits() {
         let Ok(be) = MetalBackend::new() else { return };
@@ -5025,8 +5046,17 @@ mod fa_tests {
         let f = Fns::new(&be);
         let (nh, nkv, hd, dr, extent) = (24usize, 8usize, 128usize, 16usize, 1024usize);
         let kw = nkv * hd;
+        let (window, cap) = (1024usize, 1088usize);
+        let cases = [
+            (0usize, 70usize, false),
+            (1800, 100, false),
+            (4097, 512, false),
+            (0, 300, true),
+            (700, 512, true),
+            (5000, 200, true),
+        ];
         for (fmt, fi) in [(KvCache::F32, 0usize), (KvCache::F16, 1), (KvCache::Q8, 2)] {
-            for (pos, t) in [(0usize, 70usize), (1800, 100), (4097, 512)] {
+            for (pos, t, win) in cases {
                 let n = pos + t;
                 let mut seed = 3 + pos as u64;
                 let kv: Vec<f32> = (0..2 * n * kw).map(|_| lcg(&mut seed)).collect();
@@ -5046,21 +5076,44 @@ mod fa_tests {
                         .collect(),
                     _ => kv.iter().flat_map(|v| v.to_le_bytes()).collect(),
                 };
-                let half_len = bytes.len() / 2;
                 let sbytes: Vec<u8> = scales.iter().flat_map(|v| v.to_le_bytes()).collect();
-                let shalf = sbytes.len() / 2;
+                let (rb, sb) = (bytes.len() / 2 / n, sbytes.len() / 2 / n);
+                // Rows by position, or (a window) the ring's rows of the positions before the pass
+                // and the pass's rows apart.
+                let rows = |src: &[u8], w: usize, ring: bool| -> Vec<u8> {
+                    let mut o = vec![0u8; (if ring { cap } else { t }) * w];
+                    for j in 0..n {
+                        let r = match ring {
+                            true if j < pos && j + cap >= pos => j % cap,
+                            false if j >= pos => j - pos,
+                            _ => continue,
+                        };
+                        o[r * w..(r + 1) * w].copy_from_slice(&src[j * w..(j + 1) * w]);
+                    }
+                    o
+                };
                 let buf = |b: &[u8]| {
                     let (id, p) = be.ink_buffer(b.len().max(16)).unwrap();
                     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), p, b.len()) };
-                    (id, p)
+                    id
                 };
-                let (kb, _) = buf(&bytes[..half_len]);
-                let (vb, _) = buf(&bytes[half_len..]);
-                let (ksb, _) = buf(&sbytes[..shalf]);
-                let (vsb, _) = buf(&sbytes[shalf..]);
+                let (kh, vh) = bytes.split_at(n * rb);
+                let (ksh, vsh) = sbytes.split_at(n * sb);
+                let parts = [(kh, rb), (vh, rb), (ksh, sb), (vsh, sb)];
+                let cache: Vec<Id> = if win {
+                    parts.iter().map(|&(x, w)| buf(&rows(x, w, true))).collect()
+                } else {
+                    parts.iter().map(|&(x, _)| buf(x)).collect()
+                };
+                let pass: Vec<Id> = if win {
+                    parts.iter().map(|&(x, w)| buf(&rows(x, w, false))).collect()
+                } else {
+                    cache.clone()
+                };
                 let rel: Vec<f32> = (0..dr * extent).map(|_| lcg(&mut seed)).collect();
-                let (cb, _) = buf(&rel.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
-                // The arena: q, r, gate, sink, out, the splits' partials.
+                let cb = buf(&rel.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+                // The arena: q, r, gate, sink, out, the splits' partials (the flash kernel's
+                // queries).
                 let (q, r) = (0usize, t * nh * hd);
                 let gate = r + t * nh * dr;
                 let sink = gate + t * nh * hd;
@@ -5088,12 +5141,15 @@ mod fa_tests {
                             .max(len.div_ceil(PF_SPLIT).div_ceil(32) * 32)
                     };
                     let maxsplit = (0..t).map(|ti| (pos + ti + 1).div_ceil(chunk(pos + ti + 1))).max().unwrap();
+                    let wn = if win { window as u32 } else { 0 };
                     let ap_ = AttnP {
                         nh: nh as u32,
                         nkv: nkv as u32,
                         hd: hd as u32,
                         dr: dr as u32,
                         pos: pos as u32,
+                        window: wn,
+                        cap: if win { cap as u32 } else { 0 },
                         extent: extent as u32,
                         cmin: cmin as u32,
                         maxsplit: PF_SPLIT as u32,
@@ -5102,6 +5158,8 @@ mod fa_tests {
                         r: r as u32,
                         part: part as u32,
                         kw: kw as u32,
+                        tbase: pos as u32,
+                        tmp: win as u32,
                         sink: sink as u32,
                         gate: gate as u32,
                         out: out as u32,
@@ -5117,28 +5175,29 @@ mod fa_tests {
                         gate: gate as u32,
                         out: out as u32,
                         pos: pos as u32,
+                        window: wn,
                         cmin: cmin as u32,
                         ..Default::default()
                     };
                     let fa = lib.pipeline(&be, ["ink_fa_f", "ink_fa_h", "ink_fa_q"][fi]).unwrap();
                     let attn = lib.pipeline(&be, &format!("ink_attn_4_3_{fi}")).unwrap();
                     let merge = lib.pipeline(&be, "ink_attn_merge").unwrap();
+                    let mut res = vec![cb];
+                    res.extend(&cache);
+                    res.extend(&pass);
                     let (ok, _) = run_concurrent(&be, &f, &[std::ops::Range { start: 0, end: 1 }], |fe, _| {
-                        fe.use_resources(&[kb, vb, cb, ksb, vsb]);
+                        fe.use_resources(&res);
                         fe.buf(ab, 0, 0);
                         fe.buf(cb, 0, 1);
                         fe.bytes(&ap_, 2);
-                        fe.buf(kb, 0, 3);
-                        fe.buf(vb, 0, 4);
-                        fe.buf(ksb, 0, 5);
-                        fe.buf(vsb, 0, 6);
+                        for i in 0..4 {
+                            fe.buf(cache[i], 0, 3 + i);
+                            fe.buf(pass[i], 0, 7 + i);
+                        }
                         if kernel == "fa" {
                             fe.pipe(fa);
-                            fe.dispatch((t.div_ceil(FA_Q), nh), 128);
+                            fe.dispatch((t.div_ceil(FA_Q[fi]), nh), 128);
                         } else {
-                            for i in 7..11 {
-                                fe.buf(kb, 0, i);
-                            }
                             fe.pipe(attn);
                             fe.dispatch3((nkv, maxsplit, t), 256);
                             fe.barrier();
@@ -5157,12 +5216,202 @@ mod fa_tests {
                 // (f32 rows: f32 operands, the sums in another order; f16 and q8: half queries,
                 // probabilities and (q8) dequantized rows.)
                 let tol = if fmt == KvCache::F32 { 1e-4 } else { 4e-3 };
-                eprintln!("{fmt:?} from {pos}, {t} tokens: max |out| {big:.3}, max diff {diff:.2e}");
-                assert!(big > 0.01 && diff <= tol * big, "{fmt:?} from {pos}: max diff {diff} of {big}");
-                for b in [kb, vb, cb, ksb, vsb] {
+                eprintln!("{fmt:?} from {pos}, {t} tokens, window {win}: max |out| {big:.3}, max diff {diff:.2e}");
+                assert!(
+                    big > 0.01 && diff <= tol * big,
+                    "{fmt:?} from {pos} (window {win}): max diff {diff} of {big}"
+                );
+                let mut all = vec![cb];
+                all.extend(&cache);
+                if win {
+                    all.extend(&pass);
+                }
+                for b in all {
                     be.ink_release(b);
                 }
             }
+        }
+    }
+
+    /// Times flash-attention kernels on synthetic caches (`OXINFER_FA_BENCH_POS` past positions,
+    /// default 65536; `OXINFER_FA_BENCH_T` queries, default 512; `OXINFER_FA_BENCH_FMT` f16 / q8 /
+    /// f32) and compares their outputs to the first's. `OXINFER_FA_KERNELS`: `name:q:heads:threads`
+    /// a kernel, `q` queries and `heads` query heads a threadgroup.
+    #[test]
+    #[ignore]
+    fn flash_attention_bench() {
+        let Ok(be) = MetalBackend::new() else { return };
+        let lib = library(&be).unwrap();
+        if !lib.mma {
+            return;
+        }
+        let f = Fns::new(&be);
+        let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let (pos, t, reps) = (
+            env("OXINFER_FA_BENCH_POS", 65536),
+            env("OXINFER_FA_BENCH_T", 512),
+            env("OXINFER_FA_BENCH_REPS", 5),
+        );
+        let fmt = std::env::var("OXINFER_FA_BENCH_FMT").unwrap_or_else(|_| "f16".into());
+        let kernels = std::env::var("OXINFER_FA_KERNELS").unwrap_or_else(|_| "ink_fa_h:16:1:128".into());
+        let (nh, nkv, hd, dr, extent) = (24usize, 8usize, 128usize, 16usize, 1024usize);
+        let kw = nkv * hd;
+        let n = pos + t;
+        let mut seed = 3u64;
+        let mut scales: Vec<f32> = Vec::new();
+        let mut bytes: Vec<u8> = Vec::new();
+        for _ in 0..2 * n * kw / 32 {
+            let b: Vec<f32> = (0..32).map(|_| lcg(&mut seed)).collect();
+            match fmt.as_str() {
+                "f16" => bytes.extend(b.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes())),
+                "q8" => {
+                    let d = b.iter().fold(0f32, |m, v| m.max(v.abs())) / 127.0;
+                    scales.push(d);
+                    bytes.extend(b.iter().map(|v| (v / d).round().clamp(-128.0, 127.0) as i8 as u8));
+                }
+                _ => bytes.extend(b.iter().flat_map(|v| v.to_le_bytes())),
+            }
+        }
+        let half_len = bytes.len() / 2;
+        let sbytes: Vec<u8> = scales.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let shalf = sbytes.len() / 2;
+        let buf = |b: &[u8]| {
+            let (id, p) = be.ink_buffer(b.len().max(16)).unwrap();
+            unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), p, b.len()) };
+            (id, p)
+        };
+        let (kb, _) = buf(&bytes[..half_len]);
+        let (vb, _) = buf(&bytes[half_len..]);
+        drop(bytes);
+        let (ksb, _) = buf(&sbytes[..shalf]);
+        let (vsb, _) = buf(&sbytes[shalf..]);
+        let rel: Vec<f32> = (0..dr * extent).map(|_| lcg(&mut seed)).collect();
+        let (cb, _) = buf(&rel.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        let (q, r) = (0usize, t * nh * hd);
+        let gate = r + t * nh * dr;
+        let sink = gate + t * nh * hd;
+        let out = sink + t * nh;
+        // (`part`: room for the queries as half rows.)
+        let part = out + t * nh * hd;
+        let len = part + t * nh * PF_SPLIT * (hd + 2);
+        // (`OXINFER_FA_BENCH_WINDOW`: a sliding window over the rows by position.)
+        let window = env("OXINFER_FA_BENCH_WINDOW", 0);
+        let ap_ = AttnP {
+            part: part as u32,
+            window: window as u32,
+            cmin: 256,
+            maxsplit: PF_SPLIT as u32,
+            nh: nh as u32,
+            nkv: nkv as u32,
+            hd: hd as u32,
+            dr: dr as u32,
+            pos: pos as u32,
+            extent: extent as u32,
+            scale: (hd as f32).powf(-0.5),
+            q: q as u32,
+            r: r as u32,
+            kw: kw as u32,
+            sink: sink as u32,
+            gate: gate as u32,
+            out: out as u32,
+            _m1: t as u32,
+            ..Default::default()
+        };
+        let mut first: Option<Vec<f32>> = None;
+        // (SAFETY of the env write: a test binary's own setting before the timed runs.)
+        unsafe { std::env::set_var("OXINFER_PF_PROFILE", "1") };
+        for spec in kernels.split(',') {
+            let v: Vec<&str> = spec.split(':').collect();
+            let (name, qn, grp, nthr) = (
+                v[0],
+                v[1].parse::<usize>().unwrap(),
+                v[2].parse::<usize>().unwrap(),
+                v[3].parse::<usize>().unwrap(),
+            );
+            // (`split`: `ink_attn`'s splits and the merge.)
+            let fi = ["f32", "f16", "q8"].iter().position(|x| *x == fmt).unwrap();
+            let fa = if name == "split" {
+                lib.pipeline(&be, &format!("ink_attn_4_3_{fi}")).unwrap()
+            } else {
+                lib.pipeline(&be, name).unwrap()
+            };
+            let merge = lib.pipeline(&be, "ink_attn_merge").unwrap();
+            let mp = MergeP {
+                nh: nh as u32,
+                hd: hd as u32,
+                maxsplit: PF_SPLIT as u32,
+                part: part as u32,
+                sink: sink as u32,
+                gate: gate as u32,
+                out: out as u32,
+                pos: pos as u32,
+                window: window as u32,
+                cmin: 256,
+                ..Default::default()
+            };
+            let (ab, ap) = be.ink_buffer(len * 4).unwrap();
+            let a = unsafe { std::slice::from_raw_parts_mut(ap as *mut f32, len) };
+            let mut xs = 17u64;
+            for (i, v) in a[..out].iter_mut().enumerate() {
+                let x = lcg(&mut xs);
+                *v = if i < r {
+                    4.0 * x
+                } else if i >= sink {
+                    2.0 * x
+                } else {
+                    x
+                };
+            }
+            let mut times = Vec::new();
+            for _ in 0..reps {
+                let (ok, g) = run_concurrent(&be, &f, &[std::ops::Range { start: 0, end: 1 }], |fe, _| {
+                    fe.use_resources(&[kb, vb, cb, ksb, vsb]);
+                    fe.buf(ab, 0, 0);
+                    fe.buf(cb, 0, 1);
+                    fe.bytes(&ap_, 2);
+                    fe.buf(kb, 0, 3);
+                    fe.buf(vb, 0, 4);
+                    fe.buf(ksb, 0, 5);
+                    fe.buf(vsb, 0, 6);
+                    for (i, b) in [kb, vb, ksb, vsb].into_iter().enumerate() {
+                        fe.buf(b, 0, 7 + i);
+                    }
+                    fe.pipe(fa);
+                    if name == "split" {
+                        fe.dispatch3((nkv, PF_SPLIT, t), 256);
+                        fe.barrier();
+                        fe.pipe(merge);
+                        fe.buf(ab, 0, 0);
+                        fe.bytes(&mp, 1);
+                        fe.dispatch((nh, t), 128);
+                    } else {
+                        fe.dispatch((t.div_ceil(qn), nh / grp), nthr);
+                    }
+                });
+                assert!(ok, "{name} failed");
+                times.push(g);
+            }
+            times.sort_by(f64::total_cmp);
+            let pairs: usize = (pos..pos + t).map(|q| if window > 0 { (q + 1).min(window) } else { q + 1 }).sum();
+            let flops = 4.0 * (hd * nh * pairs) as f64;
+            let o = a[out..part].to_vec();
+            let diff = first
+                .as_ref()
+                .map_or(0.0, |f0| f0.iter().zip(&o).fold(0f32, |m, (x, y)| m.max((x - y).abs())));
+            let big = o.iter().fold(0f32, |m, v| m.max(v.abs()));
+            eprintln!(
+                "{name} {fmt} pos {pos} t {t}: {:.3} ms min, {:.3} median ({:.1} TFLOP/s), max |out| {big:.3}, diff {diff:.2e}",
+                times[0] * 1e3,
+                times[times.len() / 2] * 1e3,
+                flops / times[0] / 1e12
+            );
+            if first.is_none() {
+                first = Some(o);
+            }
+            be.ink_release(ab);
+        }
+        for b in [kb, vb, cb, ksb, vsb] {
+            be.ink_release(b);
         }
     }
 }

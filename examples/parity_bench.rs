@@ -6,6 +6,8 @@
 //! (other options are `EngineOptions` keys, e.g. `device=cpu`, `lookup=0`, `draft=none`;
 //! `chain_ab=1` measures decoding with the greedy chain off and on, run by run alternated;
 //! `depth=8192,32768` measures decoding of G tokens after a prompt of each length instead;
+//! `pp_depth=16384,65536` measures prompt processing of each N tokens appended after a prompt of
+//! each length instead (llama-bench `-p N -d D`);
 //! `text=FILE` takes the prompts from FILE rather than the corpus).
 
 use oxinfer::engine::{Engine, EngineOptions, Flow};
@@ -18,6 +20,7 @@ fn main() -> anyhow::Result<()> {
     let mut opts = EngineOptions::default();
     let (mut pps, mut tg, mut reps) = (vec![512usize, 2048], 128usize, 3usize);
     let mut depths: Vec<usize> = Vec::new();
+    let mut pp_depths: Vec<usize> = Vec::new();
     let mut chain_ab = false;
     let mut text: Option<String> = None;
     for kv in args {
@@ -33,6 +36,13 @@ fn main() -> anyhow::Result<()> {
             "tg" => tg = v.parse()?,
             "depth" => {
                 depths = v
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse())
+                    .collect::<Result<_, _>>()?
+            }
+            "pp_depth" => {
+                pp_depths = v
                     .split(',')
                     .filter(|s| !s.is_empty())
                     .map(|s| s.parse())
@@ -56,7 +66,7 @@ fn main() -> anyhow::Result<()> {
     )?;
     // Long prompts repeat the corpus (llama-bench's prompts are random tokens; the dense models'
     // speed depends only on the length).
-    let longest = pps.iter().chain(&depths).copied().max().unwrap_or(0);
+    let longest = pps.iter().chain(&depths).copied().max().unwrap_or(0) + pp_depths.iter().copied().max().unwrap_or(0);
     let mut ids = e.tokenizer().encode(corpus.as_str(), false)?.get_ids().to_vec();
     let copies = longest / ids.len().max(1) + 1;
     if copies > 1 {
@@ -93,7 +103,25 @@ fn main() -> anyhow::Result<()> {
             v.iter().map(|x| (x * 10.0).round() / 10.0).collect::<Vec<_>>()
         )
     };
-    for &n in &pps {
+    // Prompt processing at depth: N more tokens after a prompt of D (the same context continued).
+    for &d in &pp_depths {
+        let prefix = text_of(&e, d)?;
+        for &n in &pps {
+            let chunk = e.tokenizer().decode(&ids[d + 64..d + 64 + n], false)?;
+            let mut v = Vec::new();
+            let mut toks = 0;
+            for _ in 0..reps.max(1) {
+                run(&mut e, &prefix, 1)?;
+                e.config_mut().max_tokens = 1;
+                e.complete(&chunk, &mut |_| Flow::Continue)?;
+                let s = e.stats();
+                toks = s.prompt_tokens;
+                v.push(s.prefill_tok_s());
+            }
+            println!("pp{n} @ d{d} ({toks} tok): {}", stat(v));
+        }
+    }
+    for &n in if pp_depths.is_empty() { &pps[..] } else { &[] } {
         // Exactly n prompt tokens with the BOS the model adds, as llama-bench counts them.
         let mut p = text_of(&e, n)?;
         let (got, ..) = run(&mut e, &p, 1)?;

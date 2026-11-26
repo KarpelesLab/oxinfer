@@ -82,62 +82,118 @@ MMAG(mmag_nvfp4, NVFP4W, MK_GG(NVFP4W)) MMAG(mmag_Q2_0, Q2_0W, MK_GG(Q2_0W)) MMA
 #define MK_MXF8B MXF8B{ (device const uchar*)qb, (device const uchar*)sb, p.n_in }
 MMAG(mmag_mxf8b, MXF8B, MK_MXF8B)
 
-// ---- Prefill attention of a full-attention layer on the matrix units (flash attention) ---------
-// `ink_attn` with its splits and `ink_attn_merge` in one kernel for a pass's queries over a cache
-// of rows by position, as `pfm_body` (metal_pfmma.metal): a threadgroup of NSG SIMD-groups takes
-// Q tokens of one query head and walks the keys C at a time, S = Q K^T (f32 sums) to threadgroup
-// memory for an online softmax (the maximum moving lazily, by more than 8 in log2 units), the
-// probabilities back as ET for O += P V in a cooperative tensor. The keys within `extent` of a
-// query get their relative bias (`ink_attn`'s), the sink joins the sum at the end and the output
-// is gated. `IAP` as `ink_attn`'s, `_m1` the pass's token count. The keys and values come from
-// SRC: f32 or f16 rows read in place (`InkFaDev`), or int8 rows with their scales dequantized
-// to half tiles in threadgroup memory (`InkFaQ8`).
+// ---- Prefill attention on the matrix units (flash attention) ------------------------------------
+// `ink_attn` with its splits and `ink_attn_merge` in one kernel for a pass's queries, as `pfm_body`
+// (metal_pfmma.metal): a threadgroup of NSG SIMD-groups takes Q tokens of one query head and walks
+// their keys a tile of up to C at a time, S = Q K^T (f32 sums) to threadgroup memory for an online
+// softmax (the maximum moving lazily, by more than 8 in log2 units), the probabilities back as ET
+// over the first half of their scores' rows for O += P V in a cooperative tensor. Keys within
+// `extent` of a query get their relative bias (`ink_attn`'s), the sink joins the sum at the end
+// and the output is gated. `IAP` as `ink_attn`'s, `_m1` the pass's token count; a sliding window
+// (`window`) reads its keys from the window's ring (`cap` rows, position j at row j % cap) and,
+// with `tmp`, the pass's own from their rows apart (from position `tbase`), a tile never
+// straddling the two or the ring's end. The queries are converted (times the scale and log2 e) to
+// ET rows in the arena's `part`, a region per threadgroup, which the products read from there
+// (threadgroup memory holds the scores only, so that two threadgroups fit a core). The keys and
+// values come from SRC: f32 or f16 rows read in place (`InkFaDev`), or int8 rows with their scales
+// (`InkFaQ8`), each thread loading its share of the next tile's raw rows into registers while the
+// threadgroup works on the current one, dequantized into a half tile in threadgroup memory (keys,
+// then values over them).
 // (Rounding: ET operands, f32 sums; f16 caches are half already.)
 template <int HD, int C, typename ET>
 struct InkFaDev {
     device const ET* kq;
     device const ET* vq;
+    device const ET* tkq;
+    device const ET* tvq;
     int rs;
-    inline void load_k(uint, int, ushort, int) const {}
-    inline void load_v(uint, int, ushort, int) const {}
-    inline auto kt(uint kb, int nk) const {
-        return tensor((device ET*)(kq + (ulong)kb * rs), dextents<int32_t, 2>(HD, nk), array<int, 2>({1, rs}));
+    // The tile's first row and whether it is in the pass's rows.
+    uint row;
+    bool tmp;
+    inline void at(uint r, bool t) { row = r; tmp = t; }
+    inline void fetch(uint, uint, int, ushort, constant IAP&) {}
+    inline void put_k(ushort) const {}
+    inline void put_v(ushort) const {}
+    inline auto kt(int nk) const {
+        return tensor((device ET*)((tmp ? tkq : kq) + (ulong)row * rs), dextents<int32_t, 2>(HD, nk), array<int, 2>({1, rs}));
     }
-    inline auto vt(uint kb, int nk) const {
-        return tensor((device ET*)(vq + (ulong)kb * rs), dextents<int32_t, 2>(HD, nk), array<int, 2>({1, rs}));
+    inline auto vt(int nk) const {
+        return tensor((device ET*)((tmp ? tvq : vq) + (ulong)row * rs), dextents<int32_t, 2>(HD, nk), array<int, 2>({1, rs}));
     }
 };
-template <int HD, int C>
+template <int HD, int C, int NT>
 struct InkFaQ8 {
     device const char* kq;
     device const char* vq;
     device const float* ks;
     device const float* vs;
+    device const char* tkq;
+    device const char* tvq;
+    device const float* tks;
+    device const float* tvs;
     uint off;
     uint kw;
     threadgroup half* skv;
-    // Keys kb .. kb + nk - 1 as half rows [C][HD] (zeros past nk).
-    inline void load(device const char* q, device const float* s, uint kb, int nk, ushort tid, int nt) const {
-        for (int i = tid; i < C * HD / 4; i += nt) {
-            int key = i / (HD / 4), d = i % (HD / 4) * 4;
-            half4 v = 0.h;
+    // (Each thread: 16 values of a key row a load, with their scale.)
+    enum { NL = C * HD / 16 / NT };
+    uint4 rk[NL], rv[NL];
+    float sk[NL], sv[NL];
+    inline void at(uint, bool) {}
+    // Keys `kb .. kb + nk - 1`, the first at `row` (of the pass's rows with `tmp`).
+    inline void fetch(uint row, bool tmp, int nk, ushort tid, constant IAP&) {
+#pragma unroll
+        for (int l = 0; l < NL; l++) {
+            int i = tid + l * NT, key = i / (HD / 16), d = i % (HD / 16) * 16;
             if (key < nk) {
-                ulong idx = (ulong)(kb + key) * kw + off + d;
-                v = half4(float4(*(device const char4*)(q + idx)) * s[idx / 32]);
+                ulong idx = (ulong)(row + key) * kw + off + d;
+                rk[l] = *(device const uint4*)((tmp ? tkq : kq) + idx);
+                rv[l] = *(device const uint4*)((tmp ? tvq : vq) + idx);
+                sk[l] = (tmp ? tks : ks)[idx / 32];
+                sv[l] = (tmp ? tvs : vs)[idx / 32];
+            } else {
+                rk[l] = 0;
+                rv[l] = 0;
+                sk[l] = 0.f;
+                sv[l] = 0.f;
             }
-            *(threadgroup half4*)(skv + key * HD + d) = v;
         }
     }
-    inline void load_k(uint kb, int nk, ushort tid, int nt) const { load(kq, ks, kb, nk, tid, nt); }
-    inline void load_v(uint kb, int nk, ushort tid, int nt) const { load(vq, vs, kb, nk, tid, nt); }
-    inline auto kt(uint, int) const { return tensor<threadgroup half, extents<int32_t, HD, C>, tensor_inline>(skv, extents<int32_t, HD, C>()); }
-    inline auto vt(uint, int) const { return kt(0, 0); }
+    inline void put(thread const uint4* r, thread const float* sc, ushort tid) const {
+#pragma unroll
+        for (int l = 0; l < NL; l++) {
+            int i = tid + l * NT, key = i / (HD / 16), d = i % (HD / 16) * 16;
+            threadgroup half4* o = (threadgroup half4*)(skv + key * HD + d);
+            o[0] = half4(float4(as_type<char4>(r[l].x)) * sc[l]);
+            o[1] = half4(float4(as_type<char4>(r[l].y)) * sc[l]);
+            o[2] = half4(float4(as_type<char4>(r[l].z)) * sc[l]);
+            o[3] = half4(float4(as_type<char4>(r[l].w)) * sc[l]);
+        }
+    }
+    inline void put_k(ushort tid) const { put(rk, sk, tid); }
+    inline void put_v(ushort tid) const { put(rv, sv, tid); }
+    inline auto kt(int) const { return tensor<threadgroup half, extents<int32_t, HD, C>, tensor_inline>(skv, extents<int32_t, HD, C>()); }
+    inline auto vt(int) const { return kt(0); }
 };
+// The tile of keys from `kb` (below `kend`): its first row, whether in the pass's rows, its length.
+template <int C>
+inline int ink_fa_tile(constant IAP& p, uint kb, uint kend, thread uint& row, thread bool& tmp) {
+    uint lim = kend;
+    tmp = p.tmp != 0 && kb >= p.tbase;
+    if (tmp) {
+        row = kb - p.tbase;
+    } else {
+        if (p.tmp != 0) lim = min(lim, p.tbase);
+        row = kb;
+        if (p.cap != 0) {
+            row = kb % p.cap;
+            lim = min(lim, kb + (p.cap - row));
+        }
+    }
+    return min((int)C, (int)(lim - kb));
+}
 template <int HD, int Q, int C, int NSG, typename ET, bool STAGED, typename SRC>
-inline void ink_fa_body(device float* a, device const float* c, constant IAP& p, thread const SRC& src, uint2 tg, ushort sg, ushort lane,
-                        threadgroup ET* sq, threadgroup float* ss, threadgroup ET* sp, threadgroup float* sr, threadgroup float* srr,
-                        threadgroup int* sf) {
-    typedef vec<ET, 4> ET4;
+inline void ink_fa_body(device float* a, device const float* c, constant IAP& p, thread SRC& src, uint2 tg, uint2 ntg, ushort sg,
+                        ushort lane, threadgroup float* ss, threadgroup float* sr, threadgroup int* sf) {
     constexpr int NT = NSG * 32;
     constexpr int NQ = Q / NSG;
     constexpr int NC = C / 32;
@@ -146,20 +202,19 @@ inline void ink_fa_body(device float* a, device const float* c, constant IAP& p,
     const uint h = tg.y, nt = p._m1;
     const uint i0 = tg.x * Q;
     const float sc = p.scale * M_LOG2E_F;
+    device ET* sq = (device ET*)(a + p.part) + ((ulong)tg.y * ntg.x + tg.x) * Q * HD;
     for (uint i = tid; i < Q * H4; i += NT) {
         uint j = i / H4;
         float4 v = 0.f;
         // (Scalar loads: the arena's offsets need not be 16-byte aligned.)
         if (i0 + j < nt) {
             device const float* qr = a + p.q + (ulong)(i0 + j) * p.nh * HD + (ulong)h * HD + (i % H4) * 4;
-            v = float4(qr[0], qr[1], qr[2], qr[3]);
+            v = float4(qr[0], qr[1], qr[2], qr[3]) * sc;
         }
-        ((threadgroup ET4*)sq)[i] = ET4(v * sc);
-    }
-    // The relative vectors (times log2 e), 16 per query.
-    for (uint i = tid; i < Q * 16; i += NT) {
-        uint j = i / 16, d = i % 16;
-        srr[i] = i0 + j < nt && d < p.dr ? a[p.r + ((ulong)(i0 + j) * p.nh + h) * p.dr + d] * M_LOG2E_F : 0.f;
+        sq[4 * i] = ET(v.x);
+        sq[4 * i + 1] = ET(v.y);
+        sq[4 * i + 2] = ET(v.z);
+        sq[4 * i + 3] = ET(v.w);
     }
     const uint pfirst = p.pos + i0;
     const uint kend = p.pos + min(i0 + Q, nt);
@@ -171,56 +226,79 @@ inline void ink_fa_body(device float* a, device const float* c, constant IAP& p,
         L[jj] = 0.f;
         pi[jj] = pfirst + jj * NSG + sg;
     }
-    auto tq = tensor<threadgroup ET, extents<int32_t, HD, Q>, tensor_inline>(sq, extents<int32_t, HD, Q>());
+    auto tq = tensor<device ET, extents<int32_t, HD, Q>, tensor_inline>(sq, extents<int32_t, HD, Q>());
     auto ts = tensor<threadgroup float, extents<int32_t, C, Q>, tensor_inline>(ss, extents<int32_t, C, Q>());
-    auto tp = tensor<threadgroup ET, extents<int32_t, C, Q>, tensor_inline>(sp, extents<int32_t, C, Q>());
+    threadgroup ET* sp = (threadgroup ET*)ss;
+    constexpr int PS = C * 4 / sizeof(ET);
+    auto tp = tensor<threadgroup ET, extents<int32_t, C, Q>, tensor_inline>(sp, extents<int32_t, C, Q>(), array<int, 2>({1, PS}));
     matmul2d<matmul2d_descriptor(Q, C, HD, false, true, false, matmul2d_descriptor::mode::multiply), execution_simdgroups<NSG>> mm_qk;
     matmul2d<matmul2d_descriptor(Q, HD, C, false, false, false, matmul2d_descriptor::mode::multiply_accumulate),
              execution_simdgroups<NSG>> mm_pv;
-    auto tv0 = src.vt(0, C);
+    auto tv0 = src.vt(C);
     auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tp), decltype(tv0), float>();
 #pragma unroll
     for (uint16_t i = 0; i < co.get_capacity(); ++i)
         if (co.is_valid_element(i)) co[i] = 0.f;
     if (tid == 0) sf[0] = 0;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    // (Keys from distance `extent` before the first query on get a bias.)
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    // (Keys from distance `extent` before the first query on get a bias; a window's first keys
+    // are those of the first query.)
     const uint kbias = pfirst + 1 > p.extent ? pfirst + 1 - p.extent : 0;
+    const uint klo = p.window != 0 && pfirst + 1 > p.window ? pfirst + 1 - p.window : 0;
+    uint row;
+    bool tmp;
+    int nk = ink_fa_tile<C>(p, klo, kend, row, tmp);
+    if (STAGED) src.fetch(row, tmp, nk, tid, p);
     uint it = 0;
-    for (uint kb = 0; kb < kend; kb += C, it++) {
-        int nk = min((int)C, (int)(kend - kb));
+    for (uint kb = klo; kb < kend; it++) {
+        src.at(row, tmp);
         if (STAGED) {
-            src.load_k(kb, nk, tid, NT);
+            src.put_k(tid);
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        auto tk = src.kt(kb, nk);
+        auto tk = src.kt(nk);
         mm_qk.run(tq, tk, ts);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // (A staged tile's values replace its keys while the scores are made.)
-        if (STAGED) src.load_v(kb, nk, tid, NT);
-        const bool near = kb + C > kbias;
+        const uint kn = kb + nk;
+        uint nrow;
+        bool ntmp;
+        const int nnk = kn < kend ? ink_fa_tile<C>(p, kn, kend, nrow, ntmp) : 0;
+        // (A staged tile's values replace its keys while the scores are made, and the next
+        // tile's rows are on their way.)
+        if (STAGED) {
+            src.put_v(tid);
+            if (nnk > 0) src.fetch(nrow, ntmp, nnk, tid, p);
+        }
+        const bool fast = p.window == 0 && kb + C <= kbias && nk == C;
 #pragma unroll
         for (int jj = 0; jj < NQ; jj++) {
             const int j = jj * NSG + sg;
             float s[NC];
-            float m = M[jj];
+            float m = -INFINITY;
+            if (fast) {
 #pragma unroll
-            for (int ii = 0; ii < NC; ii++) {
-                uint cc = ii * 32 + lane;
-                uint key = kb + cc;
-                float x = ss[j * C + cc];
-                if (near) {
+                for (int ii = 0; ii < NC; ii++) {
+                    s[ii] = ss[j * C + ii * 32 + lane];
+                    m = max(m, s[ii]);
+                }
+            } else {
+#pragma unroll
+                for (int ii = 0; ii < NC; ii++) {
+                    uint cc = ii * 32 + lane;
+                    uint key = kb + cc;
+                    float x = ss[j * C + cc];
                     uint dist = pi[jj] - key;
-                    if (key <= pi[jj] && dist < p.extent) {
+                    if (key <= pi[jj] && dist < p.extent && i0 + j < nt) {
                         device const float* rel = c + p.rel + dist;
-                        threadgroup const float* rr = srr + j * 16;
+                        device const float* rr = a + p.r + ((ulong)(i0 + j) * p.nh + h) * p.dr;
                         float b = 0.f;
                         for (uint d = 0; d < p.dr; d++) b += rr[d] * rel[d * p.extent];
-                        x += b;
+                        x += b * M_LOG2E_F;
                     }
+                    bool vis = (int)cc < nk && key <= pi[jj] && (p.window == 0 || dist < p.window);
+                    s[ii] = vis ? x : -INFINITY;
+                    m = max(m, s[ii]);
                 }
-                s[ii] = (int)cc < nk && key <= pi[jj] ? x : -INFINITY;
-                m = max(m, s[ii]);
             }
             m = simd_max(m);
             float ms = 1.f;
@@ -229,14 +307,15 @@ inline void ink_fa_body(device float* a, device const float* c, constant IAP& p,
                 M[jj] = m;
                 if (lane == 0) sf[0] = it + 1;
             }
+            // (Each lane's share of the sums, added up at the end.)
             float sum = 0.f;
 #pragma unroll
             for (int ii = 0; ii < NC; ii++) {
                 ET pe = ET(exp2(s[ii] - M[jj]));
-                sp[j * C + ii * 32 + lane] = pe;
+                sp[j * PS + ii * 32 + lane] = pe;
                 sum += float(pe);
             }
-            L[jj] = L[jj] * ms + simd_sum(sum);
+            L[jj] = L[jj] * ms + sum;
             if (lane == 0) sr[j] = ms;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -245,21 +324,26 @@ inline void ink_fa_body(device float* a, device const float* c, constant IAP& p,
             for (uint16_t i = 0; i < co.get_capacity(); ++i)
                 if (co.is_valid_element(i)) co[i] *= sr[co.get_multidimensional_index(i)[1]];
         }
-        auto tv = src.vt(kb, nk);
+        auto tv = src.vt(nk);
         mm_pv.run(tp, tv, co);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        kb = kn;
+        row = nrow;
+        tmp = ntmp;
+        nk = nnk;
     }
     // The sink (a logit of a zero value) into each row's sum: the output factor per row.
 #pragma unroll
     for (int jj = 0; jj < NQ; jj++) {
         const int j = jj * NSG + sg;
+        float l = simd_sum(L[jj]);
         if (lane == 0) {
             float f = 0.f;
             if (i0 + j < nt) {
                 float sl = a[p.sink + (ulong)(i0 + j) * p.nh + h] * M_LOG2E_F;
                 float mf = max(M[jj], sl);
                 float e = exp2(M[jj] - mf);
-                f = e / (L[jj] * e + exp2(sl - mf));
+                f = e / (l * e + exp2(sl - mf));
             }
             sr[j] = f;
         }
@@ -276,36 +360,34 @@ inline void ink_fa_body(device float* a, device const float* c, constant IAP& p,
             }
         }
 }
-#define INK_FA_TG(Q, C, ET) \
-    threadgroup ET sq[Q * HD]; \
+// Queries Q and keys C a step, NSG SIMD-groups (`metal_inkling.rs`: FA_TILES; measured on M5 at
+// 64k positions: f16 rows 32 / 128 / 4 (16 / 128 / 2 and 4, 16 and 32 / 64, two SIMD-groups, a
+// key head's 3 query heads as 48 rows: all slower), int8 16 / 64 / 4 (32 queries, 32 keys, 2 or 8
+// SIMD-groups, 3 heads as 48 rows: slower; dequantizing in half arithmetic: no faster).
+#define INK_FA_ARGS(T) \
+    device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IAP& p [[buffer(2)]], \
+    device const T* kc [[buffer(3)]], device const T* vc [[buffer(4)]], device const float* ks [[buffer(5)]], \
+    device const float* vs [[buffer(6)]], device const T* tk [[buffer(7)]], device const T* tv [[buffer(8)]], \
+    device const float* tks [[buffer(9)]], device const float* tvs [[buffer(10)]], uint2 tg [[threadgroup_position_in_grid]], \
+    uint2 ntg [[threadgroups_per_grid]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]
+#define INK_FA(NAME, Q, C, NSG, ET) \
+kernel void NAME(INK_FA_ARGS(ET)) { \
+    constexpr int HD = 128; \
     threadgroup float ss[Q * C]; \
-    threadgroup ET sp[Q * C]; \
     threadgroup float sr[Q]; \
-    threadgroup float srr[Q * 16]; \
-    threadgroup int sf[1];
-#define INK_FA(NAME, HD_, Q, C, NSG, ET) \
-kernel void NAME(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IAP& p [[buffer(2)]], \
-                 device const ET* kc [[buffer(3)]], device const ET* vc [[buffer(4)]], \
-                 uint2 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]], \
-                 ushort lane [[thread_index_in_simdgroup]]) { \
-    constexpr int HD = HD_; \
-    INK_FA_TG(Q, C, ET) \
+    threadgroup int sf[1]; \
     uint kvh = tg.y / (p.nh / p.nkv); \
-    InkFaDev<HD, C, ET> src{kc + kvh * HD, vc + kvh * HD, (int)p.kw}; \
-    ink_fa_body<HD, Q, C, NSG, ET, false>(a, c, p, src, tg, sg, lane, sq, ss, sp, sr, srr, sf); }
-INK_FA(ink_fa_h, 128, 16, 128, 4, half)
-INK_FA(ink_fa_f, 128, 16, 128, 4, float)
-// (Measured at 64k positions, f16 caches: 32 queries and 64 keys, 64 keys, two SIMD-groups: no
-// faster; 32 queries and 128 keys exceed the threadgroup memory.)
-// int8 caches: keys and values staged as half tiles of 64 rows (16 KB, one tile at a time).
-kernel void ink_fa_q(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IAP& p [[buffer(2)]],
-                     device const char* kc [[buffer(3)]], device const char* vc [[buffer(4)]], device const float* ks [[buffer(5)]],
-                     device const float* vs [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
-                     ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    InkFaDev<HD, C, ET> src{kc + kvh * HD, vc + kvh * HD, tk + kvh * HD, tv + kvh * HD, (int)p.kw, 0, false}; \
+    ink_fa_body<HD, Q, C, NSG, ET, false>(a, c, p, src, tg, ntg, sg, lane, ss, sr, sf); }
+INK_FA(ink_fa_h, 32, 128, 4, half)
+INK_FA(ink_fa_f, 16, 128, 4, float)
+kernel void ink_fa_q(INK_FA_ARGS(char)) {
     constexpr int HD = 128;
-    INK_FA_TG(16, 64, half)
+    threadgroup float ss[16 * 64];
+    threadgroup float sr[16];
+    threadgroup int sf[1];
     threadgroup half skv[64 * HD];
     uint kvh = tg.y / (p.nh / p.nkv);
-    InkFaQ8<HD, 64> src{kc, vc, ks, vs, kvh * HD, p.kw, skv};
-    ink_fa_body<HD, 16, 64, 4, half, true>(a, c, p, src, tg, sg, lane, sq, ss, sp, sr, srr, sf);
+    InkFaQ8<HD, 64, 128> src{kc, vc, ks, vs, tk, tv, tks, tvs, kvh * HD, p.kw, skv};
+    ink_fa_body<HD, 16, 64, 4, half, true>(a, c, p, src, tg, ntg, sg, lane, ss, sr, sf);
 }

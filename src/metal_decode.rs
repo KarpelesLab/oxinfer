@@ -4757,7 +4757,7 @@ impl MetalBackend {
                     let precise = pf_precise_scores(scale, hd) && !cache_half;
                     let mma = match (hd, precise) {
                         (64, false) => Some(("pfm_64", 32, 128)),
-                        (128, false) => Some(("pfm_128", 16, 128)),
+                        (128, false) => Some(("pfm_128", 32, 128)),
                         (256, false) => Some(("pfm_256", 16, 128)),
                         (512, false) => Some(("pfm_512", 16, 256)),
                         (64, true) => Some(("pfmq_64", 32, 128)),

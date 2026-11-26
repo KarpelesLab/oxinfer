@@ -4149,6 +4149,83 @@ threadgroup memory). The flash kernel spends about 0.45 s of a 2048-token chunk 
 TFLOPS); a threadgroup holding a key head's three query heads (each tile read once rather than
 three times) was not tried.
 
+#### Inkling-2-Mini at long contexts on Metal, round 2 (November 2026)
+
+The same measurements as the section above (`inkling2_ctx_bench MODEL DEPTH --kv KV --prefill
+2048 --reps 2`, UD-IQ3_XXS, M5 Max), the build before this round and after it alternated run by
+run under the bench lock in a quieter window (load averages 2-4), so the "before" column is faster
+than the table above. tok/s, 2048 tokens appended (two passes) / decoding:
+
+| depth | KV | llama.cpp pp2048 | before | after | after / llama.cpp |
+|---:|---|---:|---|---|---:|
+| 0 | f16 | 650 | 1713, 1452 / 100.0 | **1940, 1792 / 100.6** | 3.0x |
+| | q8 | | 1601, 1355 / 102.4 | **1921, 1814 / 104.2** | |
+| 32k | f16 | 273 | 1362, 1355 / 85.2 | **1633, 1628 / 84.8** | 6.0x |
+| | q8 | | 841, 807 / 89.3 | **1421, 1405 / 88.9** | |
+| 128k | f16 | 105 | 907, 888 / 53.6 | **1146, 1143 / 56.1** | 10.9x |
+| | q8 | | 381, 372 / 62.9 | **827, 823 / 62.7** | |
+
+What changed (`ink_fa_*` in `metal_inkling_pf.metal`; kernel times from
+`metal::inkling::fa_tests::flash_attention_bench`, an ignored test: 512 queries of 24 heads on 8,
+synthetic caches; `OXINFER_INKLING_PF_METAL=FILE` swaps the shader source for experiments):
+
+- **The queries in device memory, the probabilities over the scores.** Each threadgroup converts
+  its queries (times the scale and log2 e) to half rows in the arena's `part` (unused by the flash
+  path) and the products read them from there; the probabilities are written as half over the
+  first half of their own scores' rows. Threadgroup memory then holds the scores only (16 KB for
+  32 queries and 128 keys), so a threadgroup takes 32 queries rather than 16, and the key tiles
+  every query sees whole, beyond the relative bias's extent, skip the masks and the bias test.
+  f16 caches, 512 queries after 64k positions: 15.0 -> 11.1 ms (27 -> 37 TFLOP/s); after 128k
+  29.8 -> 21.8 ms. Measured and dropped: a key head's 3 query heads as the 48 rows of one
+  threadgroup (sharing the key and value tiles: 27 TFLOP/s, 64-key tiles 20-23), 16 queries with
+  2 or 4 SIMD-groups (26-31), 8 SIMD-groups (24), 64 queries on 64 keys (11-22), and scores,
+  softmax and probabilities in the SIMD-groups' registers (cooperative tensors with
+  `reduce_rows`, as `un_flash_body`, one SIMD-group a query block: 6.5-13.5 TFLOP/s; even its
+  products alone ran at 15-18).
+- **int8 caches: the next tile's rows in registers.** `ink_fa_q` dequantized 64 keys into
+  threadgroup memory right before each product, waiting on its loads; each thread now loads its
+  share of the next tile's raw rows and scales (16 values a load) while the threadgroup works on
+  the current one, and only converts and stores them when they are due. 58 -> 22.6 ms after 64k,
+  121 -> 44.8 ms after 128k. Dropped: the products on int8 operands (MPP's `half x int8`,
+  a product per 32 dimensions with the key scales on the scores and the value scales on bf16
+  probabilities: 52-65 ms; the products alone took 59), 3 heads sharing a tile, 32 queries, 32-key
+  tiles, 2 or 8 SIMD-groups, dequantizing in half arithmetic (no faster, less exact).
+- **The sliding-window layers on the flash kernel too** (5 of 6): their keys come
+  from the window's ring (`cap` rows) and the pass's own rows apart (`tmp`), a tile never
+  straddling the two or the ring's end; the window and the relative bias (every key of the window
+  has one) are applied per element. A pass of 512 tokens after 4096 positions: 2.26 -> 1.00 ms
+  (f16), 2.80 -> 1.20 ms (q8) per layer against the splits and the merge; that is most of the
+  gain at depth 0.
+
+Agreement: `fa_tests::flash_attention_matches_splits` now also covers windows (a ring of 1088
+rows, passes from 0, 700 and 5000 positions): max difference to the split kernels 1e-6 (f32 rows),
+2.7e-4 (f16), 4.5e-4 (q8) of outputs up to 0.7. On a real prompt (the first 120 KB of these docs,
+44943 tokens fed in passes of 2048, `inkling2_ctx_bench --text`, the split kernels with
+`OXINFER_INKLING_FA=0`): the top token after it is the same for all six runs (f32 / f16 / q8
+caches, flash / split kernels); KL of the logits against the split kernels on f32 caches: 3.0e-2
+(flash, f32), 2.6e-2 (flash, f16), 2.3e-2 (split, f16), 4.2e-2 (flash, q8), 4.5e-2 (split, q8);
+flash against split on the same cache type 3.5e-2 (f16) and 2.8e-2 (q8). The 24 greedy tokens
+agree for the first 17 everywhere, then the runs split into two continuations at a near tie, each
+taken by flash and split runs alike (f32 split = f16 flash; f32 flash = q8 flash = q8 split).
+These are the prompt's sensitivity (the f32 flash kernel differs from the splits by 7e-7 per
+output) rather than the kernels' error.
+
+int8 caches as the default above some length: not done. At 128k, a turn of 2048 new tokens and
+500 decoded ones takes 1.79 + 8.9 = 10.7 s with f16 caches and 2.48 + 7.97 = 10.4 s with q8 (half
+the cache memory: 2.4 GB against 4.3), a wash, and below that f16 is ahead; `kv_cache=q8` stays
+the choice for memory.
+
+**Other models' prefill attention.** Qwen3 / 3.5 / 3.6, Llama, Gemma 3 / 4 already attend on the
+matrix units at any depth (`pfm_*` over the half caches, `gpu_kv=f16` by default); DeepSeek V4 has
+its own compressed attention. `pfm_body` took the same two changes (probabilities over the scores,
+the mask-free tiles; the queries stay in threadgroup memory, no scratch there) and `pfm_128` 32
+queries: `metal::decode::tests::pf_attn_bench`, 2048 queries after 30000 positions: 32 x 128 heads
+on 8 31.3 -> 22.7 ms (33 -> 46 TFLOP/s), 32 x 512 on 4 (Gemma 4's global layers) 74.1 -> 58.9 ms,
+heads of 256 level (32 queries there need 64-key tiles: slower), from position 0 level to 15%
+faster. Qwen3-8B Q8_0, `parity_bench pp=2048 pp_depth=16384,32768` (new: N tokens appended after a
+prompt of D, as llama-bench's `-p N -d D`): 1502 and 898 tok/s against llama.cpp's 1050 and 698
+(`llama-bench -fa 1 -p 2048 -d ...`; 2793 at depth 0).
+
 #### DGX Spark, CUDA (November 2026)
 
 On a DGX Spark (GB10, 121 GB shared between the CPU and the GPU) against llama.cpp's CUDA backend
