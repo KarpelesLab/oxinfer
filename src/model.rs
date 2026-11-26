@@ -2260,13 +2260,21 @@ impl<'a> Model<'a> {
     /// E4B), which add nothing to the caches, the GPU prefill runs the layers before them on the
     /// whole chunk and those layers only on its last token (on none for earlier chunks), as
     /// llama.cpp does; the result is then the last token's hidden state alone.
+    ///
+    /// A chunk of fewer tokens than [`crate::qwen::PREFILL_GPU_MIN`] (a short next turn, the end
+    /// of a prompt the cache held most of) runs on the prefill plan too ([`small_prompt_gpu`]).
     pub fn prefill_hidden(&self, sess: &mut Session, tokens: &[u32], mm: &[(usize, &[f32])], last: bool) -> Vec<f32> {
-        if tokens.len() > 1
-            && mm.is_empty()
-            && crate::qwen::prefill_gpu(tokens.len(), "plan")
-            && let Some(hs) = self.gpu_prefill_pruned(sess, tokens, last)
-        {
-            return hs;
+        let t = tokens.len();
+        if t > 1 && mm.is_empty() && crate::qwen::prefill_gpu(t.max(crate::qwen::PREFILL_GPU_MIN), "plan") {
+            if let Some(hs) = self.gpu_prefill_pruned(sess, tokens, last) {
+                return hs;
+            }
+            if t < crate::qwen::PREFILL_GPU_MIN
+                && small_prompt_gpu()
+                && let Some(hs) = self.gpu_prefill(sess, tokens, &[], &mut Vec::new())
+            {
+                return hs;
+            }
         }
         self.forward_hidden_mm(sess, tokens, mm)
     }
@@ -2591,9 +2599,75 @@ impl<'a> Model<'a> {
     }
 }
 
+/// Whether prompt chunks of fewer than [`crate::qwen::PREFILL_GPU_MIN`] tokens run on the GPU
+/// (the prefill plan; one token with captured features on the one-token kernels) instead of the
+/// host path, which took 40-130 ms for one Qwen3-8B token and more for a few
+/// (`OXINFER_PREFILL_GPU_SMALL=0`: on the host, as before).
+pub(crate) fn small_prompt_gpu() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OXINFER_PREFILL_GPU_SMALL").map_or(true, |v| v != "0"))
+}
+
+impl Model<'_> {
+    /// [`crate::dspark::Target::forward_feats`] on the GPU prefill plan (which copies the
+    /// captured rows out); None (nothing changed) when it cannot run there.
+    fn gpu_prefill_feats(&self, sess: &mut Session, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>) -> Option<Vec<f32>> {
+        let (t, h) = (tokens.len(), self.cfg.hidden_size);
+        let mut cap: Vec<usize> = layers.iter().filter(|&&l| l > 0).map(|&l| l - 1).collect();
+        cap.sort_unstable();
+        cap.dedup();
+        if cap.last().is_some_and(|&l| l >= self.layers.len()) {
+            return None;
+        }
+        let mut rows = Vec::new();
+        let hs = self.gpu_prefill(sess, tokens, &cap, &mut rows)?;
+        let (nf, nc) = (layers.len(), cap.len());
+        feats.clear();
+        feats.resize(t * nf * h, 0.0);
+        crate::kernels::for_chunks(feats, nf * h, true, |ti, f| {
+            for (fi, &l) in layers.iter().enumerate() {
+                let out = &mut f[fi * h..(fi + 1) * h];
+                if l == 0 {
+                    out.copy_from_slice(&self.embed_scaled(tokens[ti]));
+                } else {
+                    let ci = cap.binary_search(&(l - 1)).unwrap();
+                    out.copy_from_slice(&rows[(ti * nc + ci) * h..(ti * nc + ci + 1) * h]);
+                }
+            }
+        });
+        Some(hs)
+    }
+}
+
 /// The target of a DSpark draft ([`crate::dspark`]): Gemma 4 (and Gemma 3) text models. The
 /// features are read on the CPU path (one-token GPU steps do not record them).
 impl crate::dspark::Target for Model<'_> {
+    fn prefill_feats(
+        &self,
+        sess: &mut Session,
+        tokens: &[u32],
+        mm: &[(usize, &[f32])],
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+    ) -> Vec<f32> {
+        let t = tokens.len();
+        if t < crate::qwen::PREFILL_GPU_MIN
+            && mm.is_empty()
+            && small_prompt_gpu()
+            && crate::qwen::prefill_gpu(crate::qwen::PREFILL_GPU_MIN, "plan")
+        {
+            // One token: the one-token kernels (a verification pass of it); a few: the prefill plan.
+            let hs = if t == 1 {
+                self.gpu_verify_hidden(sess, tokens, layers, feats, false).map(|r| r.0)
+            } else {
+                self.gpu_prefill_feats(sess, tokens, layers, feats)
+            };
+            if let Some(hs) = hs {
+                return hs;
+            }
+        }
+        self.forward_feats(sess, tokens, mm, layers, feats)
+    }
     fn forward_feats(
         &self,
         sess: &mut Session,
@@ -2608,26 +2682,10 @@ impl crate::dspark::Target for Model<'_> {
         cap.sort_unstable();
         cap.dedup();
         // A prompt: on the GPU prefill plan, which copies the captured rows out.
-        let mut rows = Vec::new();
         if mm.is_empty()
             && crate::qwen::prefill_gpu(t, "plan")
-            && cap.last().is_none_or(|&l| l < self.layers.len())
-            && let Some(hs) = self.gpu_prefill(sess, tokens, &cap, &mut rows)
+            && let Some(hs) = self.gpu_prefill_feats(sess, tokens, layers, feats)
         {
-            let (nf, nc) = (layers.len(), cap.len());
-            feats.clear();
-            feats.resize(t * nf * h, 0.0);
-            crate::kernels::for_chunks(feats, nf * h, true, |ti, f| {
-                for (fi, &l) in layers.iter().enumerate() {
-                    let out = &mut f[fi * h..(fi + 1) * h];
-                    if l == 0 {
-                        out.copy_from_slice(&self.embed_scaled(tokens[ti]));
-                    } else {
-                        let ci = cap.binary_search(&(l - 1)).unwrap();
-                        out.copy_from_slice(&rows[(ti * nc + ci) * h..(ti * nc + ci + 1) * h]);
-                    }
-                }
-            });
             return hs;
         }
         sess.capture = cap;

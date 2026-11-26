@@ -3090,7 +3090,85 @@ pub(crate) fn gated_norm(out: &mut [f32], z: &[f32], w: &[f32], eps: f32, sig: b
 /// The target of a DSpark draft ([`crate::dspark`]): Qwen3 dense, Qwen3.5 / 3.6 / 3.8 dense and
 /// MoE. The verification forward records the Gated DeltaNet inputs, so a rejected draft rewinds
 /// exactly (see [`QwenSession::rewind`]).
+impl QwenModel<'_> {
+    /// [`crate::dspark::Target::forward_feats`] on the GPU prefill plan (which copies the
+    /// captured rows out); None (nothing changed) when it cannot run there.
+    fn gpu_prefill_feats(
+        &self,
+        sess: &mut QwenSession,
+        tokens: &[u32],
+        mm: &[(usize, &[f32])],
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+    ) -> Option<Vec<f32>> {
+        let (t, h) = (tokens.len(), self.cfg.hidden_size);
+        let mut cap: Vec<usize> = layers.iter().filter(|&&l| l > 0).map(|&l| l - 1).collect();
+        cap.sort_unstable();
+        cap.dedup();
+        if self.exp.is_some() || cap.last().is_some_and(|&l| l >= self.layers.len()) {
+            return None;
+        }
+        let mut rows = Vec::new();
+        let hs = self.gpu_prefill(sess, tokens, mm, &cap, &mut rows)?;
+        let (nf, nc) = (layers.len(), cap.len());
+        feats.clear();
+        feats.resize(t * nf * h, 0.0);
+        for_chunks(feats, nf * h, true, |ti, f| {
+            for (fi, &l) in layers.iter().enumerate() {
+                let out = &mut f[fi * h..(fi + 1) * h];
+                if l == 0 {
+                    match mm.iter().find(|m| m.0 == ti) {
+                        Some(&(_, e)) => out.copy_from_slice(e),
+                        None => self.embed.row(tokens[ti] as usize, out),
+                    }
+                } else {
+                    let ci = cap.binary_search(&(l - 1)).unwrap();
+                    out.copy_from_slice(&rows[(ti * nc + ci) * h..(ti * nc + ci + 1) * h]);
+                }
+            }
+        });
+        Some(hs)
+    }
+
+    /// [`crate::generate::TextLm::prefill_hidden`]: a chunk of fewer tokens than
+    /// [`PREFILL_GPU_MIN`] runs on the prefill plan too (see [`crate::model::small_prompt_gpu`]).
+    pub fn prefill_hidden(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
+        let t = tokens.len();
+        if (2..PREFILL_GPU_MIN).contains(&t)
+            && self.exp.is_none()
+            && crate::model::small_prompt_gpu()
+            && prefill_gpu(PREFILL_GPU_MIN, "plan")
+            && let Some(hs) = self.gpu_prefill(sess, tokens, mm, &[], &mut Vec::new())
+        {
+            return hs;
+        }
+        self.forward_hidden_mm(sess, tokens, mm)
+    }
+}
+
 impl crate::dspark::Target for QwenModel<'_> {
+    fn prefill_feats(
+        &self,
+        sess: &mut QwenSession,
+        tokens: &[u32],
+        mm: &[(usize, &[f32])],
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+    ) -> Vec<f32> {
+        let t = tokens.len();
+        if t < PREFILL_GPU_MIN && crate::model::small_prompt_gpu() && prefill_gpu(PREFILL_GPU_MIN, "plan") {
+            // One token: the one-token kernels (a verification pass of it); a few: the prefill plan.
+            let hs = if t == 1 && mm.is_empty() {
+                self.gpu_pass(sess, tokens, layers, feats, false).map(|r| r.0)
+            } else {
+                self.gpu_prefill_feats(sess, tokens, mm, layers, feats)
+            };
+            if let Some(hs) = hs {
+                return hs;
+            }
+        }
+        self.forward_feats(sess, tokens, mm, layers, feats)
+    }
     fn forward_feats(
         &self,
         sess: &mut QwenSession,
@@ -3106,29 +3184,9 @@ impl crate::dspark::Target for QwenModel<'_> {
         cap.dedup();
         // A prompt: on the GPU prefill plan, which copies the captured rows out (a prefill pass
         // records nothing for rewinds: drafts are only rewound within a verification pass).
-        let mut rows = Vec::new();
-        if self.exp.is_none()
-            && prefill_gpu(t, "plan")
-            && cap.last().is_none_or(|&l| l < self.layers.len())
-            && let Some(hs) = self.gpu_prefill(sess, tokens, mm, &cap, &mut rows)
+        if prefill_gpu(t, "plan")
+            && let Some(hs) = self.gpu_prefill_feats(sess, tokens, mm, layers, feats)
         {
-            let (nf, nc) = (layers.len(), cap.len());
-            feats.clear();
-            feats.resize(t * nf * h, 0.0);
-            for_chunks(feats, nf * h, true, |ti, f| {
-                for (fi, &l) in layers.iter().enumerate() {
-                    let out = &mut f[fi * h..(fi + 1) * h];
-                    if l == 0 {
-                        match mm.iter().find(|m| m.0 == ti) {
-                            Some(&(_, e)) => out.copy_from_slice(e),
-                            None => self.embed.row(tokens[ti] as usize, out),
-                        }
-                    } else {
-                        let ci = cap.binary_search(&(l - 1)).unwrap();
-                        out.copy_from_slice(&rows[(ti * nc + ci) * h..(ti * nc + ci + 1) * h]);
-                    }
-                }
-            });
             return hs;
         }
         sess.capture = cap;

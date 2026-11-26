@@ -296,10 +296,38 @@ What is measured and where the gap to llama-server comes from:
   fast-verification kernels (21 ms at 8 rows), at the cost of exactness (logits within ~1e-4).
 - **Mixtures of experts are batched exactly** (above); what is left of their gap at 8 rows is
   the dense matvecs' (attention, the dense MLP, the head) on the exact multi-token kernels.
-- **Mixed prompts are prefill-bound**: 30k prompt tokens at N=8, read at ~2300 tok/s (Qwen3-8B
-  on Metal) where llama.cpp reads faster, so its wall time is half ours there; TTFT p50 is lower
-  than llama-server's (shortest prompts first, chunks interleaved) but p95 higher (the longest
-  prompt is read last).
+- **Mixed prompts: the prompts are read at llama.cpp's rate; the decode steps after them are the
+  gap.** The harness sends the same prompts at N = 1, 2, 4 and 8 on one server, so at N=8 the
+  first four are in the sessions' caches (llama-server's slots reuse them: its log shows 1-token
+  prompts for those). Our sessions lost them: a new conversation scored the few bytes every
+  prompt starts with ("Request ") as a shared beginning and took a session holding another
+  conversation; now a partial match counts from 256 bytes, else an empty or the least recently
+  used session is taken (below). Per chunk (`OXINFER_BATCH_TRACE=1` prints a line per prompt
+  chunk: its size, position, the wait for the turn and its run time), 2048 tokens run in 0.9 s at
+  position 0 and 1.0-1.1 s at 2048-6144 (with the DSpark draft's feature captures), about what
+  llama-server reports for the same prompts in its server (1790-1960 tok/s for the 5442- and
+  7247-token prompts); chunking costs nothing measurable (one 6569-token chunk took as long as
+  four), and the hand-offs between chunks are the batched decode step in between (20-60 ms).
+  Of a 28.6 s N=8 run before the fix, 11.4 s were prompt chunks, 0.6 s the 14 decode steps
+  between them, and 16.3 s the 252 eight-row steps after the last prompt (65 ms each on that
+  loaded machine): mixing decode rows into the prompt chunks' passes (llama.cpp's mixed batches)
+  could save at most the 0.6 s of steps between chunks (2%) with exact rows, which re-read the
+  weights on their own kernels anyway, so it is not done; the rest of the gap is the exact
+  multi-row step. Short prompt chunks (under 32 tokens: a reused conversation's last token, a
+  short next turn) ran on the host path, 40-130 ms for one Qwen3-8B token; they now run on the
+  GPU (one token with the draft's features on the one-token kernels, 18-25 ms; 2-31 tokens on the
+  prefill plan; `OXINFER_PREFILL_GPU_SMALL=0` keeps the host path). Before / after, on a loaded
+  machine (other jobs' builds), Qwen3-8B Q8_0, aggregate tok/s, TTFT p50 / p95 in seconds:
+
+  | N | before | after | llama-server (same window) |
+  |---|---|---|---|
+  | 1 | 55.1, 0.24 | 73.4, 0.23 | 56.2, 0.20 |
+  | 2 | 63.0, 0.08 / 2.43 | 71.4, 0.04 / 2.07 | 64.5, 0.03 / 2.17 |
+  | 4 | 67.4, 2.55 / 6.80 | 79.1, 0.60 / 4.48 | 85.8, 1.22 / 5.12 |
+  | 8 | 77.1, 2.38 / 10.5 | 91.0, 0.88 / 6.10 | 136.4, 3.66 / 6.51 |
+
+  (N=1's spread is the machine's: the change does not touch a request alone with a 497-token
+  prompt.)
 - **A request alone keeps its single-request speed** (speculative decoding, chained greedy
   passes; Qwen3-8B Q8_0 alone with DSpark ~85-104 tok/s against llama-server's 61). When others
   arrive mid-reply, DSpark / prompt-lookup rounds hand over to plain batched steps at the next
@@ -308,7 +336,9 @@ What is measured and where the gap to llama-server comes from:
 Not done: exact multi-token kernels that scale past 4 rows, batched decode of DeepSeek V4,
 cross-session KV sharing
 in memory (sessions share prefixes through the prompt cache on disk only), and mixing prompt
-chunks and decode rows in one pass (llama.cpp's mixed batches).
+chunks and decode rows in one pass (llama.cpp's mixed batches: at most ~2% here with exact rows,
+see above; with `batch_fast` the rows could ride in the prompt's GEMMs, likewise bounded by the
+few steps between chunks).
 
 ## Comparison with llama.cpp
 

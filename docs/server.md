@@ -280,8 +280,9 @@ Several clients on one chat model (opencode sessions, agents, API clients) run a
 each model has `--parallel N` sessions (default 4; per model `parallel=N`; `1` for one request
 at a time), each with its own caches over the same weights (`EnginePool`, `src/engine_pool.rs`).
 A request takes the idle session whose last conversation shares the most of its beginning (the
-same leading messages, then the common start of the first that differs), else the least recently
-used one, so each client's conversation keeps its cache from one turn to the next, and a new
+same leading messages, then the common start of the first that differs if at least 256 bytes:
+conversations sharing only their first words keep their sessions), else an empty one, else the
+least recently used one, so each client's conversation keeps its cache from one turn to the next, and a new
 conversation with the same system prompt reuses that prefix of a session's cache (models without
 recurrent state; with a prompt cache, `--prompt-cache`, sessions also restore each other's
 snapshots from disk). With every session busy, a request waits (`: waiting: ... is busy` while
@@ -375,7 +376,8 @@ engine; `EnginePool::set_cache_budget` bounds a pool's sessions the same way, `t
 `idle_caches` act on them directly, `Engine::cache_bytes` / `Engine::evict_cache` on one); the C
 API through `oxi_server_new`'s options (`parallel=N`, `session_cache_gb=F`, model options
 `parallel=`, `max_batch=`, `batch_fast=`). `OXINFER_BATCH_TRACE=1` prints a line per batched step
-(rows, gather and run times).
+(rows, gather and run times) and per prompt chunk (tokens, position, the wait for the turn, run
+time).
 
 ### Status, cancelling and the caches
 

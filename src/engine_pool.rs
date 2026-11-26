@@ -197,8 +197,14 @@ impl Drop for PoolGuard<'_> {
     }
 }
 
+/// The common start of two differing messages that counts in [`shared`] (bytes): below it, the
+/// conversations only share a few words ("Request 1" / "Request 2"), a session holding the
+/// other one is worth more kept than reused (its own client may continue it), and a new
+/// conversation takes an empty or the least recently used session instead.
+const MIN_PARTIAL: usize = 256;
+
 /// How much of `new`'s beginning `old` has: the length of the leading messages they share and of
-/// the common start of the first that differs (bytes of content).
+/// the common start of the first that differs if at least [`MIN_PARTIAL`] (bytes of content).
 fn shared(old: &[Message], new: &[Message]) -> usize {
     let mut n = 0;
     for (a, b) in old.iter().zip(new) {
@@ -210,7 +216,10 @@ fn shared(old: &[Message], new: &[Message]) -> usize {
             continue;
         }
         if a.media == b.media {
-            n += a.content.bytes().zip(b.content.bytes()).take_while(|(x, y)| x == y).count();
+            let c = a.content.bytes().zip(b.content.bytes()).take_while(|(x, y)| x == y).count();
+            if c >= MIN_PARTIAL {
+                n += c;
+            }
         }
         break;
     }
@@ -474,5 +483,20 @@ mod tests {
         turn(&b);
         assert_eq!(pool.idle_caches().len(), 2);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_few_shared_words_do_not_count() {
+        let (a, b) = ([Message::user("Request 1. notes")], [Message::user("Request 2. notes")]);
+        assert_eq!(shared(&a, &b), 0);
+        let long = "x".repeat(MIN_PARTIAL);
+        let a = [Message::user(format!("{long} one"))];
+        let b = [Message::user(format!("{long} two"))];
+        assert_eq!(shared(&a, &b), MIN_PARTIAL + 1);
+        // Whole messages count, however short.
+        let sys = Message::system("Be brief.");
+        let a = [sys.clone(), Message::user("a")];
+        let b = [sys, Message::user("b")];
+        assert_eq!(shared(&a, &b), "Be brief.".len() + 1);
     }
 }

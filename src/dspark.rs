@@ -64,6 +64,19 @@ pub trait Target: TextLm {
         layers: &[usize],
         feats: &mut Vec<f32>,
     ) -> Vec<f32>;
+    /// [`Target::forward_feats`] for a chunk of a prompt (the prefill passes, not verification:
+    /// where the model has faster kernels for a few prompt tokens whose rounding differs from
+    /// one-token steps, it may use them).
+    fn prefill_feats(
+        &self,
+        sess: &mut Self::Sess,
+        tokens: &[u32],
+        mm: &[(usize, &[f32])],
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+    ) -> Vec<f32> {
+        self.forward_feats(sess, tokens, mm, layers, feats)
+    }
     /// The verification pass: [`Target::forward_feats`] without multimodal inputs, returning the
     /// logits `[t, vocab]` of every token (a GPU pass where the model has one). With `fast`, a
     /// GPU pass may use batched kernels whose rounding differs from one-token steps
@@ -3530,7 +3543,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         let t0 = crate::clock::Instant::now();
         let hs = self
             .model
-            .forward_feats(&mut self.sess, tokens, mm, &self.draft.cfg.target_layers, &mut feats);
+            .prefill_feats(&mut self.sess, tokens, mm, &self.draft.cfg.target_layers, &mut feats);
         let t1 = t0.elapsed().as_secs_f64();
         // Inkling-2's drafter on the accelerator (made once, after the target's first pass made
         // its device state: the head product runs there), so that the context goes in there.
@@ -3584,18 +3597,30 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         let mut start = 0;
         for c in tokens.chunks(self.model.prefill_chunk(chunk).max(1)) {
             // Other requests on the model ([`crate::batch`]) go between the chunks.
+            let tw = crate::clock::Instant::now();
             if start > 0 {
                 crate::batch::set_remaining(tokens.len() - start);
                 crate::batch::yield_now();
             }
+            let waited = tw.elapsed();
             let end = start + c.len();
             let local: Vec<(usize, &[f32])> = overrides
                 .iter()
                 .filter(|(p, _)| *p >= start && *p < end)
                 .map(|(p, e)| (p - start, e.as_slice()))
                 .collect();
-            start = end;
+            let tr = crate::clock::Instant::now();
             let hs = self.run(c, &local);
+            if crate::batch::trace() {
+                eprintln!(
+                    "[prompt chunk (dspark): {} tokens at {start} of {}, waited {:.2} ms, ran in {:.2} ms]",
+                    c.len(),
+                    tokens.len(),
+                    waited.as_secs_f64() * 1e3,
+                    tr.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            start = end;
             last = hs[hs.len() - h..].to_vec();
         }
         self.model.logits(&last, 1)

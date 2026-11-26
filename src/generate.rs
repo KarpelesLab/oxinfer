@@ -246,6 +246,9 @@ impl TextLm for QwenModel<'_> {
     fn prefill_chunk(&self, chunk: usize) -> usize {
         QwenModel::prefill_chunk(self, chunk)
     }
+    fn prefill_hidden(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])], _last: bool) -> Vec<f32> {
+        QwenModel::prefill_hidden(self, sess, tokens, mm)
+    }
     fn forward(&self, sess: &mut QwenSession, tokens: &[u32]) -> Vec<f32> {
         QwenModel::forward(self, sess, tokens)
     }
@@ -331,10 +334,12 @@ fn prefill_inner<M: TextLm + ?Sized>(
     while start < ids.len() {
         // Other requests on the model ([`crate::batch`]) go between the chunks, the shortest
         // prompt left first.
+        let tw = Instant::now();
         if start > 0 {
             crate::batch::set_remaining(ids.len() - start);
             crate::batch::yield_now();
         }
+        let waited = tw.elapsed();
         let mut end = (start + chunk.max(1)).min(ids.len());
         if whole {
             while end < ids.len() && is_mm(end - 1) && is_mm(end) {
@@ -347,7 +352,17 @@ fn prefill_inner<M: TextLm + ?Sized>(
             .filter(|(p, _)| *p >= start && *p < end)
             .map(|(p, e)| (p - start, e.as_slice()))
             .collect();
+        let tr = Instant::now();
         hs = model.prefill_hidden(sess, c, &local, end == ids.len());
+        if crate::batch::trace() {
+            eprintln!(
+                "[prompt chunk: {} tokens at {start} of {}, waited {:.2} ms, ran in {:.2} ms]",
+                c.len(),
+                ids.len(),
+                waited.as_secs_f64() * 1e3,
+                tr.elapsed().as_secs_f64() * 1e3
+            );
+        }
         start = end;
         if start == ids.len() {
             crate::batch::set_remaining(0);
