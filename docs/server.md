@@ -368,6 +368,7 @@ other families' sessions are let go of only under memory pressure). The Status v
 | `parallel` | `--parallel`, server option, model option | sessions of each chat model (default 4) |
 | `max_batch` | model option | most rows of a batched step (default 8) |
 | `batch_fast` | model option | batched steps of 5+ rows on the fast kernels (default off) |
+| `decode_chunk` | model option | most prompt tokens a chunk reads while others decode (default 0: the model's chunk) |
 | `session_cache_gb` | `--session-cache-gb`, server option | memory of all sessions' caches (default `auto`) |
 
 The library has them as `ServerOptions::parallel` / `ServerOptions::session_cache` and
@@ -375,7 +376,7 @@ The library has them as `ServerOptions::parallel` / `ServerOptions::session_cach
 engine; `EnginePool::set_cache_budget` bounds a pool's sessions the same way, `trim`, `evict` and
 `idle_caches` act on them directly, `Engine::cache_bytes` / `Engine::evict_cache` on one); the C
 API through `oxi_server_new`'s options (`parallel=N`, `session_cache_gb=F`, model options
-`parallel=`, `max_batch=`, `batch_fast=`). `OXINFER_BATCH_TRACE=1` prints a line per batched step
+`parallel=`, `max_batch=`, `batch_fast=`, `decode_chunk=`). `OXINFER_BATCH_TRACE=1` prints a line per batched step
 (rows, gather and run times) and per prompt chunk (tokens, position, the wait for the turn, run
 time).
 

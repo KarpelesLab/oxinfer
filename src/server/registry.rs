@@ -1152,6 +1152,11 @@ impl Registry {
                 if let Some(v) = spec.option("batch_fast") {
                     b.fast = matches!(v, "1" | "true" | "yes" | "on");
                 }
+                if let Some(v) = spec.option("decode_chunk") {
+                    b.decode_chunk = v
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("decode_chunk: expected a count, got {v:?}"))?;
+                }
                 if let Some(v) = spec.option("max_batch") {
                     b.max_batch = v.parse().map_err(|_| anyhow::anyhow!("max_batch: expected a count, got {v:?}"))?;
                 }

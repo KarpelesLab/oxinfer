@@ -328,6 +328,13 @@ What is measured and where the gap to llama-server comes from:
 
   (N=1's spread is the machine's: the change does not touch a request alone with a 497-token
   prompt.)
+
+  Smaller chunks while others decode (`decode_chunk=512`, model option; default off) change
+  little: Inkling-2-Mini UD-IQ3_XXS (its 2048-token chunks read 2-3x faster than 256-token ones)
+  N=8 94.3 -> 94.1 tok/s, TTFT p50 2.74 -> 1.66 s but p95 8.66 -> 9.26; N=4 76.1 -> 77.6, p50
+  3.89 -> 1.30, p95 6.20 -> 6.18; Qwen3-8B Q8_0 N=8 89.0 -> 87.1, p50 0.90 -> 1.06, p95 6.17 ->
+  7.68. Inkling's N=8 run has the same shape as Qwen's: 7.6 s of prompt chunks, 0.3 s of steps
+  between them, 12.3 s of steps after them (246 eight-row steps of 49 ms; one row 11 ms).
 - **A request alone keeps its single-request speed** (speculative decoding, chained greedy
   passes; Qwen3-8B Q8_0 alone with DSpark ~85-104 tok/s against llama-server's 61). When others
   arrive mid-reply, DSpark / prompt-lookup rounds hand over to plain batched steps at the next

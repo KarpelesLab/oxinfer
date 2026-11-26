@@ -45,6 +45,11 @@ pub struct BatchOptions {
     /// row's logits then differ from its one-token step's by rounding (~1e-4), so a reply may
     /// depend on the requests decoded with it. Default off (process-wide, see [`set_fast`]).
     pub fast: bool,
+    /// The most prompt tokens a chunk reads while other requests of the model are decoding (0:
+    /// the model's own prefill chunk; see [`chunk_for`]). Their steps wait for each chunk: a
+    /// smaller one lets them run more often, at the cost of prompt speed where a model reads
+    /// big chunks faster (mixtures of experts).
+    pub decode_chunk: usize,
 }
 
 static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -73,6 +78,7 @@ impl Default for BatchOptions {
             max_batch: 8,
             gather_us: 3000,
             fast: false,
+            decode_chunk: 0,
         }
     }
 }
@@ -415,6 +421,21 @@ pub fn set_remaining(n: usize) {
     });
 }
 
+/// The size of the next prompt chunk of this thread's request: `chunk`, or at most
+/// [`BatchOptions::decode_chunk`] tokens while other requests of its group are decoding.
+pub fn chunk_for(chunk: usize) -> usize {
+    CURRENT.with(|c| {
+        let b = c.borrow();
+        let Some(c) = b.as_ref() else { return chunk };
+        let dc = c.group.opts.decode_chunk;
+        if dc > 0 && c.group.lock().decoding > 0 {
+            chunk.min(dc)
+        } else {
+            chunk
+        }
+    })
+}
+
 /// Gives up the turn (keeping the membership).
 fn give_up() {
     let Some((g, run)) = CURRENT.with(|c| {
@@ -597,7 +618,7 @@ mod tests {
         let g = Group::new(BatchOptions {
             max_batch: 4,
             gather_us: 20_000,
-            fast: false,
+            ..Default::default()
         });
         let start = Arc::new(std::sync::Barrier::new(4));
         let hs: Vec<_> = (0..4)
@@ -637,6 +658,21 @@ mod tests {
 
     fn toy_rows(_t: &Toy, st: &GroupStats) -> usize {
         st.rows as usize
+    }
+
+    #[test]
+    fn prompt_chunks_shrink_while_others_decode() {
+        let g = Group::new(BatchOptions {
+            decode_chunk: 512,
+            ..Default::default()
+        });
+        assert_eq!(chunk_for(2048), 2048, "outside a group");
+        let _m = enter(&g);
+        assert_eq!(chunk_for(2048), 2048, "nobody decoding");
+        g.lock().decoding += 1;
+        assert_eq!(chunk_for(2048), 512);
+        assert_eq!(chunk_for(256), 256);
+        g.lock().decoding -= 1;
     }
 
     #[test]

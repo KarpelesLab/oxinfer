@@ -340,7 +340,7 @@ fn prefill_inner<M: TextLm + ?Sized>(
             crate::batch::yield_now();
         }
         let waited = tw.elapsed();
-        let mut end = (start + chunk.max(1)).min(ids.len());
+        let mut end = (start + crate::batch::chunk_for(chunk).max(1)).min(ids.len());
         if whole {
             while end < ids.len() && is_mm(end - 1) && is_mm(end) {
                 end += 1;

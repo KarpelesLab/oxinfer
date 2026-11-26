@@ -86,7 +86,9 @@ impl ModelSpec {
     /// - `max_batch`: chat models, the most decode steps of those run as one batched step
     ///   (default 8; see [`crate::batch`]);
     /// - `batch_fast`: chat models, batched steps on the fast-verification kernels (`1`; see
-    ///   [`crate::batch::BatchOptions::fast`]).
+    ///   [`crate::batch::BatchOptions::fast`]);
+    /// - `decode_chunk`: chat models, the most prompt tokens a chunk reads while other requests
+    ///   decode ([`crate::batch::BatchOptions::decode_chunk`]).
     pub const KEYS: &'static [&'static str] = &[
         "kind",
         "system",
@@ -102,6 +104,7 @@ impl ModelSpec {
         "parallel",
         "max_batch",
         "batch_fast",
+        "decode_chunk",
     ];
 
     /// Parses `[ID=]SOURCE[,KEY=VALUE...]`.

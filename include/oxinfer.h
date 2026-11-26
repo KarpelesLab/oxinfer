@@ -1160,7 +1160,8 @@ typedef int (*oxi_bytes_fn)(void *user, const char *data, size_t len);
  *   tls_cert=PATH, tls_key=PATH, self_signed=0|1   HTTPS
  *   workers=N            connections served at once (default 32)
  *   parallel=N           conversations each chat model runs at once, each with its own caches
- *                        (default 4; model options parallel=N, max_batch=N, batch_fast=1; see
+ *                        (default 4; model options parallel=N, max_batch=N, batch_fast=1,
+ *                        decode_chunk=N; see
  *                        docs/server.md#concurrent-requests)
  *   session_cache_gb=F   memory the chat sessions' caches may hold together (default auto: a
  *                        quarter of RAM, at least 2 GB; none: no limit): beyond it the least

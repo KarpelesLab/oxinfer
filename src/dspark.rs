@@ -3595,7 +3595,8 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         let h = self.model.hidden_size();
         let mut last = Vec::new();
         let mut start = 0;
-        for c in tokens.chunks(self.model.prefill_chunk(chunk).max(1)) {
+        let chunk = self.model.prefill_chunk(chunk).max(1);
+        while start < tokens.len() {
             // Other requests on the model ([`crate::batch`]) go between the chunks.
             let tw = crate::clock::Instant::now();
             if start > 0 {
@@ -3603,7 +3604,8 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
                 crate::batch::yield_now();
             }
             let waited = tw.elapsed();
-            let end = start + c.len();
+            let end = (start + crate::batch::chunk_for(chunk).max(1)).min(tokens.len());
+            let c = &tokens[start..end];
             let local: Vec<(usize, &[f32])> = overrides
                 .iter()
                 .filter(|(p, _)| *p >= start && *p < end)
