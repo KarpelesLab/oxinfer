@@ -1,7 +1,9 @@
 //! The T5 v1.1 encoder (transformers `T5EncoderModel`), FLUX's main text encoder (T5-XXL:
 //! 24 blocks, width 4096, 64 heads of 64, gated-GELU feed-forward of 10240): RMS norms, no
 //! attention scaling, and a learned relative-position bias (32 buckets, max distance 128)
-//! computed once from the first block and shared by all. The tokenizer is the SentencePiece
+//! computed once from the first block and shared by all; umT5 (`UMT5EncoderModel`: Wan's and
+//! LongCat-Video's text encoder) is the same encoder with a bias table per block. The tokenizer
+//! is the SentencePiece
 //! `tokenizer.json` through `crate::tokenizer`; prompts are padded (`<pad>`, attended like
 //! any token, as diffusers runs it) to a fixed length.
 
@@ -29,8 +31,8 @@ pub struct T5Encoder {
     eps: f32,
     num_buckets: usize,
     max_distance: usize,
-    /// `[num_buckets, heads]`.
-    rel_bias: Vec<f32>,
+    /// `[num_buckets, heads]`: one table shared by the blocks (T5), or one per block (umT5).
+    rel_bias: Vec<Vec<f32>>,
     final_ln: Vec<f32>,
     blocks: Vec<Block<'static>>,
     tokenizer: crate::tokenizer::Tokenizer,
@@ -91,6 +93,12 @@ impl T5Encoder {
             crate::tokenizer::Tokenizer::from_file(tok_dir.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("T5 tokenizer: {e}"))?;
         let pad_id = cfg["pad_token_id"].as_u64().unwrap_or(0) as u32;
         let eos_id = cfg["eos_token_id"].as_u64().unwrap_or(1) as u32;
+        let bias_name = |i: usize| format!("encoder.block.{i}.layer.0.SelfAttention.relative_attention_bias.weight");
+        let rel_bias = if n_layers > 1 && fs.has(&bias_name(1)) {
+            (0..n_layers).map(|i| ld.f32(&bias_name(i))).collect::<Result<Vec<_>>>()?
+        } else {
+            vec![ld.f32(&bias_name(0))?]
+        };
         let weight_bytes = blocks
             .iter()
             .flat_map(|b| b.qkv.iter().chain(&b.wi).chain([&b.o, &b.wo]))
@@ -103,7 +111,7 @@ impl T5Encoder {
             eps: cfg["layer_norm_epsilon"].as_f64().unwrap_or(1e-6) as f32,
             num_buckets: cfg["relative_attention_num_buckets"].as_u64().unwrap_or(32) as usize,
             max_distance: cfg["relative_attention_max_distance"].as_u64().unwrap_or(128) as usize,
-            rel_bias: ld.f32("encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight")?,
+            rel_bias,
             final_ln: ld.f32("encoder.final_layer_norm.weight")?,
             blocks,
             tokenizer,
@@ -188,7 +196,7 @@ impl T5Encoder {
     /// T5 plan or declines (an unsupported shape or weight format).
     fn forward_device(&self, h: &[f32], t: usize) -> Option<Vec<f32>> {
         use crate::gpu::dit::{T5Block, T5Model};
-        if !self.device_passes.load(std::sync::atomic::Ordering::Relaxed) || self.d_kv != 64 {
+        if !self.device_passes.load(std::sync::atomic::Ordering::Relaxed) || self.d_kv != 64 || self.rel_bias.len() != 1 {
             return None;
         }
         let be = crate::gpu::active()?;
@@ -221,7 +229,7 @@ impl T5Encoder {
         for r in 0..tb {
             let bk = self.bucket(r as i64 - (t as i64 - 1));
             for hh in 0..nh {
-                bias[hh * tb + r] = self.rel_bias[bk * nh + hh];
+                bias[hh * tb + r] = self.rel_bias[0][bk * nh + hh];
             }
         }
         let _t = crate::prof::start(crate::prof::Cat::Matmul);
@@ -247,12 +255,18 @@ impl T5Encoder {
         let (nh, dk) = (self.heads, self.d_kv);
         let mut bias = vec![0f32; nh * t * t];
         let buckets: Vec<usize> = (0..t * t).map(|p| self.bucket((p % t) as i64 - (p / t) as i64)).collect();
-        for_chunks(&mut bias, t * t, true, |hh, b| {
-            for (o, &bk) in b.iter_mut().zip(&buckets) {
-                *o = self.rel_bias[bk * nh + hh];
+        let fill = |bias: &mut [f32], table: &[f32]| {
+            for_chunks(bias, t * t, true, |hh, b| {
+                for (o, &bk) in b.iter_mut().zip(&buckets) {
+                    *o = table[bk * nh + hh];
+                }
+            });
+        };
+        fill(&mut bias, &self.rel_bias[0]);
+        for (i, blk) in self.blocks.iter().enumerate() {
+            if i > 0 && self.rel_bias.len() > 1 {
+                fill(&mut bias, &self.rel_bias[i]);
             }
-        });
-        for blk in &self.blocks {
             let x = rms(&h, &blk.ln1, d, self.eps);
             let qkv = forward_many(&blk.qkv.iter().collect::<Vec<_>>(), &x, t);
             let a = attention_bias(&qkv[0], &qkv[1], &qkv[2], t, nh, dk, &bias);
