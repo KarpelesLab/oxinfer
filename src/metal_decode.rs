@@ -22,27 +22,90 @@ pub(crate) const MVK_CLASSES: [usize; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 16];
 /// The multi-token matvec variant for a format, a row of `n_in` values split over `ks`
 /// SIMD-groups and steps of up to `tt` tokens: rows per threadgroup (each lane holds a decoded
 /// chunk of every row and an accumulator per row and token, and loads each token's x chunk once
-/// for the rows) and the kernel's kind ([`MvkKind`]). See [`mvk_table`]; `OXINFER_MVK_ROWS=n` /
-/// `OXINFER_MVK_KIND=0|1|2` override it.
-pub(crate) fn mvk_variant(fmt: MvFmt, n_out: usize, n_in: usize, ks: usize, tt: usize, pair: bool) -> (usize, MvkKind) {
+/// for the rows), the kernel's kind ([`MvkKind`]) and the row groups of a threadgroup
+/// ([`MvkGeo`]). See [`mvk_table`]; `OXINFER_MVK_ROWS=n` / `OXINFER_MVK_KIND=0..8` /
+/// `OXINFER_MVK_G=n` override it.
+pub(crate) fn mvk_variant(fmt: MvFmt, n_out: usize, n_in: usize, ks: usize, tt: usize, pair: bool) -> (usize, MvkKind, MvkGeo) {
     let long = n_in / fmt.chunk() > 32 * ks;
-    let (nr, kind) = if pair {
+    let (nr, kind, g) = if pair {
         mvk_pair_table(fmt, long, ks, tt)
     } else {
-        mvk_table(fmt, long, ks, tt)
+        let (nr, kind) = mvk_table(fmt, long, ks, tt);
+        (nr, kind, 1)
     };
     // Few rows: a threadgroup each, to spread them over the GPU.
-    let nr = if n_out < MVK_FEW_ROWS { 1 } else { nr };
+    let (nr, g) = if n_out < MVK_FEW_ROWS { (1, 1) } else { (nr, g) };
     let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
-    static OVER: std::sync::OnceLock<(Option<usize>, Option<usize>)> = std::sync::OnceLock::new();
-    let (r, h) = *OVER.get_or_init(|| (env("OXINFER_MVK_ROWS").filter(|r| [1, 2, 4].contains(r)), env("OXINFER_MVK_KIND")));
-    let kind = match h {
-        Some(0) => MvkKind::Float,
-        Some(1) => MvkKind::Half,
-        Some(2) => MvkKind::Sweeps,
-        _ => kind,
+    static OVER: std::sync::OnceLock<(Option<usize>, Option<usize>, Option<usize>)> = std::sync::OnceLock::new();
+    let (r, h, eg) = *OVER.get_or_init(|| {
+        (
+            env("OXINFER_MVK_ROWS").filter(|r| [1, 2, 4, 8].contains(r)),
+            env("OXINFER_MVK_KIND").filter(|&k| k < MvkKind::ALL.len()),
+            env("OXINFER_MVK_G"),
+        )
+    });
+    let kind = h.map_or(kind, |k| MvkKind::ALL[k]);
+    let kind = match kind {
+        _ if !kind.ok(fmt) => MvkKind::Float,
+        // (Reduced token by token: rows of one chunk a lane, up to 8 tokens.)
+        MvkKind::OneF if long || tt > 8 => MvkKind::Float,
+        MvkKind::OneH if long || tt > 8 => MvkKind::Half,
+        MvkKind::OneP if long || tt > 8 => MvkKind::Packed,
+        k => k,
     };
-    (r.unwrap_or(nr), kind)
+    let nr = r.unwrap_or(nr);
+    let geo = MvkGeo { g: eg.unwrap_or(g) };
+    (nr, kind, if geo.valid(nr, ks, tt, kind) { geo } else { MvkGeo::ONE })
+}
+
+/// Whether to compile every variant of a format's `tt`-token kernels: with `OXINFER_MVK_ALL`
+/// (`decode_mvk_bench`), for the formats and token counts of `OXINFER_MVK_FMTS` /
+/// `OXINFER_MVK_T` when given.
+fn mvk_all_for(f: MvFmt, tt: usize) -> bool {
+    if std::env::var_os("OXINFER_MVK_ALL").is_none() {
+        return false;
+    }
+    let fmt_ok = std::env::var("OXINFER_MVK_FMTS").map_or(true, |v| {
+        v.split(',').any(|n| n == f.name() || n.strip_suffix('a') == Some(&f.name()))
+    });
+    let t_ok = std::env::var("OXINFER_MVK_T").map_or(true, |v| {
+        v.split(',')
+            .filter_map(|t| t.parse::<usize>().ok())
+            .any(|t| MVK_CLASSES[mvk_class(t)] == tt)
+    });
+    fmt_ok && t_ok
+}
+
+/// What `OXINFER_MVK_ALL` compiles (and `decode_mvk_bench` measures): rows `OXINFER_MVK_NR`
+/// (default 1, 2, 4), kinds `OXINFER_MVK_H` (default all), row groups `OXINFER_MVK_GS` (default
+/// 1).
+fn mvk_bench_list(k: &str, d: &str) -> Vec<usize> {
+    std::env::var(k)
+        .unwrap_or(d.into())
+        .split(',')
+        .filter_map(|v| v.parse().ok())
+        .collect()
+}
+
+/// How a multi-token matvec's threadgroup is laid out (`MVK_G` in the shader): `g` groups of
+/// SIMD-groups for as many sets of rows, each as a threadgroup of the one-group kernel would take
+/// them.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) struct MvkGeo {
+    pub g: usize,
+}
+
+impl MvkGeo {
+    pub(crate) const ONE: MvkGeo = MvkGeo { g: 1 };
+    fn valid(self, nr: usize, ks: usize, tt: usize, kind: MvkKind) -> bool {
+        // Threadgroup memory: the reductions' sums (`MVK_RED`).
+        let red = 2 * nr * ks * if kind == MvkKind::Sweeps { 1 } else { tt.min(8) } * self.g;
+        self.g.is_power_of_two() && 32 * ks * self.g <= 1024 && 4 * red <= 16384
+    }
+    /// The kernel name's suffix.
+    fn suffix(self) -> String {
+        if self.g > 1 { format!("_g{}", self.g) } else { String::new() }
+    }
 }
 
 /// [`mvk_table`] for SiLU / GELU pairs, where each lane holds both matrices' decoded chunks: one
@@ -50,9 +113,9 @@ pub(crate) fn mvk_variant(fmt: MvFmt, n_out: usize, n_in: usize, ks: usize, tt: 
 /// with `OXINFER_MVK_PAIR=1`, 12288 x 4096 and 4096 x 4096 pairs: Q8_0 at 8 tokens 851 us with two
 /// float rows, 375 with one half; Q4_K 2183 / 540; at 16 tokens Q4_K 1379 in sweeps against
 /// 1463-5073).
-fn mvk_pair_table(fmt: MvFmt, _long: bool, _ks: usize, tt: usize) -> (usize, MvkKind) {
+fn mvk_pair_table(fmt: MvFmt, _long: bool, _ks: usize, tt: usize) -> (usize, MvkKind, usize) {
     if tt > 8 {
-        return (2, MvkKind::Sweeps);
+        return (2, MvkKind::Sweeps, 1);
     }
     (
         1,
@@ -60,6 +123,13 @@ fn mvk_pair_table(fmt: MvFmt, _long: bool, _ks: usize, tt: usize) -> (usize, Mvk
             MvkKind::Float
         } else {
             MvkKind::Half
+        },
+        // Two row groups a threadgroup at 6-8 tokens (Q8_0 12288 x 4096 pair, 8 tokens: 385 ->
+        // 352 us).
+        if tt >= 6 && matches!(fmt, MvFmt::Gguf(GgmlType::Q8_0)) {
+            2
+        } else {
+            1
         },
     )
 }
@@ -76,11 +146,35 @@ pub(crate) enum MvkKind {
     Half = 1,
     /// Sweeps of 4 tokens bounded by the step's count, finished token by token, float quants.
     Sweeps = 2,
+    /// As `Float`, the quants kept packed as stored and unpacked at each use (Q8_0, Q4_K: see
+    /// [`MvFmt::packs`]), so that more rows fit in the registers.
+    Packed = 3,
+    /// Rows of one chunk a lane (up to 8 tokens): each token's sums reduced over the SIMD-group
+    /// as soon as they are computed (`mvk_one` in the shader), with float, half or packed quants.
+    OneF = 6,
+    OneH = 7,
+    OneP = 8,
 }
 
 impl MvkKind {
+    /// By value (4 and 5 unused).
+    const ALL: [MvkKind; 9] = [
+        MvkKind::Float,
+        MvkKind::Half,
+        MvkKind::Sweeps,
+        MvkKind::Packed,
+        MvkKind::Float,
+        MvkKind::Float,
+        MvkKind::OneF,
+        MvkKind::OneH,
+        MvkKind::OneP,
+    ];
     fn suffix(self) -> &'static str {
-        ["", "h", "s"][self as usize]
+        ["", "h", "s", "p", "", "", "o", "oh", "op"][self as usize]
+    }
+    /// Whether the format's kernels have this kind.
+    fn ok(self, fmt: MvFmt) -> bool {
+        !matches!(self, MvkKind::Packed | MvkKind::OneP) || fmt.packs()
     }
 }
 
@@ -110,10 +204,28 @@ fn mvk_table(fmt: MvFmt, long: bool, ks: usize, tt: usize) -> (usize, MvkKind) {
             _ => (if ks == 1 { 1 } else { 2 }, Half),
         };
     }
+    // Rows of one chunk a lane on several SIMD-groups (4096 values on 4), 6 to 8 tokens: each
+    // token reduced as it comes (`MvkKind::OneF`; 4096 x 4096 at 8 tokens: Q8_0 92 -> 63 us, Q4_K
+    // 90 -> 78, Q4_0 80 -> 72).
+    if !long && ks > 1 && many {
+        match fmt {
+            MvFmt::Gguf(Q8_0) => return (2, OneF),
+            MvFmt::Gguf(Q4_K | Q4_0) => return (1, OneF),
+            MvFmt::Gguf(Q6_K) => return (1, Half),
+            _ => {}
+        }
+    }
     match fmt {
         MvFmt::Q4 | MvFmt::Gguf(Q4_0) if ks == 1 => (1, Float),
+        MvFmt::Gguf(Q4_0) if !long && tt <= 2 => (1, OneF),
         MvFmt::Q4 | MvFmt::Gguf(Q4_0) => (if long && many { 2 } else { 1 }, Half),
         MvFmt::Gguf(Q4_K) if ks == 1 => (1, Float),
+        MvFmt::Gguf(Q4_K) if !long && tt <= 2 => (2, OneP),
+        // Long Q4_K rows at 6-8 tokens: packed quants (4096 x 12288, 8 tokens: 353 -> 303 us).
+        MvFmt::Gguf(Q4_K) if long && many => (2, Packed),
+        // Long Q8_0 rows at 6-8 tokens: four packed rows (4096 x 12288, 8 tokens: 329 -> 298 us).
+        MvFmt::Gguf(Q8_0) if long && many && ks > 1 => (4, Packed),
+        MvFmt::Gguf(Q6_K) if !long && ks > 1 && tt > 2 => (1, Half),
         // Long Q5_K rows at 6-8 tokens: sweeps of 4 on two rows (5120 x 8192: 8 tokens 306 ->
         // 277 us, 6 tokens 233 -> 215; 4096 x 12288: 357 -> 334, 278 -> 261).
         MvFmt::Gguf(Q5_K) if long && many => (2, Sweeps),
@@ -186,18 +298,18 @@ impl MvFmt {
         }
     }
     /// The multi-token instantiation (up to `tt` tokens; see `mvk_body` in the shader).
-    fn instantiate_k(self, nr: usize, ks: usize, tt: usize, kind: MvkKind) -> String {
+    fn instantiate_k(self, nr: usize, ks: usize, tt: usize, kind: MvkKind, g: MvkGeo) -> String {
         // (The one-token kernel's weight type: the same chunk arithmetic, see `wdot`.)
         let one = self.instantiate_mv(nr, ks);
         let (mac, rest) = one.split_once('(').unwrap();
-        let rest = rest
-            .strip_suffix(')')
-            .unwrap()
-            .replacen(&format!("mv_{}_{nr}_{ks}", self.name()), &self.mvk_name(nr, ks, tt, kind), 1);
-        format!("{}({rest}, {tt}, {})", mac.replacen("MV_", "MVK_", 1), kind as u8)
+        let rest =
+            rest.strip_suffix(')')
+                .unwrap()
+                .replacen(&format!("mv_{}_{nr}_{ks}", self.name()), &self.mvk_name(nr, ks, tt, kind, g), 1);
+        format!("{}({rest}, {tt}, {}, {})", mac.replacen("MV_", "MVK_", 1), kind as u8, g.g)
     }
-    fn mvk_name(self, nr: usize, ks: usize, tt: usize, kind: MvkKind) -> String {
-        format!("mvk_{}_{nr}_{ks}_{tt}{}", self.name(), kind.suffix())
+    fn mvk_name(self, nr: usize, ks: usize, tt: usize, kind: MvkKind, g: MvkGeo) -> String {
+        format!("mvk_{}_{nr}_{ks}_{tt}{}{}", self.name(), kind.suffix(), g.suffix())
     }
     /// The kernel's weight type, x chunk type and chunk size, and the `MKX_` constructor of the
     /// weight type from an expert table entry `e`.
@@ -263,6 +375,10 @@ impl MvFmt {
             MvFmt::Bf16 | MvFmt::Q8 | MvFmt::Gguf(GgmlType::F16) => 16,
             _ => 32,
         }
+    }
+    /// Whether the multi-token kernels have a packed form ([`MvkKind::Packed`]).
+    pub(crate) fn packs(self) -> bool {
+        matches!(self, MvFmt::Gguf(GgmlType::Q8_0 | GgmlType::Q4_K))
     }
     fn specialized(self) -> bool {
         !matches!(self, MvFmt::Gguf(k) if !matches!(k, GgmlType::F16 | GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::IQ4_XS))
@@ -337,11 +453,21 @@ pub(crate) fn shader_src() -> String {
             if f.specialized() || ks == 4 {
                 for tt in MVK_CLASSES {
                     // The variants of short and long rows (decode_mvk_bench: all of them).
-                    let mut vs: Vec<(usize, MvkKind)> = if std::env::var_os("OXINFER_MVK_ALL").is_some() {
-                        [1, 2, 4]
-                            .into_iter()
-                            .flat_map(|nr| [(nr, MvkKind::Float), (nr, MvkKind::Half), (nr, MvkKind::Sweeps)])
-                            .collect()
+                    let mut vs: Vec<(usize, MvkKind, MvkGeo)> = if mvk_all_for(f, tt) {
+                        let gs = mvk_bench_list("OXINFER_MVK_GS", "1");
+                        let ks_ = mvk_bench_list("OXINFER_MVK_H", "0,1,2,3,6,7,8");
+                        let mut v = Vec::new();
+                        for nr in mvk_bench_list("OXINFER_MVK_NR", "1,2,4") {
+                            for &k in &ks_ {
+                                for &g in &gs {
+                                    let (k, g) = (MvkKind::ALL[k.min(8)], MvkGeo { g });
+                                    if g.valid(nr, ks, tt, k) && k.ok(f) {
+                                        v.push((nr, k, g));
+                                    }
+                                }
+                            }
+                        }
+                        v
                     } else {
                         let chunk = f.chunk() * 32 * ks;
                         let few = MVK_FEW_ROWS - 1;
@@ -357,10 +483,10 @@ pub(crate) fn shader_src() -> String {
                             })
                             .collect()
                     };
-                    vs.sort_by_key(|&(nr, kind)| (nr, kind as u8));
+                    vs.sort_by_key(|&(nr, kind, g)| (nr, kind as u8, g));
                     vs.dedup();
-                    for (nr, kind) in vs {
-                        let _ = writeln!(s, "{}", f.instantiate_k(nr, ks, tt, kind));
+                    for (nr, kind, g) in vs {
+                        let _ = writeln!(s, "{}", f.instantiate_k(nr, ks, tt, kind, g));
                     }
                 }
             }
@@ -1214,23 +1340,23 @@ impl MetalBackend {
         Some((self.named_pipeline(&format!("mvt_{}_1_{ks}", fmt.name()))?, 1, ks))
     }
     /// The multi-token matvec pipeline for up to `tt` tokens (one of [`MVK_CLASSES`]).
-    pub(crate) fn mvk_pipe(&self, fmt: MvFmt, nr: usize, ks: usize, tt: usize, kind: MvkKind) -> Option<Id> {
+    pub(crate) fn mvk_pipe(&self, fmt: MvFmt, nr: usize, ks: usize, tt: usize, kind: MvkKind, g: MvkGeo) -> Option<Id> {
         if !fmt.specialized() && ks != 4 {
             return None;
         }
-        self.named_pipeline(&fmt.mvk_name(nr, ks, tt, kind))
+        self.named_pipeline(&fmt.mvk_name(nr, ks, tt, kind, g))
     }
     /// The multi-token matvec kernels of a format and SIMD-group split for steps of up to `tokens`
     /// tokens: the kernel of every token class that holds such a step.
     pub(crate) fn mvk_pipes(&self, fmt: MvFmt, n_out: usize, n_in: usize, ks: usize, tokens: usize, pair: bool) -> Option<MvkPipe> {
-        let mut pipes = [(std::ptr::null_mut(), 0); MVK_CLASSES.len()];
+        let mut pipes = [(std::ptr::null_mut(), 0, 0); MVK_CLASSES.len()];
         let top = mvk_class(tokens);
         for (i, &tt) in MVK_CLASSES.iter().enumerate() {
             let tt = if i <= top { tt } else { MVK_CLASSES[top] };
-            let (nr, kind) = mvk_variant(fmt, n_out, n_in, ks, tt, pair);
-            pipes[i] = (self.mvk_pipe(fmt, nr, ks, tt, kind)?, nr);
+            let (nr, kind, g) = mvk_variant(fmt, n_out, n_in, ks, tt, pair);
+            pipes[i] = (self.mvk_pipe(fmt, nr, ks, tt, kind, g)?, nr * g.g, 32 * ks * g.g);
         }
-        Some(MvkPipe::Exact(pipes, 32 * ks))
+        Some(MvkPipe::Exact(pipes))
     }
 }
 
@@ -1245,7 +1371,7 @@ pub(crate) fn mvk_class(t: usize) -> usize {
 /// threads).
 #[derive(Clone, Copy)]
 pub(crate) enum MvkPipe {
-    Exact([(Id, usize); MVK_CLASSES.len()], usize),
+    Exact([(Id, usize, usize); MVK_CLASSES.len()]),
     Fast(Id, usize, usize),
 }
 
@@ -1253,10 +1379,7 @@ impl MvkPipe {
     /// The pipeline, rows per threadgroup and threads per threadgroup for a step of `t` tokens.
     pub(crate) fn pick(&self, t: usize) -> (Id, usize, usize) {
         match *self {
-            MvkPipe::Exact(p, threads) => {
-                let (pipe, nr) = p[mvk_class(t)];
-                (pipe, nr, threads)
-            }
+            MvkPipe::Exact(p) => p[mvk_class(t)],
             MvkPipe::Fast(pipe, nr, threads) => (pipe, nr, threads),
         }
     }
@@ -1445,6 +1568,46 @@ pub(crate) fn wait_timed(b: &MetalBackend, f: &Fns, cb: Id) -> f64 {
         (f.void)(cb, f.s_wait);
         let time: unsafe extern "C" fn(Id, Sel) -> f64 = b.o.msg_send();
         time(cb, b.o.sel(c"GPUEndTime")) - time(cb, b.o.sel(c"GPUStartTime"))
+    }
+}
+
+/// The kind of a plan op, for the GPU time profiles (`OXINFER_PF_PROFILE`).
+fn op_kind(op: &MOp) -> String {
+    match op {
+        MOp::Gemm { n_out, n_in, .. } => format!("gemm {n_out}x{n_in}"),
+        MOp::GemmF32 { n_out, n_in, .. } => format!("gemm f32 {n_out}x{n_in}"),
+        MOp::Mv { w, w2, .. } => format!("mv {}x{}{}", w.n_out, w.n_in, if w2.is_some() { " pair" } else { "" }),
+        MOp::Attn { .. } => "attn".into(),
+        MOp::XHalf { .. } => "xhalf".into(),
+        MOp::Norm { .. } => "norm".into(),
+        MOp::Ew { .. } => "ew".into(),
+        MOp::Glu { .. } => "glu".into(),
+        MOp::AddRows { .. } => "addrows".into(),
+        MOp::PfTopk { .. } => "topk".into(),
+        MOp::PfExperts(_, ph) => match *ph {
+            0 => "experts route".into(),
+            1 => "experts gather".into(),
+            2 => "experts gate/up".into(),
+            3 => "experts act".into(),
+            4 => "experts down".into(),
+            5 => "experts combine".into(),
+            _ => "experts".into(),
+        },
+        MOp::PfGdn { .. } => "gdn rule".into(),
+        MOp::GdnConv { .. } => "conv".into(),
+        MOp::PfAttn { .. } => "attn".into(),
+        MOp::PfFlash { .. } => "flash attn".into(),
+        MOp::PfKvHalf { .. } => "kv half".into(),
+        MOp::NormHalf { .. } => "norm+half".into(),
+        MOp::AddNormHalf { .. } => "addnorm+half".into(),
+        MOp::PfMoeTail { .. } => "moe tail".into(),
+        MOp::GluHalf { .. } => "glu+half".into(),
+        MOp::QkRope { .. } => "qkrope".into(),
+        MOp::QsaKey { .. } => "qsa key".into(),
+        MOp::QsaScore { .. } => "qsa score".into(),
+        MOp::QsaTopk { .. } => "qsa topk".into(),
+        MOp::PleGate { .. } => "ple".into(),
+        _ => "other".into(),
     }
 }
 
@@ -8396,9 +8559,26 @@ impl MetalPlan<'_> {
         let at = |from: usize| (from..end).find(|&i| matches!(self.ops[i], MOp::Barrier)).unwrap_or(end);
         let cut = at(end / 16);
         let parts = [0..cut, cut..end];
-        let (ok, _) = run_concurrent(self.be, &self.f, &parts, encode);
-        if !ok {
-            return false;
+        if pf_prof() {
+            // Each op in a command buffer of its own, its GPU time added up by kind (printed
+            // every 16 steps).
+            static STEPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            for i in (0..end).filter(|&i| !matches!(self.ops[i], MOp::Barrier) && dec_only(&self.ops[i])) {
+                let (ok, g) = run_concurrent(self.be, &self.f, std::slice::from_ref(&(i..i + 1)), encode);
+                if !ok {
+                    return false;
+                }
+                pf_note(format!("{b} rows {}", op_kind(&self.ops[i])), g);
+            }
+            if STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 16 == 15 {
+                pf_report();
+                pf_reset();
+            }
+        } else {
+            let (ok, _) = run_concurrent(self.be, &self.f, &parts, encode);
+            if !ok {
+                return false;
+            }
         }
         let h = self.hidden.1;
         unsafe {
@@ -8818,41 +8998,7 @@ impl DecodePlan for MetalPlan<'_> {
                             None => return false,
                         }
                     }
-                    let kind = match op {
-                        MOp::Gemm { n_out, n_in, .. } => format!("gemm {n_out}x{n_in}"),
-                        MOp::GemmF32 { n_out, n_in, .. } => format!("gemm f32 {n_out}x{n_in}"),
-                        MOp::Mv { w, .. } => format!("mv {}x{}", w.n_out, w.n_in),
-                        MOp::XHalf { .. } => "xhalf".into(),
-                        MOp::Norm { .. } => "norm".into(),
-                        MOp::Ew { .. } => "ew".into(),
-                        MOp::Glu { .. } => "glu".into(),
-                        MOp::AddRows { .. } => "addrows".into(),
-                        MOp::PfTopk { .. } => "topk".into(),
-                        MOp::PfExperts(_, ph) => match *ph {
-                            0 => "experts route".into(),
-                            1 => "experts gather".into(),
-                            2 => "experts gate/up".into(),
-                            3 => "experts act".into(),
-                            4 => "experts down".into(),
-                            5 => "experts combine".into(),
-                            _ => "experts".into(),
-                        },
-                        MOp::PfGdn { .. } => "gdn rule".into(),
-                        MOp::GdnConv { .. } => "conv".into(),
-                        MOp::PfAttn { .. } => "attn".into(),
-                        MOp::PfFlash { .. } => "flash attn".into(),
-                        MOp::PfKvHalf { .. } => "kv half".into(),
-                        MOp::NormHalf { .. } => "norm+half".into(),
-                        MOp::AddNormHalf { .. } => "addnorm+half".into(),
-                        MOp::PfMoeTail { .. } => "moe tail".into(),
-                        MOp::GluHalf { .. } => "glu+half".into(),
-                        MOp::QkRope { .. } => "qkrope".into(),
-                        MOp::QsaKey { .. } => "qsa key".into(),
-                        MOp::QsaScore { .. } => "qsa score".into(),
-                        MOp::QsaTopk { .. } => "qsa topk".into(),
-                        MOp::PleGate { .. } => "ple".into(),
-                        _ => "other".into(),
-                    };
+                    let kind = op_kind(op);
                     let (o, g) = run_concurrent(self.be, &self.f, std::slice::from_ref(&(i..i + 1)), |e, r| encode(e, r, &[]));
                     if !o {
                         return false;
@@ -9793,12 +9939,12 @@ mod tests {
                             reset();
                             // Up to 8 tokens through the 8-token kernels, more through the 16-token ones.
                             let tt = *MVK_TOKENS.iter().find(|&&t| t >= ntok).unwrap();
-                            let (tnr, kind) = mvk_variant(fmt, n_out, n_in, ks, tt, pair.is_some());
-                            let tpipe = be.mvk_pipe(fmt, tnr, ks, tt, kind).unwrap();
+                            let (tnr, kind, g) = mvk_variant(fmt, n_out, n_in, ks, tt, pair.is_some());
+                            let tpipe = be.mvk_pipe(fmt, tnr, ks, tt, kind, g).unwrap();
                             let (ok, _) = run_concurrent(&be, &f, &[std::ops::Range { start: 0, end: 1 }], |e, _| {
                                 encode_mvk(
                                     e,
-                                    (tpipe, tnr, ks),
+                                    (tpipe, tnr * g.g, 32 * ks * g.g),
                                     &wt(0),
                                     pair,
                                     mode,
@@ -10083,7 +10229,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn encode_mvk(
         e: &FastEnc,
-        (pipe, nr, ks): (Id, usize, usize),
+        (pipe, nr, threads): (Id, usize, usize),
         w: &MvWeight,
         w2: Option<&MvWeight>,
         mode: MvMode,
@@ -10127,7 +10273,7 @@ mod tests {
         e.buf(w.offs, 0, 7);
         e.buf(w2.offs, 0, 8);
         e.buf(gate.0, gate.1, 9);
-        e.dispatch((w.n_out.div_ceil(nr), 1), 32 * ks);
+        e.dispatch((w.n_out.div_ceil(nr), 1), threads);
     }
 
     /// Encodes a fast verification matmul (`fv_*`) of `ntok` tokens (x / y rows `sx` / `sy`
@@ -10456,17 +10602,19 @@ mod tests {
         let toks: Vec<usize> = env("OXINFER_MVK_T", "1,2,4,8").split(',').map(|v| v.parse().unwrap()).collect();
         // (rows, kind): every variant with OXINFER_MVK_ALL (`OXINFER_MVK_NR=1,2,4`,
         // `OXINFER_MVK_H=0,1,2`, see MvkKind), else the plans' (0).
-        let vars: Vec<(usize, MvkKind)> = if std::env::var_os("OXINFER_MVK_ALL").is_some() {
-            let hs: Vec<MvkKind> = env("OXINFER_MVK_H", "0,1,2")
+        let vars: Vec<(usize, MvkKind, MvkGeo)> = if std::env::var_os("OXINFER_MVK_ALL").is_some() {
+            let hs: Vec<MvkKind> = env("OXINFER_MVK_H", "0,1,2,3,6,7,8")
                 .split(',')
-                .map(|v| [MvkKind::Float, MvkKind::Half, MvkKind::Sweeps][v.parse::<usize>().unwrap()])
+                .map(|v| MvkKind::ALL[v.parse::<usize>().unwrap().min(8)])
                 .collect();
+            let gs = mvk_bench_list("OXINFER_MVK_GS", "1");
             env("OXINFER_MVK_NR", "1,2,4")
                 .split(',')
                 .flat_map(|v| hs.iter().map(move |&h| (v.parse().unwrap(), h)))
+                .flat_map(|(nr, h)| gs.iter().map(move |&g| (nr, h, MvkGeo { g })))
                 .collect()
         } else {
-            vec![(0, MvkKind::Float)]
+            vec![(0, MvkKind::Float, MvkGeo::ONE)]
         };
         let mut seed = 9u64;
         for name in fmts.split(',') {
@@ -10546,20 +10694,27 @@ mod tests {
                 let mut line = format!("{name:>7} {n_out}x{n_in} ks {ks}: one {one:.1}us ({gbs:.0} GB/s)");
                 for &t in &toks {
                     let tt = *MVK_CLASSES.iter().find(|&&c| c >= t).unwrap();
-                    for &(nr, kind) in &vars {
-                        let (nr, kind) = if nr == 0 {
+                    for &(nr, kind, g) in &vars {
+                        let (nr, kind, g) = if nr == 0 {
                             mvk_variant(fmt, n_out, n_in, ks, tt, std::env::var_os("OXINFER_MVK_PAIR").is_some())
                         } else {
-                            (nr, kind)
+                            (nr, kind, g)
                         };
-                        let Some(pipe) = be.mvk_pipe(fmt, nr, ks, tt, kind) else { continue };
+                        // (The reduced-per-token kinds take rows of one chunk a lane, up to 8 tokens.)
+                        let per_tok = matches!(kind, MvkKind::OneF | MvkKind::OneH | MvkKind::OneP);
+                        if !g.valid(nr, ks, tt, kind) || !kind.ok(fmt) || (per_tok && (n_in / fmt.chunk() > 32 * ks || tt > 8)) {
+                            continue;
+                        }
+                        let Some(pipe) = be.mvk_pipe(fmt, nr, ks, tt, kind, g) else {
+                            continue;
+                        };
                         // `OXINFER_MVK_PAIR=1`: SiLU pairs (the next copy as the second matrix).
                         let pair = std::env::var_os("OXINFER_MVK_PAIR").is_some();
                         let us = best(&|e, c| {
                             let w2 = wt((c + 1) % copies);
                             encode_mvk(
                                 e,
-                                (pipe, nr, ks),
+                                (pipe, nr * g.g, 32 * ks * g.g),
                                 &wt(c),
                                 pair.then_some(&w2),
                                 if pair { MvMode::SiluPair } else { MvMode::Store },
@@ -10567,11 +10722,12 @@ mod tests {
                                 (st.x, 0),
                                 (st.y, 0),
                                 (st.y, 0),
-                                n_in,
+                                // `OXINFER_MVK_SX0=1`: every token on the same x row.
+                                if std::env::var_os("OXINFER_MVK_SX0").is_some() { 0 } else { n_in },
                                 n_out,
                             )
                         });
-                        let _ = write!(line, " | t{t} nr{nr}{} {us:.1} ({:.2}x)", ["f", "h", "s"][kind as usize], us / one);
+                        let _ = write!(line, " | t{t} nr{nr}{}{} {us:.1} ({:.2}x)", kind.suffix(), g.suffix(), us / one);
                     }
                 }
                 println!("{line}");

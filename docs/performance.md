@@ -290,10 +290,30 @@ What is measured and where the gap to llama-server comes from:
   exact multi-token kernels; checked on the real models: 8 concurrent Qwen3-8B Q8_0 and Q4_K_M
   requests, 4 Inkling-2 ones and 8 Gemma 4 26B-A4B / Qwen3.5-35B-A3B ones give the replies each
   gets alone on a fresh server).
-  llama.cpp's batched kernels are not batch-invariant. The exact multi-token matvecs cost about
-  1.4x a one-token step at 2 rows, 1.8x at 4 and 4x at 8 (Qwen3-8B Q8_0: 11.2, 15.4, 20, 45 ms a
-  step), so exact batching gains up to 4 rows; `batch_fast=1` runs 5+ rows on the
+  llama.cpp's batched kernels are not batch-invariant. A batched step on the exact multi-token
+  matvecs (`examples/rows_bench.rs`, Qwen3-8B Q8_0, 137-token sessions; a one-token step through
+  the same path 15.3 ms) takes 15.5 ms at 2 rows, 19.8 at 4 and 34.4 at 8 (before the
+  per-token reduced kernels below: 15.7, 20.0, 40.2); `batch_fast=1` runs 5+ rows on the
   fast-verification kernels (21 ms at 8 rows), at the cost of exactness (logits within ~1e-4).
+  `OXINFER_PF_PROFILE=1` prints a batched step's GPU time per kind of op (each op in a command
+  buffer of its own): at 8 rows the matvecs are 95% of it.
+- **Why the exact kernels stop scaling at 8 rows.** Each (row, token) must be the one-token
+  kernel's arithmetic: the same chunk per lane, its float products in the same order, the
+  SIMD-group sum and the sums of the SIMD-groups in order, so the weights' reads are shared but
+  every token's x chunk is loaded by every lane holding a row (8 tokens of a 4096-wide row are
+  128 KB per threadgroup), with a sum per token and row per lane in registers. The kernels are
+  bound by those loads and by occupancy (`decode_mvk_bench`, 4096 x 4096 Q8_0 at 8 tokens: 92 us
+  as they were, 56 with the x chunk loaded once for all tokens, which is no longer exact; 40 us
+  one token). What paid: rows of one chunk a lane reduced token by token as computed
+  (`MvkKind::OneF` / `OneH` / `OneP`, `mvk_one`: no 8 x rows accumulators kept; 4096 x 4096 at 8
+  tokens Q8_0 92 -> 63 us, Q4_K 90 -> 78, Q4_0 80 -> 72), packed quants unpacked at each use
+  (`Packed`, Q8_0 / Q4_K: long Q8_0 rows 329 -> 298 us on four rows), two row groups a
+  threadgroup for the Q8_0 gate / up pair (`MvkGeo`, 385 -> 352 us). Measured slower: x staged in
+  threadgroup memory for the threadgroup's rows (per token, or per SIMD-group with coalesced
+  loads: 2-3x slower, the threadgroup memory cuts occupancy), x loads software-pipelined or all
+  tokens' x loaded up front (registers: 2.5-25x slower), the tokens split over SIMD-groups
+  sharing the weights, eight rows a lane. With the x loads gone entirely, 8 rows would still
+  take about 22 ms a step: exactness keeps 8 rows above the fast kernels.
 - **Mixtures of experts are batched exactly** (above); what is left of their gap at 8 rows is
   the dense matvecs' (attention, the dense MLP, the head) on the exact multi-token kernels.
 - **Mixed prompts: the prompts are read at llama.cpp's rate; the decode steps after them are the

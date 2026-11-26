@@ -320,8 +320,9 @@ a plain turn of a DSpark model, the next turn reads that reply as prompt (prefil
 kernels) where alone it would have been verified tokens, so later turns may round differently,
 as a restored snapshot does. `batch_fast=1` runs batched steps of 5 rows or more on the
 fast-verification kernels (as `fast_verify` does for speculative rounds: logits within ~1e-4 of
-one-token steps, so a reply may then depend on the requests decoded with it), about twice the
-throughput at 8 concurrent requests.
+one-token steps, so a reply may then depend on the requests decoded with it): Qwen3-8B Q8_0 at 8
+rows 21 ms a step against 34 ms exact (see [performance](performance.md#concurrent-requests-the-server)
+for why exact steps stop scaling there).
 
 Batched on the GPU: dense models (Qwen3, Llama, Gemma 3 / 4 dense, and Qwen3.5 / 3.6 / 3.8,
 whose Gated DeltaNet layers run each row's one-token conv and delta-rule kernels on that
