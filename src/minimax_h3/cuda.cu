@@ -36,6 +36,8 @@ __device__ __forceinline__ void mma16816(float* c, const u32* a, const u32* b) {
 // times 2^-8, subnormals included.
 __device__ __forceinline__ u32 f8h(u32 b) { return ((b & 0x80u) << 8) | ((b & 0x7fu) << 7); }
 __device__ __forceinline__ u32 f8h2(u32 two) { return f8h(two & 255u) | (f8h((two >> 8) & 255u) << 16); }
+// Two signed bytes as two halves (every int8 is exact in a half).
+__device__ __forceinline__ u32 i8h2(u32 two) { return pack_h2((float)(signed char)(two & 255u), (float)(signed char)((two >> 8) & 255u)); }
 
 __device__ __forceinline__ float block_sum256(float v, float* red) {
     red[threadIdx.x] = v;
@@ -79,7 +81,8 @@ __device__ __forceinline__ void pow2_for(float m, float& f, float& inv) {
 // ---- GEMM: Y[m][n] (= or +=) f rs[m] sum_k X[m][k] W[n][k] + bias[n] (`rs`, `bias`: or null).
 // A 128-thread block computes 64
 // rows x 64 outputs in 32-wide K steps (the grid: see `cg` below). X: half2 planes `xh` (and `xl`), rows of n_in / 2 words.
-// W: FP8 bytes (WK 0; rows of n_in bytes) or half2 planes `w` (and `wl`; WK 1).
+// W: FP8 bytes (WK 0; rows of n_in bytes), half2 planes `w` (and `wl`; WK 1) or signed bytes
+// (WK 2; rows of n_in bytes, with `cs`: `longcat_avatar/cuda.cu`).
 // NP: 1 (xh w), 2 (+ xl w), 3 (+ xh wl).
 
 #define GBM 64
@@ -99,8 +102,9 @@ struct GemmP {
     u32 cg;
 };
 
+// `cs`: a factor per output (int8 rows with a scale each), or null.
 template <int WK, int NP>
-__device__ __forceinline__ void gemm_body(const GemmP& p) {
+__device__ __forceinline__ void gemm_body(const GemmP& p, const float* cs = nullptr) {
     __shared__ u32 smem[(NP == 3 ? 4 : NP == 2 ? 3 : 2) * GBM * GLD];
     u32* As = smem;
     u32* Bs = smem + GBM * GLD;
@@ -121,7 +125,7 @@ __device__ __forceinline__ void gemm_body(const GemmP& p) {
     bool xok = lr < nr;
     u32 wr = n0 + lr;
     bool wok = wr < p.n_out;
-    const u8* wrow = p.w + (u64)wr * (WK == 0 ? (u64)p.n_in : (u64)half_in * 4);
+    const u8* wrow = p.w + (u64)wr * (WK == 1 ? (u64)half_in * 4 : (u64)p.n_in);
     const u32* wlrow = NP == 3 ? p.wl + (u64)wr * half_in : nullptr;
     float acc[2][4][4], accl[2][4][4];
 #pragma unroll
@@ -162,6 +166,11 @@ __device__ __forceinline__ void gemm_body(const GemmP& p) {
                 u32* bh = Bs + at;
                 bh[0] = f8h2(v.x), bh[1] = f8h2(v.x >> 16), bh[2] = f8h2(v.y), bh[3] = f8h2(v.y >> 16);
                 bh[4] = f8h2(v.z), bh[5] = f8h2(v.z >> 16), bh[6] = f8h2(v.w), bh[7] = f8h2(v.w >> 16);
+            } else if constexpr (WK == 2) {
+                uint4 v = *(const uint4*)(wrow + 32 * b + 16 * lh);
+                u32* bh = Bs + at;
+                bh[0] = i8h2(v.x), bh[1] = i8h2(v.x >> 16), bh[2] = i8h2(v.y), bh[3] = i8h2(v.y >> 16);
+                bh[4] = i8h2(v.z), bh[5] = i8h2(v.z >> 16), bh[6] = i8h2(v.w), bh[7] = i8h2(v.w >> 16);
             } else {
                 const uint4* ph = (const uint4*)((const u32*)wrow + 16 * b + 8 * lh);
                 uint4 h0 = ph[0], h1 = ph[1];
@@ -279,6 +288,7 @@ __device__ __forceinline__ void gemm_body(const GemmP& p) {
                 u32 rr = wm + 16 * mt + g + 8 * (q >> 1), cc = n0 + wn + 8 * nt + 2 * c4 + (q & 1);
                 if (rr < nr && cc < p.n_out) {
                     float v = acc[mt][nt][q] * p.f;
+                    if (cs) v *= cs[cc];
                     if (p.rs) v *= p.rs[r0 + rr];
                     if (p.bias) v += p.bias[cc];
                     float* o = p.y + (u64)(r0 + rr) * p.ys + cc;
@@ -529,8 +539,9 @@ __device__ __forceinline__ void flash_step(float acc[2][NT][4], const u32* ah, c
             for (int c = 0; c < 4; c++) acc[a][b][c] += st[a][b][c] + stl[a][b][c] * (1.f / 2048.f);
 }
 
+// Queries `qlo..qhi` against keys `klo..khi` (rows of the same planes: `p.n` is their stride).
 template <int HD>
-__device__ __forceinline__ void flash_body(const AttP& p) {
+__device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 klo, u32 khi) {
     const u32 HW = HD / 2, QLD = HW + 4;
     const u32 BW = FK * QLD > HD * PLD ? FK * QLD : HD * PLD;
     const int NO = HD / 32; // 8-wide output tiles per warp (a quarter of the head's channels)
@@ -544,9 +555,9 @@ __device__ __forceinline__ void flash_body(const AttP& p) {
     float* rmax = (float*)(Pl + FQ * PLD); // [4][FQ]: per key quarter of the step
     float* rsum = rmax + 4 * FQ;
     u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    u32 head = blockIdx.y, q0 = blockIdx.x * FQ;
-    if (q0 >= p.n) return;
-    u32 nq = min((u32)FQ, p.n - q0);
+    u32 head = blockIdx.y, q0 = qlo + blockIdx.x * FQ;
+    if (q0 >= qhi) return;
+    u32 nq = min((u32)FQ, qhi - q0);
     // A thread's part of a 64-row tile of HD halves: a quarter of a row.
     u32 tr = tid >> 2, to = (HW / 4) * (tid & 3);
 #pragma unroll
@@ -595,8 +606,8 @@ __device__ __forceinline__ void flash_body(const AttP& p) {
             }
         }
     };
-    read_keys(0);
-    for (u32 k0 = 0; k0 < p.n; k0 += FK) {
+    read_keys(klo / FK * FK);
+    for (u32 k0 = klo / FK * FK; k0 < khi; k0 += FK) {
 #pragma unroll
         for (int i = 0; i < KN; i++) {
             store4(Bh + tr * QLD + to + 4 * i, kr[0][i]);
@@ -632,7 +643,7 @@ __device__ __forceinline__ void flash_body(const AttP& p) {
 #pragma unroll
                 for (int q = 0; q < 4; q++) {
                     u32 kc = k0 + wn + 8 * nt + 2 * c4 + (q & 1);
-                    float v = kc < p.n ? s[mt][nt][q] * p.scale : ninf;
+                    float v = kc >= klo && kc < khi ? s[mt][nt][q] * p.scale : ninf;
                     s[mt][nt][q] = v;
                     mx[q >> 1] = fmaxf(mx[q >> 1], v);
                 }
@@ -710,5 +721,5 @@ __device__ __forceinline__ void flash_body(const AttP& p) {
             }
 }
 
-extern "C" __global__ void __launch_bounds__(256) attn_flash_64(AttP p) { flash_body<64>(p); }
-extern "C" __global__ void __launch_bounds__(256) attn_flash_128(AttP p) { flash_body<128>(p); }
+extern "C" __global__ void __launch_bounds__(256) attn_flash_64(AttP p) { flash_body<64>(p, 0, p.n, 0, p.n); }
+extern "C" __global__ void __launch_bounds__(256) attn_flash_128(AttP p) { flash_body<128>(p, 0, p.n, 0, p.n); }
