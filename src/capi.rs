@@ -2738,11 +2738,12 @@ pub struct OxiVideo {
 
 /// Loads a video model: MiniMax-H3 (a release folder, a single-file transformer or a repo id;
 /// `options` as the server's: `text_encoder`, `transformer`, `vae`, `audio_vae`, `quant`, `lora`,
-/// `shift`, `audio_shift`) or LTX-2.5 (`Lightricks/LTX-2.5`, its parts fetched from the public
-/// mirror, a release folder or a transformer file; options `transformer` (`int8`, `bf16`,
-/// `nvfp4`, `dev`, `dev-bf16` or a file), `text_encoder`, `vae`, `audio_vae`, `upsampler`,
-/// `temporal_upsampler`, `duration_head`, `text_bf16`, `temporal`, `distilled_lora`, `lora`,
-/// `device`, `exact_attention`), plus `cache_dir`.
+/// `shift`, `audio_shift`, `corrector` and `corrector_strength` / `_budget` / `_floor` / `_start` /
+/// `_end`: [`crate::minimax_h3::video::load_with_options`]) or LTX-2.5 (`Lightricks/LTX-2.5`, its
+/// parts fetched from the public mirror, a release folder or a transformer file; options
+/// `transformer` (`int8`, `bf16`, `nvfp4`, `dev`, `dev-bf16` or a file), `text_encoder`, `vae`,
+/// `audio_vae`, `upsampler`, `temporal_upsampler`, `duration_head`, `text_bf16`, `temporal`,
+/// `distilled_lora`, `lora`, `device`, `exact_attention`), plus `cache_dir`.
 #[cfg(not(target_arch = "wasm32"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxi_video_load(
@@ -2775,7 +2776,9 @@ pub unsafe extern "C" fn oxi_video_load(
 
 /// Generates a video. `params_json`: `prompt` (required), `frames` or `seconds`, `size`
 /// (`"WxH"`), `steps`, `seed`, `first_frame` / `last_frame` (image files), `references` (files,
-/// ref2va), `ref_image_edge`; LTX-2.5 also `fps`, `one_stage`, `temporal_upscale`, `audio`,
+/// ref2va), `ref_image_edge`, the MiniMax-H3 motion / structure guidance of
+/// [`crate::minimax_h3::video::MotionGuidance`] (`still_prompt`, `motion_scale`, `stg_scale`,
+/// `stg_layers`, `guidance_until`); LTX-2.5 also `fps`, `one_stage`, `temporal_upscale`, `audio`,
 /// `eta`, `sigmas`, `stage2_sigmas`, `noise`, `strength` and `images` (`{"path", "frame",
 /// "strength"}` objects or `FILE@FRAME[:STRENGTH]`). `progress` gets each denoising step
 /// (non-zero cancels). Writes the
@@ -2842,6 +2845,7 @@ pub unsafe extern "C" fn oxi_video_generate(
             p.steps = s;
         }
         p.seed = o["seed"].as_u64().unwrap_or(0);
+        (p.guidance, p.still_prompt) = crate::minimax_h3::video::guidance_fields(&|k| crate::minimax_h3::video::json_field(o.get(k)))?;
         #[cfg(feature = "media")]
         {
             let img = |k: &str| {

@@ -155,6 +155,12 @@ struct Args {
     audio_shift: Option<f32>,
     /// MiniMax-H3: the audio VAE (a folder or ComfyUI's single file) instead of `audio_vae/`.
     audio_vae: Option<String>,
+    /// MiniMax-H3: an H3 corrector file (Sulphur-3's `s3_corrector.safetensors`) and its
+    /// settings by option name (`corrector_strength`, ...).
+    h3_corrector: Option<String>,
+    h3_corrector_opts: Vec<(String, String)>,
+    /// MiniMax-H3: the motion / structure guidance fields by name (`still_prompt`, ...).
+    h3_guidance: Vec<(String, String)>,
     mask: Option<PathBuf>,
     strength: Option<f32>,
     image_guidance: Option<f32>,
@@ -498,6 +504,14 @@ fn usage() -> ! {
          \x20 --audio-vae DIR|FILE the audio VAE when the model folder has no audio_vae/ (a\n\
          \x20                      single-file --model): the release's folder or ComfyUI's fp32 file\n\
          \x20 --quant q8           the text encoder quantized at load\n\
+         \x20 --corrector FILE     an H3 corrector on the video velocity (SulphurAI/Sulphur-3's\n\
+         \x20                      s3_corrector.safetensors); --corrector-strength F (1),\n\
+         \x20                      --corrector-budget F (0.5), --corrector-floor F (0.001),\n\
+         \x20                      --corrector-start N (0), --corrector-end N (-1: the last step)\n\
+         \x20 --still-prompt TEXT  motion guidance (Sulphur-3's ComfyUI pack): the prompt's scene\n\
+         \x20                      with every motion frozen; --motion-scale F (1), --stg-scale F (1),\n\
+         \x20                      --stg-layers 20,21,22 (blocks bypassed for the structure term),\n\
+         \x20                      --guidance-until F (0.25 of the steps, from the first)\n\
          \x20 --init-image FILE    the first frame; --last-image FILE the last frame\n\
          \x20 --ref FILE           Ref2VA/: a reference, in the order the prompt names them (repeat;\n\
          \x20                      up to 9 images, 3 videos with their sound, 3 audio clips);\n\
@@ -771,6 +785,9 @@ fn parse_args() -> Result<Args> {
         shift: None,
         audio_shift: None,
         audio_vae: None,
+        h3_corrector: None,
+        h3_corrector_opts: Vec::new(),
+        h3_guidance: Vec::new(),
         transformer: None,
         qwen_image: Default::default(),
         size: None,
@@ -1050,6 +1067,13 @@ fn parse_args() -> Result<Args> {
             "--shift" => a.shift = Some(val()?.parse()?),
             "--audio-shift" => a.audio_shift = Some(val()?.parse()?),
             "--audio-vae" => a.audio_vae = Some(val()?),
+            "--corrector" => a.h3_corrector = Some(val()?),
+            f @ ("--corrector-strength" | "--corrector-budget" | "--corrector-floor" | "--corrector-start" | "--corrector-end") => {
+                a.h3_corrector_opts.push((f[2..].replace('-', "_"), val()?))
+            }
+            f @ ("--still-prompt" | "--motion-scale" | "--stg-scale" | "--stg-layers" | "--guidance-until") => {
+                a.h3_guidance.push((f[2..].replace('-', "_"), val()?))
+            }
             "--mask" => a.mask = Some(PathBuf::from(val()?)),
             "--strength" => a.strength = Some(val()?.parse()?),
             "--image-guidance" => a.image_guidance = Some(val()?.parse()?),

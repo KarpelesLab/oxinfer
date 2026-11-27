@@ -18,6 +18,9 @@
 //! folder too.
 //! `--lora FILE[:SCALE]` applies LoRA files; a turbo LoRA sets the step count and the shifts its
 //! name stands for (`--steps`, `--shift`, `--audio-shift` override them).
+//! `--corrector FILE` applies an H3 corrector (SulphurAI/Sulphur-3's `s3_corrector.safetensors`:
+//! `oxinfer::minimax_h3::corrector`) with `--corrector-strength`, `--corrector-budget`,
+//! `--corrector-floor`, `--corrector-start` and `--corrector-end`.
 //!
 //! `OXINFER_H3_PROMPT_EMBEDS=FILE` keeps the text encoder's output of a text-only prompt in FILE
 //! (written when missing, read when present), so the 63 GB text encoder and the 66 GB transformer
@@ -198,6 +201,8 @@ pub fn run(args: &Args) -> Result<()> {
     if let Some(i) = &args.last_image {
         p.last = Some(load_image(i)?);
     }
+    (p.guidance, p.still_prompt) =
+        oxinfer::minimax_h3::video::guidance_fields(&|k| args.h3_guidance.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.clone()))?;
     p.latents = std::env::var_os("OXINFER_H3_LATENTS").map(PathBuf::from);
     let cache = std::env::var_os("OXINFER_H3_PROMPT_EMBEDS").map(PathBuf::from);
     if cache.is_some() && (p.first.is_some() || p.last.is_some()) {
@@ -263,7 +268,12 @@ pub fn run(args: &Args) -> Result<()> {
         }
         None => None,
     };
-    src.text_encoder = if cond.is_some() { PathBuf::new() } else { text_encoder()? };
+    // A kept prompt embedding needs no text encoder, unless a still caption is to be encoded.
+    src.text_encoder = if cond.is_some() && p.still_prompt.is_none() {
+        PathBuf::new()
+    } else {
+        text_encoder()?
+    };
     let t1 = Instant::now();
     let mut pipe = VideoPipeline::load_from(&src)?;
     if pipe.audio_vae.is_none() {
@@ -271,6 +281,12 @@ pub fn run(args: &Args) -> Result<()> {
     }
     for line in pipe.apply_loras(&args.loras)? {
         eprintln!("{line}");
+    }
+    if let Some(c) = &args.h3_corrector {
+        pipe.load_corrector(&resolve_part(c, args)?)?;
+    }
+    for (k, v) in &args.h3_corrector_opts {
+        pipe.corrector_settings.set(k, v)?;
     }
     // A turbo LoRA is distilled for a step count and a pair of shifts (its name says which).
     if let Some(t) = args.loras.iter().find_map(|l| oxinfer::minimax_h3::lora::turbo_settings(&l.path)) {

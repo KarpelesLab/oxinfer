@@ -53,7 +53,8 @@ pub mod bert;
 pub mod capi;
 pub mod chat;
 pub mod clock;
-mod comfy_quant;
+#[doc(hidden)]
+pub mod comfy_quant;
 pub mod config;
 pub mod constrain;
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]

@@ -817,9 +817,6 @@ impl<'a> Qwen35Tower<'a> {
         } else {
             bail!("the checkpoint has no vision tower (model.visual.*)");
         };
-        if gguf && !cfg.deepstack_visual_indexes.is_empty() {
-            bail!("DeepStack vision features (deepstack_visual_indexes) from an mmproj file are not supported");
-        }
         let name = |hf: &str| if gguf { mmproj_name(hf) } else { format!("{pre}{hf}") };
         let h = cfg.hidden_size;
         let (c, t, p) = (cfg.in_channels, cfg.temporal_patch_size, cfg.patch_size);
@@ -876,13 +873,21 @@ impl<'a> Qwen35Tower<'a> {
         let inv_freq = (0..spatial / 2)
             .map(|i| (1.0 / theta.powf((2 * i) as f64 / spatial as f64)) as f32)
             .collect();
+        // llama.cpp names a DeepStack merger by the tower layer it reads (`v.deepstack.8.fc1`).
         let deepstack = (0..cfg.deepstack_visual_indexes.len())
             .map(|i| {
-                let p = format!("deepstack_merger_list.{i}.");
+                let (p, fc1, fc2) = if gguf {
+                    let p = format!("v.deepstack.{}.", cfg.deepstack_visual_indexes[i]);
+                    (p.clone(), format!("{p}fc1"), format!("{p}fc2"))
+                } else {
+                    let p = format!("{pre}deepstack_merger_list.{i}.");
+                    (p.clone(), format!("{p}linear_fc1"), format!("{p}linear_fc2"))
+                };
+                let raw = |n: &str, o: usize, i: usize| VLin::load(files, n, (o, i), (o, i));
                 Ok((
-                    LayerNorm::load(files, &name(&format!("{p}norm")), mh)?,
-                    dense(&format!("{p}linear_fc1"), mh, mh)?,
-                    dense(&format!("{p}linear_fc2"), cfg.out_hidden_size, mh)?,
+                    LayerNorm::load(files, &format!("{p}norm"), mh)?,
+                    raw(&fc1, mh, mh)?,
+                    raw(&fc2, cfg.out_hidden_size, mh)?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;

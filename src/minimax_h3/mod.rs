@@ -14,6 +14,7 @@
 //! - the VAE (`vae`), ImageNet de-normalization, 8-bit rounding (truncation, as `to(uint8)`).
 
 pub mod audio_vae;
+pub mod corrector;
 #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
 mod cuda;
 pub mod dit;

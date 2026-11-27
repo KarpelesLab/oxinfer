@@ -788,7 +788,19 @@ impl<'a> Dit<'a> {
 
     /// The block stack over the packed sequence `x` (`[n, H]`): `st` holds the SiLU of each distinct
     /// timestep embedding (`[nt, time_dim]`), a row reads the AdaLN set of its `(timestep, tag)`.
-    fn stack(&self, x: &mut [f32], st: &[f32], timestep_index: &[usize], tags: &[u8], positions: &[[f32; 3]], dump: Option<&Dump>) {
+    /// The block stack over `x`; the blocks in `skip` are bypassed (the identity: the structure
+    /// guidance of [`super::video::MotionGuidance`]).
+    #[allow(clippy::too_many_arguments)]
+    fn stack(
+        &self,
+        x: &mut [f32],
+        st: &[f32],
+        timestep_index: &[usize],
+        tags: &[u8],
+        positions: &[[f32; 3]],
+        dump: Option<&Dump>,
+        skip: &[usize],
+    ) {
         let h = self.cfg.hidden;
         let n = x.len() / h;
         let nt = st.len() / self.cfg.time_dim;
@@ -800,8 +812,10 @@ impl<'a> Dit<'a> {
         if let Some(d) = dump {
             d.write("x_in.bin", x);
         }
-        // The whole stack on the accelerator when it takes it (not while every block is dumped).
+        // The whole stack on the accelerator when it takes it (not while every block is dumped,
+        // nor with blocks bypassed).
         if dump.is_none()
+            && skip.is_empty()
             && let Some(dev) = self.device.get(self, "transformer")
         {
             let tables: Vec<Vec<f32>> = self.blocks.iter().map(|b| b.adaln.as_ref().unwrap().forward(st, nt)).collect();
@@ -814,6 +828,9 @@ impl<'a> Dit<'a> {
             }
         }
         for (bi, b) in self.blocks.iter().enumerate() {
+            if skip.contains(&bi) {
+                continue;
+            }
             // [nt * 3, 6H]: the six vectors of each (timestep, modality).
             let table = b.adaln.as_ref().unwrap().forward(st, nt);
             self.block(
@@ -870,7 +887,7 @@ impl<'a> Dit<'a> {
         x[n_text * h..].copy_from_slice(&self.proj_in.forward(p.image, n_img));
         let temb: Vec<f32> = p.timesteps.iter().flat_map(|&t| self.time_embed(t)).collect();
         let st = self.time_act(&temb);
-        self.stack(&mut x, &st, p.timestep_index, p.tags, p.positions, None);
+        self.stack(&mut x, &st, p.timestep_index, p.tags, p.positions, None, &[]);
         // Output norm with the per-timestep shift / scale, then the head over the latent rows.
         let rows: Vec<usize> = (n_text..n).collect();
         let hn = self.norm_out_rows(&x, &rows, &st, p.timestep_index);
@@ -915,7 +932,7 @@ impl<'a> Dit<'a> {
         let st = self.time_act(p.temb);
         drop(tm);
         let dump = Dump::from_env();
-        self.stack(&mut x, &st, p.timestep_index, p.tags, p.positions, dump.as_ref());
+        self.stack(&mut x, &st, p.timestep_index, p.tags, p.positions, dump.as_ref(), p.skip_blocks);
         let _tm = stage::start(stage::IO);
         let v = self.heads_out[0].forward(&self.norm_out_rows(&x, p.video_index, &st, p.timestep_index), nv);
         let a = aout.forward(&self.norm_out_rows(&x, p.audio_index, &st, p.timestep_index), na);
@@ -993,6 +1010,8 @@ pub struct PackedAv<'p> {
     pub timestep_index: &'p [usize],
     /// Each row's modality tag.
     pub tags: &'p [u8],
+    /// Blocks (0-based) bypassed in this forward (none for a plain one).
+    pub skip_blocks: &'p [usize],
 }
 
 /// The AdaLN vectors of every row: row `r` reads set `key[r]` of `table` (`[sets, 6H]`).

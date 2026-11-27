@@ -30,6 +30,7 @@
 //!   silent.
 
 use super::audio_vae::AudioDecoder;
+use super::corrector::{Corrector, CorrectorSettings};
 use super::dit::{Dit, DitConfig, PackedAv, TAG_AUDIO, TAG_IMAGE, TAG_TEXT};
 use super::vae::{VaeConfig, VaeDecoder};
 use super::video_vae::VideoEncoder;
@@ -370,10 +371,130 @@ pub fn denoise_layout(
     sig: (&[f32], &[f32]),
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<(Vec<f32>, Vec<f32>)> {
-    denoise_cancellable(dit, text, lay, video, audio, sig, progress, None)
+    denoise_cancellable(dit, text, lay, video, audio, sig, progress, &StepHooks::default())
 }
 
-/// [`denoise_layout`] that stops with an error between two steps once `cancel` is set.
+/// A corrector ([`super::corrector`]) on the generated video rows of a denoising loop: the
+/// network, how it is applied, and the latent geometry of those rows.
+pub struct CorrectorRun<'a> {
+    pub net: &'a Corrector,
+    pub settings: CorrectorSettings,
+    pub g: Geometry,
+    /// The DiT's patch side.
+    pub patch: usize,
+}
+
+/// The motion and structure guidance of Sulphur-3's ComfyUI pack (`H3MotionGuider`,
+/// `H3_Corrector_Advanced_Motion_STG`'s `guidance.py`). On the first `round(steps * until)`
+/// steps the video velocity `v` of the prompt is pushed away from two weaker predictions:
+/// `g = v + stg_scale (v - v_skip)` with `v_skip` the prompt's velocity with the transformer
+/// blocks `stg_layers` bypassed, then `g += motion_scale (g - v_still)` with `v_still` the
+/// velocity of a "still" caption (the same scene with every motion frozen). The audio keeps the
+/// prompt's velocity; a corrector then runs on `g`. Each guided step costs one forward more for
+/// each of the two terms in use.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MotionGuidance {
+    /// The pack's node default is 2, its workflows use 1; 0 (or no still caption): off.
+    pub motion_scale: f32,
+    pub stg_scale: f32,
+    /// Blocks (0-based) bypassed in the structure term; empty: off.
+    pub stg_layers: Vec<usize>,
+    /// The fraction of the steps, from the first, that are guided.
+    pub until: f32,
+}
+
+impl Default for MotionGuidance {
+    /// The pack's workflows: motion 1, STG 1 on blocks 20, 21, 22, the first quarter of the steps.
+    fn default() -> Self {
+        Self {
+            motion_scale: 1.0,
+            stg_scale: 1.0,
+            stg_layers: vec![20, 21, 22],
+            until: 0.25,
+        }
+    }
+}
+
+impl MotionGuidance {
+    /// Sets one option by name (`motion_scale`, `stg_scale`, `stg_layers` as `20,21,22` or
+    /// empty, `guidance_until`); false for another name.
+    pub fn set(&mut self, key: &str, v: &str) -> Result<bool> {
+        let f = || -> Result<f32> { v.parse().with_context(|| format!("{key}: not a number: {v:?}")) };
+        match key {
+            "motion_scale" => self.motion_scale = f()?,
+            "stg_scale" => self.stg_scale = f()?,
+            "guidance_until" | "until" => self.until = f()?,
+            "stg_layers" => {
+                let mut l: Vec<usize> = Vec::new();
+                for p in v.split(|c: char| c == ',' || c.is_whitespace()).filter(|p| !p.is_empty()) {
+                    let b = p.parse().with_context(|| format!("stg_layers: {p:?} is not a block index"))?;
+                    if !l.contains(&b) {
+                        l.push(b);
+                    }
+                }
+                self.stg_layers = l;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// How many leading steps of `steps` are guided (Python's `round`: halves to even).
+    pub fn guided_steps(&self, steps: usize) -> usize {
+        if self.until <= 0.0 {
+            return 0;
+        }
+        ((steps as f64 * self.until as f64).round_ties_even() as usize).min(steps)
+    }
+}
+
+/// The motion guidance of a request from its named fields (`still_prompt`, `motion_scale`,
+/// `stg_scale`, `stg_layers`, `guidance_until`, as text; [`json_field`] reads them from JSON):
+/// the guidance ([`MotionGuidance::default`] with the fields given) when any is set, and the
+/// still caption.
+pub fn guidance_fields(get: &dyn Fn(&str) -> Option<String>) -> Result<(Option<MotionGuidance>, Option<String>)> {
+    let still = get("still_prompt").filter(|s| !s.trim().is_empty());
+    let mut g = MotionGuidance::default();
+    let mut any = still.is_some();
+    for k in ["motion_scale", "stg_scale", "stg_layers", "guidance_until"] {
+        if let Some(v) = get(k) {
+            g.set(k, &v)?;
+            any = true;
+        }
+    }
+    Ok((any.then_some(g), still))
+}
+
+/// A JSON request field as text: strings as they are, numbers and booleans printed, arrays
+/// joined with commas (`stg_layers: [20, 21, 22]`); None for null or a missing field.
+pub fn json_field(v: Option<&serde_json::Value>) -> Option<String> {
+    use serde_json::Value;
+    match v? {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        Value::Array(a) => Some(a.iter().filter_map(|x| json_field(Some(x))).collect::<Vec<_>>().join(",")),
+        x => Some(x.to_string()),
+    }
+}
+
+/// [`MotionGuidance`] in a denoising loop: the still caption's conditioning (`[n, text_dim]`
+/// rows) and its packed layout, when the motion term is in use.
+pub struct GuidanceRun<'a> {
+    pub settings: MotionGuidance,
+    pub still: Option<(&'a [f32], &'a Layout)>,
+}
+
+/// What a denoising loop does besides the plain Euler steps.
+#[derive(Default)]
+pub struct StepHooks<'a> {
+    pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
+    pub corrector: Option<CorrectorRun<'a>>,
+    pub guidance: Option<GuidanceRun<'a>>,
+}
+
+/// [`denoise_layout`] that stops with an error between two steps once `hooks.cancel` is set, with
+/// motion / structure guidance and a corrector on the generated video rows' velocity when
+/// `hooks` has them.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_cancellable(
     dit: &Dit,
@@ -383,16 +504,29 @@ pub fn denoise_cancellable(
     mut audio: Vec<f32>,
     sig: (&[f32], &[f32]),
     progress: &mut dyn FnMut(usize, usize),
-    cancel: Option<&std::sync::atomic::AtomicBool>,
+    hooks: &StepHooks,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
-    let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+    let cancelled = || hooks.cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
     let cfg = &dit.cfg;
     let emb = dit.embed_text(text);
     let (pd, ac) = (cfg.patch_dim(), cfg.audio_channels);
     let (sv, sa) = sig;
     let steps = sv.len().min(sa.len()) - 1;
-    let cond_idx = &lay.video_index[..lay.n_cond];
-    let cond_audio = &lay.audio_index[..lay.n_cond_audio];
+    let guide = hooks.guidance.as_ref().filter(|g| {
+        let s = &g.settings;
+        (s.motion_scale != 0.0 && g.still.is_some()) || (s.stg_scale != 0.0 && !s.stg_layers.is_empty())
+    });
+    if let Some(&b) = guide.and_then(|g| g.settings.stg_layers.iter().find(|&&b| b >= cfg.layers)) {
+        bail!("stg_layers: block {b} of a transformer of {} blocks", cfg.layers);
+    }
+    let still = guide.and_then(|g| g.still.filter(|_| g.settings.motion_scale != 0.0));
+    if let Some((_, sl)) = still
+        && (sl.video_index.len() != lay.video_index.len() || sl.audio_index.len() != lay.audio_index.len() || sl.n_cond != lay.n_cond)
+    {
+        bail!("motion guidance: the still caption's layout has other video / audio rows than the prompt's");
+    }
+    let still_emb = still.map(|(t, _)| dit.embed_text(t));
+    let guided_steps = guide.map_or(0, |g| g.settings.guided_steps(steps));
     for i in 0..steps {
         if cancelled() {
             bail!("cancelled");
@@ -410,23 +544,46 @@ pub fn denoise_cancellable(
         ts.sort_by(|a, b| a.total_cmp(b));
         ts.dedup();
         let at = |t: f32| ts.iter().position(|&v| v == t).unwrap();
-        let mut tidx = vec![at(tv); lay.positions.len()];
-        cond_idx.iter().for_each(|&r| tidx[r] = at(tc));
-        lay.audio_index.iter().for_each(|&r| tidx[r] = at(ta));
-        cond_audio.iter().for_each(|&r| tidx[r] = at(1.0));
+        let tidx_of = |l: &Layout| {
+            let mut tidx = vec![at(tv); l.positions.len()];
+            l.video_index[..l.n_cond].iter().for_each(|&r| tidx[r] = at(tc));
+            l.audio_index.iter().for_each(|&r| tidx[r] = at(ta));
+            l.audio_index[..l.n_cond_audio].iter().for_each(|&r| tidx[r] = at(1.0));
+            tidx
+        };
         let temb: Vec<f32> = ts.iter().flat_map(|&t| dit.time_embed(t)).collect();
-        let (v, a) = dit.forward_av(&PackedAv {
-            text_embedded: &emb,
-            video: &video,
-            audio: &audio,
-            text_index: &lay.text_index,
-            video_index: &lay.video_index,
-            audio_index: &lay.audio_index,
-            positions: &lay.positions,
-            temb: &temb,
-            timestep_index: &tidx,
-            tags: &lay.tags,
-        })?;
+        let forward = |emb: &[f32], l: &Layout, skip: &[usize]| {
+            let tidx = tidx_of(l);
+            dit.forward_av(&PackedAv {
+                text_embedded: emb,
+                video: &video,
+                audio: &audio,
+                text_index: &l.text_index,
+                video_index: &l.video_index,
+                audio_index: &l.audio_index,
+                positions: &l.positions,
+                temb: &temb,
+                timestep_index: &tidx,
+                tags: &l.tags,
+                skip_blocks: skip,
+            })
+        };
+        let (mut v, a) = forward(&emb, lay, &[])?;
+        if let Some(g) = guide.filter(|_| i < guided_steps) {
+            let s = &g.settings;
+            let pos = v.clone();
+            if s.stg_scale != 0.0 && !s.stg_layers.is_empty() {
+                let (weak, _) = forward(&emb, lay, &s.stg_layers)?;
+                v.iter_mut()
+                    .zip(&pos)
+                    .zip(&weak)
+                    .for_each(|((g, &p), &w)| *g += s.stg_scale * (p - w));
+            }
+            if let (Some((_, sl)), Some(se)) = (still, &still_emb) {
+                let (vs, _) = forward(se, sl, &[])?;
+                v.iter_mut().zip(&vs).for_each(|(g, &w)| *g += s.motion_scale * (*g - w));
+            }
+        }
         // x0 from the timestep's sigma, the Euler ratio from the grid's.
         let step = |x: &mut [f32], v: &[f32], t: f32, s: f32, s_next: f32| {
             let (st, r) = (1.0 - t, s_next / s);
@@ -435,6 +592,26 @@ pub fn denoise_cancellable(
             }
         };
         let (c0, a0) = (lay.n_cond * pd, lay.n_cond_audio * ac);
+        if let Some(cr) = hooks.corrector.as_ref().filter(|cr| cr.settings.active(i)) {
+            // The network works on `[C, T, H, W]` latents: H3's velocity (x0 - z) / sigma is v.
+            let (g, p) = (cr.g, cr.patch);
+            let c = cr.net.cfg.video_channels;
+            let z = unpatchify_video(&video[c0..], c, g.lt, g.lh, g.lw, p);
+            let mut vl = unpatchify_video(&v[c0..], c, g.lt, g.lh, g.lw, p);
+            let t0 = Instant::now();
+            let ratio = cr
+                .net
+                .correct(&cr.settings, &z, &mut vl, g.lt, g.lh, g.lw, sv[i], sv[i + 1], text)?;
+            if std::env::var_os("OXINFER_H3_CORRECTOR_LOG").is_some() {
+                eprintln!(
+                    "\n[corrector step {i}: sigma {:.4} -> {:.4}, residual / velocity RMS {ratio:.3}, {:.1}s]",
+                    sv[i],
+                    sv[i + 1],
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+            v[c0..].copy_from_slice(&patchify_video(&vl, c, g.lt, g.lh, g.lw, p));
+        }
         step(&mut video[c0..], &v[c0..], tv, sv[i], sv[i + 1]);
         step(&mut audio[a0..], &a[a0..], ta, sa[i], sa[i + 1]);
         debug_assert_eq!(audio.len() % ac, 0);
@@ -511,6 +688,10 @@ pub struct VideoParams {
     /// Set from another thread to stop the generation between two denoising steps (it then
     /// returns an error saying "cancelled").
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Motion / structure guidance ([`MotionGuidance`]); None: one forward per step.
+    pub guidance: Option<MotionGuidance>,
+    /// The still caption of the motion term (the prompt's scene with every motion frozen).
+    pub still_prompt: Option<String>,
 }
 
 impl VideoParams {
@@ -532,6 +713,8 @@ impl VideoParams {
             max_pixels: 768 * 1344,
             latents: None,
             cancel: None,
+            guidance: None,
+            still_prompt: None,
         }
     }
 }
@@ -666,6 +849,49 @@ pub struct VideoPipeline {
     vae_json: serde_json::Value,
     /// The sigma shifts of the video and audio schedules.
     pub shifts: (f32, f32),
+    /// A corrector on the video velocity ([`super::corrector`]; Sulphur-3's `s3_corrector`).
+    pub corrector: Option<Corrector>,
+    /// How [`VideoPipeline::corrector`] is applied.
+    pub corrector_settings: CorrectorSettings,
+}
+
+impl VideoPipeline {
+    /// Loads a corrector file ([`super::corrector`]) to apply on every request.
+    pub fn load_corrector(&mut self, path: &Path) -> Result<()> {
+        let c = Corrector::load(path)?;
+        if c.cfg.video_channels != self.vae.cfg.latent_channels || c.cfg.text_dim != self.dit.cfg.text_dim {
+            bail!(
+                "{}: a corrector for {} latent channels and caption states of {}, this model has {} and {}",
+                path.display(),
+                c.cfg.video_channels,
+                c.cfg.text_dim,
+                self.vae.cfg.latent_channels,
+                self.dit.cfg.text_dim
+            );
+        }
+        if c.cfg.patch[1] != self.dit.cfg.patch[1] || c.cfg.patch[2] != self.dit.cfg.patch[2] {
+            bail!(
+                "{}: corrector patches {:?}, the transformer's {:?}",
+                path.display(),
+                c.cfg.patch,
+                self.dit.cfg.patch
+            );
+        }
+        eprintln!("[H3 corrector {}: {} blocks of width {}]", path.display(), c.cfg.depth, c.cfg.width);
+        self.corrector = Some(c);
+        Ok(())
+    }
+
+    /// The corrector of a request with geometry `g`, when one is loaded and its strength not 0.
+    pub(crate) fn corrector_run(&self, g: Geometry) -> Option<CorrectorRun<'_>> {
+        let net = self.corrector.as_ref().filter(|_| self.corrector_settings.strength != 0.0)?;
+        Some(CorrectorRun {
+            net,
+            settings: self.corrector_settings,
+            g,
+            patch: self.dit.cfg.patch[1],
+        })
+    }
 }
 
 fn shift_of(dir: &Path, default: f32) -> f32 {
@@ -698,7 +924,25 @@ pub fn encode_prompt_quant(
     prompt: &str,
     keyframes: &[&Image],
 ) -> Result<Conditioning> {
+    encode_prompts_quant(model, text_encoder, quant, &[prompt], keyframes)?
+        .pop()
+        .context("no conditioning")
+}
+
+/// [`encode_prompt_quant`] for several prompts (each with the same keyframes), with one load of
+/// the text encoder.
+pub fn encode_prompts_quant(
+    model: &Path,
+    text_encoder: &Path,
+    quant: crate::model::Quant,
+    prompts: &[&str],
+    keyframes: &[&Image],
+) -> Result<Vec<Conditioning>> {
     let vl = load_text_encoder(model, text_encoder, quant, !keyframes.is_empty())?;
+    prompts.iter().map(|prompt| encode_with(&vl, prompt, keyframes)).collect()
+}
+
+fn encode_with(vl: &crate::qwen_vl::QwenVl, prompt: &str, keyframes: &[&Image]) -> Result<Conditioning> {
     let (mut ids, mut tags, mut images) = (Vec::new(), Vec::new(), Vec::new());
     for (i, k) in keyframes.iter().enumerate() {
         let im = vl.encode_image(&k.rgb, k.width, k.height, 0)?;
@@ -747,10 +991,7 @@ pub const EXTRA_TOKENS: [(&str, u32); 7] = [
 pub fn load_text_encoder(model: &Path, text_encoder: &Path, quant: crate::model::Quant, vision: bool) -> Result<crate::qwen_vl::QwenVl> {
     use crate::qwen_vl::{QwenVl, QwenVlOptions};
     let parent = text_encoder.parent().map(Path::to_path_buf).unwrap_or_default();
-    if crate::gguf::is_gguf(text_encoder) && vision {
-        bail!("a GGUF text encoder has no vision tower: keyframes need the safetensors text encoder");
-    }
-    if text_encoder.is_file() && vision {
+    if text_encoder.is_file() && !crate::gguf::is_gguf(text_encoder) && vision {
         bail!("the vision tower of a single-file text encoder is not read: keyframes need the text encoder's folder");
     }
     let opts = QwenVlOptions {
@@ -898,6 +1139,8 @@ impl VideoPipeline {
             partition,
             vae_json,
             shifts: (shift("scheduler", "video", 12.0), shift("audio_scheduler", "audio", 3.0)),
+            corrector: None,
+            corrector_settings: CorrectorSettings::default(),
         })
     }
 
@@ -955,6 +1198,11 @@ impl VideoPipeline {
     /// [`encode_prompt`] with this release's text encoder.
     pub fn encode_prompt(&self, prompt: &str, keyframes: &[&Image]) -> Result<Conditioning> {
         encode_prompt_quant(&self.dir, &self.text_encoder_dir, self.text_quant, prompt, keyframes)
+    }
+
+    /// [`Self::encode_prompt`] for several prompts with one load of the text encoder.
+    pub fn encode_prompts(&self, prompts: &[&str], keyframes: &[&Image]) -> Result<Vec<Conditioning>> {
+        encode_prompts_quant(&self.dir, &self.text_encoder_dir, self.text_quant, prompts, keyframes)
     }
 
     /// A keyframe's conditioning latents `[C, 1, lh, lw]` (normalized): the posterior sampled with
@@ -1097,9 +1345,21 @@ impl VideoPipeline {
         let keys = Self::keyframes(p, w, h);
         let anchors: Vec<Anchor> = keys.iter().map(|k| k.0).collect();
         let t0 = Instant::now();
-        let cond = match cond {
-            Some(c) => c,
-            None => self.encode_prompt(&p.prompt, &keys.iter().map(|k| &k.1).collect::<Vec<_>>())?,
+        let kf: Vec<&Image> = keys.iter().map(|k| &k.1).collect();
+        // The still caption of the motion guidance, encoded with the prompt (one load).
+        let still_prompt = p
+            .still_prompt
+            .as_deref()
+            .filter(|_| p.guidance.as_ref().is_some_and(|g| g.motion_scale != 0.0));
+        let (cond, still_cond) = match (cond, still_prompt) {
+            (Some(c), None) => (c, None),
+            (Some(c), Some(sp)) => (c, self.encode_prompts(&[sp], &kf)?.pop()),
+            (None, sp) => {
+                let mut prompts = vec![p.prompt.as_str()];
+                prompts.extend(sp);
+                let mut cs = self.encode_prompts(&prompts, &kf)?.into_iter();
+                (cs.next().context("no conditioning")?, cs.next())
+            }
         };
         let t_enc = t0.elapsed().as_secs_f64();
         let cfg = &self.dit.cfg;
@@ -1128,7 +1388,18 @@ impl VideoPipeline {
         let (sv, sa) = (sigmas(p.steps, self.shifts.0), sigmas(p.steps, self.shifts.1));
         let t1 = Instant::now();
         let lay = layout(&cond.tags, g.lt, g.lh, g.lw, g.n_audio, cfg.patch[1], &anchors);
-        let (video, audio) = denoise_cancellable(&self.dit, &cond.text, &lay, video, audio, (&sv, &sa), progress, p.cancel.as_deref())?;
+        let still_lay = still_cond
+            .as_ref()
+            .map(|sc| layout(&sc.tags, g.lt, g.lh, g.lw, g.n_audio, cfg.patch[1], &anchors));
+        let hooks = StepHooks {
+            cancel: p.cancel.as_deref(),
+            corrector: self.corrector_run(g),
+            guidance: p.guidance.clone().map(|settings| GuidanceRun {
+                settings,
+                still: still_cond.as_ref().zip(still_lay.as_ref()).map(|(c, l)| (&c.text[..], l)),
+            }),
+        };
+        let (video, audio) = denoise_cancellable(&self.dit, &cond.text, &lay, video, audio, (&sv, &sa), progress, &hooks)?;
         if p.cancelled() {
             bail!("cancelled");
         }
@@ -1169,7 +1440,10 @@ fn video_part(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
 /// with the server's and the C API's options: `text_encoder`, `transformer`, `vae`,
 /// `audio_vae` (parts replacing the folder's), `quant` / `text_quant` (the text encoder's
 /// precision: bf16 or q8), `lora` (`FILE[:SCALE]`, repeatable; a turbo LoRA sets the step count
-/// and the shifts), `shift`, `audio_shift`. Returns the pipeline and the step count a turbo LoRA
+/// and the shifts), `shift`, `audio_shift`, `corrector` (an H3 corrector file, e.g. Sulphur-3's
+/// `s3_corrector.safetensors`: [`super::corrector`]) and its `corrector_strength`,
+/// `corrector_budget`, `corrector_floor`, `corrector_start`, `corrector_end`
+/// ([`CorrectorSettings::set`]). Returns the pipeline and the step count a turbo LoRA
 /// is distilled for.
 pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Path>) -> Result<(VideoPipeline, Option<usize>)> {
     use crate::model::Quant;
@@ -1187,6 +1461,7 @@ pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Pa
         ..Default::default()
     };
     let (mut te, mut loras, mut shift, mut audio_shift) = (None, Vec::new(), None, None);
+    let (mut corrector, mut corr_settings) = (None, CorrectorSettings::default());
     let num = |k: &str, v: &str| -> Result<f32> { v.parse().with_context(|| format!("{k}: not a number: {v:?}")) };
     for (k, v) in opts {
         match *k {
@@ -1208,7 +1483,11 @@ pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Pa
             }
             "shift" => shift = Some(num(k, v)?),
             "audio_shift" => audio_shift = Some(num(k, v)?),
-            k => bail!("unknown MiniMax-H3 option {k:?} (text_encoder, transformer, vae, audio_vae, quant, lora, shift, audio_shift)"),
+            "corrector" => corrector = Some(video_part(v, cache_dir)?),
+            k if corr_settings.set(k, v)? => {}
+            k => bail!(
+                "unknown MiniMax-H3 option {k:?} (text_encoder, transformer, vae, audio_vae, quant, lora, shift, audio_shift, corrector, corrector_strength, corrector_budget, corrector_floor, corrector_start, corrector_end)"
+            ),
         }
     }
     if single && s.vae.is_none() {
@@ -1219,6 +1498,10 @@ pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Pa
         None => crate::minimax_h3::find_text_encoder(&model, cache_dir)?,
     };
     let mut pipe = VideoPipeline::load_from(&s)?;
+    if let Some(c) = &corrector {
+        pipe.load_corrector(c)?;
+    }
+    pipe.corrector_settings = corr_settings;
     for line in pipe.apply_loras(&loras)? {
         eprintln!("{line}");
     }
@@ -1298,6 +1581,29 @@ mod tests {
         assert_eq!(ids(&tok), got);
         assert!(tok.add_special_tokens_at(&[("<x>", 151669)]).is_err());
         assert!(tok.add_special_tokens_at(&[("<d>", 7)]).is_err());
+    }
+
+    #[test]
+    fn motion_guidance_fields() {
+        let none = guidance_fields(&|_| None).unwrap();
+        assert_eq!(none, (None, None));
+        let f = |k: &str| match k {
+            "still_prompt" => Some("frozen".to_string()),
+            "stg_layers" => Some("3, 4 4".to_string()),
+            "guidance_until" => Some("0.5".to_string()),
+            _ => None,
+        };
+        let (g, still) = guidance_fields(&f).unwrap();
+        let g = g.unwrap();
+        assert_eq!(still.as_deref(), Some("frozen"));
+        assert_eq!(g.stg_layers, vec![3, 4]);
+        assert_eq!((g.motion_scale, g.stg_scale), (1.0, 1.0));
+        // Python's round: 20 x 0.25 = 5 steps; 10 x 0.25 = 2.5 -> 2.
+        assert_eq!(MotionGuidance::default().guided_steps(20), 5);
+        assert_eq!(MotionGuidance::default().guided_steps(10), 2);
+        assert!(guidance_fields(&|k| (k == "stg_layers").then(|| "x".to_string())).is_err());
+        assert_eq!(json_field(Some(&serde_json::json!([20, 21]))).as_deref(), Some("20,21"));
+        assert_eq!(json_field(Some(&serde_json::json!(1.5))).as_deref(), Some("1.5"));
     }
 
     #[test]

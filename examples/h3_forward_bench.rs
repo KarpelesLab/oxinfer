@@ -154,6 +154,7 @@ fn main() -> Result<()> {
             temb: &temb,
             timestep_index: &tidx,
             tags: &tags,
+            skip_blocks: &[],
         })?;
         println!("[forward {step}: {:.2}s]", t1.elapsed().as_secs_f64());
         if let Some(d) = &out {

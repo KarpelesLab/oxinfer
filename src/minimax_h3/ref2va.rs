@@ -537,8 +537,22 @@ impl VideoPipeline {
         );
         let (sv, sa) = (sigmas(p.steps, self.shifts.0), sigmas(p.steps, self.shifts.1));
         let t2 = Instant::now();
-        let (video, audio) =
-            super::video::denoise_cancellable(&self.dit, &cond.text, &lay, video, audio, (&sv, &sa), progress, p.cancel.as_deref())?;
+        // The structure term of the motion guidance applies as it is; the still caption would
+        // need the references' presentation of its own.
+        if p.still_prompt.is_some() && p.guidance.as_ref().is_some_and(|g| g.motion_scale != 0.0) {
+            bail!(
+                "motion guidance with a still caption is for text and keyframe requests, not references (the structure term, stg_scale, works with references)"
+            );
+        }
+        let hooks = super::video::StepHooks {
+            cancel: p.cancel.as_deref(),
+            corrector: self.corrector_run(g),
+            guidance: p
+                .guidance
+                .clone()
+                .map(|settings| super::video::GuidanceRun { settings, still: None }),
+        };
+        let (video, audio) = super::video::denoise_cancellable(&self.dit, &cond.text, &lay, video, audio, (&sv, &sa), progress, &hooks)?;
         if p.cancelled() {
             bail!("cancelled");
         }

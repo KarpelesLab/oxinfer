@@ -97,6 +97,8 @@ pub struct QwenVl {
     pub tokenizer: crate::tokenizer::Tokenizer,
     pub dir: PathBuf,
     _files: Box<ModelFiles>,
+    /// The llama.cpp `mmproj` file the tower of a GGUF model comes from.
+    _mmproj: Option<Box<ModelFiles>>,
 }
 
 /// The DeepStack rows of `images` for a session (`QwenSession::deepstack`): each image's
@@ -177,10 +179,21 @@ impl QwenVl {
         // (every borrow of it) before `_files`.
         let fs: &'static ModelFiles = unsafe { &*(files.as_ref() as *const ModelFiles) };
         let model = QwenModel::load(cfg, fs, opts.quant)?;
-        // A GGUF file is the language model alone (its tower would be an `mmproj` file): text only.
-        // A single safetensors file has a tower (`visual.*`) but not its configuration: not read.
-        let mut mm = if single || crate::gguf::is_gguf(&dir) {
+        // A GGUF file is the language model alone: its tower is the `qwen3vl_merger` mmproj file
+        // beside it (`mmproj*.gguf`, llama.cpp's), read when vision is asked for. A single
+        // safetensors file has a tower (`visual.*`) but not its configuration: not read.
+        let gguf = crate::gguf::is_gguf(&dir);
+        let mut mm = if single || (gguf && !opts.vision) {
             None
+        } else if gguf {
+            Some(
+                crate::qwen_vision::QwenMmConfig::load_with(&dir, &crate::pixtral::Mmproj::Auto)?.with_context(|| {
+                    format!(
+                        "{}: a GGUF language model needs its vision tower as one mmproj*.gguf file (llama.cpp's qwen3vl_merger) beside it",
+                        dir.display()
+                    )
+                })?,
+            )
         } else {
             QwenMmConfig::load(&dir)?
         };
@@ -190,6 +203,15 @@ impl QwenVl {
                 m.image = crate::qwen_vision::ProcessorConfig::load(&p, false);
             }
         }
+        let mmproj = match &mm {
+            Some(m) if opts.vision => m.open_mmproj()?.map(Box::new),
+            _ => None,
+        };
+        // SAFETY: as for `fs`: the box is kept beside the tower and dropped after it.
+        let tfs: &'static ModelFiles = match &mmproj {
+            Some(b) => unsafe { &*(b.as_ref() as *const ModelFiles) },
+            None => fs,
+        };
         let tower = match (&mm, opts.vision) {
             (Some(m), true) => {
                 if m.vision.out_hidden_size != model.cfg.hidden_size {
@@ -199,7 +221,7 @@ impl QwenVl {
                         model.cfg.hidden_size
                     );
                 }
-                Some(QwenVisionTower::load_deep(m.vision.clone(), fs)?)
+                Some(QwenVisionTower::load_deep(m.vision.clone(), tfs)?)
             }
             _ => None,
         };
@@ -210,6 +232,7 @@ impl QwenVl {
             tokenizer,
             dir,
             _files: files,
+            _mmproj: mmproj,
         })
     }
 

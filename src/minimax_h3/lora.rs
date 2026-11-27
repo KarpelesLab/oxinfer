@@ -17,7 +17,11 @@
 //!   `final_layer.adaln_proj.linear`; an `.alpha` scalar per module;
 //! - diffusers' (PEFT): `transformer_blocks.N.attn.to_q` / `to_k` / `to_v` / `to_out.0`,
 //!   `.ff.net.0.proj` over `[value; gate]` rows, `.ff.net.2`, `token_refiner.refiner_blocks.N.*`,
-//!   `norm_out.linear`; alpha from the header's `alpha` entry (lightx2v's files).
+//!   `norm_out.linear`; alpha from the header's `alpha` entry (lightx2v's files);
+//! - kohya's flattened form of ComfyUI's (`lora_unet_blocks_N_attn_qkv_proj`, `..._mlp_fc1`,
+//!   `lora_unet_token_refiner_blocks_N_*`, `lora_unet_final_layer_adaln_proj_linear`): the LoRAs
+//!   of SulphurAI's Sulphur-3 (`s3_raw_lora`, `sulphur3_lora_r256`, `minimax_h3_max`, the
+//!   `minimax_S3_tuned_*` and `s3rl*` files), extracted from or trained on ComfyUI's layout.
 //!
 //! Without an alpha the scale is 1 (alpha = rank). Either naming goes on either layout of the
 //! base weights: a module on a matrix this checkpoint stores split, fused or with its rows in
@@ -94,9 +98,38 @@ pub fn turbo_settings(path: &Path) -> Option<Turbo> {
     })
 }
 
+/// The dotted module of a kohya-style flattened name (`lora_unet_blocks_12_attn_qkv_proj`, as
+/// ComfyUI's LoRA tools and musubi-tuner write for MiniMax-H3: SulphurAI's Sulphur-3 LoRAs), or
+/// None when `key` is not one.
+fn kohya(key: &str) -> Option<String> {
+    let rest = key.strip_prefix("lora_unet_")?;
+    const TAILS: [(&str, &str); 5] = [
+        ("attn_qkv_proj", "attn.qkv_proj"),
+        ("attn_out_proj", "attn.out_proj"),
+        ("mlp_fc1", "mlp.fc1"),
+        ("mlp_fc2", "mlp.fc2"),
+        ("adaln_proj_linear", "adaln_proj.linear"),
+    ];
+    if rest == "final_layer_adaln_proj_linear" {
+        return Some("final_layer.adaln_proj.linear".into());
+    }
+    let (prefix, rest) = if let Some(r) = rest.strip_prefix("token_refiner_blocks_") {
+        ("token_refiner.blocks.", r)
+    } else {
+        ("blocks.", rest.strip_prefix("blocks_")?)
+    };
+    let (idx, tail) = rest.split_once('_')?;
+    idx.parse::<usize>().ok()?;
+    let (_, t) = TAILS.iter().find(|(k, _)| *k == tail)?;
+    Some(format!("{prefix}{idx}.{t}"))
+}
+
 /// ComfyUI's module for module path `path`, and for a pair that covers part of it or stores its
 /// rows in another order, the module row of each row of the pair's `up`.
 fn canonical(path: &str, inner: usize, ffn: usize) -> (String, Option<Vec<usize>>) {
+    if let Some(m) = kohya(path) {
+        return (m, None);
+    }
     if path == "norm_out.linear" {
         return ("final_layer.adaln_proj.linear".into(), None);
     }
@@ -296,5 +329,20 @@ mod tests {
         assert_eq!(m, "token_refiner.blocks.0.mlp.fc1");
         assert_eq!(rows, Some(vec![3, 4, 5, 0, 1, 2]));
         assert_eq!(canonical("blocks.1.mlp.fc2", 4, 3), ("blocks.1.mlp.fc2".to_string(), None));
+    }
+
+    #[test]
+    fn kohya_modules() {
+        let c = |p: &str| canonical(p, 4, 3).0;
+        assert_eq!(c("lora_unet_blocks_12_attn_qkv_proj"), "blocks.12.attn.qkv_proj");
+        assert_eq!(c("lora_unet_blocks_0_mlp_fc2"), "blocks.0.mlp.fc2");
+        assert_eq!(c("lora_unet_blocks_3_adaln_proj_linear"), "blocks.3.adaln_proj.linear");
+        assert_eq!(
+            c("lora_unet_token_refiner_blocks_1_attn_out_proj"),
+            "token_refiner.blocks.1.attn.out_proj"
+        );
+        assert_eq!(c("lora_unet_final_layer_adaln_proj_linear"), "final_layer.adaln_proj.linear");
+        assert_eq!(kohya("lora_unet_blocks_x_mlp_fc1"), None);
+        assert_eq!(kohya("lora_te_blocks_1_mlp_fc1"), None);
     }
 }

@@ -19,7 +19,9 @@
 //! default 16:9 at a 768 short edge, or the first frame's aspect ratio); `steps` (points of the
 //! sigma grid, default 50, or a turbo LoRA's); `seed`; `input_reference` or `first_frame`, and
 //! `last_frame`: images (first / last frame to video); `references`: images, audio clips and
-//! videos for ref2va (a model whose folder is the release's `Ref2VA/`); `ref_image_edge`. In
+//! videos for ref2va (a model whose folder is the release's `Ref2VA/`); `ref_image_edge`;
+//! `still_prompt`, `motion_scale`, `stg_scale`, `stg_layers`, `guidance_until`: the motion /
+//! structure guidance of Sulphur-3's ComfyUI pack (`crate::minimax_h3::video::MotionGuidance`). In
 //! JSON the media are `data:` or `http(s)://` URLs (as the chat endpoint takes them); in a
 //! multipart body files (`references[]` repeated).
 
@@ -198,6 +200,10 @@ struct Request {
     steps: Option<usize>,
     seed: Option<u64>,
     ref_image_edge: Option<usize>,
+    /// Motion / structure guidance and its still caption
+    /// ([`crate::minimax_h3::video::MotionGuidance`]).
+    guidance: Option<crate::minimax_h3::video::MotionGuidance>,
+    still_prompt: Option<String>,
     /// The video file's format: `mp4` (H.264 and AAC, the default), `webm` (VP9 and Opus), `avi`
     /// (Motion JPEG and PCM).
     format: crate::minimax_h3::video::VideoFormat,
@@ -331,6 +337,8 @@ impl Request {
         if refs.len() > crate::minimax_h3::ref2va::MAX_REFERENCES {
             return Err(ApiError::bad(format!("at most {} references", crate::minimax_h3::ref2va::MAX_REFERENCES)).param("references"));
         }
+        let (guidance, still_prompt) = crate::minimax_h3::video::guidance_fields(&|k| crate::minimax_h3::video::json_field(fields.get(k)))
+            .map_err(|e| ApiError::bad(format!("{e:#}")))?;
         Ok(Self {
             model,
             prompt,
@@ -340,6 +348,8 @@ impl Request {
             steps,
             seed: num("seed")?.map(|v| v as u64),
             ref_image_edge: num("ref_image_edge")?.map(|v| v as usize),
+            guidance,
+            still_prompt,
             format,
             first,
             last,
@@ -506,6 +516,8 @@ fn run(api: &Api, j: &Job, r: Request) -> ApiResult<()> {
     }
     p.seed = r.seed.unwrap_or_else(super::media::random_seed);
     p.cancel = Some(j.cancel.clone());
+    p.guidance = r.guidance.clone();
+    p.still_prompt = r.still_prompt.clone();
     let bad = |e: anyhow::Error| ApiError::bad(format!("{e:#}"));
     #[cfg(feature = "media")]
     let load_image = |f: &std::path::Path| crate::minimax_h3::encode::load_image(f).map_err(bad);

@@ -18,6 +18,14 @@
 //!   `clamp(round((code - 32) s_rel), -127, 127) s_channel`: the int8 value the reference's
 //!   kernels compute with, on the ConvRot rotation above. Decoded to that int8 matrix at load
 //!   (8 bits per weight in memory for 6 in the file).
+//! - `asym_w4a8_int8` (the same files; `*_w4a8.safetensors`, e.g. SulphurAI's Sulphur-3): the
+//!   same storage at the width the packed row implies (`K bits / 8` bytes for `K / group_size`
+//!   scales; comfy_kitchen's `_w4a8_geometry`). 4 bits: one nibble plane, the code indexing
+//!   `weight_codebook` (16 float32 levels; comfy_kitchen's frozen Lloyd-Max table when absent);
+//!   3 bits: a 2-bit plane then a 1-bit plane into an 8-level codebook; 5 bits: the nibble plane
+//!   then a 1-bit plane, uniform `code - 16`. A weight is `clamp(round(level s_rel), -127, 127)
+//!   s_channel` in the ConvRot basis, decoded to that int8 matrix at load like W6A8. A
+//!   `weight_correction` (an asymmetric zero point per group) is refused.
 //! - `nvfp4` (`tensor/nvfp4.py`): E2M1 pairs `[N, K/2]`, the first value of a pair in the high
 //!   nibble (ModelOpt and compressed-tensors put it in the low one), an E4M3 scale per 16 values
 //!   in cuBLAS's tiled order (`float_utils.to_blocked`: tiles of 128 rows by 4 blocks, stored as
@@ -32,7 +40,7 @@
 //! rotated input to int8 with one scale per row (the "A8" of W6A8): that is not reproduced, and
 //! `input_scale` (a calibrated activation scale for its FP8 / NVFP4 kernels) is not read.
 //! `float8_e4m3fn` entries are left to [`crate::model::fp8_scaled`], `float8_e5m2` and `mxfp8`
-//! ones to whatever read or refused them before; `asym_w4a8_int8` and `convrot_w4a4` are refused.
+//! ones to whatever read or refused them before; `convrot_w4a4` is refused.
 
 use crate::ggml::{GgufMatrix, e4m3_to_f32};
 use crate::hadamard::Fold;
@@ -53,10 +61,21 @@ struct Conf {
 
 fn conf(files: &ModelFiles, base: &str) -> Result<Option<Conf>> {
     let name = format!("{base}.comfy_quant");
-    if !files.has(&name) {
-        return Ok(None);
-    }
-    let v: serde_json::Value = serde_json::from_slice(files.bytes(&name)?).with_context(|| format!("{name}: not JSON"))?;
+    let v: serde_json::Value = if files.has(&name) {
+        serde_json::from_slice(files.bytes(&name)?).with_context(|| format!("{name}: not JSON"))?
+    } else {
+        // Files written without the per-module tensors keep the entries in the header
+        // (`_quantization_metadata`: `{"layers": {module: entry}}`), which ComfyUI's loader turns
+        // into `comfy_quant` tensors (Sulphur-3's `*_w4a8.safetensors`).
+        let Some(m) = files.metadata("_quantization_metadata") else {
+            return Ok(None);
+        };
+        let all: serde_json::Value = serde_json::from_str(m).context("_quantization_metadata: not JSON")?;
+        match all.get("layers").and_then(|l| l.get(base)) {
+            Some(e) => e.clone(),
+            None => return Ok(None),
+        }
+    };
     let format = v
         .get("format")
         .and_then(|f| f.as_str())
@@ -105,56 +124,109 @@ fn int8_matrix(files: &ModelFiles, full: &str, base: &str, n_out: usize, n_in: u
     GgufMatrix::i8(unsafe { QBuf::borrowed(files.bytes(full)?) }, scales(&s), n_out, n_in).with_context(|| sn)
 }
 
-/// The W6A8 matrix `full` decoded to the int8 values the reference computes with, times its row
-/// scales (see the module docs).
-fn w6a8_matrix(files: &ModelFiles, full: &str, base: &str, c: &Conf, n_out: usize, n_in: usize) -> Result<GgufMatrix> {
-    let g = c.group_size;
-    if g < 16 || !g.is_multiple_of(16) || !n_in.is_multiple_of(32) || !n_in.is_multiple_of(g) {
-        bail!("{full}: 6-bit rows of {n_in} in groups of {g} (K divisible by 32, groups a multiple of 16)");
+/// comfy_kitchen's frozen 16-level Lloyd-Max table (`tensor/w4a8_packed.py`, `_FIXED_LUT`), the
+/// levels of a 4-bit weight that stores no `weight_codebook` of its own.
+const FIXED_LUT16: [f32; 16] = [
+    -0.980602, -0.794529, -0.638165, -0.500986, -0.377321, -0.263187, -0.155210, -0.050720, 0.052541, 0.156985, 0.265284, 0.379533,
+    0.502636, 0.638953, 0.794876, 0.980671,
+];
+
+/// The code of column `col` of a packed row of `k` columns at `bits` bits (the bit planes of the
+/// module docs: comfy_kitchen's `_unpack_codes`).
+fn grouped_code(row: &[u8], k: usize, bits: usize, col: usize) -> usize {
+    let plane = |off: usize, width: usize| {
+        let per = 8 / width;
+        ((row[off + col / per] >> (width * (col % per))) as usize) & ((1 << width) - 1)
+    };
+    match bits {
+        3 => plane(0, 2) | (plane(k / 4, 1) << 2),
+        4 => plane(0, 4),
+        5 => plane(0, 4) | (plane(k / 2, 1) << 4),
+        _ => plane(0, 4) | (plane(k / 2, 2) << 4),
     }
-    let (rn, cn) = (format!("{base}.weight_s_rel"), format!("{base}.weight_s_channel"));
+}
+
+/// A grouped W3A8 / W4A8 / W5A8 / W6A8 matrix `full` (`w6a8_int8`, `asym_w4a8_int8`) decoded to
+/// the int8 values the reference computes with, times its row scales (see the module docs). The
+/// bit width is the packed row's, `[N, K bits / 8]`, as comfy_kitchen infers it.
+fn grouped_matrix(files: &ModelFiles, full: &str, base: &str, c: &Conf, n_out: usize, n_in: usize) -> Result<GgufMatrix> {
+    let g = c.group_size;
+    let (rn, cn, bn) = (
+        format!("{base}.weight_s_rel"),
+        format!("{base}.weight_s_channel"),
+        format!("{base}.weight_codebook"),
+    );
     let (wi, ri) = (
         files.info(full).with_context(|| format!("missing tensor {full}"))?,
         files.info(&rn).with_context(|| format!("missing tensor {rn}"))?,
     );
-    let ng = n_in / g;
-    if wi.dtype != "I8" || wi.shape != [n_out, n_in * 3 / 4] || ri.shape != [n_out, ng] || !matches!(ri.dtype.as_str(), "F8_E4M3" | "U8") {
+    if g == 0 || !n_in.is_multiple_of(g) || wi.dtype != "I8" || wi.shape.len() != 2 || wi.shape[0] != n_out {
         bail!(
-            "{full}: {} {:?} with {} {:?} group scales for a 6-bit [{n_out}, {n_in}] weight",
+            "{full}: {} {:?} for a grouped [{n_out}, {n_in}] weight in groups of {g}",
+            wi.dtype,
+            wi.shape
+        );
+    }
+    let rb = wi.shape[1];
+    let bits = rb * 8 / n_in;
+    let ng = n_in / g;
+    if !(3..=6).contains(&bits) || bits * n_in != rb * 8 || ri.shape != [n_out, ng] || !matches!(ri.dtype.as_str(), "F8_E4M3" | "U8") {
+        bail!(
+            "{full}: {} {:?} with {} {:?} group scales for a [{n_out}, {n_in}] weight of 3 to 6 bits in groups of {g}",
             wi.dtype,
             wi.shape,
             ri.dtype,
             ri.shape
         );
     }
-    if files.has(&format!("{base}.weight_codebook")) || files.has(&format!("{base}.weight_correction")) {
-        bail!("{full}: a 6-bit weight with a codebook or a correction");
+    // The multi-plane widths keep a group inside one decode vector (`_check_plane_layout`).
+    if bits != 4 && (!g.is_multiple_of(16) || !n_in.is_multiple_of(if bits == 6 { 32 } else { 64 })) {
+        bail!("{full}: {bits}-bit rows of {n_in} in groups of {g} (K divisible by 32 or 64, groups a multiple of 16)");
     }
+    if files.has(&format!("{base}.weight_correction")) {
+        bail!("{full}: a grouped weight with a weight_correction (an asymmetric zero point) is not supported");
+    }
+    // 3- and 4-bit codes index a table, 5- and 6-bit ones are uniform around the middle code.
+    let has_book = files.has(&bn);
+    let levels: Vec<f32> = match (bits, has_book) {
+        (3 | 4, true) => {
+            let t = files.f32(&bn)?;
+            if t.len() != 1 << bits {
+                bail!("{bn}: {} levels for {bits}-bit codes", t.len());
+            }
+            t
+        }
+        (4, false) => FIXED_LUT16.to_vec(),
+        (3, false) => bail!("{full}: a 3-bit weight without its weight_codebook"),
+        (_, true) => bail!("{full}: a {bits}-bit weight with a codebook"),
+        (_, false) => (0..1usize << bits).map(|q| q as f32 - (1usize << (bits - 1)) as f32).collect(),
+    };
     let s_channel = files.f32(&cn)?;
     if s_channel.len() != n_out {
         bail!("{cn}: {} scales for {n_out} rows", s_channel.len());
     }
     let (packed, s_rel) = (files.bytes(full)?, files.bytes(&rn)?);
-    let rb = n_in * 3 / 4;
     let mut out = PageVec::<u8>::zeroed(n_out * n_in);
     let p = SendPtr(out.as_mut_ptr());
     crate::pool::run(n_out, &|r| {
         // SAFETY: rows are disjoint and `out` outlives the call.
         let o = unsafe { std::slice::from_raw_parts_mut(p.get().add(r * n_in), n_in) };
         let row = &packed[r * rb..(r + 1) * rb];
-        let (low, high) = row.split_at(n_in / 2);
         for (gi, og) in o.chunks_mut(g).enumerate() {
             let s = e4m3_to_f32(s_rel[r * ng + gi]);
             for (j, v) in og.iter_mut().enumerate() {
-                let col = gi * g + j;
-                let code = ((low[col / 2] >> (4 * (col % 2))) & 0xF) | (((high[col / 4] >> (2 * (col % 4))) & 3) << 4);
                 // torch.round: halves to even.
-                *v = ((code as f32 - 32.0) * s).round_ties_even().clamp(-127.0, 127.0) as i8 as u8;
+                *v = (levels[grouped_code(row, n_in, bits, gi * g + j)] * s)
+                    .round_ties_even()
+                    .clamp(-127.0, 127.0) as i8 as u8;
             }
         }
     });
     for n in [full, &rn, &cn] {
         files.note_use(n, true, false);
+    }
+    if has_book {
+        files.note_use(&bn, true, false);
     }
     GgufMatrix::i8(out.into(), scales(&s_channel), n_out, n_in)
 }
@@ -206,6 +278,28 @@ fn nvfp4_matrix(files: &ModelFiles, full: &str, base: &str, n_out: usize, n_in: 
     crate::model::nvfp4_blocks(&vals, &sc, g, n_out, n_in)
 }
 
+/// `W x` for `t` seeded normal input rows `x` (`[t, n_in]`) of the quantized weight `full` of
+/// the safetensors file `path`, as the loaders compute it: `(n_out, n_in, x, y)`
+/// (`examples/comfy_quant_check.rs` compares it with comfy_kitchen's dequantized weight).
+#[doc(hidden)]
+pub fn check_product(path: &std::path::Path, full: &str, t: usize, seed: u64) -> Result<(usize, usize, Vec<f32>, Vec<f32>)> {
+    let files = ModelFiles::open_file(path, false)?;
+    let base = full.strip_suffix(".weight").context("a .weight tensor")?;
+    let c = conf(&files, base)?.with_context(|| format!("{full}: no comfy_quant entry"))?;
+    let info = files.info(full).with_context(|| format!("missing tensor {full}"))?;
+    let n_out = info.shape[0];
+    // The logical width: the scale grid's for grouped weights.
+    let n_in = match files.info(&format!("{base}.weight_s_rel")) {
+        Some(r) => r.shape[1] * c.group_size,
+        None => info.shape[1],
+    };
+    let l = lin(&files, full, n_out, n_in)?.context("not a supported comfy_quant weight")?;
+    let x = crate::sd::ops::Rng::new(seed).normals(t * n_in);
+    let mut y = vec![0f32; t * n_out];
+    crate::model::linear(&l, n_out, n_in, &x, t, &mut y);
+    Ok((n_out, n_in, x, y))
+}
+
 /// The linear weight `full` (`[n_out, n_in]`) when its module has a `comfy_quant` entry in one of
 /// the formats of the module docs; None without an entry, or for one another loader reads.
 pub(crate) fn lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize) -> Result<Option<Lin<'a>>> {
@@ -215,7 +309,7 @@ pub(crate) fn lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usi
     let Some(c) = conf(files, base)? else { return Ok(None) };
     let m = match c.format.as_str() {
         "int8_tensorwise" => int8_matrix(files, full, base, n_out, n_in)?,
-        "w6a8_int8" => w6a8_matrix(files, full, base, &c, n_out, n_in)?,
+        "w6a8_int8" | "asym_w4a8_int8" => grouped_matrix(files, full, base, &c, n_out, n_in)?,
         "nvfp4" => nvfp4_matrix(files, full, base, n_out, n_in)?,
         "float8_e4m3fn" | "float8_e5m2" | "mxfp8" => return Ok(None),
         f => bail!("{full}: ComfyUI's {f} weights are not supported"),
@@ -340,6 +434,46 @@ mod tests {
             // Its own inverse.
             fwht_regular(&mut got);
             assert!(got.iter().zip(&x).all(|(a, b)| (a - b).abs() < 1e-4), "n = {n}");
+        }
+    }
+
+    /// comfy_kitchen's `_pack_codes`: the planes of `grouped_code`, written the other way round.
+    fn pack(codes: &[usize], bits: usize) -> Vec<u8> {
+        let k = codes.len();
+        let mut out = vec![0u8; k * bits / 8];
+        let mut put = |off: usize, width: usize, shift: usize| {
+            let per = 8 / width;
+            for (c, &q) in codes.iter().enumerate() {
+                out[off + c / per] |= (((q >> shift) & ((1 << width) - 1)) as u8) << (width * (c % per));
+            }
+        };
+        match bits {
+            3 => {
+                put(0, 2, 0);
+                put(k / 4, 1, 2);
+            }
+            4 => put(0, 4, 0),
+            5 => {
+                put(0, 4, 0);
+                put(k / 2, 1, 4);
+            }
+            _ => {
+                put(0, 4, 0);
+                put(k / 2, 2, 4);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn grouped_codes_round_trip() {
+        let k = 128;
+        for bits in 3..=6 {
+            let codes: Vec<usize> = (0..k).map(|c| (c * 29 + 7) % (1 << bits)).collect();
+            let row = pack(&codes, bits);
+            assert_eq!(row.len(), k * bits / 8);
+            let got: Vec<usize> = (0..k).map(|c| super::grouped_code(&row, k, bits, c)).collect();
+            assert_eq!(got, codes, "{bits} bits");
         }
     }
 }

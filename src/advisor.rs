@@ -847,10 +847,37 @@ pub const CATALOG: &[Model] = &[
         .note("with MiniMax-H3's Qwen3-VL text encoder; 2048x2048 and up"),
     Model::new("MiniMaxAI/MiniMax-H3", Kind::Video, 67.4, 140.1, &[TextToVideo, ImageToVideo])
         .note(
-            "transformer/, text_encoder/ and vae/ of the 498 GB repository; 24 fps, 5 to 15 s; no audio track; on the CPU; \
-             Comfy-Org/MiniMax-H3's single files, the turbo LoRAs and a GGUF text encoder load too (48 GB, 4 or 8 \
-             forwards; not run on the real files: docs/video.md)",
+            "transformer/, text_encoder/, vae/ and audio_vae/ of the 498 GB repository; 24 fps, 5 to 15 s with a stereo \
+             soundtrack; on the CPU (CUDA: the blocks and the VAE decoder); Comfy-Org/MiniMax-H3's single files, the turbo \
+             LoRAs and a GGUF text encoder (with its mmproj for keyframes and references) load too (48 GB, 4 or 8 forwards): \
+             docs/video.md",
         ),
+    // SulphurAI/Sulphur-3: a fine-tune of MiniMax-H3 as ComfyUI single files; the downloads
+    // count the VAEs of Comfy-Org/MiniMax-H3 (5.8 GB) and the Q8_0 GGUF text encoder (34.8 GB).
+    Model::new("SulphurAI/Sulphur-3/s3.safetensors", Kind::Video, 53.5, 88.8, &[TextToVideo, ImageToVideo])
+        .note(
+            "Sulphur-3 (a MiniMax-H3 fine-tune), the release's pruned bf16 file (40.2 GB) with its corrector \
+             (--corrector SulphurAI/Sulphur-3/s3_corrector.safetensors, 8.0 GB); --vae / --audio-vae from \
+             Comfy-Org/MiniMax-H3, --text-encoder unsloth/Qwen3-VL-32B-Instruct-GGUF (Q8_0); 20 Euler steps (--steps 21), \
+             JSON captions; CPU: 448x256, 22 frames in 12 min (33 s a forward, corrector 1.7 s), 62 GB resident: docs/video.md#sulphur-3",
+        ),
+    Model::new("SulphurAI/Sulphur-3/quantized/s3_w4a8.safetensors", Kind::Video, 53.5, 52.0, &[TextToVideo, ImageToVideo])
+        .note(
+            "Sulphur-3 in comfy_kitchen's W4A8 (4-bit codebook codes, 11.4 GB; decoded to int8 at load), same parts and \
+             settings as s3.safetensors; CPU: 448x256, 22 frames in 11 min (31 s a forward), 34 GB resident: \
+             docs/video.md#sulphur-3",
+        ),
+    Model::new(
+        "SulphurAI/Sulphur-3/experimental/Sulphur-3_Ref2VA-hybrid_mid_int8_convrot_keepB0-1-49.safetensors",
+        Kind::Video,
+        54.1,
+        63.9,
+        &[TextToVideo, ImageToVideo],
+    )
+    .note(
+        "Sulphur-3's experimental Ref2VA transformer (int8 ConvRot blocks 2-48, 22.1 GB): references with --ref, the \
+         text encoder's vision tower from mmproj-F16.gguf beside the GGUF (1.2 GB); CPU: one image reference, 448x256, 22 frames, 12 forwards in 7 min (32 s each), 37 GB resident: docs/video.md#sulphur-3",
+    ),
     Model::new("meituan-longcat/LongCat-Video-Avatar-1.6", Kind::Video, 22.2, 47.3, &[TextToVideo, ImageToVideo])
         .note(
             "audio-driven avatar video (--audio, --init-image), 25 fps, 93 frames a clip; the int8 transformer, the two LoRAs \
@@ -1379,7 +1406,9 @@ fn speed(token_gb: f64, rate: f64, layers: u16, layer_ms: f64) -> Option<f64> {
 
 /// The repo folder of the cache (`org--name`), for a `repo` or `repo:FILE` spec.
 fn cache_folder(repo: &str) -> String {
-    repo.split(':').next().unwrap_or(repo).replace('/', "--")
+    // `org/name`, `org/name:QUANT` or a file of a repository, `org/name/path/file.safetensors`.
+    let r = repo.split(':').next().unwrap_or(repo);
+    r.splitn(3, '/').take(2).collect::<Vec<_>>().join("--")
 }
 
 impl Row {
