@@ -136,8 +136,10 @@ model oxinfer runs with `--prompt-enhancer`) rewrites the prompt with the releas
 (`gemma4_t2v_system_prompt.txt`, `gemma4_i2v_system_prompt.txt`, Apache-2.0, copied from the LTX-2
 repository), greedily, up to 600 tokens; with a first-frame image, the image goes first in the user
 turn; then `clean_response`. "a cat plays piano in a jazz bar" became a 160-word caption (shot
-sizes, camera push-in, the music's tone) in 2 s with E2B-it on Metal; the video follows it. The
-reference also bans repeated 5-grams (`no_repeat_ngram_size`); oxinfer's sampler has no such ban.
+sizes, camera push-in, the music's tone) in 2 s with E2B-it on Metal; the video follows it. As
+the reference's `generate(no_repeat_ngram_size=5)`, no 5 tokens appear twice in the sequence, the
+system prompt and the user's prompt included (`ChatConfig::no_repeat_ngram`,
+`sampler::NoRepeatNgram`: transformers' `NoRepeatNGramLogitsProcessor`, for any engine model).
 
 ### The dev transformer: guidance
 
@@ -378,7 +380,6 @@ precision of the int8 and bf16 sessions; `ltx_check dit` with `LTX_SAVE` and `LT
   has constant QP only: the frame QP x264 picks is used).
 - The guided pipelines' `skip_step` with only one stream skipping a step runs both streams (the
   reference leaves the skipped stream out of that pass); off by default.
-- The prompt enhancer's `no_repeat_ngram_size = 5` (greedy decoding without the ban).
 - Audio-to-video (`a2vid_two_stage`: needs the audio VAE's encoder and mel front end), retake
   (video-to-video regeneration of a time window: needs whole-clip VAE encoding of a decoded video),
   the IC-LoRA pipelines (`ic_lora`, `hdr_ic_lora`, `dubit`: their LoRAs are not among the release's

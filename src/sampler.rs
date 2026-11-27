@@ -19,6 +19,96 @@ pub trait TokenFilter: Send {
     fn complete(&self) -> bool;
 }
 
+/// transformers' `NoRepeatNGramLogitsProcessor` (`no_repeat_ngram_size`): a token that would
+/// complete an n-gram of `n` tokens already in the sequence (the prompt included) is banned,
+/// on top of an optional inner filter.
+pub struct NoRepeatNgram {
+    n: usize,
+    tokens: Vec<u32>,
+    /// The tokens that followed each `n - 1`-token prefix.
+    next: std::collections::HashMap<Vec<u32>, Vec<u32>>,
+    inner: Option<Box<dyn TokenFilter>>,
+}
+
+impl NoRepeatNgram {
+    /// The ban of n-grams of `n` tokens (at least 1) over `context` and what follows it.
+    pub fn new(n: usize, context: &[u32], inner: Option<Box<dyn TokenFilter>>) -> Self {
+        let mut f = Self {
+            n: n.max(1),
+            tokens: Vec::with_capacity(context.len() + 1024),
+            next: std::collections::HashMap::new(),
+            inner,
+        };
+        for &t in context {
+            f.push(t);
+        }
+        f
+    }
+
+    fn push(&mut self, t: u32) {
+        self.tokens.push(t);
+        let n = self.n;
+        if self.tokens.len() >= n {
+            let g = &self.tokens[self.tokens.len() - n..];
+            let e = self.next.entry(g[..n - 1].to_vec()).or_default();
+            if !e.contains(&g[n - 1]) {
+                e.push(g[n - 1]);
+            }
+        }
+    }
+
+    /// The tokens that cannot come next.
+    pub fn banned(&self) -> &[u32] {
+        let k = self.n - 1;
+        if self.tokens.len() < k {
+            return &[];
+        }
+        self.next.get(&self.tokens[self.tokens.len() - k..]).map_or(&[], |v| v.as_slice())
+    }
+}
+
+impl TokenFilter for NoRepeatNgram {
+    fn mask(&mut self, logits: &mut [f32]) {
+        if let Some(f) = &mut self.inner {
+            f.mask(logits);
+        }
+        let banned = self.banned();
+        // At least one token stays.
+        let left = logits
+            .iter()
+            .enumerate()
+            .filter(|&(i, &l)| l > f32::NEG_INFINITY && !banned.contains(&(i as u32)))
+            .count();
+        if left > 0 {
+            for &t in banned {
+                if let Some(l) = logits.get_mut(t as usize) {
+                    *l = f32::NEG_INFINITY;
+                }
+            }
+        }
+    }
+
+    fn accept(&mut self, token: u32) {
+        if let Some(f) = &mut self.inner {
+            f.accept(token);
+        }
+        self.push(token);
+    }
+
+    fn fork(&self) -> Box<dyn TokenFilter> {
+        Box::new(Self {
+            n: self.n,
+            tokens: self.tokens.clone(),
+            next: self.next.clone(),
+            inner: self.inner.as_ref().map(|f| f.fork()),
+        })
+    }
+
+    fn complete(&self) -> bool {
+        self.inner.as_ref().is_none_or(|f| f.complete())
+    }
+}
+
 /// The log probability of a generated token and of the most likely tokens at its position, in
 /// the distribution the model produced: the softmax of its logits, before the repetition
 /// penalty, temperature, top-k, top-p and any constraint.
@@ -803,6 +893,24 @@ unsafe fn argmax_neon(x: &[f32]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The n-gram ban over the context and the accepted tokens (transformers' rule).
+    #[test]
+    fn no_repeat_ngram_bans_completions() {
+        // Context 1 2 3 4 5 ... 1 2 3: with n = 4, 4 cannot follow (1 2 3 4 is there).
+        let mut f = NoRepeatNgram::new(4, &[1, 2, 3, 4, 5, 9, 1, 2, 3], None);
+        let mut l = vec![0f32; 10];
+        f.mask(&mut l);
+        assert_eq!(l[4], f32::NEG_INFINITY);
+        assert!(l.iter().enumerate().all(|(i, &v)| i == 4 || v == 0.0));
+        f.accept(7);
+        // Now 2 3 7 then 3 7 ...: nothing banned.
+        assert!(f.banned().is_empty());
+        let mut g = NoRepeatNgram::new(2, &[5, 6], None);
+        g.accept(5);
+        assert_eq!(g.banned(), &[6]);
+        assert!(g.fork().complete());
+    }
 
     /// Cut draws: top-k, then top-p over the top-k set's weight, then min-p against the most
     /// likely token, ties ranked by token id, the draw in rank order; `DeviceSampling::pick`

@@ -1045,6 +1045,10 @@ pub struct ChatConfig {
     /// Records the log probability of every generated token and of this many most likely
     /// alternatives ([`Reply::logprobs`], [`Delta::logprob`]).
     pub logprobs: Option<usize>,
+    /// Bans repeated n-grams of this many tokens (0: off): a token that would complete an
+    /// n-gram already in the context (the prompt included) cannot come next, as transformers'
+    /// `no_repeat_ngram_size` ([`crate::sampler::NoRepeatNgram`]).
+    pub no_repeat_ngram: usize,
 }
 
 impl Default for ChatConfig {
@@ -1057,6 +1061,7 @@ impl Default for ChatConfig {
             response_format: ResponseFormat::Text,
             tool_choice: ToolChoice::Auto,
             logprobs: None,
+            no_repeat_ngram: 0,
         }
     }
 }
@@ -4156,6 +4161,7 @@ impl PendingTurn {
             constrain,
             token_hook,
             checkpoints,
+            history,
             ..
         } = e;
         let tok: &Tokenizer = tok;
@@ -4168,6 +4174,18 @@ impl PendingTurn {
         let filter = constraint
             .map(|c| Box::new(c) as Box<dyn crate::sampler::TokenFilter>)
             .or_else(|| lm.reply_guard(&ids));
+        // The n-gram ban over the whole context (the history in the cache, then the prompt).
+        let filter = match config.no_repeat_ngram {
+            0 => filter,
+            n => {
+                let ctx: Vec<u32> = if known {
+                    history.iter().chain(&ids).copied().collect()
+                } else {
+                    ids.clone()
+                };
+                Some(Box::new(crate::sampler::NoRepeatNgram::new(n, &ctx, filter)) as Box<dyn crate::sampler::TokenFilter>)
+            }
+        };
         // The token hook wraps the rest: its forced tokens first.
         let filter = match token_hook {
             Some(h) => {

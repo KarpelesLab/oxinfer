@@ -2,7 +2,8 @@
 //! `LTXGemmaTextEncoder.enhance_t2v` / `enhance_i2v`): a Gemma 4 instruct model rewrites a short
 //! prompt into a detailed audio-visual caption in the style of the training captions, with the
 //! release's system prompts (`gemma4_t2v_system_prompt.txt`, `gemma4_i2v_system_prompt.txt`,
-//! Apache-2.0, from github.com/Lightricks/LTX-2) and greedy decoding up to 600 tokens; with a
+//! Apache-2.0, from github.com/Lightricks/LTX-2) and greedy decoding up to 600 tokens with no
+//! 5-token sequence twice (`no_repeat_ngram_size`, the prompt included); with a
 //! conditioning image, the image goes first in the user turn. LTX-2.5's own text encoder is not
 //! an instruct model, so the reference takes a separate one (`--prompt-enhancer-gemma-root`, e.g.
 //! Gemma 4 E2B-it); so does oxinfer (any Gemma 4 instruct model it runs, by name or path).
@@ -20,6 +21,9 @@ pub const I2V_SYSTEM_PROMPT: &str = include_str!("prompts/gemma4_i2v_system_prom
 pub const DEFAULT_ENHANCER: &str = "google/gemma-4-E2B-it";
 /// `GEMMA4_ENHANCE_GENERATION_KWARGS["max_new_tokens"]`.
 pub const MAX_TOKENS: usize = 600;
+/// `GEMMA4_ENHANCE_GENERATION_KWARGS["no_repeat_ngram_size"]`: no 5 tokens twice in the
+/// sequence (the prompt included).
+pub const NO_REPEAT_NGRAM: usize = 5;
 
 /// `clean_response`: curly quotes and dashes made plain, leading non-letters dropped.
 pub fn clean_response(text: &str) -> String {
@@ -52,6 +56,7 @@ pub fn enhance(enhancer: &str, prompt: &str, image: Option<&Image>, cache_dir: O
         ..SamplingParams::default()
     });
     engine.config_mut().max_tokens = MAX_TOKENS;
+    engine.config_mut().no_repeat_ngram = NO_REPEAT_NGRAM;
     engine.config_mut().think = false;
     let mut tmp = None;
     let messages = match image {
