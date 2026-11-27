@@ -1161,11 +1161,24 @@ impl CudaBackend {
     }
 
     fn htod<T>(&self, dst: u64, src: &[T]) -> bool {
-        unsafe {
+        let rc = unsafe {
             self.cu
                 .cuMemcpyHtoD_v2(dst, src.as_ptr() as *const c_void, std::mem::size_of_val(src))
-                == 0
+        };
+        if rc != 0 {
+            // Not a full device (an allocation fails first): a kernel's fault stays with the
+            // context, and every plan step from then on is declined and runs on the CPU.
+            crate::gpu::warn(format!(
+                "cuda: a copy to the device failed with error {rc}; the steps that need it run on the CPU"
+            ));
+            if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                eprintln!(
+                    "[cuda: copy of {} bytes to the device failed: error {rc}]",
+                    std::mem::size_of_val(src)
+                );
+            }
         }
+        rc == 0
     }
 
     /// The kernels for ggml format `kind`, compiled on first use.

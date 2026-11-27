@@ -2177,13 +2177,19 @@ template <int K>
 __device__ __forceinline__ constexpr bool has_mvq() {
     return K == K_Q4_K || K == K_Q6_K || K == K_Q8_0;
 }
-// 9 aligned words around 32 bytes at a 2-byte aligned p, funnel-shifted into w[0..7].
+// 8 aligned words and 2 bytes around 32 bytes at a 2-byte aligned p, funnel-shifted into
+// w[0..7]. Nothing past p + 32 is read: a Q8_0 block ends there, and the last one of a matrix
+// may end its allocation at a page's end (a 1024 x 5120 Q8_0 matrix is 1360 pages of 4 KiB; the
+// two or four bytes a ninth word took past it were an illegal address on a DGX Spark). The last
+// two bytes are p + 30 .. 31, the ninth word's low half when p is not 4-byte aligned; when it
+// is, the shift is 0 and they are not used (the load is then of the two bytes before).
 __device__ __forceinline__ void ld32x8_h(const u8* p, u32* w) {
-    u32 fs = 8 * ((u32)(u64)p & 2);
+    u32 odd = (u32)(u64)p & 2, fs = 8 * odd;
     const u32* a = (const u32*)((u64)p & ~(u64)3);
     u32 r[9];
 #pragma unroll
-    for (int j = 0; j < 9; j++) r[j] = a[j];
+    for (int j = 0; j < 8; j++) r[j] = a[j];
+    r[8] = *(const u16*)((const u8*)(a + 8) - (2 - odd));
 #pragma unroll
     for (int j = 0; j < 8; j++) w[j] = __funnelshift_r(r[j], r[j + 1], fs);
 }

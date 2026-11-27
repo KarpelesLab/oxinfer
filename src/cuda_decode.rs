@@ -176,6 +176,43 @@ struct GdnP {
 
 type F = *mut c_void;
 
+impl COp {
+    /// The op's kind, for the traces.
+    fn kind(&self) -> &'static str {
+        match self {
+            COp::Mv { fk: Some(_), .. } => "matvec",
+            COp::Mv { .. } => "matvec-1",
+            COp::Gmv { .. } | COp::Gmv3 { .. } => "matvec-ggml",
+            COp::Topk { .. } => "topk",
+            COp::Experts { .. } => "experts",
+            COp::Norm { .. } => "norm",
+            COp::AddNorm { .. } => "add-norm",
+            COp::QkRope { .. } => "qk-rope",
+            COp::Attn { .. } => "attention",
+            COp::GdnConv { .. } => "gdn-conv",
+            COp::GdnRule { .. } => "gdn-rule",
+            COp::Glu { .. } => "glu",
+            COp::Ew { .. } => "ew",
+            COp::LoraDown { .. } | COp::LoraUp { .. } => "lora",
+        }
+    }
+
+    /// The kind with a matvec's shape (`OXINFER_GPU_PLAN_DEBUG`).
+    fn describe(&self) -> String {
+        match *self {
+            COp::Gmv { n_out, n_in, w2, mode, .. } => {
+                format!(
+                    "matvec-ggml {n_out} x {n_in}{}, mode {mode}",
+                    if w2.is_some() { ", gate / up pair" } else { "" }
+                )
+            }
+            COp::Gmv3 { n, n_in, .. } => format!("matvec-ggml {} + {} + {} x {n_in}", n[0], n[1], n[2]),
+            COp::Mv { n_out, n_in, mode, .. } => format!("matvec {n_out} x {n_in}, mode {mode}"),
+            _ => self.kind().to_string(),
+        }
+    }
+}
+
 enum COp {
     Mv {
         f: F,
@@ -835,6 +872,20 @@ fn debug(why: &str) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some()) {
         eprintln!("[cuda decode: {why}]");
+    }
+}
+
+/// With `OXINFER_GPU_PLAN_DEBUG`: waits for the device and names the first point (`what`) after
+/// which it reports an error (a kernel's fault stays with the context: every later call fails).
+fn check(be: &CudaBackend, what: impl FnOnce() -> String) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !*ON.get_or_init(|| std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some()) || SEEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let rc = unsafe { be.cu.cuCtxSynchronize() };
+    if rc != 0 && !SEEN.swap(true, Ordering::Relaxed) {
+        eprintln!("[cuda decode: the device reports error {rc} after {}]", what());
     }
 }
 
@@ -3060,12 +3111,15 @@ impl DecodePlan for CudaPlan<'_> {
             return false;
         }
         let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        check(be, || format!("what ran before a step of {t} token(s)"));
         let Some(ms) = self.slot(slot) else { return false };
+        check(be, || "the session's buffers were made".into());
         let pos = s.pos;
         if !self.sync_kv(ms, s.kv, pos, t) {
             debug("step: KV caches could not be synced (VRAM?)");
             return false;
         }
+        check(be, || "the KV caches were synced".into());
         let tr = trace();
         let t0 = std::time::Instant::now();
         if !(s.states_kept && ms.states_valid) {
@@ -3186,7 +3240,13 @@ impl DecodePlan for CudaPlan<'_> {
             }
             let ts = std::time::Instant::now();
             self.before_op(i, end);
-            if !self.launch_tokens(op, ms, t) {
+            let launched = self.launch_tokens(op, ms, t);
+            if !recording {
+                check(be, || {
+                    format!("op {i} of {} ({}) in a step of {t} token(s)", self.ops.len(), op.describe())
+                });
+            }
+            if !launched {
                 debug(&format!("step of {t} token(s): op {i} of {} did not launch", self.ops.len()));
                 if recording {
                     // Not as a graph from now on (the step falls back as before).
@@ -3200,23 +3260,7 @@ impl DecodePlan for CudaPlan<'_> {
             self.after_op(op, t);
             if per_op {
                 unsafe { be.cu.cuCtxSynchronize() };
-                let k = match op {
-                    COp::Mv { fk: Some(_), .. } => "matvec",
-                    COp::Mv { .. } => "matvec-1",
-                    COp::Gmv { .. } | COp::Gmv3 { .. } => "matvec-ggml",
-                    COp::Topk { .. } => "topk",
-                    COp::Experts { .. } => "experts",
-                    COp::Norm { .. } => "norm",
-                    COp::AddNorm { .. } => "add-norm",
-                    COp::QkRope { .. } => "qk-rope",
-                    COp::Attn { .. } => "attention",
-                    COp::GdnConv { .. } => "gdn-conv",
-                    COp::GdnRule { .. } => "gdn-rule",
-                    COp::Glu { .. } => "glu",
-                    COp::Ew { .. } => "ew",
-                    COp::LoraDown { .. } | COp::LoraUp { .. } => "lora",
-                };
-                let e = kinds.entry(k).or_default();
+                let e = kinds.entry(op.kind()).or_default();
                 e.0 += 1;
                 e.1 += ts.elapsed().as_secs_f64() * 1e6;
             }
