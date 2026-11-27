@@ -287,6 +287,7 @@ wall time from start to the written `.mp4`, files mapped (resident set 17 to 22 
 | t2v 768x512, no `--frames` (the duration head: 4.32 s) | 97 | 69.8 s | a woman in a kitchen saying the prompt's line; Whisper large-v3-turbo transcribes the soundtrack as "Good morning. Today we are going to bake fresh bread together." |
 | first + last frame 768x512 (`--init-image car.png --last-image` a 1.67x crop of it) | 49 | 47.7 s | the camera pushes in from the first frame to the last one |
 | dev transformer + `--distilled-lora` (1660 layers as side paths), 384x256 one stage | 25 | 56.8 s (19 s of it loading the LoRA; 40 GB resident) | the dog running, softer than the distilled file's |
+| dev transformer, guided one stage (30 steps x 4 passes), 384x256 | 25 | 73.1 s (stage 64.2 s: 0.53 s a pass) | a red fox trotting through snow under pines |
 | t2v 384x256 two stages, `--temporal-rounds 2` (DFR: 1 then 2 then 4 tiles) | 25 -> 97 (96 fps) | 45.6 s | the dog trotting, smooth, no visible tile borders |
 | t2v 384x256 two stages, `--temporal-upscale`, 49 frames | 49 -> 97 (48 fps) | 63 s (machine shared) | no jump at the tile border (frame 48) |
 | t2v 384x256 one stage | 25 | 13.7 s | text 3.3 s, 8 forwards 4.4 s (0.55 s each), VAE 2.1 s, audio 1.3 s |
