@@ -374,6 +374,16 @@ impl Conv {
         })
     }
 
+    /// [`Conv::from_kernel`], exact in float32 when `exact` (the bf16 weights plus their rounding
+    /// residual on the CPU, the float32 weights on an accelerator).
+    pub fn from_kernel_exact(w: &[f32], cout: usize, cin: usize, k: usize, bias: Option<Vec<f32>>, exact: bool) -> Result<Self> {
+        let mut c = Self::from_kernel(w, cout, cin, k, bias)?;
+        if exact {
+            c.lin = c.lin.with_residual(&kernel_rows(w, cout, cin, k))?;
+        }
+        Ok(c)
+    }
+
     /// A convolution with asymmetric zero padding: `before` rows / columns above and left of the
     /// input, `after` below and right (diffusers' `Downsample2D` with `padding=0` pads (0, 1)).
     pub fn load_padded(t: &Tensors, prefix: &str, before: usize, after: usize) -> Result<Self> {

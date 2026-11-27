@@ -1,4 +1,5 @@
-//! Endpoints of the non-generative models: voice isolation (`POST /v1/audio/isolations`).
+//! Endpoints of the non-generative models: voice isolation (`POST /v1/audio/isolations`) and
+//! depth estimation (`POST /v1/images/depth`).
 //!
 //! Each takes `multipart/form-data` (the input as the `file` part, the other fields as form
 //! fields) or a JSON object (the input base64-encoded in `file`, optionally as a `data:` URL).
@@ -187,6 +188,100 @@ pub(super) fn isolations(api: &Arc<Api>, req: &ApiRequest) -> ApiResult<Output> 
     })
 }
 
+/// `POST /v1/images/depth`: the metric depth of an image (PNG, JPEG, WebP, GIF, BMP). Fields:
+/// `model`, `file` (also `image`), `focal_px` (the focal length in pixels; default: the image's
+/// EXIF 35 mm focal length, else the estimator's), `exif` (`false` ignores it),
+/// `response_format` (`json`, the default: the figures with the base64 color preview `png`,
+/// 16-bit `png16` and, with `include_depth`, the float32 depth `depth` (little-endian, meters);
+/// `png`: the color preview alone; `png16`: the 16-bit PNG alone; `f32`: the raw depth alone).
+pub(super) fn depth(api: &Arc<Api>, req: &ApiRequest) -> ApiResult<Output> {
+    let f = Fields::parse(req, "image")?;
+    let model = f
+        .get("model")
+        .ok_or_else(|| ApiError::bad("model is required").param("model"))?
+        .to_string();
+    let file = f
+        .file
+        .as_ref()
+        .ok_or_else(|| ApiError::bad("file (or image) is required").param("file"))?;
+    let format = f.get("response_format").unwrap_or("json").to_string();
+    if !["json", "png", "png16", "f32"].contains(&format.as_str()) {
+        return Err(ApiError::bad(format!("response_format {format:?}: expected json, png, png16 or f32")).param("response_format"));
+    }
+    let given: Option<f32> = match f.get("focal_px") {
+        None => None,
+        Some(v) => Some(
+            v.parse::<f32>()
+                .ok()
+                .filter(|f| f.is_finite() && *f > 0.0)
+                .ok_or_else(|| ApiError::bad("focal_px must be a positive number").param("focal_px"))?,
+        ),
+    };
+    let flag = |k: &str| f.get(k).map(|v| matches!(v, "1" | "true" | "yes" | "on"));
+    let use_exif = flag("exif").unwrap_or(true);
+    api.models.check(&model, Kind::Depth)?;
+    let img = crate::depth_pro::decode_image(&file.data).map_err(|e| ApiError::bad(format!("decode image: {e:#}")))?;
+    let (f_px, source) = match (given, use_exif.then_some(img.focal_px).flatten()) {
+        (Some(v), _) => (Some(v), "given"),
+        (None, Some(v)) => (Some(v), "exif"),
+        (None, None) => (None, "estimated"),
+    };
+    let t0 = std::time::Instant::now();
+    let mut lease = api.models.acquire(&model, Kind::Depth)?;
+    let Loaded::Depth(net) = lease.model() else { unreachable!() };
+    let d = net
+        .infer_rgb(&img.rgb, img.width, img.height, f_px)
+        .map_err(|e| ApiError::new(500, format!("{e:#}")))?;
+    drop(lease);
+    let secs = t0.elapsed().as_secs_f64();
+    let body = |ct: &str, b: Vec<u8>| {
+        Output::Full(ApiResponse {
+            status: 200,
+            content_type: ct.into(),
+            body: b,
+        })
+    };
+    let png = || crate::png::encode_rgb(d.width, d.height, &d.colorize());
+    let (g16, k) = d.gray16();
+    let png16 = || crate::png::encode_gray16(d.width, d.height, &g16);
+    let raw = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+    Ok(match format.as_str() {
+        "png" => body("image/png", png()),
+        "png16" => body("image/png", png16()),
+        "f32" => {
+            let depth = d
+                .depth()
+                .ok_or_else(|| ApiError::bad("no focal length (give focal_px or load the estimator)"))?;
+            body("application/octet-stream", raw(&depth))
+        }
+        _ => {
+            let range = d.depth_range();
+            let mut v = json!({
+                "object": "image.depth",
+                "model": model,
+                "width": d.width,
+                "height": d.height,
+                "focal_px": d.focal_px,
+                "focal_source": if d.focal_px.is_some() { Some(source) } else { None },
+                "fov_deg": d.fov_deg,
+                "depth_p05": range.map(|r| r.0).filter(|v| v.is_finite()),
+                "depth_p95": range.map(|r| r.1).filter(|v| v.is_finite()),
+                "far_fraction": range.map(|r| r.2),
+                "png16_meters_numerator": d.focal_px.map(|_| k),
+                "seconds": secs,
+                "png": crate::b64::encode(&png()),
+                "png16": crate::b64::encode(&png16()),
+            });
+            if flag("include_depth").unwrap_or(false)
+                && let Some(depth) = d.depth()
+            {
+                v["depth"] = json!(crate::b64::encode(&raw(&depth)));
+            }
+            body("application/json", serde_json::to_vec(&v).unwrap_or_default())
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +321,31 @@ mod tests {
         };
         assert_eq!(r.status, 400);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn depth_endpoint() {
+        let (dir, fdir) = crate::depth_pro::tests::tiny("srv");
+        let mut opts = ServerOptions::default();
+        opts.set("model", &format!("d={},focal={}", dir.display(), fdir.display())).unwrap();
+        let api = Api::new(opts).unwrap();
+        let (w, h) = (40, 30);
+        let png = crate::png::encode_rgb(w, h, &crate::depth_pro::tests::image(w, h));
+        let body = json!({ "model": "d", "image": crate::b64::encode(&png), "include_depth": true });
+        let Output::Full(r) = api.handle(&ApiRequest::post_json("/v1/images/depth", &body.to_string())) else {
+            panic!()
+        };
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!((v["width"].as_u64(), v["height"].as_u64()), (Some(40), Some(30)));
+        assert_eq!(v["focal_source"], "estimated");
+        let depth = crate::b64::decode(v["depth"].as_str().unwrap()).unwrap();
+        assert_eq!(depth.len(), w * h * 4);
+        let body = json!({ "model": "d", "file": crate::b64::encode(&png), "focal_px": 50, "response_format": "png16" });
+        let Output::Full(r) = api.handle(&ApiRequest::post_json("/v1/images/depth", &body.to_string())) else {
+            panic!()
+        };
+        assert_eq!((r.status, r.content_type.as_str()), (200, "image/png"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1216,6 +1216,32 @@ int oxi_isolator_stream_flush(OxiIsolatorStream *s, float **out, size_t *n_out);
 int64_t oxi_isolator_stream_latency(const OxiIsolatorStream *s);
 void oxi_isolator_stream_free(OxiIsolatorStream *s);
 
+/* ---- Depth estimation (Depth Pro 2, apple/DepthPro2-S / -B / -L / -H) ----------------------- */
+
+typedef struct OxiDepth OxiDepth;
+
+/* Loads Depth Pro 2: a repo id (apple/DepthPro2-S, -B, -L, -H) or a folder with config.json and
+ * model.safetensors. `options` (key=value lines or ;-separated pairs): focal (the focal length
+ * estimator: default apple/DepthPro2-focal, none for none), device, threads, cache_dir. */
+OxiDepth *oxi_depth_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
+void oxi_depth_free(OxiDepth *d);
+/* {"path", "backbone", "params", "focal_estimator", "device", "load_secs"}. */
+char *oxi_depth_info_json(const OxiDepth *d);
+
+/* Depth of an RGB8 image (width * height * 3 bytes, row-major) at its full resolution. `f_px` > 0
+ * is the focal length in pixels, else the estimator's is used. `depth_out` (meters, INFINITY where
+ * infinitely far) and `inverse_out` (focal-normalized inverse depth) receive width * height floats
+ * when not NULL (free each with oxi_audio_free(p, width * height)). Returns JSON {"width",
+ * "height", "focal_px", "focal_estimated", "fov_deg", "depth_p05", "depth_p95", "far_fraction"}
+ * (free with oxi_string_free), or NULL on error. */
+char *oxi_depth_rgb(const OxiDepth *d, const uint8_t *rgb, int width, int height, float f_px, float **depth_out,
+                    float **inverse_out);
+/* Depth of an image file (EXIF orientation and 35 mm focal length applied), written as
+ * `out_prefix`-depth.png (turbo color preview of inverse depth), -depth16.png (16-bit inverse
+ * depth: meters = png16_meters_numerator / value) and -depth.f32 (meters, float32). `options_json`:
+ * {"focal_px", "exif"}. Returns the figures with "files" as JSON, or NULL on error. */
+char *oxi_depth_file(const OxiDepth *d, const char *path, const char *options_json, const char *out_prefix);
+
 /* ---- OpenAI-compatible server (cargo features `capi` + `server`) -----------------------------
  * The OpenAI API (GET /v1/models; POST /v1/chat/completions, /v1/completions, /v1/embeddings,
  * /v1/images/generations, /v1/images/edits, /v1/audio/transcriptions, /v1/audio/translations,

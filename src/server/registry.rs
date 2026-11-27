@@ -28,6 +28,8 @@ pub enum Kind {
     Video,
     /// Voice isolation (Inworld Voice Isolator): `/v1/audio/isolations`.
     Isolation,
+    /// Monocular depth (Depth Pro 2): `/v1/images/depth`.
+    Depth,
 }
 
 impl Kind {
@@ -40,6 +42,7 @@ impl Kind {
             "speech" | "tts" => Kind::Speech,
             "video" | "videos" => Kind::Video,
             "isolation" | "voice-isolation" | "denoise" | "denoising" => Kind::Isolation,
+            "depth" | "depth-estimation" => Kind::Depth,
             _ => return None,
         })
     }
@@ -52,6 +55,7 @@ impl Kind {
             Kind::Speech => "speech",
             Kind::Video => "video",
             Kind::Isolation => "isolation",
+            Kind::Depth => "depth",
         }
     }
 }
@@ -123,6 +127,7 @@ pub(crate) enum Loaded {
     Haru(Box<crate::haru::Haru>),
     Video(Box<VideoModel>),
     Isolation(Box<crate::voice_isolator::VoiceIsolator>),
+    Depth(Box<crate::depth_pro::DepthPro>),
 }
 
 impl Loaded {
@@ -177,6 +182,7 @@ impl Loaded {
             Loaded::Speech(_) | Loaded::Zonos(_) | Loaded::Drama(_) | Loaded::Arktts(_) | Loaded::Haru(_) => Kind::Speech,
             Loaded::Video(_) => Kind::Video,
             Loaded::Isolation(_) => Kind::Isolation,
+            Loaded::Depth(_) => Kind::Depth,
         }
     }
 }
@@ -1278,6 +1284,16 @@ impl Registry {
                 }
                 Loaded::Isolation(Box::new(crate::voice_isolator::VoiceIsolator::load(src, &o)?))
             }
+            Kind::Depth => {
+                let mut o = crate::depth_pro::DepthOptions {
+                    cache_dir: self.cache_dir.clone(),
+                    ..Default::default()
+                };
+                for (k, v) in &opts {
+                    o.set(k, v)?;
+                }
+                Loaded::Depth(Box::new(crate::depth_pro::DepthPro::load(src, &o)?))
+            }
         };
         // Repo ids are resolved now: count what is on disk.
         let est = match spec.option("memory_gb") {
@@ -1487,6 +1503,9 @@ pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>
     if crate::voice_isolator::is_voice_isolator(path) {
         return (Kind::Isolation, None);
     }
+    if crate::depth_pro::is_depth_pro(path) {
+        return (Kind::Depth, None);
+    }
     if crate::gguf::is_gguf(path) {
         if crate::flux::is_flux_gguf(path) {
             return img(ImageKind::Flux);
@@ -1642,6 +1661,7 @@ mod tests {
             Kind::Speech,
             Kind::Video,
             Kind::Isolation,
+            Kind::Depth,
         ] {
             assert_eq!(Kind::parse(k.as_str()), Some(k));
         }

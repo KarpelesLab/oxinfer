@@ -27,6 +27,7 @@ use std::time::Instant;
 mod anemll_cli;
 mod arktts_cli;
 mod bagel_cli;
+mod depth_pro_cli;
 #[cfg(feature = "media")]
 mod fish_cli;
 mod flux_cli;
@@ -1543,6 +1544,10 @@ fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("web") {
         let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
         return web_cli::run(&rest, "web", true);
+    }
+    if std::env::args().nth(1).as_deref() == Some("depth") {
+        let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
+        return depth_pro_cli::run(&rest);
     }
     if std::env::args().nth(1).as_deref() == Some("isolate") {
         let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();

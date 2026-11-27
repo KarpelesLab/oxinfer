@@ -36,6 +36,8 @@ pub enum Kind {
     Video,
     /// Audio in, audio out (voice isolation).
     Audio,
+    /// Image in, a depth map out.
+    Depth,
 }
 
 impl Kind {
@@ -48,6 +50,7 @@ impl Kind {
             Kind::Tts => "text-to-speech",
             Kind::Video => "video",
             Kind::Audio => "audio",
+            Kind::Depth => "depth",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -59,6 +62,7 @@ impl Kind {
             "tts" | "text-to-speech" => Kind::Tts,
             "video" | "videos" => Kind::Video,
             "audio" | "isolation" | "voice-isolation" => Kind::Audio,
+            "depth" | "depth-estimation" => Kind::Depth,
             _ => return None,
         })
     }
@@ -176,10 +180,12 @@ pub enum Cap {
     ImageToVideo,
     /// The voice of a recording kept, the background removed (denoising).
     VoiceIsolation,
+    /// Metric depth of an image (and the focal length).
+    DepthEstimation,
 }
 
 impl Cap {
-    pub const ALL: [Cap; 20] = [
+    pub const ALL: [Cap; 21] = [
         Cap::Text,
         Cap::ImageInput,
         Cap::VideoInput,
@@ -200,6 +206,7 @@ impl Cap {
         Cap::TextToVideo,
         Cap::ImageToVideo,
         Cap::VoiceIsolation,
+        Cap::DepthEstimation,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
@@ -223,6 +230,7 @@ impl Cap {
             Cap::TextToVideo => "text-to-video",
             Cap::ImageToVideo => "image-to-video",
             Cap::VoiceIsolation => "voice-isolation",
+            Cap::DepthEstimation => "depth-estimation",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -940,6 +948,12 @@ pub const CATALOG: &[Model] = &[
          time on an M5 Max with Metal), --mode streaming the realtime one (58M, 233 MB; 63 ms latency, about real time \
          in 20 ms pieces on the CPU); f32 like the reference (126-132 dB SNR against it)",
     ),
+    Model::new("apple/DepthPro2-S", Kind::Depth, 0.048, 0.19, &[DepthEstimation])
+        .note("metric depth at full resolution (oxinfer depth, /v1/images/depth), with apple/DepthPro2-focal; research-only license"),
+    Model::new("apple/DepthPro2-B", Kind::Depth, 0.12, 0.48, &[DepthEstimation]).note("with apple/DepthPro2-focal; research-only license"),
+    Model::new("apple/DepthPro2-L", Kind::Depth, 0.36, 1.43, &[DepthEstimation]).note("with apple/DepthPro2-focal; research-only license"),
+    Model::new("apple/DepthPro2-H", Kind::Depth, 0.9, 3.6, &[DepthEstimation])
+        .note("DINOv3 ViT-H+ (SwiGLU), with apple/DepthPro2-focal; research-only license; not run against the reference"),
 ];
 
 /// A curated stack: a base model of the catalog with LoRA files at set strengths, a trigger word
@@ -1649,7 +1663,7 @@ fn path_of(m: &Model) -> EnginePath {
         Kind::Tts if has(&["orpheus"]) => EnginePath::Graph,
         Kind::Video if has(&["ltx-2"]) => EnginePath::Pipeline,
         Kind::Tts | Kind::Video | Kind::Audio => EnginePath::Cpu,
-        Kind::Image | Kind::Embedding => EnginePath::Pipeline,
+        Kind::Image | Kind::Embedding | Kind::Depth => EnginePath::Pipeline,
     }
 }
 
@@ -2198,6 +2212,7 @@ mod tests {
                     Kind::Tts => has(Cap::TextToSpeech),
                     Kind::Video => has(Cap::TextToVideo),
                     Kind::Audio => has(Cap::VoiceIsolation),
+                    Kind::Depth => has(Cap::DepthEstimation),
                     Kind::Image => has(Cap::TextToImage) || has(Cap::ImageEdit) || has(Cap::Inpainting),
                 },
                 "{}",

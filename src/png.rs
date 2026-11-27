@@ -39,9 +39,21 @@ pub fn encode_rgba(width: usize, height: usize, rgba: &[u8]) -> Vec<u8> {
     encode(width, height, rgba, 4)
 }
 
+/// Encodes 16-bit grayscale `gray` (`width * height` values, row-major) as a PNG file.
+pub fn encode_gray16(width: usize, height: usize, gray: &[u16]) -> Vec<u8> {
+    assert_eq!(gray.len(), width * height, "pixel buffer does not match the size");
+    let bytes: Vec<u8> = gray.iter().flat_map(|v| v.to_be_bytes()).collect();
+    encode_raw(width, height, &bytes, 2, 16, 0)
+}
+
 /// 8-bit truecolour (`ch` 3) or truecolour with alpha (`ch` 4).
 fn encode(width: usize, height: usize, rgb: &[u8], ch: usize) -> Vec<u8> {
     assert_eq!(rgb.len(), width * height * ch, "pixel buffer does not match the size");
+    encode_raw(width, height, rgb, ch, 8, if ch == 4 { 6 } else { 2 })
+}
+
+/// Scanlines of `bpp` bytes per pixel, the given bit depth and PNG colour type.
+fn encode_raw(width: usize, height: usize, rgb: &[u8], ch: usize, depth: u8, colour: u8) -> Vec<u8> {
     // Scanlines with filter type 0.
     let mut raw = Vec::with_capacity(height * (width * ch + 1));
     for row in rgb.chunks_exact(width * ch) {
@@ -67,8 +79,8 @@ fn encode(width: usize, height: usize, rgb: &[u8], ch: usize) -> Vec<u8> {
     let mut ihdr = Vec::with_capacity(13);
     ihdr.extend_from_slice(&(width as u32).to_be_bytes());
     ihdr.extend_from_slice(&(height as u32).to_be_bytes());
-    // 8-bit, truecolour (with alpha), deflate, adaptive filter, no interlace
-    ihdr.extend_from_slice(&[8, if ch == 4 { 6 } else { 2 }, 0, 0, 0]);
+    // Bit depth, colour type, deflate, adaptive filter, no interlace.
+    ihdr.extend_from_slice(&[depth, colour, 0, 0, 0]);
     chunk(&mut out, b"IHDR", &ihdr);
     chunk(&mut out, b"IDAT", &z);
     chunk(&mut out, b"IEND", &[]);

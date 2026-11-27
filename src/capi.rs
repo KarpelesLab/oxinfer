@@ -3278,6 +3278,157 @@ pub unsafe extern "C" fn oxi_isolator_stream_free(s: *mut OxiIsolatorStream) {
     }
 }
 
+// ---- Depth estimation (Depth Pro 2) ---------------------------------------------------------
+
+/// A loaded Depth Pro 2 model.
+pub struct OxiDepth(crate::depth_pro::DepthPro);
+
+unsafe fn depth_model<'a>(d: *const OxiDepth) -> Result<&'a OxiDepth> {
+    unsafe { d.as_ref() }.context("depth model is NULL")
+}
+
+/// Loads Depth Pro 2 (`apple/DepthPro2-S` ... `-H`, or a folder); `key=value` options (`focal`:
+/// the focal length estimator, default `apple/DepthPro2-focal`, `none` for none; `device`,
+/// `threads`, `cache_dir`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_depth_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiDepth {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let mut o = crate::depth_pro::DepthOptions::default();
+        for item in unsafe { opt_str_arg(options, "options") }?.unwrap_or("").split(['\n', ';']) {
+            let item = item.trim();
+            if item.is_empty() || item.starts_with('#') {
+                continue;
+            }
+            let (k, v) = item.split_once('=').with_context(|| format!("option {item:?} is not key=value"))?;
+            o.set(k.trim(), v.trim())?;
+        }
+        let m = with_progress(progress, user, || crate::depth_pro::DepthPro::load(model, &o))?;
+        Ok(Box::into_raw(Box::new(OxiDepth(m))))
+    })
+}
+
+/// Frees a depth model (NULL is ignored).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_depth_free(d: *mut OxiDepth) {
+    if !d.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(d) });
+            Ok(())
+        })
+    }
+}
+
+/// Model information as JSON (free with `oxi_string_free`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_depth_info_json(d: *const OxiDepth) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        Ok(out_string(serde_json::to_string(unsafe { depth_model(d) }?.0.info())?))
+    })
+}
+
+fn depth_json(d: &crate::depth_pro::DepthMap) -> String {
+    let r = d.depth_range();
+    serde_json::json!({
+        "width": d.width,
+        "height": d.height,
+        "focal_px": d.focal_px,
+        "focal_estimated": d.focal_estimated,
+        "fov_deg": d.fov_deg,
+        "depth_p05": r.map(|r| r.0).filter(|v| v.is_finite()),
+        "depth_p95": r.map(|r| r.1).filter(|v| v.is_finite()),
+        "far_fraction": r.map(|r| r.2),
+    })
+    .to_string()
+}
+
+/// Predicts depth for an RGB8 image (`width * height * 3` bytes). `f_px` > 0 is the focal length
+/// in pixels, else the estimator's is used. Writes `width * height` floats to `depth_out` (meters,
+/// infinite where infinitely far; needs a focal length) and `inverse_out` (focal-normalized
+/// inverse depth) when not NULL (free each with `oxi_audio_free(p, width * height)`). Returns the
+/// figures as JSON (`width`, `height`, `focal_px`, `focal_estimated`, `fov_deg`, `depth_p05`,
+/// `depth_p95`, `far_fraction`; free with `oxi_string_free`), or NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_depth_rgb(
+    d: *const OxiDepth,
+    rgb: *const u8,
+    width: c_int,
+    height: c_int,
+    f_px: f32,
+    depth_out: *mut *mut f32,
+    inverse_out: *mut *mut f32,
+) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let d = unsafe { depth_model(d) }?;
+        let (w, h) = (usize::try_from(width)?, usize::try_from(height)?);
+        if rgb.is_null() {
+            bail!("rgb is NULL");
+        }
+        let px = unsafe { std::slice::from_raw_parts(rgb, w * h * 3) };
+        let m = d.0.infer_rgb(px, w, h, (f_px > 0.0).then_some(f_px))?;
+        unsafe {
+            if let Some(p) = depth_out.as_mut() {
+                let v = m.depth().context("no focal length: give f_px or load the estimator")?;
+                *p = Box::into_raw(v.into_boxed_slice()) as *mut f32;
+            }
+            if let Some(p) = inverse_out.as_mut() {
+                *p = Box::into_raw(m.inverse_depth.clone().into_boxed_slice()) as *mut f32;
+            }
+        }
+        Ok(out_string(depth_json(&m)))
+    })
+}
+
+/// Predicts depth for an image file and writes, as the CLI does, `out_prefix` + `-depth.png`
+/// (color preview), `-depth16.png` (16-bit inverse depth) and `-depth.f32` (meters, float32).
+/// `options_json`: {"focal_px", "exif" (default true: the EXIF 35 mm focal length)}. Returns the
+/// figures as JSON with `files` and `png16_meters_numerator`, or NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_depth_file(
+    d: *const OxiDepth,
+    path: *const c_char,
+    options_json: *const c_char,
+    out_prefix: *const c_char,
+) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let d = unsafe { depth_model(d) }?;
+        let path = unsafe { str_arg(path, "path") }?;
+        let prefix = unsafe { str_arg(out_prefix, "out_prefix") }?;
+        let o: serde_json::Value = match unsafe { opt_str_arg(options_json, "options_json") }?.map(str::trim) {
+            Some(s) if !s.is_empty() => serde_json::from_str(s).context("options_json")?,
+            _ => serde_json::json!({}),
+        };
+        let img = crate::depth_pro::decode_image(&crate::fsx::read(std::path::Path::new(path))?)?;
+        let f = o["focal_px"]
+            .as_f64()
+            .map(|v| v as f32)
+            .or_else(|| o["exif"].as_bool().unwrap_or(true).then_some(img.focal_px).flatten());
+        let m = d.0.infer_rgb(&img.rgb, img.width, img.height, f)?;
+        let mut files = Vec::new();
+        let p = format!("{prefix}-depth.png");
+        std::fs::write(&p, crate::png::encode_rgb(m.width, m.height, &m.colorize())).with_context(|| format!("write {p}"))?;
+        files.push(p);
+        let (g16, k) = m.gray16();
+        let p = format!("{prefix}-depth16.png");
+        std::fs::write(&p, crate::png::encode_gray16(m.width, m.height, &g16)).with_context(|| format!("write {p}"))?;
+        files.push(p);
+        if let Some(depth) = m.depth() {
+            let p = format!("{prefix}-depth.f32");
+            std::fs::write(&p, depth.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).with_context(|| format!("write {p}"))?;
+            files.push(p);
+        }
+        let mut v: serde_json::Value = serde_json::from_str(&depth_json(&m))?;
+        v["files"] = serde_json::json!(files);
+        v["png16_meters_numerator"] = serde_json::json!(m.focal_px.map(|_| k));
+        Ok(out_string(v.to_string()))
+    })
+}
+
 // ---- OpenAI-compatible server ---------------------------------------------------------------
 
 /// Receives bytes of a response body (`len` bytes at `data`); return non-zero to stop a streamed

@@ -100,14 +100,14 @@ offline windows and that the stream's output does not depend on the pushes or th
 
 ## Speed
 
-M5 Max (18 cores), sample_14.wav (10.8 s):
+M5 Max (18 cores), sample_14.wav (10.8 s), under `tools/bench/with-lock.sh` on a machine shared
+with other builds:
 
-| | time | real-time factor |
+| | Metal (per-op GPU matmuls and attention, scan on the CPU) | CPU |
 |---|---|---|
-| offline, Metal (per-op GPU matmuls and attention, scan on the CPU) | 4.5 s | 2.4x |
-| offline, CPU | 7.1 s | 1.5x |
-| realtime checkpoint, whole clip (`isolate`, 64-frame blocks), CPU | 5.4 s | 2.0x |
-| realtime checkpoint, 20 ms pushes, CPU | 10.0-10.8 s | about 1.0x |
+| offline | 4.5 s (2.4x real time) | 7.6 s (1.4x) |
+| realtime checkpoint, whole clip (`isolate`, 64-frame blocks) | 5.8 s (1.9x) | 6.2 s (1.7x) |
+| realtime checkpoint, 20 ms pushes | 11.2 s (1.0x; slowest push 59 ms) | 11.3 s (0.9x) |
 
 The reference package takes 297 s offline and 555 s streaming on the same machine (its selective
 scan runs frame by frame in Python on the CPU). A live stream on this machine runs at about real

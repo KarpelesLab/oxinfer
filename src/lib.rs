@@ -63,6 +63,7 @@ pub mod coreml;
 pub mod cuda;
 pub mod decide;
 pub mod deepseek4;
+pub mod depth_pro;
 pub mod drafter;
 pub mod dspark;
 pub mod embed;
