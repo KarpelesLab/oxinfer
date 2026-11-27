@@ -60,6 +60,9 @@ mod cuda;
 #[path = "inkling_tiny.rs"]
 pub mod tiny;
 
+#[path = "inkling_train.rs"]
+pub mod train;
+
 use crate::intervene::{NeuronHook, Target};
 use crate::kernels::*;
 use crate::model::{Lin, Quant, Table, linear, linear_multi, load_lin, load_lin_experts, table_quant};
