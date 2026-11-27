@@ -392,8 +392,8 @@ impl EnginePool {
     ///
     /// Waits for the requests in flight to end (none sees the change); then every session
     /// starts again (their conversations are read again, or restored from the prompt cache) and
-    /// the GPU plans are compiled again on their next use. For Qwen-path and Gemma models
-    /// decoded without MTP or a DSpark draft and not streamed from disk
+    /// the GPU plans are compiled again on their next use. For Inkling-2 models and for
+    /// Qwen-path and Gemma models decoded without MTP or a DSpark draft, not streamed from disk
     /// (`Engine::change_adapters`); others return an error and stay as they were. When the
     /// adapter does not load or fit, the model computes what it did before, and an adapter it
     /// was to replace is gone.
@@ -882,6 +882,70 @@ mod tests {
         assert!(pool.detach_adapter("q"));
         assert_eq!(turn(Some("q")), (base.clone(), None));
         assert_eq!(turn(Some("p")).0, with2);
+        assert_eq!(turn(None).0, base);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With the model's MTP head drafting (the tiny looped checkpoint and its tiny drafter): an
+    /// adapter attaches as without it, the drafts go on, and the replies are those of the model
+    /// loaded with `lora=` or with none, decoded without drafts.
+    #[test]
+    fn inkling_adapters_attach_while_the_mtp_head_drafts() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-pool-ink-mtp-adapters-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (model, ad1, ad2) = (dir.join("model"), dir.join("a1"), dir.join("a2"));
+        crate::inkling::tiny::write_tiny(&model, 3).unwrap();
+        crate::inkling::tiny::write_tiny_mtp(&model, 9, &[0, 2]).unwrap();
+        crate::inkling::tiny::write_adapter(&ad1, 11, 0.4).unwrap();
+        crate::inkling::tiny::write_adapter(&ad2, 12, 0.4).unwrap();
+        let mut o = EngineOptions::default();
+        o.set("device", "cpu").unwrap();
+        o.set("draft", "none").unwrap();
+        o.set("draft_device", "cpu").unwrap();
+        let load = |o: &EngineOptions| {
+            let mut e = Engine::load(model.to_str().unwrap(), o).unwrap();
+            e.config_mut().max_tokens = 40;
+            e
+        };
+        let m = vec![Message::system("Be brief."), Message::user("Hello there, how are you?")];
+        let alone = |lora: Option<&std::path::Path>| {
+            let mut o = o.clone();
+            if let Some(l) = lora {
+                o.set("lora", l.to_str().unwrap()).unwrap();
+            }
+            load(&o).chat(&m, &mut quiet).unwrap().tokens
+        };
+        let (base, with1, with2) = (alone(None), alone(Some(&ad1)), alone(Some(&ad2)));
+        assert_ne!(base, with1, "the adapter changes nothing");
+        assert_ne!(with1, with2);
+        let mut mtp = o.clone();
+        mtp.set("mtp", "on").unwrap();
+        let pool = EnginePool::new(load(&mtp), 2, BatchOptions::default());
+        // The reply's tokens and its drafted tokens.
+        let turn = |adapter: Option<&str>| -> (Vec<u32>, usize) {
+            let mut g = pool
+                .acquire_with(&m, adapter, std::time::Duration::from_millis(50), &mut || true)
+                .unwrap();
+            let r = g.chat(&m, &mut quiet).unwrap();
+            g.remember(&m);
+            (r.tokens, r.stats.drafted)
+        };
+        let (t, drafted) = turn(None);
+        assert_eq!(t, base);
+        assert!(drafted > 0, "no drafts");
+        pool.attach_adapter("p", &ad1, 1.0, "v1").unwrap();
+        let (t, drafted) = turn(Some("p"));
+        assert_eq!(t, with1);
+        assert!(drafted > 0, "no drafts with the adapter on");
+        let (t, drafted) = turn(None);
+        assert_eq!(t, base);
+        assert!(drafted > 0, "no drafts after the attach");
+        pool.attach_adapter("q", &ad2, 1.0, "v1").unwrap();
+        assert_eq!(turn(Some("q")).0, with2);
+        assert_eq!(turn(Some("p")).0, with1);
+        assert!(pool.detach_adapter("p"));
+        assert_eq!(turn(Some("p")).0, base);
+        assert_eq!(turn(Some("q")).0, with2);
         assert_eq!(turn(None).0, base);
         std::fs::remove_dir_all(&dir).ok();
     }

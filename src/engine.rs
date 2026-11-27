@@ -3286,10 +3286,11 @@ impl Engine {
     /// Changes the adapters of the loaded model itself, for every session of it: forgets its
     /// GPU plans (they hold the adapters' side paths), attaches the adapter at `path` when one
     /// is given ([`crate::lora::attach_switched`]: runtime updates, switched off) and starts this
-    /// session again ([`Engine::rebind`]). For Qwen-path, Gemma and Inkling-2 models decoded
-    /// without MTP or a DSpark draft, not streamed from disk, without interventions or decision
-    /// assets. (Inkling-2 has no plans: its GPU engine is built again for the new set of
-    /// adapters, [`Inkling2Model::reset_device`].)
+    /// session again ([`Engine::rebind`]). For Inkling-2 models (with or without their MTP head
+    /// or a DSpark draft) and for Qwen-path and Gemma models decoded without MTP or a DSpark
+    /// draft; not streamed from disk, without interventions or decision assets. (Inkling-2 has
+    /// no plans: its GPU engine reads the new set of adapters at its next pass, or is built
+    /// again for it, [`Inkling2Model::reset_device`].)
     ///
     /// # Safety
     /// The model is shared with this engine's forks ([`Engine::fork`]): none of them may be
@@ -3342,13 +3343,20 @@ impl Engine {
                 *model = unsafe { &*p };
                 r
             }
+            // With its MTP head or a DSpark draft: the draft reads the target's streams and its
+            // head through the model at every round, and holds no copy of the weights an
+            // adapter updates; the decoder is made again on the changed model (`rebind`).
+            Lm::Inkling2Dspark { dec } => {
+                let model = dec.model();
+                let p = arena.raw_of(model).ok_or_else(missing)?;
+                model.to_host(&mut dec.sess);
+                // SAFETY: as above.
+                change(unsafe { &mut *p }, Inkling2Model::reset_device, attach, &base)
+            }
             _ => bail!(
-                "adapters are attached to a loaded model for Qwen-path, Gemma and Inkling-2 models decoded without MTP or a DSpark draft, not {}{}",
+                "adapters are attached to a loaded model for Inkling-2 and for Qwen-path and Gemma models decoded without MTP or a DSpark draft, not {}{}",
                 self.info.model_type,
-                if matches!(
-                    self.info.family,
-                    Family::Qwen | Family::Llama | Family::Gemma4 | Family::Gemma3 | Family::Inkling2
-                ) {
+                if matches!(self.info.family, Family::Qwen | Family::Llama | Family::Gemma4 | Family::Gemma3) {
                     " with speculative decoding"
                 } else {
                     ""
@@ -3385,6 +3393,17 @@ impl Engine {
                     *model = unsafe { &*p };
                 }
                 *sess = model.new_session();
+            }
+            Lm::Inkling2Dspark { dec } => {
+                let opts = dec.opts.clone();
+                let lk = reset_lookup(dec.lookup.take());
+                let model = match arena.raw_of(dec.model()) {
+                    // SAFETY: as above.
+                    Some(p) => unsafe { &*p },
+                    None => dec.model(),
+                };
+                **dec = DsparkDecoder::new(model, dec.draft(), opts);
+                dec.lookup = lk;
             }
             _ => {}
         }
