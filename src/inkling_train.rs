@@ -125,6 +125,17 @@ pub struct Trainer<'m, 'a> {
 
 // ---- helpers ----------------------------------------------------------------------------------
 
+/// Nanoseconds a pass spent in parts of its backward (`OXINFER_TRAIN_TIMES`): the steps run
+/// again, the experts' gradient, the attention's own (scores and softmax), the head.
+static SPENT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn spent<R>(part: usize, f: impl FnOnce() -> R) -> R {
+    let t0 = std::time::Instant::now();
+    let r = f();
+    SPENT[part].fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
 #[derive(Clone, Copy)]
 struct P(*mut f32);
 unsafe impl Send for P {}
@@ -224,32 +235,36 @@ fn lin_fwd(l: &Lin, n_out: usize, n_in: usize, x: &[f32], t: usize) -> Vec<f32> 
 /// thread (`g` is `[n, gs]`, `out` `[n, n_in]`).
 #[allow(clippy::too_many_arguments)]
 fn axpy_rows(l: &Lin, r0: usize, r1: usize, n_in: usize, g: &[f32], gs: usize, n: usize, out: &mut [f32], wb: &mut Vec<f32>) {
+    // Columns per block: a block of `RB` rows by `CB` columns stays in the first-level cache
+    // while every token's coefficients pass over it.
+    const CB: usize = 256;
     wb.resize(RB * n_in, 0.0);
     let mut b = r0;
     while b < r1 {
         let nb = RB.min(r1 - b);
         lin_rows(l, b, b + nb, n_in, &mut wb[..nb * n_in]);
-        for i in 0..n {
-            let c = &g[i * gs + b..i * gs + b + nb];
-            let o = &mut out[i * n_in..(i + 1) * n_in];
-            let mut r = 0;
-            while r + 4 <= nb {
-                let (c0, c1, c2, c3) = (c[r], c[r + 1], c[r + 2], c[r + 3]);
-                let w = &wb[r * n_in..(r + 4) * n_in];
-                let (w0, rest) = w.split_at(n_in);
-                let (w1, rest) = rest.split_at(n_in);
-                let (w2, w3) = rest.split_at(n_in);
-                for ((((o, &a0), &a1), &a2), &a3) in o.iter_mut().zip(w0).zip(w1).zip(w2).zip(w3) {
-                    *o = fma(c3, a3, fma(c2, a2, fma(c1, a1, fma(c0, a0, *o))));
+        for k0 in (0..n_in).step_by(CB) {
+            let k1 = (k0 + CB).min(n_in);
+            for i in 0..n {
+                let c = &g[i * gs + b..i * gs + b + nb];
+                let o = &mut out[i * n_in + k0..i * n_in + k1];
+                let mut r = 0;
+                while r + 4 <= nb {
+                    let (c0, c1, c2, c3) = (c[r], c[r + 1], c[r + 2], c[r + 3]);
+                    let row = |q: usize| &wb[(r + q) * n_in + k0..(r + q) * n_in + k1];
+                    let (w0, w1, w2, w3) = (row(0), row(1), row(2), row(3));
+                    for ((((o, &a0), &a1), &a2), &a3) in o.iter_mut().zip(w0).zip(w1).zip(w2).zip(w3) {
+                        *o = fma(c3, a3, fma(c2, a2, fma(c1, a1, fma(c0, a0, *o))));
+                    }
+                    r += 4;
                 }
-                r += 4;
-            }
-            while r < nb {
-                let cr = c[r];
-                for (o, &a) in o.iter_mut().zip(&wb[r * n_in..(r + 1) * n_in]) {
-                    *o = fma(cr, a, *o);
+                while r < nb {
+                    let cr = c[r];
+                    for (o, &a) in o.iter_mut().zip(&wb[r * n_in + k0..r * n_in + k1]) {
+                        *o = fma(cr, a, *o);
+                    }
+                    r += 1;
                 }
-                r += 1;
             }
         }
         b += nb;
@@ -292,6 +307,17 @@ fn lin_t(l: &Lin, rows: usize, n_in: usize, g: &[f32], n: usize, out: &mut [f32]
     for part in local.chunks(n * n_in) {
         add_inplace(out, part);
     }
+}
+
+/// `x` (`[t, heads * d]`) with each head's rows together (`[heads][t][d]`): what one head reads
+/// of the others' positions is then contiguous.
+fn by_head(x: &[f32], t: usize, heads: usize, d: usize) -> Vec<f32> {
+    let mut y = vec![0f32; x.len()];
+    for_chunks(&mut y, d, t * heads > 64, |i, o| {
+        let (h, ti) = (i / t, i % t);
+        o.copy_from_slice(&x[(ti * heads + h) * d..(ti * heads + h + 1) * d]);
+    });
+    y
 }
 
 /// `rms_unit` of each row.
@@ -656,6 +682,9 @@ struct AttnTape {
     r: Vec<f32>,
     k: Vec<f32>,
     v: Vec<f32>,
+    /// `k` and `v` by key/value head ([`by_head`]).
+    kh: Vec<f32>,
+    vh: Vec<f32>,
     att: Vec<f32>,
     lse: Vec<f32>,
     y: Vec<f32>,
@@ -904,7 +933,9 @@ impl<'a> Inkling2Model<'a> {
         tp.att = vec![0f32; t * w];
         tp.lse = vec![0f32; t * nh];
         let (ap, lp) = (P(tp.att.as_mut_ptr()), P(tp.lse.as_mut_ptr()));
-        let (q, r, k, v, sink) = (&tp.q, &tp.r, &tp.k, &tp.v, &tp.sink);
+        tp.kh = by_head(&tp.k, t, nkv, d);
+        tp.vh = by_head(&tp.v, t, nkv, d);
+        let (q, r, kh, vh, sink) = (&tp.q, &tp.r, &tp.kh, &tp.vh, &tp.sink);
         par(0, t, |i| {
             let lo = a.window.map_or(0, |win| (i + 1).saturating_sub(win));
             let n = i + 1 - lo;
@@ -913,7 +944,7 @@ impl<'a> Inkling2Model<'a> {
             let mut b = vec![0f32; nb];
             for hh in 0..nh {
                 let g = hh / groups;
-                dots(&q[i * w + hh * d..i * w + (hh + 1) * d], &k[lo * kw + g * d..], kw, &mut s);
+                dots(&q[i * w + hh * d..i * w + (hh + 1) * d], &kh[(g * t + lo) * d..], d, &mut s);
                 b.fill(0.0);
                 for (&rv, prof) in r[(i * nh + hh) * dr..(i * nh + hh + 1) * dr].iter().zip(a.rel.chunks(extent)) {
                     axpy(&mut b, rv, &prof[..nb]);
@@ -933,7 +964,7 @@ impl<'a> Inkling2Model<'a> {
                 scale_inplace(&mut s, 1.0 / z);
                 // SAFETY: this query's head slice and log-sum belong to this task.
                 let (o, ls) = unsafe { (ap.s(i * w + hh * d, d), lp.s(i * nh + hh, 1)) };
-                weighted_values(&s, &v[lo * kw + g * d..], kw, d, o);
+                weighted_values(&s, &vh[(g * t + lo) * d..], d, d, o);
                 ls[0] = m + z.ln();
             }
         });
@@ -992,8 +1023,9 @@ impl<'a> Inkling2Model<'a> {
         let groups = nh / nkv;
         let scaling = (d as f32).powf(-0.5);
         let extent = a.extent;
-        let (q, r, k, v) = (&tp.q, &tp.r, &tp.k, &tp.v);
+        let (q, r, k, v, kh, vh) = (&tp.q, &tp.r, &tp.k, &tp.v, &tp.kh, &tp.vh);
         // The queries' side: gradients of q, r and the sink; `mean` is `g_att . att`.
+        let t_core = std::time::Instant::now();
         let mut gq = vec![0f32; t * w];
         let mut gr = vec![0f32; t * nh * dr];
         let mut g_sink = vec![0f32; t * nh];
@@ -1013,12 +1045,12 @@ impl<'a> Inkling2Model<'a> {
                     let g = hh / groups;
                     let ga = &g_att[i * w + hh * d..i * w + (hh + 1) * d];
                     let ls = tp.lse[i * nh + hh];
-                    dots(&q[i * w + hh * d..i * w + (hh + 1) * d], &k[klo * kw + g * d..], kw, &mut s);
+                    dots(&q[i * w + hh * d..i * w + (hh + 1) * d], &kh[(g * t + klo) * d..], d, &mut s);
                     b.fill(0.0);
                     for (&rv, prof) in r[(i * nh + hh) * dr..(i * nh + hh + 1) * dr].iter().zip(a.rel.chunks(extent)) {
                         axpy(&mut b, rv, &prof[..nb]);
                     }
-                    dots(ga, &v[klo * kw + g * d..], kw, &mut cv);
+                    dots(ga, &vh[(g * t + klo) * d..], d, &mut cv);
                     let m = dot(ga, &tp.att[i * w + hh * d..i * w + (hh + 1) * d]);
                     for (jj, x) in s.iter_mut().enumerate() {
                         let dist = nk - 1 - jj;
@@ -1037,7 +1069,7 @@ impl<'a> Inkling2Model<'a> {
                             mp.s(i * nh + hh, 1),
                         )
                     };
-                    weighted_values(&s, &k[klo * kw + g * d..], kw, d, oq);
+                    weighted_values(&s, &kh[(g * t + klo) * d..], d, d, oq);
                     scale_inplace(oq, scaling);
                     for (o, prof) in or.iter_mut().zip(a.rel.chunks(extent)) {
                         *o = dot(&rev, &prof[..nb]);
@@ -1058,7 +1090,8 @@ impl<'a> Inkling2Model<'a> {
                 }
             }
             let (kp, vp) = (P(gk.as_mut_ptr()), P(gv.as_mut_ptr()));
-            let (g_att, mean, rel_t) = (&g_att, &mean, &rel_t);
+            let (qh, gah) = (by_head(q, t, nh, d), by_head(&g_att, t, nh, d));
+            let (qh, gah, mean, rel_t) = (&qh, &gah, &mean, &rel_t);
             par(lo, t, |j| {
                 let i1 = a.window.map_or(t, |win| t.min(j + win));
                 let ni = i1 - j;
@@ -1071,8 +1104,8 @@ impl<'a> Inkling2Model<'a> {
                     // SAFETY: this key's head slices belong to this task.
                     let (ok, ov) = unsafe { (kp.s(j * kw + g * d, d), vp.s(j * kw + g * d, d)) };
                     for hh in g * groups..(g + 1) * groups {
-                        dots(kj, &q[j * w + hh * d..], w, &mut s);
-                        dots(vj, &g_att[j * w + hh * d..], w, &mut cv);
+                        dots(kj, &qh[(hh * t + j) * d..], d, &mut s);
+                        dots(vj, &gah[(hh * t + j) * d..], d, &mut cv);
                         for (ii, x) in s.iter_mut().enumerate() {
                             let i = j + ii;
                             let bias = if ii < extent {
@@ -1084,15 +1117,16 @@ impl<'a> Inkling2Model<'a> {
                             *x = p;
                             cv[ii] = p * (cv[ii] - mean[i * nh + hh]);
                         }
-                        weighted_values(&cv, &q[j * w + hh * d..], w, d, &mut tmp);
+                        weighted_values(&cv, &qh[(hh * t + j) * d..], d, d, &mut tmp);
                         axpy(ok, scaling, &tmp);
-                        weighted_values(&s, &g_att[j * w + hh * d..], w, d, &mut tmp);
+                        weighted_values(&s, &gah[(hh * t + j) * d..], d, d, &mut tmp);
                         add_inplace(ov, &tmp);
                     }
                 }
             });
         }
         drop((g_att, mean));
+        SPENT[2].fetch_add(t_core.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         // Back through the clips, the scales and the value norm.
         let (qk_clip, rel_clip) = (c.qk_l2_clip_threshold as f32, c.rel_l2_clip_threshold as f32);
         for (g, x0, scale, clip, dim) in [
@@ -1533,7 +1567,7 @@ impl<'a> Inkling2Model<'a> {
         // out = x_mid + conv(o_raw): `g` goes on as the gradient of x_mid.
         let mut g_oraw = vec![0f32; n];
         conv_bwd(&layer.mlp_conv, None, &tp.o_raw, h, conv_norm, &g, lo, &mut g_oraw, None);
-        let g_hn = self.moe_bwd(layer, &tp.moe, &g_oraw, lo, t);
+        let g_hn = spent(1, || self.moe_bwd(layer, &tp.moe, &g_oraw, lo, t));
         drop(g_oraw);
         let mut g_hn1 = vec![0f32; n];
         norm_bwd(
@@ -1878,7 +1912,7 @@ impl<'m, 'a> Trainer<'m, 'a> {
             });
         };
         let mut g_out = vec![0f32; n];
-        let loss = m.head_loss(&out, tokens, first, positive, obj, &mut logp, Some(&mut g_out));
+        let loss = spent(3, || m.head_loss(&out, tokens, first, positive, obj, &mut logp, Some(&mut g_out)));
         let k = factor / n_targets as f32;
         g_out.iter_mut().for_each(|v| *v *= k);
         let mut gstream: Vec<Option<Vec<f32>>> = (0..plan.n_streams).map(|_| None).collect();
@@ -1926,7 +1960,7 @@ impl<'m, 'a> Trainer<'m, 'a> {
             let x = &tape.streams[ps.x_in];
             let bank_x = ps.bank.as_ref().map(|b| &tape.streams[b.1][..]);
             // The step again from its saved input, for what its gradient reads.
-            let (_, tp) = m.step_fwd(Some(ad), ps, x, &states, bank_x, t, Some(&tape.routes[si]));
+            let (_, tp) = spent(0, || m.step_fwd(Some(ad), ps, x, &states, bank_x, t, Some(&tape.routes[si])));
             let g = gstream[ps.x_out].take().unwrap_or_else(|| vec![0f32; n]);
             m.step_bwd(ad, ps, x, &states, bank_x, &tp, g, lo, t, &mut gstream, &mut gstate, grads);
             if let Some(id) = ps.push {
@@ -1953,11 +1987,33 @@ impl Passes for Trainer<'_, '_> {
         let pass = self
             .pass(ad, &tokens, first, ep.weight > 0.0, obj, grads)
             .with_context(|| format!("episode {}", ep.id))?;
+        // `OXINFER_TRAIN_TIMES=1`: each pass's times and kept bytes on standard error.
+        if std::env::var_os("OXINFER_TRAIN_TIMES").is_some() {
+            eprintln!(
+                "[inkling train: episode {} of {} tokens: forward {:.2}s, backward {:.2}s, {:.2} GB kept, gradient from position {}]",
+                ep.id,
+                tokens.len(),
+                pass.forward_secs,
+                pass.backward_secs,
+                pass.tape_bytes as f64 / 1e9,
+                pass.grad_from
+            );
+            let s: Vec<f64> = SPENT
+                .iter()
+                .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9)
+                .collect();
+            if pass.backward_secs > 0.0 {
+                eprintln!(
+                    "[inkling train: of the backward, steps run again {:.2}s, experts {:.2}s, attention scores {:.2}s, head {:.2}s]",
+                    s[0], s[1], s[2], s[3]
+                );
+            }
+        }
         Ok(pass.loss)
     }
     fn describe(&self) -> String {
         format!(
-            "Inkling-2: {} layer applications of {}, {:.0} KB kept per token, gradient {}",
+            "Inkling-2 passes ({} layer applications of {}, {:.0} KB kept per token, gradient {}) ready",
             self.plan.steps.len(),
             self.model.cfg.hidden_size,
             self.tape_bytes_per_token() as f64 / 1e3,

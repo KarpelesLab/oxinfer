@@ -15,7 +15,8 @@ odds `p / (1 - p)` of `--neg-clip` (default 4).
 
 MODEL_DIR is a tiny checkpoint of `tools/inkling2_tiny.py` (with or without `--loop`; run in
 float64, random token ids), or with --real the release (`thinkingmachines/Inkling-2-Mini`): float32 on the weights
-exactly as stored, as `tools/ref_inkling2_mini.py` loads them, on a chat prompt (about 56 GB).
+exactly as stored, as `tools/ref_inkling2_mini.py` loads them, on a chat prompt and a reply
+(about 60 GB; the experts' float32 weights are not kept for the backward pass, see `FrozenLinear`).
 
 Writes `ids`, `first` (the first target's index), `positive` (I64), `neg_clip`, `alpha`, `loss`,
 `logp` (per target), and per site
@@ -99,6 +100,28 @@ if real:
 
     cml.Inkling2LoopDequantizeExperts.convert = convert
 
+    class FrozenLinear(torch.autograd.Function):
+        """`F.linear` with an expert's weight, which autograd would keep (float32, 42 MB an
+        expert and layer application: far more than the machine holds): the backward makes it
+        again from the stored bfloat16."""
+
+        @staticmethod
+        def forward(ctx, x, experts, which, e):
+            ctx.at = (experts, which, e)
+            return F.linear(x, experts.weight32(which, e))
+
+        @staticmethod
+        def backward(ctx, g):
+            experts, which, e = ctx.at
+            return g @ experts.weight32(which, e), None, None, None
+
+    def weight32(self, which, e):
+        if which == "gu":
+            return self.gate_up_proj[e].float() * self.gu_factor[e]
+        return self.down_proj[e].float() * self.dn_factor[e]
+
+    mod.Inkling2LoopExperts.weight32 = weight32
+
     def experts_forward(self, hidden_states, top_k_index, top_k_weights):
         final = torch.zeros_like(hidden_states, dtype=torch.float32)
         for e in top_k_index.unique().tolist():
@@ -106,9 +129,8 @@ if real:
                 continue
             pos, tok = torch.where(top_k_index.T == e)
             x = hidden_states[tok].float()
-            gu = self.gate_up_proj[e].float() * self.gu_factor[e]
-            dn = self.down_proj[e].float() * self.dn_factor[e]
-            hcur = F.linear(self._apply_gate(F.linear(x, gu)), dn) * top_k_weights[tok, pos, None]
+            act = self._apply_gate(FrozenLinear.apply(x, self, "gu", e))
+            hcur = FrozenLinear.apply(act, self, "dn", e) * top_k_weights[tok, pos, None]
             final = final.index_add(0, tok, hcur)
         return final.to(hidden_states.dtype)
 
