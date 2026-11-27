@@ -168,7 +168,22 @@ prompt: all 248,320 logits to the bit; against the CPU KL 2.0e-4, the same top 1
 the next block's words loaded ahead (+1%: registers), two weight buffers with one barrier a K
 step (+2%), the trits through a threadgroup-memory table of digit pairs (no faster), 256-token
 tiles of 32 outputs or of 8 SIMD-groups (the matrix units run those 1-9% slower), the gate / up
-pair GEMM for the ternary types (within noise). With
+pair GEMM for the ternary types (within noise).
+
+The 2-bit files' GEMM loaders then got the same treatment: `Q2_0` / `PQ2_0` codes are made halves
+two bytes at a time in the 16-bit halves of a 32-bit word (`(w >> 2k) & 0x00030003` ORed into
+`1024 + c`, minus 1025, times the scale in half: the f32 path's `(c - 1) d`, exact in half),
+where the generic path shifted, converted and scaled each value in f32 and rounded it to half,
+and the matrix-unit tile of `PQ2_0` reads a block's scale once and its row's two quarters for its
+two K steps together. On random weights (17408 x 5120 x 2048 tokens, a Swift harness on the
+library's source): `PQ2_0` 6.81 -> 6.61 ms against 6.45 with no dequantization at all (the
+loader alone 6.69; bytes as `uchar4` lanes converted to half 6.78). In the 27B's 2,047-token
+pass (`OXINFER_PF_PROFILE`, two runs each, the same in both): `PQ2_0` GEMMs 1,359 -> 1,317 ms
+(-3.1%), `Q2_0` (whose 64-value blocks give a K step one block, so only the loader) 1,417 / 1,469 ->
+1,414 / 1,448 ms (-0.2 / -1.4%); whole passes under other jobs' load +2-5% at 511 tokens (`PQ2_0` 660-820 ->
+696-839 tok/s, alternated rounds) and within the load's noise at 2,047. Logits on the
+2,590-token prompt identical to the old loaders' for both files (all 248,320, matrix units and
+SIMD-group path). With
 `--mtp` (the files' Q4_0 MTP layer; PrismML's Metal preset drafts one token at p >= 0.6) the
 drafts were accepted 42-57% of the time on Metal, and `--mtp-cost` then drafts in few rounds: 30-33 tok/s,
 no faster than plain decoding (a verification pass costs about a plain step plus the drafts'

@@ -1117,6 +1117,37 @@ inline void loadh(Q4_0W w, uint row, uint b, thread half4* out) {
 }
 // PTQ1_0 in half: +-d or 0, the same values.
 inline void loadh(PTQ1_0W w, uint row, uint b, thread half4* out) { ptq1_quarter(w, row, b, out); }
+// Q2_0 / PQ2_0 in half: the codes of a word's four bytes (16 values) as 16-bit halves of 32-bit
+// words, two bytes' codes per operation (bytes 0 and 2, then 1 and 3), made halves by their bits
+// (1024 + c, minus 1025: c - 1 exactly), times the scale: the f32 path's (c - 1) d, exact in
+// half, without its per-value shifts and conversions.
+template <typename P>
+inline void t2h_word(uint w, half d, P out) {
+    half2 a[4], c[4];
+    for (uint k = 0; k < 4; k++) {
+        a[k] = (as_type<half2>(((w >> (2 * k)) & 0x00030003u) | 0x64006400u) - 1025.h) * d;
+        c[k] = (as_type<half2>(((w >> (2 * k + 8)) & 0x00030003u) | 0x64006400u) - 1025.h) * d;
+    }
+    out[0] = half4(a[0].x, a[1].x, a[2].x, a[3].x);
+    out[1] = half4(c[0].x, c[1].x, c[2].x, c[3].x);
+    out[2] = half4(a[0].y, a[1].y, a[2].y, a[3].y);
+    out[3] = half4(c[0].y, c[1].y, c[2].y, c[3].y);
+}
+// A 32-value quarter: 8 bytes of codes at Q (2-byte aligned).
+template <typename P>
+inline void load_t2h(device const ushort* Q, half d, P out) {
+    packed_ushort4 q = *(device const packed_ushort4*)Q;
+    t2h_word(uint(q[0]) | (uint(q[1]) << 16), d, out);
+    t2h_word(uint(q[2]) | (uint(q[3]) << 16), d, out + 4);
+}
+inline void loadh(Q2_0W w, uint row, uint b, thread half4* out) {
+    device const ushort* B = (device const ushort*)(gblk(w.g, row, b / 2, 18));
+    load_t2h(B + 1 + 4 * (b % 2), as_type<half>(B[0]), out);
+}
+inline void loadh(PQ2_0W w, uint row, uint b, thread half4* out) {
+    device const ushort* B = (device const ushort*)(gblk(w.g, row, b / 4, 34));
+    load_t2h(B + 1 + 4 * (b % 4), as_type<half>(B[0]), out);
+}
 #if MMA_UNITS
 // PTQ1_0 tiles (`mma_tile`'s, chosen over it as the more specialized overload): each block's 7
 // words are read once for its two K steps, whose quarters are then known to be 0 / 1 and 2 / 3.
@@ -1143,6 +1174,44 @@ inline void mma_tile(PTQ1_0W w, device const half* xh, device const float* rs, d
         op.run(a, Wt, c);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         pk_q23(k, blk, d, wd);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto a1 = X.template slice<MKB, TM>(kb * 128 + MKB, t0);
+        op.run(a1, Wt, c);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (ldy != 0 || add != 0) scale_store_ld(c, rs, t0, y, ldy != 0 ? ldy : n_out, o0, add != 0);
+    else scale_store(c, rs, t0, Y.slice(o0, t0));
+}
+// PQ2_0 tiles: each thread reads its row's block scale once and its two quarters (one per K
+// step: 0 / 1, then 2 / 3) together, unpacked as `loadh` does (the same values; on random
+// weights, 17408 x 5120 x 2048 tokens: 6.81 -> 6.61 ms, no dequantization at all 6.45).
+template <typename W, int TM>
+inline void mma_tile(PQ2_0W w, device const half* xh, device const float* rs, device float* y, uint n_out, uint n_in, uint rows,
+                     uint o0, uint t0, uint tid, threadgroup half* Ws, uint ldy = 0, uint add = 0) {
+    XT X((device half*)xh, dextents<int32_t, 2>(n_in, rows));
+    YT Y(y, dextents<int32_t, 2>(n_out, rows));
+    constexpr auto desc = matmul2d_descriptor(TM, 64, MKB, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    typedef tensor<threadgroup half, extents<int32_t, MKB, 64>, tensor_inline> WT;
+    WT Wt(Ws, extents<int32_t, MKB, 64>());
+    auto a0 = X.template slice<MKB, TM>(0, t0);
+    auto c = op.template get_destination_cooperative_tensor<decltype(a0), WT, float>();
+    zero(c);
+    uint row = tid / 2, blk = tid % 2;   // each thread dequantizes one quarter of a block of one row
+    threadgroup half4* wd = (threadgroup half4*)(Ws + row * MKB + blk * 32);
+    for (uint kb = 0; kb < n_in / 128; kb++) {
+        device const ushort* B = (device const ushort*)(gblk(w.g, o0 + row, kb, 34));
+        half d = as_type<half>(B[0]);
+        packed_ushort4 q0 = *(device const packed_ushort4*)(B + 1 + 4 * blk);
+        packed_ushort4 q1 = *(device const packed_ushort4*)(B + 9 + 4 * blk);
+        t2h_word(uint(q0[0]) | (uint(q0[1]) << 16), d, wd);
+        t2h_word(uint(q0[2]) | (uint(q0[3]) << 16), d, wd + 4);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto a = X.template slice<MKB, TM>(kb * 128, t0);
+        op.run(a, Wt, c);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        t2h_word(uint(q1[0]) | (uint(q1[1]) << 16), d, wd);
+        t2h_word(uint(q1[2]) | (uint(q1[3]) << 16), d, wd + 4);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         auto a1 = X.template slice<MKB, TM>(kb * 128 + MKB, t0);
         op.run(a1, Wt, c);
