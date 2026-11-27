@@ -6,7 +6,9 @@
 //! layout: the same int8 bytes (borrowed from the mapped file) with the row scale repeated per
 //! block of 32; the session rotates their inputs (`dit_rot_half`). bf16 layers go as stored.
 //! LoRA updates become side paths (`up (down x)`, float16, the rank padded to 64; `down` in the
-//! rotated basis of a ConvRot layer). Anything else (NVFP4) keeps the CPU path.
+//! rotated basis of a ConvRot layer). NVFP4 layers (ggml's blocks, repacked at load) go as they
+//! are: the GEMMs dequantize their E2M1 codes, E4M3 scales and tensor-wide factor
+//! (`mma_NVFP4`). Anything else keeps the CPU path.
 
 use super::dit::Dit;
 use super::nn::Rope;

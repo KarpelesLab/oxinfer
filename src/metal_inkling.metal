@@ -1579,14 +1579,7 @@ kernel void ink_embed_##T(device float* a [[buffer(0)]], device const float* c [
 // a sub-block of 16; the codes through MXFP4's doubled table): chunk b of 32 values is half of
 // block b / 2.
 struct NVFP4W { GgW g; };
-// Four E2M1 codes (the low nibbles of v's bytes) as floats over 2^-14: the code's exponent and mantissa
-// bits are a half's (subnormal for exponent 0), its sign the half's sign (no table lookups).
-inline float4 e2m1x4(uint v) {
-    uint lo = ((v & 0x00070007u) << 9) | ((v & 0x00080008u) << 12);
-    uint hi = (((v >> 8) & 0x00070007u) << 9) | (((v >> 8) & 0x00080008u) << 12);
-    half2 a = as_type<half2>(lo), b = as_type<half2>(hi);
-    return float4(float(a.x), float(b.x), float(a.y), float(b.y));
-}
+// (`e2m1x4`: the GEMM library's, `GGUF_SHADER_SRC`.)
 inline void load(NVFP4W w, uint row, uint b, thread float4* out) {
     device const uchar* B = w.g.q + (ulong)row * w.g.rb + (b / 2) * 36;
     for (uint s2 = 0; s2 < 2; s2++) {

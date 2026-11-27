@@ -941,6 +941,35 @@ inline void load(F8W w, uint row, uint b, thread float4* out) {
     for (uint i = 0; i < 8; i++) out[i] = e4m3x4(ld4(B + 4 * i)) * d;
 }
 GEMM(gemm_F8_E4M3, F8W, MK_F8)
+// NVFP4 in ggml's blocks of 64 (four unsigned E4M3 scales, halved, then four runs of 8 bytes
+// holding elements j and j + 8 of a sub-block of 16; the codes through MXFP4's doubled table),
+// times the tensor-wide factor (the matrix's one block scale, at s_off floats): chunk b of 32
+// values is half of block b / 2. Rows of n_in / 64 blocks of 36 bytes.
+// Four E2M1 codes (the low nibbles of v's bytes) as floats over 2^-14: the code's exponent and
+// mantissa bits are a half's (subnormal for exponent 0), its sign the half's sign (no lookups).
+inline float4 e2m1x4(uint v) {
+    uint lo = ((v & 0x00070007u) << 9) | ((v & 0x00080008u) << 12);
+    uint hi = (((v >> 8) & 0x00070007u) << 9) | (((v >> 8) & 0x00080008u) << 12);
+    half2 a = as_type<half2>(lo), b = as_type<half2>(hi);
+    return float4(float(a.x), float(b.x), float(a.y), float(b.y));
+}
+struct NvfW { device const uchar* q; float f; uint rb; };
+#define MK_NV NvfW{ (device const uchar*)qb + p.w_off, ((device const float*)sb)[p.s_off], (p.n_in / 64) * 36 }
+inline void load(NvfW w, uint row, uint b, thread float4* out) {
+    device const uchar* B = w.q + (ulong)row * w.rb + (b / 2) * 36;
+    for (uint s2 = 0; s2 < 2; s2++) {
+        uint s = 2 * (b % 2) + s2;
+        // (The scale, halved, times the codes' 2^14, the table's doubling and the factor.)
+        float d = float(as_type<half>(ushort(ushort(B[s] & 0x7f) << 7))) * (128.f * 32768.f) * w.f;
+        // Byte i's low nibble is element i, its high one element i + 8 of the sub-block.
+        uint v0 = rd32(B + 4 + 8 * s), v1 = rd32(B + 8 + 8 * s);
+        out[4 * s2 + 0] = e2m1x4(v0) * d;
+        out[4 * s2 + 1] = e2m1x4(v1) * d;
+        out[4 * s2 + 2] = e2m1x4(v0 >> 4) * d;
+        out[4 * s2 + 3] = e2m1x4(v1 >> 4) * d;
+    }
+}
+GEMM(gemm_NVFP4, NvfW, MK_NV)
 #define GG(T) GEMM(gemm_##T, T##W, MK_GG(T##W))
 GEMM(gemm_F32, F32W2, MK_GG(F32W2)) GG(F16) GG(Q4_1) GG(Q5_0) GG(Q5_1)
 GG(Q4_0) GG(IQ4_NL) GG(Q8_0) GG(Q4_K) GG(Q5_K) GG(Q6_K) GG(Q3_K) GG(Q2_K) GG(IQ4_XS)
@@ -1177,6 +1206,7 @@ MMAG_SIG(NAME##_s) { MMAG_PRE WT w = MAKE; mma_tile<WT, 16>(MMAG_ARGS); }
 MMAD(mma_q8, Q8W, MK_Q8) MMAD(mma_q4, Q4W, MK_Q4)
 MMAG(mmag_q8, Q8W, MK_Q8) MMAG(mmag_q4, Q4W, MK_Q4)
 MMAD(mma_F8_E4M3, F8W, MK_F8) MMAG(mmag_F8_E4M3, F8W, MK_F8)
+MMAD(mma_NVFP4, NvfW, MK_NV) MMAG(mmag_NVFP4, NvfW, MK_NV)
 #define MMA_Q4A(NAME, TM) \
 kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]], device const half* xh [[buffer(2)]], \
                  device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
@@ -1805,10 +1835,12 @@ const GGUF_GPU_TYPES: [GgmlType; 24] = [
 ];
 
 /// GGUF types with a matrix-unit GEMM (`mma_<TYPE>` / `mmag_<TYPE>` in `MMA_SHADER_SRC`): all but
-/// F32, whose values would lose precision as half, and MXFP4 (which has the GEMMs but no decode
-/// matvec, so it is not in [`GGUF_GPU_TYPES`]).
-const GGUF_MMA_TYPES: [GgmlType; 25] = [
+/// F32, whose values would lose precision as half, and MXFP4 / NVFP4 (which have the GEMMs but
+/// no decode matvec, so they are not in [`GGUF_GPU_TYPES`]; NVFP4, with its tensor-wide factor,
+/// no pair GEMMs either).
+const GGUF_MMA_TYPES: [GgmlType; 26] = [
     GgmlType::MXFP4,
+    GgmlType::NVFP4,
     GgmlType::F8E4M3,
     GgmlType::F16,
     GgmlType::Q4_1,
@@ -1871,13 +1903,16 @@ fn find_kind(v: &[(GgmlType, Id)], k: GgmlType) -> Option<Id> {
     v.iter().find(|(t, _)| *t == k).map(|(_, p)| *p)
 }
 
-/// Whether the device kernels take `m`: anything but FP8, or FP8 with the 128 x 128 block scales
-/// the shaders assume; not other formats with extra scales (row-wide factors the shaders would
-/// leave out).
+/// Whether the device kernels take `m`: anything but FP8, FP8 with the 128 x 128 block scales
+/// the shaders assume, or NVFP4 with its one tensor-wide factor (`MK_NV`); not other formats
+/// with extra scales (row-wide factors the shaders would leave out).
 fn fp8_ok(m: &crate::ggml::GgufMatrix) -> bool {
     match &m.block_scales {
         None => m.kind != GgmlType::F8E4M3,
-        Some(b) => m.kind == GgmlType::F8E4M3 && b.rows == 128 && b.cols == 128,
+        Some(b) => {
+            (m.kind == GgmlType::F8E4M3 && b.rows == 128 && b.cols == 128)
+                || (m.kind == GgmlType::NVFP4 && b.s.len() == 1 && b.e8m0.is_none() && !m.x4)
+        }
     }
 }
 
@@ -2543,7 +2578,7 @@ impl MetalBackend {
         let gemm_f32 = pipeline(c"gemm_f32")?;
         let gguf_pipes = GGUF_GPU_TYPES
             .iter()
-            .chain(&[GgmlType::F8E4M3, GgmlType::MXFP4])
+            .chain(&[GgmlType::F8E4M3, GgmlType::MXFP4, GgmlType::NVFP4])
             .map(|&k| Ok((k, pipeline(&CString::new(format!("gemm_{}", k.name()))?)?)))
             .collect::<Result<Vec<_>>>()?;
         let group_stats = pipeline(c"group_stats")?;
@@ -3484,7 +3519,7 @@ impl MetalBackend {
         let base = match w {
             WeightRef::Q8(_) => "mmap_q8".to_string(),
             WeightRef::Q4(_) => "mmap_q4".to_string(),
-            WeightRef::Gguf(g) if fp8_ok(g) => format!("mmap_{}", g.kind.name()),
+            WeightRef::Gguf(g) if fp8_ok(g) && g.kind != GgmlType::NVFP4 => format!("mmap_{}", g.kind.name()),
             _ => return None,
         };
         Some([
@@ -5043,7 +5078,19 @@ mod tests {
             })
             .collect();
         let f8 = fp8(n_out, n_in, &mut seed);
-        let mut ws = vec![WeightRef::Bf16(&w), WeightRef::Q8(&q8), WeightRef::Q4(&q4), WeightRef::Gguf(&f8)];
+        // NVFP4 with its tensor-wide factor: random codes, E4M3 scales between 2^-3 and 2^3.
+        let packed: Vec<u8> = (0..n_out * n_in / 2).map(|_| (rnd(&mut seed).to_bits() >> 9) as u8).collect();
+        let sc: Vec<u8> = (0..n_out * n_in / 16)
+            .map(|_| 32 + (rnd(&mut seed).to_bits() >> 9) as u8 % 48)
+            .collect();
+        let nv = crate::model::nvfp4_blocks(&packed, &sc, 0.013, n_out, n_in).unwrap();
+        let mut ws = vec![
+            WeightRef::Bf16(&w),
+            WeightRef::Q8(&q8),
+            WeightRef::Q4(&q4),
+            WeightRef::Gguf(&f8),
+            WeightRef::Gguf(&nv),
+        ];
         ws.extend(gg.iter().map(WeightRef::Gguf));
         // Dense tiles (with a partial one) and 32-token tiles.
         for (w, t) in ws.iter().flat_map(|w| [(w, 150), (w, 37)]) {

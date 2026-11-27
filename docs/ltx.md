@@ -235,8 +235,10 @@ cross-attention between the streams on `flash_attn64` (float32), the norms, modu
 and residuals on the `ltx_*` kernels of `metal_ltx.metal`. The output heads, the text encoder
 and its connectors, the VAEs and the vocoder run on the CPU kernels (their convolutions and
 matmuls on the GPU's per-op path). `OXINFER_LTX_GPU=0` keeps the transformer on the CPU; the
-`device=cpu` option of the server and the C API does the same per model. NVFP4 weights have no
-Metal kernels here: that transformer runs on the CPU.
+`device=cpu` option of the server and the C API does the same per model. The NVFP4 transformer
+runs in the same session: its layers (repacked into ggml's NVFP4 blocks at load) go through
+`mma_NVFP4`, which dequantizes the E2M1 codes, the E4M3 scales of 16 values and the tensor-wide
+factor into the GEMMs' half tiles (no re-quantization).
 
 ## Runs and speed
 
@@ -316,6 +318,8 @@ The other transformer files, on one-block copies (block 0 and connector block 0 
 fetched by HTTP ranges) against the reference on bf16 weights: the bf16 file 6.7e-7 / 8.7e-7 on
 the CPU, 5.1e-5 / 1.0e-4 on Metal; the int8 file is 7e-4 / 1.2e-3 from the bf16 reference (its
 quantization) and the NVFP4 file 2.7e-2 / 1.6e-2 (its rows correlate 0.9956 with the bf16 ones).
+The NVFP4 file on the Metal session is 5.9e-5 / 1.0e-4 from the same file on the CPU (the
+precision of the int8 and bf16 sessions; `ltx_check dit` with `LTX_SAVE` and `LTX_DEVICE=metal`).
 
 ## Not done
 
@@ -326,8 +330,11 @@ quantization) and the NVFP4 file 2.7e-2 / 1.6e-2 (its rows correlate 0.9956 with
 - `ti2vid_two_stages_hq` (the res2s sampler) and the guidance factories by sigma.
 - DFR's detailing IC-LoRA second stage and its spatial epilogue (`spatial_upscalings = 2`): the
   LoRA is not part of the release's files.
-- NVFP4 on the GPU (CPU only), the DiffVAE's tiled decode (the reference's memory-driven tiles
+- The DiffVAE's tiled decode (the reference's memory-driven tiles
   and its keyframe-anchored decode), the prompt enhancer, audio-to-video and
   video-to-video (IC-LoRA) pipelines.
+- The NVFP4 file is repacked into ggml's blocks at load (3 s, 18.7 GB of anonymous memory beside
+  the mapped file: 34 GB resident at 384x256): the kernels do not read ComfyUI's packing (high
+  nibble first, scales in cuBLAS's tiled order) in place.
 - The text encoder, connectors, VAEs and vocoder run on the CPU kernels with per-op GPU matmuls
   and convolutions, not as whole GPU passes.
