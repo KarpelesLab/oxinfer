@@ -261,6 +261,95 @@ extern "C" __global__ void __launch_bounds__(256) lc_ln_affine(const float* x, c
     for (u32 i = tid; i < h; i += 256) o[i] = (row[i] - mean) * inv * w[i] + b[i];
 }
 
+// ---- the norms with what follows them, for a GPU where a pass over the activations costs what
+// it reads and writes: the same values as the kernels above and `split_rows` or `lc_resid`
+// after them, without the float32 rows in between.
+
+// The planes of a GEMM's input rows (`hi`, row scales `rs`) from `lc_ln_mod`'s result; row r is
+// row `row0 + r` of its frames.
+extern "C" __global__ void __launch_bounds__(256) lc_ln_mod_planes(const float* x, const float* tab, u32* hi, float* rs, u32 h, u32 s, u32 frame0, u32 stride, u32 shift_at, u32 scale_at, u32 row0) {
+    __shared__ float red[256];
+    u32 r = blockIdx.x, tid = threadIdx.x;
+    const float* row = x + (u64)r * h;
+    float a = 0.f;
+    for (u32 i = tid; i < h; i += 256) a += row[i];
+    float mean = block_sum256(a, red) / (float)h;
+    float v = 0.f;
+    for (u32 i = tid; i < h; i += 256) {
+        float d = row[i] - mean;
+        v += d * d;
+    }
+    float inv = 1.f / sqrtf(block_sum256(v, red) / (float)h + 1e-6f);
+    const float* m = tab + (u64)(frame0 + (row0 + r) / s) * stride;
+    const float* sh = m + shift_at;
+    const float* sc = m + scale_at;
+    float mx = 0.f;
+    for (u32 i = tid; i < h; i += 256) mx = fmaxf(mx, fabsf((row[i] - mean) * inv * (1.f + sc[i]) + sh[i]));
+    mx = block_max256(mx, red);
+    float f, finv;
+    pow2_for(mx, f, finv);
+    u32 per = h / 2;
+    for (u32 i = tid; i < per; i += 256) {
+        float v0 = (row[2 * i] - mean) * inv * (1.f + sc[2 * i]) + sh[2 * i];
+        float v1 = (row[2 * i + 1] - mean) * inv * (1.f + sc[2 * i + 1]) + sh[2 * i + 1];
+        hi[(u64)r * per + i] = pack_h2(v0 * f, v1 * f);
+    }
+    if (tid == 0) rs[r] = finv;
+}
+
+// The same from `lc_ln_affine`'s result.
+extern "C" __global__ void __launch_bounds__(256) lc_ln_affine_planes(const float* x, const float* w, const float* b, u32* hi, float* rs, u32 h) {
+    __shared__ float red[256];
+    u32 r = blockIdx.x, tid = threadIdx.x;
+    const float* row = x + (u64)r * h;
+    float a = 0.f;
+    for (u32 i = tid; i < h; i += 256) a += row[i];
+    float mean = block_sum256(a, red) / (float)h;
+    float v = 0.f;
+    for (u32 i = tid; i < h; i += 256) {
+        float d = row[i] - mean;
+        v += d * d;
+    }
+    float inv = 1.f / sqrtf(block_sum256(v, red) / (float)h + 1e-6f);
+    float mx = 0.f;
+    for (u32 i = tid; i < h; i += 256) mx = fmaxf(mx, fabsf((row[i] - mean) * inv * w[i] + b[i]));
+    mx = block_max256(mx, red);
+    float f, finv;
+    pow2_for(mx, f, finv);
+    u32 per = h / 2;
+    for (u32 i = tid; i < per; i += 256) {
+        float v0 = (row[2 * i] - mean) * inv * w[2 * i] + b[2 * i];
+        float v1 = (row[2 * i + 1] - mean) * inv * w[2 * i + 1] + b[2 * i + 1];
+        hi[(u64)r * per + i] = pack_h2(v0 * f, v1 * f);
+    }
+    if (tid == 0) rs[r] = finv;
+}
+
+// x[r] += gate * (`lc_ln_mod`'s result for y[r]), the gate at `gate_at` of the row's frame.
+extern "C" __global__ void __launch_bounds__(256) lc_ln_mod_resid(const float* y, const float* tab, float* x, u32 h, u32 s, u32 frame0, u32 stride, u32 shift_at, u32 scale_at, u32 gate_at) {
+    __shared__ float red[256];
+    u32 r = blockIdx.x, tid = threadIdx.x;
+    const float* row = y + (u64)r * h;
+    float a = 0.f;
+    for (u32 i = tid; i < h; i += 256) a += row[i];
+    float mean = block_sum256(a, red) / (float)h;
+    float v = 0.f;
+    for (u32 i = tid; i < h; i += 256) {
+        float d = row[i] - mean;
+        v += d * d;
+    }
+    float inv = 1.f / sqrtf(block_sum256(v, red) / (float)h + 1e-6f);
+    const float* m = tab + (u64)(frame0 + r / s) * stride;
+    const float* sh = m + shift_at;
+    const float* sc = m + scale_at;
+    const float* gt = m + gate_at;
+    float* o = x + (u64)r * h;
+    for (u32 i = tid; i < h; i += 256) {
+        float t = (row[i] - mean) * inv * (1.f + sc[i]) + sh[i];
+        o[i] += gt[i] * t;
+    }
+}
+
 // ---- x[r] += gate y[r], the gate at `gate_at` of the row's frame (`tab` null: x[r] += y[r]).
 extern "C" __global__ void __launch_bounds__(256) lc_resid(float* x, const float* y, const float* tab, u32 h, u32 s, u32 frame0, u32 stride, u32 gate_at) {
     u32 r = blockIdx.y;

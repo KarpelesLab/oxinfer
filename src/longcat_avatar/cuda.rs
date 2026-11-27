@@ -431,6 +431,10 @@ struct Funcs {
     attn: F,
     ln_mod: F,
     ln_affine: F,
+    /// The norms with the row split, or the residual, that follows them (the fused path).
+    ln_mod_planes: F,
+    ln_affine_planes: F,
+    ln_mod_resid: F,
     resid: F,
     qk_prep: F,
     /// The queries and the shared memory of an attention block.
@@ -578,6 +582,9 @@ impl Engine {
             })?,
             ln_mod: get("lc_ln_mod")?,
             ln_affine: get("lc_ln_affine")?,
+            ln_mod_planes: get("lc_ln_mod_planes")?,
+            ln_affine_planes: get("lc_ln_affine_planes")?,
+            ln_mod_resid: get("lc_ln_mod_resid")?,
             resid: get("lc_resid")?,
             qk_prep: get("lc_qk_prep")?,
             fq,
@@ -1352,15 +1359,26 @@ impl Engine {
             self.mark(&mut tm, 0);
 
             // Self-attention.
-            self.go(
-                self.f.ln_mod,
-                (n as u32, 1),
-                256,
-                0,
-                &mut args![bf.x, tab, bf.hn, hu, su, 0u32, m6, 0u32, hu],
-            );
-            self.mark(&mut tm, 1);
-            self.split(bf.hn, h, h, n, bf.xs, bf.rs);
+            if self.fuse {
+                self.go(
+                    self.f.ln_mod_planes,
+                    (n as u32, 1),
+                    256,
+                    0,
+                    &mut args![bf.x, tab, bf.xs[0], bf.rs, hu, su, 0u32, m6, 0u32, hu, 0u32],
+                );
+                self.mark(&mut tm, 1);
+            } else {
+                self.go(
+                    self.f.ln_mod,
+                    (n as u32, 1),
+                    256,
+                    0,
+                    &mut args![bf.x, tab, bf.hn, hu, su, 0u32, m6, 0u32, hu],
+                );
+                self.mark(&mut tm, 1);
+                self.split(bf.hn, h, h, n, bf.xs, bf.rs);
+            }
             lin(0, bf.big, 3 * h, n);
             self.mark(&mut tm, 2);
             for (part, planes) in [bf.qp, bf.kp].into_iter().enumerate() {
@@ -1407,9 +1425,23 @@ impl Engine {
             if nn > 0 {
                 let xn = bf.x + (nc * s * h * 4) as u64;
                 let att = bf.big + (nn * h * 4) as u64;
+                // The planes of the affine norm of the noisy rows.
+                let normed = |w: u64, b: u64| {
+                    if self.fuse {
+                        self.go(
+                            self.f.ln_affine_planes,
+                            (nn as u32, 1),
+                            256,
+                            0,
+                            &mut args![xn, w, b, bf.xs[0], bf.rs, hu],
+                        );
+                    } else {
+                        self.go(self.f.ln_affine, (nn as u32, 1), 256, 0, &mut args![xn, w, b, bf.hn, hu]);
+                        self.split(bf.hn, h, h, nn, bf.xs, bf.rs);
+                    }
+                };
                 // Text cross-attention.
-                self.go(self.f.ln_affine, (nn as u32, 1), 256, 0, &mut args![xn, nrm(6), nrm(7), bf.hn, hu]);
-                self.split(bf.hn, h, h, nn, bf.xs, bf.rs);
+                normed(nrm(6), nrm(7));
                 lin(2, bf.big, h, nn);
                 self.go(
                     self.f.qk_prep,
@@ -1447,8 +1479,7 @@ impl Engine {
                 self.mark(&mut tm, 8);
 
                 // Audio cross-attention, frame by frame.
-                self.go(self.f.ln_affine, (nn as u32, 1), 256, 0, &mut args![xn, nrm(8), nrm(9), bf.hn, hu]);
-                self.split(bf.hn, h, h, nn, bf.xs, bf.rs);
+                normed(nrm(8), nrm(9));
                 lin(5, bf.big, h, nn);
                 self.go(
                     self.f.qk_prep,
@@ -1475,48 +1506,68 @@ impl Engine {
                 self.mark(&mut tm, 10);
                 self.split(att, h, h, nn, bf.xs, bf.rs);
                 lin(7, bf.hn, h, nn);
-                self.go(
-                    self.f.ln_mod,
-                    (nn as u32, 1),
-                    256,
-                    0,
-                    &mut args![bf.hn, atab, bf.big, hu, su, nc as u32, m3, 0u32, hu],
-                );
-                self.go(
-                    self.f.resid,
-                    (ceil(h, 256), nn as u32),
-                    256,
-                    0,
-                    &mut args![xn, bf.big, atab, hu, su, nc as u32, m3, 2 * hu],
-                );
+                if self.fuse {
+                    self.go(
+                        self.f.ln_mod_resid,
+                        (nn as u32, 1),
+                        256,
+                        0,
+                        &mut args![bf.hn, atab, xn, hu, su, nc as u32, m3, 0u32, hu, 2 * hu],
+                    );
+                } else {
+                    self.go(
+                        self.f.ln_mod,
+                        (nn as u32, 1),
+                        256,
+                        0,
+                        &mut args![bf.hn, atab, bf.big, hu, su, nc as u32, m3, 0u32, hu],
+                    );
+                    self.go(
+                        self.f.resid,
+                        (ceil(h, 256), nn as u32),
+                        256,
+                        0,
+                        &mut args![xn, bf.big, atab, hu, su, nc as u32, m3, 2 * hu],
+                    );
+                }
                 self.mark(&mut tm, 11);
             }
 
             // Feed-forward, in row chunks.
-            self.go(
-                self.f.ln_mod,
-                (n as u32, 1),
-                256,
-                0,
-                &mut args![bf.x, tab, bf.hn, hu, su, 0u32, m6, 3 * hu, 4 * hu],
-            );
+            if !self.fuse {
+                self.go(
+                    self.f.ln_mod,
+                    (n as u32, 1),
+                    256,
+                    0,
+                    &mut args![bf.x, tab, bf.hn, hu, su, 0u32, m6, 3 * hu, 4 * hu],
+                );
+            }
             let gu = bf.big;
             let act = gu + (rc * 2 * ffn * 4) as u64;
             for r0 in (0..n).step_by(rc) {
                 let rn = rc.min(n - r0);
                 let rows = bf.hn + (r0 * h * 4) as u64;
-                self.split(rows, h, h, rn, bf.xs, bf.rs);
                 if self.fuse {
-                    // The gate rows, the value rows times their SiLU over them, and the result
-                    // into the residual stream.
+                    // The norm's planes, the gate rows, the value rows times their SiLU over
+                    // them, and the result into the residual stream.
+                    let xr = bf.x + (r0 * h * 4) as u64;
+                    self.go(
+                        self.f.ln_mod_planes,
+                        (rn as u32, 1),
+                        256,
+                        0,
+                        &mut args![xr, tab, bf.xs[0], bf.rs, hu, su, 0u32, m6, 3 * hu, 4 * hu, r0 as u32],
+                    );
                     lin(8, gu, ffn, rn);
                     lin_out(9, gu, ffn, rn, Out::Swiglu);
                     self.mark(&mut tm, 12);
                     self.split(gu, ffn, ffn, rn, bf.xs, bf.rs);
-                    lin_out(10, bf.x + (r0 * h * 4) as u64, h, rn, resid(tab, 5 * hu, r0));
+                    lin_out(10, xr, h, rn, resid(tab, 5 * hu, r0));
                     self.mark(&mut tm, 13);
                     continue;
                 }
+                self.split(rows, h, h, rn, bf.xs, bf.rs);
                 lin(8, gu, 2 * ffn, rn);
                 lin(9, gu + (ffn * 4) as u64, 2 * ffn, rn);
                 self.go(
