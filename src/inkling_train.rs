@@ -1,6 +1,7 @@
 //! LoRA training for Inkling-2 (`inkling2`, `inkling2_loop`): the text forward with low-rank
 //! updates on the attention projections, and its backward pass, giving the gradient of a
-//! token-level loss with respect to every `A` and `B` ([`Inkling2Model::train_grads`]).
+//! token-level loss with respect to every `A` and `B` ([`Trainer`], which the training loop of
+//! [`crate::lora_train`] drives through its [`Passes`]).
 //!
 //! - **What is trained.** PEFT's LoRA, `W x + (alpha / r) B A x`, on any of the seven attention
 //!   projections of a layer ([`Proj`]; `wo_ud`, the output projection, by default). A looped
@@ -18,15 +19,15 @@
 //! - **Memory.** The forward pass keeps the stream entering each layer application (and the
 //!   routing): `(steps + 1) * hidden` floats per token. The backward pass runs each application
 //!   again from its saved input to rebuild what its gradient reads, one application at a time.
-//!   [`TrainOptions::grad_window`] truncates the gradient to the positions from that many
+//!   [`Trainer::grad_window`] truncates the gradient to the positions from that many
 //!   tokens before the first target on (the prompt before still runs forward in full).
 //!
 //! The whole sequence is one pass from position 0 (no session, no cache). Images are not
 //! handled.
 
 use super::*;
+use crate::lora_train::{Adapter, Episode, Family, Grads, Module, Objective, Passes};
 use crate::moe::GateUp;
-use std::path::Path;
 
 /// An attention projection that can take a low-rank update.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -74,202 +75,36 @@ impl Proj {
     }
 }
 
-/// One low-rank pair: `a` is `[rank, n_in]`, `b` `[n_out, rank]` (PEFT's `lora_A` / `lora_B`).
+/// The targets' names by slot ([`Proj::ALL`]'s order).
+pub const TARGETS: [&str; 7] = ["wq_du", "wk_dv", "wv_dv", "wr_du", "gate_attn", "attn_sink_proj", "wo_ud"];
+
+/// An Inkling-2 adapter is a [`crate::lora_train::Adapter`] over the attention projections, saved
+/// under the release's module names (`base_model.model.model.llm.layers.N.attn.NAME`).
+impl Family for Inkling2Model<'_> {
+    fn target_names(&self) -> &'static [&'static str] {
+        &TARGETS
+    }
+    fn n_layers(&self) -> usize {
+        self.cfg.num_hidden_layers
+    }
+    fn dims(&self, l: usize, slot: usize) -> (usize, usize) {
+        Proj::ALL[slot].shape(&self.cfg, l)
+    }
+    fn module_name(&self, l: usize, slot: usize) -> String {
+        format!("layers.{l}.attn.{}", TARGETS[slot])
+    }
+    fn key_prefix(&self) -> &'static str {
+        "base_model.model.model.llm."
+    }
+}
+
+/// One sequence's forward (and backward) pass.
 #[derive(Clone, Debug)]
-pub struct Site {
-    pub layer: usize,
-    pub proj: Proj,
-    pub n_out: usize,
-    pub n_in: usize,
-    pub a: Vec<f32>,
-    pub b: Vec<f32>,
-}
-
-/// A LoRA adapter being trained: the update of a site is `(alpha / rank) B A x`.
-#[derive(Clone, Debug)]
-pub struct Adapter {
-    pub rank: usize,
-    pub alpha: f32,
-    pub sites: Vec<Site>,
-}
-
-/// Gradients of the loss with respect to each site's `a` and `b` (same order and shapes).
-#[derive(Clone, Debug)]
-pub struct Grads {
-    pub a: Vec<Vec<f32>>,
-    pub b: Vec<Vec<f32>>,
-}
-
-impl Adapter {
-    /// A fresh adapter on projections `projs` of `layers` (all layers when empty): `A` uniform
-    /// in `±1 / sqrt(n_in)` (PEFT's default, Kaiming with `a = sqrt(5)`), `B` zero.
-    pub fn new(cfg: &Inkling2Config, rank: usize, alpha: f32, projs: &[Proj], layers: &[usize], seed: u64) -> Self {
-        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-        let mut next = move || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (s >> 40) as f32 / (1u64 << 23) as f32 - 1.0
-        };
-        let mut sites = Vec::new();
-        for l in 0..cfg.num_hidden_layers {
-            if !layers.is_empty() && !layers.contains(&l) {
-                continue;
-            }
-            for &p in projs {
-                let (n_out, n_in) = p.shape(cfg, l);
-                let bound = 1.0 / (n_in as f32).sqrt();
-                sites.push(Site {
-                    layer: l,
-                    proj: p,
-                    n_out,
-                    n_in,
-                    a: (0..rank * n_in).map(|_| next() * bound).collect(),
-                    b: vec![0f32; n_out * rank],
-                });
-            }
-        }
-        Self { rank, alpha, sites }
-    }
-
-    /// The factor on `B A x`.
-    pub fn scale(&self) -> f32 {
-        self.alpha / self.rank as f32
-    }
-
-    pub fn n_params(&self) -> usize {
-        self.sites.iter().map(|s| s.a.len() + s.b.len()).sum()
-    }
-
-    /// Zero gradients of this adapter's shapes.
-    pub fn zeros(&self) -> Grads {
-        Grads {
-            a: self.sites.iter().map(|s| vec![0f32; s.a.len()]).collect(),
-            b: self.sites.iter().map(|s| vec![0f32; s.b.len()]).collect(),
-        }
-    }
-
-    fn site(&self, layer: usize, proj: Proj) -> Option<usize> {
-        self.sites.iter().position(|s| s.layer == layer && s.proj == proj)
-    }
-
-    /// Writes the adapter as a PEFT folder (`adapter_config.json`, `adapter_model.safetensors`
-    /// with `base_model.model.model.llm.layers.N.attn.NAME.lora_A.weight` / `lora_B.weight`
-    /// in f32), which `--lora` reads. `base` is recorded as `base_model_name_or_path`.
-    pub fn save(&self, dir: &Path, base: &str) -> Result<()> {
-        std::fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
-        let mut targets: Vec<&str> = self.sites.iter().map(|s| s.proj.name()).collect();
-        targets.sort_unstable();
-        targets.dedup();
-        let mut layers: Vec<usize> = self.sites.iter().map(|s| s.layer).collect();
-        layers.sort_unstable();
-        layers.dedup();
-        let cfg = serde_json::json!({
-            "peft_type": "LORA",
-            "task_type": "CAUSAL_LM",
-            "base_model_name_or_path": base,
-            "r": self.rank,
-            "lora_alpha": self.alpha,
-            "lora_dropout": 0.0,
-            "bias": "none",
-            "fan_in_fan_out": false,
-            "use_rslora": false,
-            "use_dora": false,
-            "inference_mode": true,
-            "target_modules": targets,
-            "layers_to_transform": layers,
-        });
-        std::fs::write(dir.join("adapter_config.json"), serde_json::to_vec_pretty(&cfg)?)?;
-        let mut header = serde_json::Map::new();
-        header.insert("__metadata__".into(), serde_json::json!({"format": "pt"}));
-        let mut off = 0usize;
-        let mut parts: Vec<&[f32]> = Vec::new();
-        for s in &self.sites {
-            let p = format!("base_model.model.model.llm.layers.{}.attn.{}", s.layer, s.proj.name());
-            for (leaf, shape, v) in [("lora_A", [self.rank, s.n_in], &s.a), ("lora_B", [s.n_out, self.rank], &s.b)] {
-                let n = v.len() * 4;
-                header.insert(
-                    format!("{p}.{leaf}.weight"),
-                    serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [off, off + n]}),
-                );
-                off += n;
-                parts.push(v);
-            }
-        }
-        let mut h = serde_json::to_string(&Value::Object(header))?.into_bytes();
-        while !h.len().is_multiple_of(8) {
-            h.push(b' ');
-        }
-        let mut out = Vec::with_capacity(8 + h.len() + off);
-        out.extend_from_slice(&(h.len() as u64).to_le_bytes());
-        out.extend_from_slice(&h);
-        // (The header lists the tensors in key order; the offsets say where each one is.)
-        for v in parts {
-            for x in v {
-                out.extend_from_slice(&x.to_le_bytes());
-            }
-        }
-        let path = dir.join("adapter_model.safetensors");
-        std::fs::write(&path, out).with_context(|| path.display().to_string())
-    }
-
-    /// Reads back an adapter written by [`Adapter::save`] (or any PEFT LoRA folder whose modules
-    /// are attention projections of this model under the release's names), to go on training it.
-    pub fn load(cfg: &Inkling2Config, dir: &Path) -> Result<Self> {
-        let raw: Value = serde_json::from_slice(&crate::fsx::read(&dir.join("adapter_config.json"))?)?;
-        let rank = raw.get("r").and_then(Value::as_u64).context("adapter_config.json: missing r")? as usize;
-        let alpha = raw.get("lora_alpha").and_then(Value::as_f64).unwrap_or(rank as f64) as f32;
-        let st = crate::safetensors::SafeTensors::open(&dir.join("adapter_model.safetensors"), true)?;
-        let f32s = |name: &str, n: usize| -> Result<Vec<f32>> {
-            let info = st.info(name).with_context(|| format!("missing tensor {name}"))?;
-            if info.dtype != "F32" || info.shape.iter().product::<usize>() != n {
-                bail!("{name}: {} {:?}, expected {n} float32 values", info.dtype, info.shape);
-            }
-            Ok(st.bytes(name)?.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
-        };
-        let mut names: Vec<String> = st.names().filter(|n| n.ends_with(".lora_A.weight")).cloned().collect();
-        names.sort();
-        let mut sites = Vec::new();
-        for an in names {
-            let module = an.strip_suffix(".lora_A.weight").unwrap();
-            let rest = module.rsplit_once("layers.").map(|x| x.1).unwrap_or("");
-            let mut it = rest.splitn(3, '.');
-            let (l, mid, leaf) = (it.next(), it.next(), it.next());
-            let (Some(Ok(layer)), Some("attn"), Some(proj)) = (l.map(str::parse::<usize>), mid, leaf.and_then(Proj::parse)) else {
-                bail!("{an}: not an attention projection this trainer knows");
-            };
-            if layer >= cfg.num_hidden_layers {
-                bail!("{an}: the model has {} layers", cfg.num_hidden_layers);
-            }
-            let (n_out, n_in) = proj.shape(cfg, layer);
-            sites.push(Site {
-                layer,
-                proj,
-                n_out,
-                n_in,
-                a: f32s(&an, rank * n_in)?,
-                b: f32s(&format!("{module}.lora_B.weight"), n_out * rank)?,
-            });
-        }
-        sites.sort_by_key(|s| (s.layer, Proj::ALL.iter().position(|p| *p == s.proj)));
-        Ok(Self { rank, alpha, sites })
-    }
-}
-
-/// What [`Inkling2Model::train_grads`] may leave out.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct TrainOptions {
-    /// Positions before the first target that still get gradient (None: all of them). Earlier
-    /// positions run forward as they are and are constants of the backward pass.
-    pub grad_window: Option<usize>,
-}
-
-/// The result of one sequence's forward and backward pass.
-#[derive(Clone, Debug)]
-pub struct Outcome {
-    /// The sum of the targets' loss terms.
+pub struct Pass {
+    /// The mean loss of the targets ([`crate::lora_train::token_loss`]).
     pub loss: f64,
-    /// The log-probability of each target token, in the order given.
+    /// The log-probability of each target token.
     pub logp: Vec<f32>,
-    pub grads: Grads,
     /// The first position that got gradient.
     pub grad_from: usize,
     /// Bytes the forward pass kept for the backward pass.
@@ -278,17 +113,14 @@ pub struct Outcome {
     pub backward_secs: f64,
 }
 
-/// The default loss term of a target of weight `w` whose token has log-probability `logp`, and
-/// its derivative with respect to `logp`: `-w logp` for `w >= 0` (the token is imitated), and
-/// for `w < 0` the bounded `-|w| ln(1 - p)` (the token is pushed down; `1 - p` floored at 1e-4).
-pub fn token_loss(w: f32, logp: f32) -> (f64, f64) {
-    let (w, lp) = (w as f64, logp as f64);
-    if w >= 0.0 {
-        return (-w * lp, -w);
-    }
-    let p = lp.exp();
-    let q = (1.0 - p).max(1e-4);
-    (w * q.ln(), -w * p / q)
+/// The forward and backward passes of an Inkling-2 model for LoRA training (see the module's
+/// documentation).
+pub struct Trainer<'m, 'a> {
+    model: &'m Inkling2Model<'a>,
+    /// Positions before the first target that still get gradient (None: all of them). Earlier
+    /// positions run forward as they are and are constants of the backward pass.
+    pub grad_window: Option<usize>,
+    plan: Plan,
 }
 
 // ---- helpers ----------------------------------------------------------------------------------
@@ -660,17 +492,11 @@ fn act_grad(act: Act, g: f32, u: f32) -> (f32, f32) {
     }
 }
 
-// ---- LoRA sites -------------------------------------------------------------------------------
+// ---- LoRA modules -----------------------------------------------------------------------------
 
 /// `y += s B (A x)`; returns `A x` (`[t, rank]`).
-fn lora_fwd(site: &Site, rank: usize, s: f32, x: &[f32], t: usize, y: &mut [f32]) -> Vec<f32> {
-    let (n_in, n_out) = (site.n_in, site.n_out);
-    let mut bt = vec![0f32; rank * n_out];
-    for o in 0..n_out {
-        for k in 0..rank {
-            bt[k * n_out + o] = site.b[o * rank + k];
-        }
-    }
+fn lora_fwd(m: &Module, rank: usize, s: f32, x: &[f32], t: usize, y: &mut [f32]) -> Vec<f32> {
+    let (n_in, n_out) = (m.n_in, m.n_out);
     let mut u = vec![0f32; t * rank];
     let (up, yp) = (P(u.as_mut_ptr()), P(y.as_mut_ptr()));
     par(0, t, |i| {
@@ -678,18 +504,18 @@ fn lora_fwd(site: &Site, rank: usize, s: f32, x: &[f32], t: usize, y: &mut [f32]
         let (ur, yr) = unsafe { (up.s(i * rank, rank), yp.s(i * n_out, n_out)) };
         let xr = &x[i * n_in..(i + 1) * n_in];
         for k in 0..rank {
-            ur[k] = dot(&site.a[k * n_in..(k + 1) * n_in], xr);
-            axpy(yr, s * ur[k], &bt[k * n_out..(k + 1) * n_out]);
+            ur[k] = dot(&m.a[k * n_in..(k + 1) * n_in], xr);
+            axpy(yr, s * ur[k], &m.bt[k * n_out..(k + 1) * n_out]);
         }
     });
     u
 }
 
-/// The gradient of a site's update: adds to `ga` / `gb` and `gx += s A^T B^T gy`, for the rows
-/// from `lo` on.
+/// The gradient of a module's update: adds to `ga` (`[r, n_in]`) and `gbt` (`[r, n_out]`), and
+/// `gx += s A^T B^T gy`, for the rows from `lo` on.
 #[allow(clippy::too_many_arguments)]
 fn lora_bwd(
-    site: &Site,
+    m: &Module,
     rank: usize,
     s: f32,
     x: &[f32],
@@ -699,15 +525,9 @@ fn lora_bwd(
     t: usize,
     gx: &mut [f32],
     ga: &mut [f32],
-    gb: &mut [f32],
+    gbt: &mut [f32],
 ) {
-    let (n_in, n_out) = (site.n_in, site.n_out);
-    let mut bt = vec![0f32; rank * n_out];
-    for o in 0..n_out {
-        for k in 0..rank {
-            bt[k * n_out + o] = site.b[o * rank + k];
-        }
-    }
+    let (n_in, n_out) = (m.n_in, m.n_out);
     // gu = s B^T gy
     let mut gu = vec![0f32; t * rank];
     let (gup, gxp) = (P(gu.as_mut_ptr()), P(gx.as_mut_ptr()));
@@ -716,21 +536,17 @@ fn lora_bwd(
         let (gr, xr) = unsafe { (gup.s(i * rank, rank), gxp.s(i * n_in, n_in)) };
         let g = &gy[i * n_out..(i + 1) * n_out];
         for k in 0..rank {
-            gr[k] = s * dot(g, &bt[k * n_out..(k + 1) * n_out]);
-            axpy(xr, gr[k], &site.a[k * n_in..(k + 1) * n_in]);
+            gr[k] = s * dot(g, &m.bt[k * n_out..(k + 1) * n_out]);
+            axpy(xr, gr[k], &m.a[k * n_in..(k + 1) * n_in]);
         }
     });
-    let (gap, gbp) = (P(ga.as_mut_ptr()), P(gb.as_mut_ptr()));
+    let (gap, gbp) = (P(ga.as_mut_ptr()), P(gbt.as_mut_ptr()));
     crate::pool::run(rank, &|k| {
-        // SAFETY: row `k` of `ga` and column `k` of `gb` belong to this task.
-        let ar = unsafe { gap.s(k * n_in, n_in) };
-        let mut col = vec![0f32; n_out];
+        // SAFETY: row `k` of `ga` and of `gbt` belong to this task.
+        let (ar, br) = unsafe { (gap.s(k * n_in, n_in), gbp.s(k * n_out, n_out)) };
         for i in lo..t {
             axpy(ar, gu[i * rank + k], &x[i * n_in..(i + 1) * n_in]);
-            axpy(&mut col, s * u[i * rank + k], &gy[i * n_out..(i + 1) * n_out]);
-        }
-        for (o, c) in col.into_iter().enumerate() {
-            unsafe { gbp.s(o * rank + k, 1)[0] += c };
+            axpy(br, s * u[i * rank + k], &gy[i * n_out..(i + 1) * n_out]);
         }
     });
 }
@@ -917,14 +733,14 @@ impl<'a> Inkling2Model<'a> {
         let (n_out, n_in) = p.shape(&self.cfg, l);
         let mut y = lin_fwd(lin, n_out, n_in, x, t);
         if let Some(ad) = ad
-            && let Some(si) = ad.site(l, p)
+            && let Some(mi) = ad.at(l, p as usize)
         {
-            u[p as usize] = Some(lora_fwd(&ad.sites[si], ad.rank, ad.scale(), x, t, &mut y));
+            u[p as usize] = Some(lora_fwd(&ad.mods[mi], ad.rank, ad.scale(), x, t, &mut y));
         }
         y
     }
 
-    /// `gx += W^T gy` (rows from `lo` on) and the gradients of the site's pair.
+    /// `gx += W^T gy` (rows from `lo` on) and the gradients of the module's pair.
     #[allow(clippy::too_many_arguments)]
     fn proj_bwd(
         &self,
@@ -942,20 +758,9 @@ impl<'a> Inkling2Model<'a> {
     ) {
         let (n_out, n_in) = p.shape(&self.cfg, l);
         lin_t(lin, n_out, n_in, &gy[lo * n_out..], t - lo, &mut gx[lo * n_in..]);
-        if let (Some(si), Some(u)) = (ad.site(l, p), &u[p as usize]) {
-            lora_bwd(
-                &ad.sites[si],
-                ad.rank,
-                ad.scale(),
-                x,
-                u,
-                gy,
-                lo,
-                t,
-                gx,
-                &mut grads.a[si],
-                &mut grads.b[si],
-            );
+        if let (Some(mi), Some(u)) = (ad.at(l, p as usize), &u[p as usize]) {
+            let (ga, gbt) = &mut grads[mi];
+            lora_bwd(&ad.mods[mi], ad.rank, ad.scale(), x, u, gy, lo, t, gx, ga, gbt);
         }
     }
 
@@ -1901,160 +1706,181 @@ impl<'a> Inkling2Model<'a> {
         logits
     }
 
-    fn plan(&self) -> Plan {
-        Plan::new(&self.cfg, |l| self.layers[l].boundary)
+    /// The loss terms of the targets `first..tokens.len()` (each token predicted from the
+    /// positions before it) from the final hidden states `out`, in chunks of rows: the sum of
+    /// the losses, and the log-probability of each target. With `g_out` (`[t, H]`), adds the
+    /// gradient of the sum with respect to `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn head_loss(
+        &self,
+        out: &[f32],
+        tokens: &[u32],
+        first: usize,
+        positive: bool,
+        obj: Objective,
+        logp: &mut Vec<f32>,
+        mut g_out: Option<&mut [f32]>,
+    ) -> f64 {
+        let c = &self.cfg;
+        let (h, u) = (c.hidden_size, c.unpadded_vocab_size);
+        let cap = c.final_logit_softcapping as f32;
+        let mut loss = 0f64;
+        const ROWS: usize = 64;
+        for j0 in (first..tokens.len()).step_by(ROWS) {
+            let n = ROWS.min(tokens.len() - j0);
+            // Token `j` is predicted from position `j - 1`.
+            let rows = &out[(j0 - 1) * h..(j0 - 1 + n) * h];
+            let mut z = self.head_raw_rows(rows, n);
+            // Per row: the capped logits, the loss term, and in place of the raw logits the
+            // gradient with respect to them.
+            let res: Vec<std::sync::Mutex<(f64, f32)>> = (0..n).map(|_| std::sync::Mutex::new((0.0, 0.0))).collect();
+            for_chunks(&mut z, u, n > 1, |i, row| {
+                let y = tokens[j0 + i] as usize;
+                let th: Vec<f32> = row.iter().map(|&x| (x / cap).tanh()).collect();
+                for (x, &t) in row.iter_mut().zip(&th) {
+                    *x = t * cap;
+                }
+                let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+                let lse = m + row.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln();
+                let lp = (row[y] as f64 - lse) as f32;
+                let ls = crate::lora_train::token_loss(row, y, positive, obj.neg_clip);
+                *res[i].lock().unwrap() = (ls, lp);
+                for (g, &t) in row.iter_mut().zip(&th) {
+                    *g *= 1.0 - t * t;
+                }
+            });
+            for r in res {
+                let (ls, lp) = r.into_inner().unwrap();
+                loss += ls;
+                logp.push(lp);
+            }
+            if let Some(g) = g_out.as_deref_mut() {
+                lin_t(&self.lm_head, u, h, &z, n, &mut g[(j0 - 1) * h..(j0 - 1 + n) * h]);
+            }
+        }
+        loss
+    }
+}
+
+impl<'m, 'a> Trainer<'m, 'a> {
+    /// A trainer for `model`, which must be on the CPU with the exact prefill GEMM, without
+    /// attached adapters. `grad_window`: see [`Trainer::grad_window`].
+    pub fn new(model: &'m Inkling2Model<'a>, grad_window: Option<usize>) -> Result<Self> {
+        model.check_trainable()?;
+        Ok(Self {
+            model,
+            grad_window,
+            plan: Plan::new(&model.cfg, |l| model.layers[l].boundary),
+        })
+    }
+
+    /// Bytes a pass keeps per token of a sequence between its forward and its backward pass
+    /// (the streams and the routing).
+    pub fn tape_bytes_per_token(&self) -> usize {
+        let c = &self.model.cfg;
+        self.plan.n_streams * c.hidden_size * 4 + self.plan.steps.len() * c.num_experts_per_tok * 4
     }
 
     /// The soft-capped logits (`[positions.len(), unpadded vocab]`) of `tokens` run as one pass
     /// from position 0 with the adapter's updates (none: the base model): the forward pass
     /// training differentiates.
-    pub fn train_logits(&self, ad: Option<&Adapter>, tokens: &[u32], positions: &[usize]) -> Result<Vec<f32>> {
-        self.check_trainable()?;
-        let (h, t) = (self.cfg.hidden_size, tokens.len());
-        if t == 0 || positions.iter().any(|&p| p >= t) {
-            bail!("train_logits: positions out of the {t} tokens");
+    pub fn logits(&self, ad: Option<&Adapter>, tokens: &[u32], positions: &[usize]) -> Result<Vec<f32>> {
+        let m = self.model;
+        let (h, t) = (m.cfg.hidden_size, tokens.len());
+        self.check(ad, tokens, 1)?;
+        if positions.iter().any(|&p| p >= t) {
+            bail!("positions out of the {t} tokens");
         }
-        let plan = self.plan();
-        let tape = self.tape(ad, &plan, self.embed_rows(tokens, &[]), t, None);
-        let (out, _, _) = self.final_fwd(&plan, &tape);
+        let tape = m.tape(ad, &self.plan, m.embed_rows(tokens, &[]), t, None);
+        let (out, _, _) = m.final_fwd(&self.plan, &tape);
         let mut rows = vec![0f32; positions.len() * h];
         for (r, &p) in rows.chunks_mut(h).zip(positions) {
             r.copy_from_slice(&out[p * h..(p + 1) * h]);
         }
-        let mut logits = self.head_raw_rows(&rows, positions.len());
-        let s = self.cfg.final_logit_softcapping as f32;
+        let mut logits = m.head_raw_rows(&rows, positions.len());
+        let s = m.cfg.final_logit_softcapping as f32;
         for x in logits.iter_mut() {
             *x = (*x / s).tanh() * s;
         }
         Ok(logits)
     }
 
-    /// The loss of `targets` (`(index of the token in `tokens`, weight)`: the token at that
-    /// index, at least 1, is predicted from the positions before it; each contributes
-    /// [`token_loss`]) and the log-probability of each target, without gradients.
-    pub fn train_loss(&self, ad: Option<&Adapter>, tokens: &[u32], targets: &[(usize, f32)]) -> Result<(f64, Vec<f32>)> {
-        self.train_loss_with(ad, tokens, targets, &token_loss, None)
+    fn check(&self, ad: Option<&Adapter>, tokens: &[u32], first: usize) -> Result<()> {
+        let m = self.model;
+        let vocab = m.cfg.unpadded_vocab_size;
+        if let Some(&tk) = tokens.iter().find(|&&tk| tk as usize >= vocab) {
+            bail!("token {tk} is outside the model's vocabulary of {vocab}");
+        }
+        if first == 0 || first > tokens.len() || tokens.is_empty() {
+            bail!("nothing to predict: targets from {first} of {} tokens", tokens.len());
+        }
+        for md in ad.iter().flat_map(|a| &a.mods) {
+            if md.layer >= m.layers.len() || md.slot >= 7 || (md.n_out, md.n_in) != Proj::ALL[md.slot].shape(&m.cfg, md.layer) {
+                bail!("the adapter's module {} of layer {} is not this model's", md.slot, md.layer);
+            }
+        }
+        Ok(())
     }
 
-    fn train_loss_with(
+    /// One sequence: `tokens` run from position 0 under adapter `ad` (None: the base model),
+    /// the tokens `first..` being the targets (`first >= 1`; a rewarded sequence's are imitated,
+    /// a penalized one's pushed down, see [`crate::lora_train::token_loss`]). The loss is the
+    /// mean over the targets; with `grads`, `factor` times its gradient is added to them.
+    pub fn pass(
         &self,
         ad: Option<&Adapter>,
         tokens: &[u32],
-        targets: &[(usize, f32)],
-        term: &(dyn Fn(f32, f32) -> (f64, f64) + Sync),
-        fixed: Option<&[Vec<u32>]>,
-    ) -> Result<(f64, Vec<f32>)> {
-        self.check_trainable()?;
-        check_targets(tokens, targets, self.cfg.unpadded_vocab_size)?;
-        let plan = self.plan();
-        let t = tokens.len();
-        let tape = self.tape(ad, &plan, self.embed_rows(tokens, &[]), t, fixed);
-        let (out, _, _) = self.final_fwd(&plan, &tape);
-        let mut loss = 0f64;
-        let mut logp = Vec::with_capacity(targets.len());
-        self.head_loss(&out, tokens, targets, term, &mut loss, &mut logp, None);
-        Ok((loss, logp))
+        first: usize,
+        positive: bool,
+        obj: Objective,
+        grads: Option<(&mut Grads, f32)>,
+    ) -> Result<Pass> {
+        self.pass_with(ad, tokens, first, positive, obj, grads, None)
     }
 
-    /// The loss terms of `targets` from the final hidden states `out`, in chunks of rows; with
-    /// `g_out` (`[t, H]`), adds the gradient of the loss with respect to `out`.
+    /// [`Self::pass`]; `fixed`: the experts of each step and token, instead of choosing them.
     #[allow(clippy::too_many_arguments)]
-    fn head_loss(
+    fn pass_with(
         &self,
-        out: &[f32],
+        ad: Option<&Adapter>,
         tokens: &[u32],
-        targets: &[(usize, f32)],
-        term: &(dyn Fn(f32, f32) -> (f64, f64) + Sync),
-        loss: &mut f64,
-        logp: &mut Vec<f32>,
-        mut g_out: Option<&mut [f32]>,
-    ) {
-        let c = &self.cfg;
-        let (h, u) = (c.hidden_size, c.unpadded_vocab_size);
-        let cap = c.final_logit_softcapping as f32;
-        for chunk in targets.chunks(64) {
-            let n = chunk.len();
-            let mut rows = vec![0f32; n * h];
-            for (r, &(j, _)) in rows.chunks_mut(h).zip(chunk) {
-                r.copy_from_slice(&out[(j - 1) * h..j * h]);
-            }
-            let mut z = self.head_raw_rows(&rows, n);
-            // Per row: the capped logits' log-softmax, the loss term, and in place of the raw
-            // logits the gradient with respect to them.
-            let res: Vec<std::sync::Mutex<(f64, f32)>> = (0..n).map(|_| std::sync::Mutex::new((0.0, 0.0))).collect();
-            let want_grad = g_out.is_some();
-            for_chunks(&mut z, u, n > 1, |i, row| {
-                let (j, w) = chunk[i];
-                let y = tokens[j] as usize;
-                let capped: Vec<f32> = row.iter().map(|&x| (x / cap).tanh() * cap).collect();
-                let m = capped.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-                let lse = m + capped.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln();
-                let lp = (capped[y] as f64 - lse) as f32;
-                let (ls, dl) = term(w, lp);
-                *res[i].lock().unwrap() = (ls, lp);
-                if want_grad {
-                    for (v, (o, &cz)) in row.iter_mut().zip(&capped).enumerate() {
-                        let p = (cz as f64 - lse).exp();
-                        let gz = dl * (if v == y { 1.0 } else { 0.0 } - p);
-                        let th = cz / cap;
-                        *o = (gz * (1.0 - (th * th) as f64)) as f32;
-                    }
-                }
-            });
-            for r in res {
-                let (ls, lp) = r.into_inner().unwrap();
-                *loss += ls;
-                logp.push(lp);
-            }
-            if let Some(g) = g_out.as_deref_mut() {
-                let mut gh = vec![0f32; n * h];
-                lin_t(&self.lm_head, u, h, &z, n, &mut gh);
-                for (r, &(j, _)) in gh.chunks(h).zip(chunk) {
-                    add_inplace(&mut g[(j - 1) * h..j * h], r);
-                }
-            }
+        first: usize,
+        positive: bool,
+        obj: Objective,
+        grads: Option<(&mut Grads, f32)>,
+        fixed: Option<&[Vec<u32>]>,
+    ) -> Result<Pass> {
+        let m = self.model;
+        self.check(ad, tokens, first)?;
+        if first >= tokens.len() {
+            bail!("nothing to predict: targets from {first} of {} tokens", tokens.len());
         }
-    }
-
-    /// The loss of `targets` over `tokens` (see [`Self::train_loss`]) and its gradient with
-    /// respect to every `A` and `B` of the adapter.
-    pub fn train_grads(&self, ad: &Adapter, tokens: &[u32], targets: &[(usize, f32)], opts: TrainOptions) -> Result<Outcome> {
-        self.train_grads_with(ad, tokens, targets, opts, &token_loss)
-    }
-
-    /// [`Self::train_grads`] with another loss term: `term(weight, logp)` returns a target's loss
-    /// and its derivative with respect to the target token's log-probability.
-    pub fn train_grads_with(
-        &self,
-        ad: &Adapter,
-        tokens: &[u32],
-        targets: &[(usize, f32)],
-        opts: TrainOptions,
-        term: &(dyn Fn(f32, f32) -> (f64, f64) + Sync),
-    ) -> Result<Outcome> {
-        self.check_trainable()?;
-        check_targets(tokens, targets, self.cfg.unpadded_vocab_size)?;
-        for s in &ad.sites {
-            if s.layer >= self.layers.len() || (s.n_out, s.n_in) != s.proj.shape(&self.cfg, s.layer) {
-                bail!("the adapter's {} of layer {} is not this model's", s.proj.name(), s.layer);
-            }
-        }
-        let h = self.cfg.hidden_size;
-        let t = tokens.len();
+        let (plan, h, t) = (&self.plan, m.cfg.hidden_size, tokens.len());
         let n = t * h;
+        let n_targets = t - first;
         let t0 = std::time::Instant::now();
-        let plan = self.plan();
-        let tape = self.tape(Some(ad), &plan, self.embed_rows(tokens, &[]), t, None);
-        let (out, fm, xn) = self.final_fwd(&plan, &tape);
+        let tape = m.tape(ad, plan, m.embed_rows(tokens, &[]), t, fixed);
+        let (out, fm, xn) = m.final_fwd(plan, &tape);
         let forward_secs = t0.elapsed().as_secs_f64();
+        let tape_bytes = tape.streams.iter().map(|s| s.len() * 4).sum::<usize>() + tape.routes.iter().map(|r| r.len() * 4).sum::<usize>();
         let t1 = std::time::Instant::now();
-        let first = targets.iter().map(|x| x.0 - 1).min().unwrap_or(0);
-        let lo = opts.grad_window.map_or(0, |w| first.saturating_sub(w));
-        let mut loss = 0f64;
-        let mut logp = Vec::with_capacity(targets.len());
+        let mut logp = Vec::with_capacity(n_targets);
+        let lo = self.grad_window.map_or(0, |w| (first - 1).saturating_sub(w));
+        let (Some((grads, factor)), Some(ad)) = (grads, ad) else {
+            let loss = m.head_loss(&out, tokens, first, positive, obj, &mut logp, None);
+            return Ok(Pass {
+                loss: loss / n_targets as f64,
+                logp,
+                grad_from: t,
+                tape_bytes,
+                forward_secs,
+                backward_secs: 0.0,
+            });
+        };
         let mut g_out = vec![0f32; n];
-        self.head_loss(&out, tokens, targets, term, &mut loss, &mut logp, Some(&mut g_out));
-        let mut grads = ad.zeros();
+        let loss = m.head_loss(&out, tokens, first, positive, obj, &mut logp, Some(&mut g_out));
+        let k = factor / n_targets as f32;
+        g_out.iter_mut().for_each(|v| *v *= k);
         let mut gstream: Vec<Option<Vec<f32>>> = (0..plan.n_streams).map(|_| None).collect();
         let mut gstate: Vec<Option<Vec<f32>>> = (0..plan.state_src.len()).map(|_| None).collect();
         let mut states: Vec<Option<Vec<f32>>> = (0..plan.state_src.len()).map(|_| None).collect();
@@ -2066,7 +1892,7 @@ impl<'a> Inkling2Model<'a> {
         // The final norm and mix.
         {
             let mut g_fm = vec![0f32; n];
-            norm_bwd(&fm, Some(&self.final_norm), h, self.cfg.rms_norm_eps as f32, &g_out, lo, &mut g_fm);
+            norm_bwd(&fm, Some(&m.final_norm), h, m.cfg.rms_norm_eps as f32, &g_out, lo, &mut g_fm);
             drop((g_out, out));
             for &id in &plan.final_states {
                 ensure(&mut states, id);
@@ -2081,7 +1907,7 @@ impl<'a> Inkling2Model<'a> {
                 .map(|&id| P(gstate[id].as_mut().unwrap().as_mut_ptr()))
                 .collect();
             gp.push(P(g_xn.as_mut_ptr()));
-            mix_bwd(&items, &self.final_query, h, &g_fm, lo, &gp);
+            mix_bwd(&items, &m.final_query, h, &g_fm, lo, &gp);
             norm_bwd(
                 &tape.streams[plan.final_stream],
                 None,
@@ -2100,30 +1926,46 @@ impl<'a> Inkling2Model<'a> {
             let x = &tape.streams[ps.x_in];
             let bank_x = ps.bank.as_ref().map(|b| &tape.streams[b.1][..]);
             // The step again from its saved input, for what its gradient reads.
-            let (_, tp) = self.step_fwd(Some(ad), ps, x, &states, bank_x, t, Some(&tape.routes[si]));
+            let (_, tp) = m.step_fwd(Some(ad), ps, x, &states, bank_x, t, Some(&tape.routes[si]));
             let g = gstream[ps.x_out].take().unwrap_or_else(|| vec![0f32; n]);
-            self.step_bwd(ad, ps, x, &states, bank_x, &tp, g, lo, t, &mut gstream, &mut gstate, &mut grads);
+            m.step_bwd(ad, ps, x, &states, bank_x, &tp, g, lo, t, &mut gstream, &mut gstate, grads);
             if let Some(id) = ps.push {
                 states[id] = None;
             }
         }
-        let tape_bytes = tape.streams.iter().map(|s| s.len() * 4).sum::<usize>() + tape.routes.iter().map(|r| r.len() * 4).sum::<usize>();
-        Ok(Outcome {
-            loss,
+        Ok(Pass {
+            loss: loss / n_targets as f64,
             logp,
-            grads,
             grad_from: lo,
             tape_bytes,
             forward_secs,
             backward_secs: t1.elapsed().as_secs_f64(),
         })
     }
+}
 
-    /// Bytes [`Self::train_grads`] keeps per token of a sequence between its forward and its
-    /// backward pass (the streams and the routing).
-    pub fn train_tape_bytes_per_token(&self) -> usize {
-        let steps = self.cfg.steps().len();
-        (steps + 1) * self.cfg.hidden_size * 4 + steps * self.cfg.num_experts_per_tok * 4
+impl Passes for Trainer<'_, '_> {
+    fn episode(&self, ad: Option<&Adapter>, ep: &Episode, obj: Objective, grads: Option<(&mut Grads, f32)>) -> Result<f64> {
+        let mut tokens = ep.prompt.clone();
+        tokens.extend_from_slice(&ep.completion);
+        // (A completion without a prompt has no prediction for its first token.)
+        let first = ep.prompt.len().max(1);
+        let pass = self
+            .pass(ad, &tokens, first, ep.weight > 0.0, obj, grads)
+            .with_context(|| format!("episode {}", ep.id))?;
+        Ok(pass.loss)
+    }
+    fn describe(&self) -> String {
+        format!(
+            "Inkling-2: {} layer applications of {}, {:.0} KB kept per token, gradient {}",
+            self.plan.steps.len(),
+            self.model.cfg.hidden_size,
+            self.tape_bytes_per_token() as f64 / 1e3,
+            match self.grad_window {
+                Some(w) => format!("truncated to {w} positions before the completion"),
+                None => "through the whole sequence".to_string(),
+            }
+        )
     }
 }
 
@@ -2141,19 +1983,6 @@ fn act_value(act: Act, g: f32, u: f32) -> f32 {
         }
         _ => unreachable!("Inkling-2's experts are SiTU"),
     }
-}
-
-fn check_targets(tokens: &[u32], targets: &[(usize, f32)], vocab: usize) -> Result<()> {
-    if tokens.is_empty() {
-        bail!("no tokens");
-    }
-    if let Some(&tk) = tokens.iter().find(|&&tk| tk as usize >= vocab) {
-        bail!("token {tk} is outside the vocabulary ({vocab})");
-    }
-    if let Some(&(j, _)) = targets.iter().find(|x| x.0 == 0 || x.0 >= tokens.len()) {
-        bail!("target {j} is not one of the tokens 1..{}", tokens.len());
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2186,84 +2015,86 @@ mod tests {
             .collect()
     }
 
-    /// An adapter on projections `projs` of every layer, with a nonzero `B`.
-    fn adapter(m: &Inkling2Model, projs: &[Proj]) -> Adapter {
-        let mut ad = Adapter::new(&m.cfg, 2, 4.0, projs, &[], 3);
-        for (i, s) in ad.sites.iter_mut().enumerate() {
-            s.b = noise(100 + i as u64, s.b.len(), 0.05);
+    /// An adapter on targets `names` of every layer, with a nonzero `B`.
+    fn adapter(m: &Inkling2Model, names: &[&str]) -> Adapter {
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        let mut ad = Adapter::new(m, 2, 4.0, &names, None, 3).unwrap();
+        for (i, md) in ad.mods.iter_mut().enumerate() {
+            md.bt = noise(100 + i as u64, md.bt.len(), 0.05);
         }
         ad
     }
 
-    fn targets(t: usize) -> Vec<(usize, f32)> {
-        (t - 14..t)
-            .map(|j| (j, if j % 4 == 1 { -0.7 } else { 1.0 + 0.1 * (j % 3) as f32 }))
-            .collect()
-    }
+    const OBJ: Objective = Objective { neg_clip: 4.0 };
 
     /// The gradients against central differences of the loss along random directions, one
     /// projection kind and one factor at a time, with the routing of the base point held fixed
-    /// (as the gradient holds it).
+    /// (as the gradient holds it), for a rewarded and for a penalized sequence.
     #[test]
     fn gradients_match_finite_differences() {
         let (_dir, m) = tiny("fd");
+        let tr = Trainer::new(&m, None).unwrap();
         let t = 44;
         let toks = tokens(t);
-        let tg = targets(t);
-        let ad = adapter(&m, &Proj::ALL);
-        let out = m.train_grads(&ad, &toks, &tg, TrainOptions::default()).unwrap();
-        let plan = m.plan();
-        let routes = m.tape(Some(&ad), &plan, m.embed_rows(&toks, &[]), t, None).routes;
-        let loss = |ad: &Adapter| m.train_loss_with(Some(ad), &toks, &tg, &token_loss, Some(&routes)).unwrap().0;
-        assert!(
-            (loss(&ad) - out.loss).abs() < 1e-5 * out.loss.abs().max(1.0),
-            "{} {}",
-            loss(&ad),
-            out.loss
-        );
+        let first = t - 14;
+        let ad = adapter(&m, &TARGETS);
         let mut worst = 0f64;
-        for &p in &Proj::ALL {
-            for which in 0..2 {
-                let dirs: Vec<Vec<f32>> = ad
-                    .sites
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| {
-                        let n = if which == 0 { s.a.len() } else { s.b.len() };
-                        if s.proj == p {
-                            noise(7 + (i * 2 + which) as u64, n, 1.0)
-                        } else {
-                            vec![0f32; n]
+        for positive in [true, false] {
+            let mut grads = ad.zero_grads();
+            // (The mean loss is scaled back to a sum, so that float32 losses resolve the steps.)
+            let k = 14.0;
+            let out = tr.pass(Some(&ad), &toks, first, positive, OBJ, Some((&mut grads, k))).unwrap();
+            let routes = m.tape(Some(&ad), &tr.plan, m.embed_rows(&toks, &[]), t, None).routes;
+            let loss = |ad: &Adapter| {
+                k as f64
+                    * tr.pass_with(Some(ad), &toks, first, positive, OBJ, None, Some(&routes))
+                        .unwrap()
+                        .loss
+            };
+            assert!((loss(&ad) - k as f64 * out.loss).abs() < 1e-4, "{} {}", loss(&ad), out.loss);
+            for slot in 0..7 {
+                for which in 0..2 {
+                    let dirs: Vec<Vec<f32>> = ad
+                        .mods
+                        .iter()
+                        .enumerate()
+                        .map(|(i, md)| {
+                            let n = if which == 0 { md.a.len() } else { md.bt.len() };
+                            if md.slot == slot {
+                                noise(7 + (i * 2 + which) as u64, n, 1.0)
+                            } else {
+                                vec![0f32; n]
+                            }
+                        })
+                        .collect();
+                    let analytic: f64 = grads
+                        .iter()
+                        .zip(&dirs)
+                        .flat_map(|(g, d)| (if which == 0 { &g.0 } else { &g.1 }).iter().zip(d))
+                        .map(|(&g, &d)| g as f64 * d as f64)
+                        .sum();
+                    let eps = 1e-3f32;
+                    let moved = |sign: f32| {
+                        let mut a2 = ad.clone();
+                        for (md, d) in a2.mods.iter_mut().zip(&dirs) {
+                            let v = if which == 0 { &mut md.a } else { &mut md.bt };
+                            for (x, &d) in v.iter_mut().zip(d) {
+                                *x += sign * eps * d;
+                            }
                         }
-                    })
-                    .collect();
-                let g = if which == 0 { &out.grads.a } else { &out.grads.b };
-                let analytic: f64 = g
-                    .iter()
-                    .zip(&dirs)
-                    .flat_map(|(g, d)| g.iter().zip(d))
-                    .map(|(&g, &d)| g as f64 * d as f64)
-                    .sum();
-                let eps = 1e-3f32;
-                let moved = |sign: f32| {
-                    let mut a2 = ad.clone();
-                    for (s, d) in a2.sites.iter_mut().zip(&dirs) {
-                        let v = if which == 0 { &mut s.a } else { &mut s.b };
-                        for (x, &d) in v.iter_mut().zip(d) {
-                            *x += sign * eps * d;
-                        }
-                    }
-                    loss(&a2)
-                };
-                let fd = (moved(1.0) - moved(-1.0)) / (2.0 * eps as f64);
-                // (float32 losses: the difference itself is only good to about 1e-2.)
-                let err = ((fd - analytic).abs() - 0.02).max(0.0) / fd.abs().max(analytic.abs());
-                eprintln!(
-                    "{} {}: analytic {analytic:+.5e} fd {fd:+.5e} rel {err:.2e}",
-                    p.name(),
-                    ["A", "B"][which]
-                );
-                worst = worst.max(err);
+                        loss(&a2)
+                    };
+                    let fd = (moved(1.0) - moved(-1.0)) / (2.0 * eps as f64);
+                    // (float32 losses: the difference itself is only good to about 2e-2.)
+                    let err = ((fd - analytic).abs() - 0.02).max(0.0) / fd.abs().max(analytic.abs());
+                    eprintln!(
+                        "{} {} {}: analytic {analytic:+.5e} fd {fd:+.5e} rel {err:.2e}",
+                        if positive { "+" } else { "-" },
+                        TARGETS[slot],
+                        ["A", "B"][which]
+                    );
+                    worst = worst.max(err);
+                }
             }
         }
         assert!(worst < 2e-2, "worst relative error {worst}");
@@ -2276,36 +2107,43 @@ mod tests {
         let (_dir, m) = tiny("win");
         let t = 40;
         let toks = tokens(t);
-        let tg = targets(t);
-        let ad = adapter(&m, &[Proj::O, Proj::Q]);
-        let full = m.train_grads(&ad, &toks, &tg, TrainOptions::default()).unwrap();
-        let wide = m.train_grads(&ad, &toks, &tg, TrainOptions { grad_window: Some(t) }).unwrap();
+        let first = t - 14;
+        let ad = adapter(&m, &["wo_ud", "wq_du"]);
+        let run = |window: Option<usize>| {
+            let tr = Trainer::new(&m, window).unwrap();
+            let mut g = ad.zero_grads();
+            let p = tr.pass(Some(&ad), &toks, first, true, OBJ, Some((&mut g, 1.0))).unwrap();
+            (p, g)
+        };
+        let (full, gf) = run(None);
+        let (wide, gw) = run(Some(t));
         assert_eq!(wide.grad_from, 0);
-        assert_eq!(full.grads.b, wide.grads.b);
-        let cut = m.train_grads(&ad, &toks, &tg, TrainOptions { grad_window: Some(4) }).unwrap();
-        assert_eq!(cut.grad_from, t - 14 - 1 - 4);
+        assert_eq!(gf, gw);
+        let (cut, gc) = run(Some(4));
+        assert_eq!(cut.grad_from, first - 1 - 4);
         assert_eq!(cut.loss, full.loss);
-        assert!(cut.grads.b.iter().flatten().all(|x| x.is_finite()));
-        assert!(cut.grads.b != full.grads.b);
+        assert!(gc.iter().flat_map(|g| g.0.iter().chain(&g.1)).all(|x| x.is_finite()));
+        assert!(gc != gf);
     }
 
     /// The adapter saved as a PEFT folder and attached to the model as `--lora` does gives the
-    /// logits of the training forward; so does a round trip through [`Adapter::load`].
+    /// logits of the training forward; and it reads back as it was.
     #[test]
     fn saved_adapter_runs_as_the_training_forward() {
         let (dir, m) = tiny("save");
+        let tr = Trainer::new(&m, None).unwrap();
         let t = 40;
         let toks = tokens(t);
-        let ad = adapter(&m, &Proj::ALL);
+        let ad = adapter(&m, &TARGETS);
         let pos: Vec<usize> = (0..t).collect();
-        let train = m.train_logits(Some(&ad), &toks, &pos).unwrap();
-        let base = m.train_logits(None, &toks, &pos).unwrap();
+        let train = tr.logits(Some(&ad), &toks, &pos).unwrap();
+        let base = tr.logits(None, &toks, &pos).unwrap();
         let out = dir.join("adapter");
-        ad.save(&out, "tiny").unwrap();
-        let back = Adapter::load(&m.cfg, &out).unwrap();
-        assert_eq!(back.sites.len(), ad.sites.len());
-        for (a, b) in ad.sites.iter().zip(&back.sites) {
-            assert_eq!((a.layer, a.proj, &a.a, &a.b), (b.layer, b.proj, &b.a, &b.b));
+        ad.save(&m, &out, "tiny").unwrap();
+        let back = Adapter::load(&m, &out).unwrap();
+        assert!(back.same_shape(&ad));
+        for (a, b) in ad.mods.iter().zip(&back.mods) {
+            assert_eq!((a.layer, a.slot, &a.a, &a.bt), (b.layer, b.slot, &b.a, &b.bt));
         }
         let run = |m: &Inkling2Model| {
             let mut s = m.new_session();
@@ -2315,7 +2153,7 @@ mod tests {
         let plain = run(&m);
         let (_d2, mut m2) = tiny("save");
         let at = crate::lora::attach_specs(&mut m2, &[LoraSpec { path: out, scale: 1.0 }], &dir, false).unwrap();
-        assert_eq!(at[0].modules, ad.sites.len());
+        assert_eq!(at[0].modules, ad.mods.len());
         let _ = m2.device.set(None);
         let adapted = run(&m2);
         let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
@@ -2328,5 +2166,61 @@ mod tests {
         assert!(diff(&train, &base) > 1e-2);
         assert!(diff(&base, &plain) < 2e-4);
         assert!(diff(&train, &adapted) < 2e-4);
+    }
+
+    /// The training loop of `lora_train` on Inkling-2: the loss of the training episodes goes
+    /// down, the adapter is written and loads.
+    #[test]
+    fn training_loop_runs_on_inkling() {
+        let (dir, m) = tiny("loop");
+        let prof = dir.join("profile");
+        std::fs::create_dir_all(&prof).unwrap();
+        let (mut eps, mut outs) = (String::new(), String::new());
+        for i in 0..6usize {
+            let all = tokens(30 + i);
+            let (p, c) = all.split_at(18);
+            eps += &format!(
+                "{}\n",
+                serde_json::json!({"id": format!("e{i}"), "prompt_tokens": p, "completion_tokens": c})
+            );
+            let reward = if i == 4 { -1.0 } else { 1.0 };
+            outs += &format!(
+                "{}\n",
+                serde_json::json!({"id": format!("e{i}"), "reward": reward, "kind": "tests"})
+            );
+        }
+        std::fs::write(prof.join("episodes.jsonl"), eps).unwrap();
+        std::fs::write(prof.join("outcomes.jsonl"), outs).unwrap();
+        let paths = crate::lora_train::Paths::profile(&prof);
+        let opts = crate::lora_train::TrainOptions {
+            targets: vec!["wo_ud".into()],
+            rank: 4,
+            alpha: 8.0,
+            lr: 5e-3,
+            steps: 12,
+            batch: 2,
+            holdout: 0.0,
+            force: true,
+            ..Default::default()
+        };
+        let rep = crate::lora_train::run_with(
+            &m,
+            &|_| Ok(Box::new(Trainer::new(&m, None)?) as Box<dyn Passes + '_>),
+            "tiny",
+            &paths,
+            &[],
+            &opts,
+            &mut |l| eprintln!("{l}"),
+        )
+        .unwrap();
+        assert!(rep.written);
+        assert!(
+            rep.train_loss_after < rep.train_loss_before,
+            "{} {}",
+            rep.train_loss_after,
+            rep.train_loss_before
+        );
+        let ad = Adapter::load(&m, &paths.adapter).unwrap();
+        assert_eq!(ad.mods.len(), m.cfg.num_hidden_layers);
     }
 }

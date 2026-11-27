@@ -3,20 +3,22 @@
 
 usage: ref_inkling2_lora_grad.py MODEL_DIR OUT.safetensors [--len N] [--targets K] [--rank R]
                                  [--alpha A] [--proj wo_ud,wq_du,...] [--seed S] [--bstd X]
-                                 [--real [--text TEXT]]
+                                 [--negative] [--neg-clip C] [--real [--text TEXT]]
 
 A low-rank pair (`lora_A` uniform in +-1/sqrt(n_in), `lora_B` normal of std `--bstd`, so that
 both factors have a gradient) is added to the chosen attention projections of every layer as a
 forward hook on the module's `nn.Linear`: `y + (alpha / r) (x A^T) B^T`. A looped layer has one
-module, so its pair runs in every pass. The loss is over the last K tokens: token j, predicted
-from position j - 1, contributes `-w log p` for a weight `w >= 0` and `|w| log(1 - p)` negated
-(`-|w| ln(max(1 - p, 1e-4))`) for `w < 0`; every fourth target has weight -0.7.
+module, so its pair runs in every pass. The loss is `oxinfer lora-train`'s for one episode whose
+completion is the last K tokens: the mean over them of `-ln p` (token j is predicted from
+position j - 1), or with --negative of `-ln(1 - p)`, continued by its tangent in `ln p` past
+odds `p / (1 - p)` of `--neg-clip` (default 4).
 
 MODEL_DIR is a tiny checkpoint of `tools/inkling2_tiny.py` (with or without `--loop`; run in
 float64, random token ids), or with --real the release (`thinkingmachines/Inkling-2-Mini`): float32 on the weights
 exactly as stored, as `tools/ref_inkling2_mini.py` loads them, on a chat prompt (about 56 GB).
 
-Writes `ids`, `tgt_idx` (I64), `tgt_w`, `alpha`, `loss`, `logp` (per target), and per site
+Writes `ids`, `first` (the first target's index), `positive` (I64), `neg_clip`, `alpha`, `loss`,
+`logp` (per target), and per site
 `A.{layer}.{name}`, `B.{layer}.{name}`, `gA.{layer}.{name}`, `gB.{layer}.{name}` (float32), with
 the release's projection names.
 """
@@ -31,6 +33,7 @@ from transformers.models.inkling2_loop import modeling_inkling2_loop as mod
 model_dir, out = sys.argv[1], sys.argv[2]
 a = sys.argv[3:]
 plen, ntg, rank, alpha, projs, seed, bstd, real, text = 48, 14, 2, 4.0, "wo_ud", 0, 0.05, False, None
+negative, neg_clip = False, 4.0
 for i, x in enumerate(a):
     if x == "--len":
         plen = int(a[i + 1])
@@ -48,6 +51,10 @@ for i, x in enumerate(a):
         bstd = float(a[i + 1])
     if x == "--real":
         real = True
+    if x == "--negative":
+        negative = True
+    if x == "--neg-clip":
+        neg_clip = float(a[i + 1])
     if x == "--text":
         text = a[i + 1]
 
@@ -172,19 +179,26 @@ for l, layer in enumerate(layers):
 
 n = ids.shape[1]
 tgt = list(range(n - ntg, n))
-w = torch.tensor([-0.7 if j % 4 == 1 else 1.0 + 0.1 * (j % 3) for j in tgt], dtype=torch.float64)
 logits = m(ids, use_cache=False).logits[0].double()
 logp_all = torch.log_softmax(logits, dim=-1)
 logp = torch.stack([logp_all[j - 1, ids[0, j]] for j in tgt])
-pos = -w * logp
-neg = w * torch.log((1 - logp.exp()).clamp_min(1e-4))
-loss = torch.where(w >= 0, pos, neg).sum()
+if negative:
+    # -ln(1 - p), linear in ln p beyond the odds `neg_clip`.
+    p = logp.exp()
+    p0 = neg_clip / (1 + neg_clip)
+    inner = -torch.log1p(-p.clamp_max(p0))
+    outer = -torch.log1p(torch.tensor(-p0, dtype=torch.float64)) + neg_clip * (logp - torch.log(torch.tensor(p0, dtype=torch.float64)))
+    terms = torch.where(p < neg_clip * (1 - p), inner, outer)
+else:
+    terms = -logp
+loss = terms.mean()
 loss.backward()
 
 res = {
     "ids": ids[0].to(torch.int64),
-    "tgt_idx": torch.tensor(tgt, dtype=torch.int64),
-    "tgt_w": w.float(),
+    "first": torch.tensor([tgt[0]], dtype=torch.int64),
+    "positive": torch.tensor([0 if negative else 1], dtype=torch.int64),
+    "neg_clip": torch.tensor([neg_clip], dtype=torch.float32),
     "alpha": torch.tensor([alpha], dtype=torch.float32),
     "loss": loss.detach().reshape(1).float(),
     "logp": logp.detach().float(),

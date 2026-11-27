@@ -54,6 +54,45 @@ fn module_name(l: usize, slot: usize) -> String {
     format!("layers.{l}.{part}.{}", TARGETS[slot])
 }
 
+/// What an adapter needs to know of the model class it is for: which linear layers of a decoder
+/// layer it can target (at most seven, by index: a "slot"), their shapes and their PEFT names.
+pub trait Family {
+    /// The targets' names, by slot.
+    fn target_names(&self) -> &'static [&'static str];
+    fn n_layers(&self) -> usize;
+    /// `(n_out, n_in)` of target `slot` in layer `l`.
+    fn dims(&self, l: usize, slot: usize) -> (usize, usize);
+    /// The module path of target `slot` in layer `l`, from `layers.` on.
+    fn module_name(&self, l: usize, slot: usize) -> String;
+    /// What an adapter file's keys put before the module path.
+    fn key_prefix(&self) -> &'static str {
+        "base_model.model.model."
+    }
+    /// The adapter row the model stores at each row of target `slot`'s weight, when the
+    /// checkpoint reorders them.
+    fn stored_rows(&self, _slot: usize) -> Option<Vec<usize>> {
+        None
+    }
+}
+
+impl Family for QwenModel<'_> {
+    fn target_names(&self) -> &'static [&'static str] {
+        &TARGETS
+    }
+    fn n_layers(&self) -> usize {
+        self.layers.len()
+    }
+    fn dims(&self, _l: usize, slot: usize) -> (usize, usize) {
+        dims(self, slot)
+    }
+    fn module_name(&self, l: usize, slot: usize) -> String {
+        module_name(l, slot)
+    }
+    fn stored_rows(&self, slot: usize) -> Option<Vec<usize>> {
+        stored_rows(self, slot)
+    }
+}
+
 /// One episode with its outcome.
 #[derive(Clone, Debug)]
 pub struct Episode {
@@ -181,15 +220,15 @@ fn id_of(v: &serde_json::Value) -> Option<String> {
 
 /// The trainable update of one linear layer: `y += scale * B (A x)`.
 #[derive(Clone)]
-struct Module {
-    layer: usize,
-    slot: usize,
-    n_in: usize,
-    n_out: usize,
+pub(crate) struct Module {
+    pub(crate) layer: usize,
+    pub(crate) slot: usize,
+    pub(crate) n_in: usize,
+    pub(crate) n_out: usize,
     /// `[r, n_in]`
-    a: Vec<f32>,
+    pub(crate) a: Vec<f32>,
     /// `[r, n_out]`: B transposed, rows in the order the model stores the weight's rows.
-    bt: Vec<f32>,
+    pub(crate) bt: Vec<f32>,
 }
 
 /// A LoRA adapter over the trainer's targets: the one being trained, or an existing one read
@@ -202,9 +241,11 @@ pub struct Adapter {
     slots: Vec<usize>,
     /// The adapted layers, sorted.
     layers: Vec<usize>,
-    mods: Vec<Module>,
+    pub(crate) mods: Vec<Module>,
     /// The module of each (layer, slot).
     index: Vec<[Option<usize>; 7]>,
+    /// The targets' names by slot ([`Family::target_names`]).
+    names: &'static [&'static str],
 }
 
 /// Gradients of an adapter's modules, in their order: (`dA`, `dB^T`).
@@ -250,17 +291,25 @@ fn tensor_f32(st: &SafeTensors, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
 impl Adapter {
     /// A new adapter of `rank` on `targets` (names of [`TARGETS`]) of `layers` (all when None):
     /// `A` uniform in `+-1 / sqrt(n_in)` (PEFT's default), `B` zero.
-    pub fn new(model: &QwenModel, rank: usize, alpha: f32, targets: &[String], layers: Option<&[usize]>, seed: u64) -> Result<Self> {
+    pub fn new<F: Family + ?Sized>(
+        model: &F,
+        rank: usize,
+        alpha: f32,
+        targets: &[String],
+        layers: Option<&[usize]>,
+        seed: u64,
+    ) -> Result<Self> {
         if rank == 0 {
             bail!("LoRA rank 0");
         }
-        let nl = model.layers.len();
+        let nl = model.n_layers();
+        let names = model.target_names();
         let mut slots = Vec::new();
         for t in targets {
-            let s = TARGETS
+            let s = names
                 .iter()
                 .position(|n| n == t)
-                .with_context(|| format!("unknown LoRA target {t:?} (one of {})", TARGETS.join(", ")))?;
+                .with_context(|| format!("unknown LoRA target {t:?} (one of {})", names.join(", ")))?;
             if !slots.contains(&s) {
                 slots.push(s);
             }
@@ -283,10 +332,11 @@ impl Adapter {
             layers: layers.clone(),
             mods: Vec::new(),
             index: vec![[None; 7]; nl],
+            names,
         };
         for &l in &layers {
             for &s in &slots {
-                let (n_out, n_in) = dims(model, s);
+                let (n_out, n_in) = model.dims(l, s);
                 let bound = 1.0 / (n_in as f32).sqrt();
                 let a = (0..rank * n_in).map(|_| (2.0 * rng.unit() - 1.0) * bound).collect();
                 ad.push(Module {
@@ -314,7 +364,7 @@ impl Adapter {
 
     /// The target names.
     pub fn targets(&self) -> Vec<String> {
-        self.slots.iter().map(|&s| TARGETS[s].to_string()).collect()
+        self.slots.iter().map(|&s| self.names[s].to_string()).collect()
     }
 
     /// The lowest adapted layer.
@@ -333,13 +383,50 @@ impl Adapter {
         self.rank == o.rank && self.alpha == o.alpha && self.slots == o.slots && self.layers == o.layers
     }
 
-    fn zero_grads(&self) -> Grads {
+    /// The index (into the adapter's modules and into [`Grads`]) of the module on target `slot`
+    /// of layer `l`.
+    pub(crate) fn at(&self, l: usize, slot: usize) -> Option<usize> {
+        self.index.get(l).and_then(|i| i[slot])
+    }
+
+    /// Each module's layer, target name, `A` (`[r, n_in]`) and `B^T` (`[r, n_out]`, rows in the
+    /// order the model stores the weight's rows).
+    pub fn modules(&self) -> impl Iterator<Item = (usize, &'static str, &[f32], &[f32])> {
+        self.mods.iter().map(|m| (m.layer, self.names[m.slot], &m.a[..], &m.bt[..]))
+    }
+
+    /// Overwrites the matrices of the module on target `name` of layer `l` (`a`: `[r, n_in]`,
+    /// `bt`: `[r, n_out]`).
+    pub fn set_module(&mut self, l: usize, name: &str, a: &[f32], bt: &[f32]) -> Result<()> {
+        let i = self
+            .names
+            .iter()
+            .position(|n| *n == name)
+            .and_then(|s| self.at(l, s))
+            .with_context(|| format!("the adapter has no {name} in layer {l}"))?;
+        let m = &mut self.mods[i];
+        if a.len() != m.a.len() || bt.len() != m.bt.len() {
+            bail!(
+                "{name} of layer {l}: {} and {} values, expected {} and {}",
+                a.len(),
+                bt.len(),
+                m.a.len(),
+                m.bt.len()
+            );
+        }
+        m.a.copy_from_slice(a);
+        m.bt.copy_from_slice(bt);
+        Ok(())
+    }
+
+    /// Zero gradients of this adapter's shapes.
+    pub fn zero_grads(&self) -> Grads {
         self.mods.iter().map(|m| (vec![0f32; m.a.len()], vec![0f32; m.bt.len()])).collect()
     }
 
     /// Writes the PEFT folder `dir` (`adapter_config.json`, `adapter_model.safetensors` in f32)
     /// for the base model `base` (recorded as `base_model_name_or_path`).
-    pub fn save(&self, model: &QwenModel, dir: &Path, base: &str) -> Result<()> {
+    pub fn save<F: Family + ?Sized>(&self, model: &F, dir: &Path, base: &str) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
         let cfg = serde_json::json!({
             "peft_type": "LORA", "task_type": "CAUSAL_LM", "base_model_name_or_path": base,
@@ -354,7 +441,7 @@ impl Adapter {
         header.insert("__metadata__".into(), serde_json::json!({"format": "pt"}));
         let mut data: Vec<u8> = Vec::new();
         for m in &self.mods {
-            let rows = stored_rows(model, m.slot);
+            let rows = model.stored_rows(m.slot);
             let mut b = vec![0f32; m.n_out * r];
             for p in 0..m.n_out {
                 let o = rows.as_ref().map_or(p, |rs| rs[p]);
@@ -362,7 +449,7 @@ impl Adapter {
                     b[o * r + k] = m.bt[k * m.n_out + p];
                 }
             }
-            let key = format!("base_model.model.model.{}", module_name(m.layer, m.slot));
+            let key = format!("{}{}", model.key_prefix(), model.module_name(m.layer, m.slot));
             for (suffix, shape, vals) in [("lora_A", [r, m.n_in], &m.a), ("lora_B", [m.n_out, r], &b)] {
                 let start = data.len();
                 for x in vals {
@@ -389,7 +476,8 @@ impl Adapter {
     /// Reads back a PEFT folder whose modules are all among [`TARGETS`] of `model`'s layers, with
     /// one rank (what [`Adapter::save`] writes; adapters with other modules, rsLoRA, DoRA or
     /// per-module ranks are an error: the trainer cannot run them).
-    pub fn load(model: &QwenModel, dir: &Path) -> Result<Self> {
+    pub fn load<F: Family + ?Sized>(model: &F, dir: &Path) -> Result<Self> {
+        let names = model.target_names();
         let cfg_path = dir.join("adapter_config.json");
         let cfg: serde_json::Value =
             serde_json::from_slice(&crate::fsx::read(&cfg_path)?).with_context(|| format!("parse {}", cfg_path.display()))?;
@@ -401,7 +489,7 @@ impl Adapter {
         let rank = cfg.get("r").and_then(|v| v.as_u64()).context("adapter_config.json: missing r")? as usize;
         let alpha = cfg.get("lora_alpha").and_then(|v| v.as_f64()).unwrap_or(rank as f64) as f32;
         let st = SafeTensors::open(&dir.join("adapter_model.safetensors"), true)?;
-        let nl = model.layers.len();
+        let nl = model.n_layers();
         let mut found: BTreeMap<(usize, usize), (Option<String>, Option<String>)> = BTreeMap::new();
         for name in st.names() {
             let (module, is_a) = if let Some(m) = name.strip_suffix(".lora_A.weight") {
@@ -418,8 +506,8 @@ impl Adapter {
             let mut it = key.split('.').skip(1);
             let l: usize = it.next().and_then(|n| n.parse().ok()).with_context(|| format!("module {module}"))?;
             let rest: Vec<&str> = it.collect();
-            let slot = TARGETS.iter().position(|t| rest.last() == Some(t));
-            let slot = slot.filter(|&s| module_name(l, s) == key && l < nl);
+            let slot = names.iter().position(|t| rest.last() == Some(t));
+            let slot = slot.filter(|&s| model.module_name(l, s) == key && l < nl);
             let slot = slot.with_context(|| format!("{}: the trainer has no module {module}", dir.display()))?;
             let e = found.entry((l, slot)).or_default();
             *(if is_a { &mut e.0 } else { &mut e.1 }) = Some(name.clone());
@@ -431,22 +519,27 @@ impl Adapter {
             layers: Vec::new(),
             mods: Vec::new(),
             index: vec![[None; 7]; nl],
+            names,
         };
         for ((l, slot), (an, bn)) in found {
             let (Some(an), Some(bn)) = (an, bn) else {
-                bail!("{}: {} lacks its lora_A or lora_B weight", dir.display(), module_name(l, slot));
+                bail!(
+                    "{}: {} lacks its lora_A or lora_B weight",
+                    dir.display(),
+                    model.module_name(l, slot)
+                );
             };
-            let (n_out, n_in) = dims(model, slot);
+            let (n_out, n_in) = model.dims(l, slot);
             let (a, ash) = tensor_f32(&st, &an)?;
             let (b, bsh) = tensor_f32(&st, &bn)?;
             if ash != [rank, n_in] || bsh != [n_out, rank] {
                 bail!(
                     "{}: {} is {bsh:?} x {ash:?}, expected [{n_out}, {rank}] x [{rank}, {n_in}]",
                     dir.display(),
-                    module_name(l, slot)
+                    model.module_name(l, slot)
                 );
             }
-            let rows = stored_rows(model, slot);
+            let rows = model.stored_rows(slot);
             let mut bt = vec![0f32; rank * n_out];
             for p in 0..n_out {
                 let o = rows.as_ref().map_or(p, |rs| rs[p]);
@@ -732,6 +825,36 @@ fn lora_back(
                 axpy(row, scale * z[ti * r + k], &m.a[k * n_in..(k + 1) * n_in]);
             }
         });
+    }
+}
+
+/// The forward and backward passes of one model class, as the training loop ([`run_with`]) drives
+/// them.
+pub trait Passes {
+    /// The mean loss of `ep`'s completion tokens ([`token_loss`], not yet weighted) under adapter
+    /// `ad` (None: the base model); with `grads`, also adds `factor` times its gradient to them.
+    fn episode(&self, ad: Option<&Adapter>, ep: &Episode, obj: Objective, grads: Option<(&mut Grads, f32)>) -> Result<f64>;
+    /// One line on what the passes hold, for the log.
+    fn describe(&self) -> String;
+    /// Bytes of transposed weights held.
+    fn transposed_bytes(&self) -> usize {
+        0
+    }
+}
+
+impl Passes for Trainer<'_, '_> {
+    fn episode(&self, ad: Option<&Adapter>, ep: &Episode, obj: Objective, grads: Option<(&mut Grads, f32)>) -> Result<f64> {
+        Trainer::episode(self, ad, ep, obj, grads)
+    }
+    fn describe(&self) -> String {
+        format!(
+            "transposed weights from layer {}: {:.2} GB",
+            self.first,
+            self.transposed_bytes as f64 / 1e9
+        )
+    }
+    fn transposed_bytes(&self) -> usize {
+        self.transposed_bytes
     }
 }
 
@@ -1382,7 +1505,7 @@ pub fn split(eps: Vec<Episode>, frac: f32) -> (Vec<Episode>, Vec<Episode>) {
 }
 
 /// The weighted loss of `eps` under `ad`: `sum |w| loss / sum |w|`.
-pub fn eval(tr: &Trainer, ad: Option<&Adapter>, eps: &[Episode], obj: Objective) -> Result<f64> {
+pub fn eval(tr: &dyn Passes, ad: Option<&Adapter>, eps: &[Episode], obj: Objective) -> Result<f64> {
     let (mut num, mut den) = (0f64, 0f64);
     for e in eps {
         let w = e.weight.abs() as f64;
@@ -1435,6 +1558,28 @@ impl Paths {
 /// kept as `adapter.prev`. The new folder is written beside the old one and renamed into place.
 pub fn run(
     model: &QwenModel,
+    base: &str,
+    paths: &Paths,
+    kind_weights: &[(String, f32)],
+    opts: &TrainOptions,
+    log: &mut dyn FnMut(&str),
+) -> Result<Report> {
+    run_with(
+        model,
+        &|first| Ok(Box::new(Trainer::new(model, first)?) as Box<dyn Passes + '_>),
+        base,
+        paths,
+        kind_weights,
+        opts,
+        log,
+    )
+}
+
+/// [`run`] for any model class: `model` says what an adapter of it looks like, `passes` makes its
+/// forward and backward passes for adapters whose lowest layer is the one given.
+pub fn run_with<'p, F: Family + ?Sized>(
+    model: &F,
+    passes: &dyn Fn(usize) -> Result<Box<dyn Passes + 'p>>,
     base: &str,
     paths: &Paths,
     kind_weights: &[(String, f32)],
@@ -1510,10 +1655,11 @@ pub fn run(
     }
     let first = ad.first_layer();
     let t0 = crate::clock::Instant::now();
-    let tr = Trainer::new(model, first)?;
+    let tr = passes(first)?;
+    let tr: &dyn Passes = &*tr;
     log(&format!(
-        "transposed weights from layer {first}: {:.2} GB in {:.1}s; {} trainable parameters (rank {}, alpha {}, {})",
-        tr.transposed_bytes as f64 / 1e9,
+        "{} in {:.1}s; {} trainable parameters (rank {}, alpha {}, {})",
+        tr.describe(),
         t0.elapsed().as_secs_f64(),
         ad.params(),
         ad.rank,
@@ -1521,16 +1667,12 @@ pub fn run(
         ad.targets().join(",")
     ));
     let obj = Objective { neg_clip: opts.neg_clip };
-    let holdout_loss_base = if hold.is_empty() {
-        None
-    } else {
-        Some(eval(&tr, None, &hold, obj)?)
-    };
+    let holdout_loss_base = if hold.is_empty() { None } else { Some(eval(tr, None, &hold, obj)?) };
     let holdout_loss_existing = match &existing {
-        Some(e) if !hold.is_empty() => Some(eval(&tr, Some(e), &hold, obj)?),
+        Some(e) if !hold.is_empty() => Some(eval(tr, Some(e), &hold, obj)?),
         _ => None,
     };
-    let train_loss_before = eval(&tr, Some(&ad), &train, obj)?;
+    let train_loss_before = eval(tr, Some(&ad), &train, obj)?;
     log(&format!("training loss before: {train_loss_before:.5}"));
 
     let batch = opts.batch.max(1);
@@ -1570,11 +1712,11 @@ pub fn run(
         ));
     }
     let seconds_per_step = t0.elapsed().as_secs_f64() / steps.max(1) as f64;
-    let train_loss_after = eval(&tr, Some(&ad), &train, obj)?;
+    let train_loss_after = eval(tr, Some(&ad), &train, obj)?;
     let holdout_loss_new = if hold.is_empty() {
         None
     } else {
-        Some(eval(&tr, Some(&ad), &hold, obj)?)
+        Some(eval(tr, Some(&ad), &hold, obj)?)
     };
     let (gate_against, reference) = match holdout_loss_existing {
         Some(l) => ("existing", Some(l)),
@@ -1631,7 +1773,7 @@ pub fn run(
         better,
         written: write,
         seconds_per_step,
-        transposed_bytes: tr.transposed_bytes,
+        transposed_bytes: tr.transposed_bytes(),
     })
 }
 

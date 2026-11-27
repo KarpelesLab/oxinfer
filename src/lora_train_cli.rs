@@ -4,13 +4,14 @@
 use anyhow::{Context, Result, bail};
 use oxinfer::lora_train::{Paths, TrainOptions, parse_kind_weights};
 use oxinfer::model::Quant;
-use oxinfer::{config, pool, qwen, safetensors};
+use oxinfer::{config, inkling, pool, qwen, safetensors};
 use std::path::PathBuf;
 
 pub const USAGE: &str = "usage: oxinfer lora-train --model DIR|org/name --profile DIR [options]\n\
 \n\
 Trains a LoRA adapter on the episodes of a learning profile and keeps it when it lowers the loss\n\
-of held-out episodes (see docs/learning.md). Dense Qwen3 and Llama 3 checkpoints, on the CPU.\n\
+of held-out episodes (see docs/learning.md). Dense Qwen3 and Llama 3 checkpoints, and Inkling-2\n\
+(inkling2, inkling2_loop), on the CPU.\n\
 \n\
   --model M             the base model the episodes were logged with (as for oxinfer --model)\n\
   --profile DIR         a profile directory: reads DIR/episodes.jsonl and DIR/outcomes.jsonl, creates\n\
@@ -20,7 +21,10 @@ of held-out episodes (see docs/learning.md). Dense Qwen3 and Llama 3 checkpoints
   --rank N              LoRA rank (default 8)\n\
   --alpha F             LoRA alpha (default 2 x rank)\n\
   --targets LIST        adapted projections, of q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj\n\
-                        (default q_proj,v_proj)\n\
+                        (default q_proj,v_proj); Inkling-2: of wq_du,wk_dv,wv_dv,wr_du,gate_attn,\n\
+                        attn_sink_proj,wo_ud (default wo_ud)\n\
+  --grad-window N       Inkling-2: backpropagate through the completion and the N positions before\n\
+                        it only (default: the whole sequence)\n\
   --layers L            adapted layers, A-B or a,b,c (default all); the backward stops at the lowest\n\
   --lr F                learning rate (default 2e-4)\n\
   --steps N             optimizer steps (default: --epochs passes over the training episodes)\n\
@@ -48,6 +52,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let (mut model, mut profile, mut episodes, mut out) = (None, None, None, None);
     let (mut alpha, mut kinds, mut threads, mut cache_dir) = (None, Vec::new(), None, None);
     let (mut quant, mut mmap) = (Quant::Bf16, false);
+    let (mut targets_given, mut grad_window) = (false, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().cloned().with_context(|| format!("{a} expects a value"));
@@ -62,7 +67,11 @@ pub fn run(args: &[String]) -> Result<()> {
             "--out" | "-o" => out = Some(PathBuf::from(val()?)),
             "--rank" => o.rank = val()?.parse()?,
             "--alpha" => alpha = Some(val()?.parse()?),
-            "--targets" => o.targets = val()?.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            "--targets" => {
+                o.targets = val()?.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                targets_given = true;
+            }
+            "--grad-window" => grad_window = Some(val()?.parse()?),
             "--layers" => o.layers = Some(parse_layers(&val()?)?),
             "--lr" => o.lr = val()?.parse()?,
             "--steps" => o.steps = val()?.parse()?,
@@ -104,6 +113,38 @@ pub fn run(args: &[String]) -> Result<()> {
     pool::init(threads.unwrap_or_else(pool::default_threads));
     let path = oxinfer::engine::resolve_model_with(&spec, cache_dir.as_deref(), &Default::default())?;
     let model_type = config::model_type(&path).unwrap_or_default();
+    if let Ok(cfg) = inkling::Inkling2Config::load(&path) {
+        if !targets_given {
+            o.targets = vec!["wo_ud".into()];
+        }
+        let t0 = std::time::Instant::now();
+        let files = safetensors::ModelFiles::open(&path, !mmap)?;
+        let model = inkling::Inkling2Model::load(cfg, &files, quant)?;
+        eprintln!(
+            "[lora-train] {spec}: Inkling-2, {} layers of {} ({} applications), loaded in {:.1}s",
+            model.cfg.num_hidden_layers,
+            model.cfg.hidden_size,
+            model.cfg.steps().len(),
+            t0.elapsed().as_secs_f64()
+        );
+        let report = oxinfer::lora_train::run_with(
+            &model,
+            &|_| Ok(Box::new(inkling::train::Trainer::new(&model, grad_window)?) as Box<dyn oxinfer::lora_train::Passes + '_>),
+            &spec,
+            &paths,
+            &kinds,
+            &o,
+            &mut |l| eprintln!("[lora-train] {l}"),
+        )?;
+        if let Some(kb) = peak_rss_kb() {
+            eprintln!("[lora-train] peak resident memory {:.2} GB", kb as f64 / 1e6);
+        }
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if grad_window.is_some() {
+        bail!("--grad-window is for Inkling-2 models");
+    }
     let cfg = config::QwenConfig::load(&path)
         .with_context(|| format!("{spec} ({model_type}): lora-train covers dense Qwen3 and Llama 3 checkpoints"))?;
     let t0 = std::time::Instant::now();
