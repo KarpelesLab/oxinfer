@@ -34,6 +34,8 @@ pub enum Kind {
     Speech,
     Tts,
     Video,
+    /// Audio in, audio out (voice isolation).
+    Audio,
 }
 
 impl Kind {
@@ -45,6 +47,7 @@ impl Kind {
             Kind::Speech => "speech-to-text",
             Kind::Tts => "text-to-speech",
             Kind::Video => "video",
+            Kind::Audio => "audio",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -55,6 +58,7 @@ impl Kind {
             "speech" | "speech-to-text" | "stt" | "whisper" => Kind::Speech,
             "tts" | "text-to-speech" => Kind::Tts,
             "video" | "videos" => Kind::Video,
+            "audio" | "isolation" | "voice-isolation" => Kind::Audio,
             _ => return None,
         })
     }
@@ -170,10 +174,12 @@ pub enum Cap {
     TextToVideo,
     /// A first and / or last frame to video.
     ImageToVideo,
+    /// The voice of a recording kept, the background removed (denoising).
+    VoiceIsolation,
 }
 
 impl Cap {
-    pub const ALL: [Cap; 19] = [
+    pub const ALL: [Cap; 20] = [
         Cap::Text,
         Cap::ImageInput,
         Cap::VideoInput,
@@ -193,6 +199,7 @@ impl Cap {
         Cap::VoiceCloning,
         Cap::TextToVideo,
         Cap::ImageToVideo,
+        Cap::VoiceIsolation,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
@@ -215,6 +222,7 @@ impl Cap {
             Cap::VoiceCloning => "voice-cloning",
             Cap::TextToVideo => "text-to-video",
             Cap::ImageToVideo => "image-to-video",
+            Cap::VoiceIsolation => "voice-isolation",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -927,6 +935,11 @@ pub const CATALOG: &[Model] = &[
              transformer in whole passes on Metal: 768x512, 121 frames (two stages) in 88 s on an M5 Max, \
              22 GB resident; 7.8 s a forward on the CPU at 384x256x25 (docs/ltx.md)",
         ),
+    Model::new("inworld/voice-isolator", Kind::Audio, 0.064, 0.49, &[VoiceIsolation]).note(
+        "48 kHz voice isolation (oxinfer isolate, /v1/audio/isolations): voice-isolator-v1 offline (64M, 256 MB; 2.4x real \
+         time on an M5 Max with Metal), --mode streaming the realtime one (58M, 233 MB; 63 ms latency, about real time \
+         in 20 ms pieces on the CPU); f32 like the reference (126-132 dB SNR against it)",
+    ),
 ];
 
 /// A curated stack: a base model of the catalog with LoRA files at set strengths, a trigger word
@@ -1635,7 +1648,7 @@ fn path_of(m: &Model) -> EnginePath {
         Kind::Speech => EnginePath::Matmuls,
         Kind::Tts if has(&["orpheus"]) => EnginePath::Graph,
         Kind::Video if has(&["ltx-2"]) => EnginePath::Pipeline,
-        Kind::Tts | Kind::Video => EnginePath::Cpu,
+        Kind::Tts | Kind::Video | Kind::Audio => EnginePath::Cpu,
         Kind::Image | Kind::Embedding => EnginePath::Pipeline,
     }
 }
@@ -2184,6 +2197,7 @@ mod tests {
                     Kind::Speech => has(Cap::SpeechToText),
                     Kind::Tts => has(Cap::TextToSpeech),
                     Kind::Video => has(Cap::TextToVideo),
+                    Kind::Audio => has(Cap::VoiceIsolation),
                     Kind::Image => has(Cap::TextToImage) || has(Cap::ImageEdit) || has(Cap::Inpainting),
                 },
                 "{}",

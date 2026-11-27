@@ -26,6 +26,8 @@ pub enum Kind {
     Speech,
     /// Video generation (MiniMax-H3): `/v1/videos`, an asynchronous job.
     Video,
+    /// Voice isolation (Inworld Voice Isolator): `/v1/audio/isolations`.
+    Isolation,
 }
 
 impl Kind {
@@ -37,6 +39,7 @@ impl Kind {
             "transcription" | "asr" | "whisper" | "stt" => Kind::Transcription,
             "speech" | "tts" => Kind::Speech,
             "video" | "videos" => Kind::Video,
+            "isolation" | "voice-isolation" | "denoise" | "denoising" => Kind::Isolation,
             _ => return None,
         })
     }
@@ -48,6 +51,7 @@ impl Kind {
             Kind::Transcription => "transcription",
             Kind::Speech => "speech",
             Kind::Video => "video",
+            Kind::Isolation => "isolation",
         }
     }
 }
@@ -118,6 +122,7 @@ pub(crate) enum Loaded {
     /// Haru (speech to speech: `/v1/chat/completions` with audio in and out).
     Haru(Box<crate::haru::Haru>),
     Video(Box<VideoModel>),
+    Isolation(Box<crate::voice_isolator::VoiceIsolator>),
 }
 
 impl Loaded {
@@ -129,6 +134,10 @@ impl Loaded {
             Loaded::Speech(s) => s.cancel_handle(),
             Loaded::Zonos(z) => z.cancel_handle(),
             Loaded::Arktts(a) => a.cancel_handle(),
+            Loaded::Isolation(i) => {
+                let h = i.cancel_handle();
+                return Some(Box::new(move || h.store(true, Ordering::Relaxed)));
+            }
             _ => return None,
         };
         Some(Box::new(move || h.cancel()))
@@ -167,6 +176,7 @@ impl Loaded {
             Loaded::Transcription(_) => Kind::Transcription,
             Loaded::Speech(_) | Loaded::Zonos(_) | Loaded::Drama(_) | Loaded::Arktts(_) | Loaded::Haru(_) => Kind::Speech,
             Loaded::Video(_) => Kind::Video,
+            Loaded::Isolation(_) => Kind::Isolation,
         }
     }
 }
@@ -233,7 +243,9 @@ impl Entry {
                     // Told apart by their names (no config file to probe), as `detect` does.
                     .or_else(|| {
                         let p = Path::new(&spec.source);
-                        (crate::zonos::is_zonos(p) || crate::fish::is_drama(p)).then_some((Kind::Speech, None))
+                        (crate::zonos::is_zonos(p) || crate::fish::is_drama(p))
+                            .then_some((Kind::Speech, None))
+                            .or_else(|| crate::voice_isolator::is_repo_id(&spec.source).then_some((Kind::Isolation, None)))
                     })
                     .and_then(|d| match spec.option("kind").and_then(Kind::parse) {
                         Some(k) if k != d.0 => None,
@@ -1070,6 +1082,7 @@ impl Registry {
             _ if crate::zonos::is_zonos(Path::new(&e.spec.source)) => (Kind::Speech, None),
             _ if crate::ltx::is_repo(&e.spec.source) => (Kind::Video, None),
             _ if !Path::new(&e.spec.source).exists() && crate::fish::is_drama(Path::new(&e.spec.source)) => (Kind::Speech, None),
+            _ if !Path::new(&e.spec.source).exists() && crate::voice_isolator::is_repo_id(&e.spec.source) => (Kind::Isolation, None),
             _ => {
                 let path = self.probe_path(&e.spec)?;
                 let (k, img) = detect_path(&path, &e.spec.source);
@@ -1255,6 +1268,16 @@ impl Registry {
                 Loaded::Image(Box::new(load_image(ik, src, &opts, self.cache_dir.as_deref(), cache.as_deref())?))
             }
             Kind::Video => Loaded::Video(Box::new(load_video(src, &opts, self.cache_dir.as_deref())?)),
+            Kind::Isolation => {
+                let mut o = crate::voice_isolator::IsolatorOptions {
+                    cache_dir: self.cache_dir.clone(),
+                    ..Default::default()
+                };
+                for (k, v) in &opts {
+                    o.set(k, v)?;
+                }
+                Loaded::Isolation(Box::new(crate::voice_isolator::VoiceIsolator::load(src, &o)?))
+            }
         };
         // Repo ids are resolved now: count what is on disk.
         let est = match spec.option("memory_gb") {
@@ -1461,6 +1484,9 @@ pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>
     if crate::nemotron_image::is_nemotron_image(path) {
         return img(ImageKind::NemotronImage);
     }
+    if crate::voice_isolator::is_voice_isolator(path) {
+        return (Kind::Isolation, None);
+    }
     if crate::gguf::is_gguf(path) {
         if crate::flux::is_flux_gguf(path) {
             return img(ImageKind::Flux);
@@ -1615,6 +1641,7 @@ mod tests {
             Kind::Transcription,
             Kind::Speech,
             Kind::Video,
+            Kind::Isolation,
         ] {
             assert_eq!(Kind::parse(k.as_str()), Some(k));
         }

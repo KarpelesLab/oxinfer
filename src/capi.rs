@@ -19,7 +19,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Receives streamed text (`len` bytes, not NUL-terminated); return non-zero to stop.
 pub type OxiTokenFn = Option<unsafe extern "C" fn(user: *mut c_void, text: *const c_char, len: usize, thinking: c_int) -> c_int>;
@@ -3052,6 +3052,229 @@ pub unsafe extern "C" fn oxi_video_free(v: *mut OxiVideo) {
             drop(unsafe { Box::from_raw(v) });
             Ok(())
         })
+    }
+}
+
+// ---- Voice isolation (Inworld Voice Isolator) ------------------------------------------------
+
+/// A loaded voice isolator.
+pub struct OxiIsolator {
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    iso: crate::voice_isolator::VoiceIsolator,
+}
+
+/// A streaming session of the realtime voice isolator.
+pub struct OxiIsolatorStream(crate::voice_isolator::IsolatorStream);
+
+unsafe fn isolator<'a>(i: *const OxiIsolator) -> Result<&'a OxiIsolator> {
+    unsafe { i.as_ref() }.context("isolator is NULL")
+}
+
+fn isolate_options(options_json: *const c_char) -> Result<crate::voice_isolator::IsolateOptions> {
+    Ok(match unsafe { opt_str_arg(options_json, "options_json") }?.map(str::trim) {
+        Some(s) if !s.is_empty() => serde_json::from_str(s).context("options_json")?,
+        _ => Default::default(),
+    })
+}
+
+/// Hands `v` to the caller as samples to free with `oxi_audio_free`.
+unsafe fn samples_out(v: Vec<f32>, out: *mut *mut f32, n_out: *mut usize) {
+    unsafe {
+        if let Some(p) = n_out.as_mut() {
+            *p = v.len();
+        }
+        if let Some(p) = out.as_mut() {
+            *p = Box::into_raw(v.into_boxed_slice()) as *mut f32;
+        }
+    }
+}
+
+/// Loads a voice isolator: `inworld/voice-isolator`, a folder or a `.safetensors` file;
+/// `key=value` options (`mode=offline|streaming`, `precision=f32|bf16`, `device`, `threads`,
+/// `cache_dir`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_isolator_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiIsolator {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let mut o = crate::voice_isolator::IsolatorOptions::default();
+        for item in unsafe { opt_str_arg(options, "options") }?.unwrap_or("").split(['\n', ';']) {
+            let item = item.trim();
+            if item.is_empty() || item.starts_with('#') {
+                continue;
+            }
+            let (k, v) = item.split_once('=').with_context(|| format!("option {item:?} is not key=value"))?;
+            o.set(k.trim(), v.trim())?;
+        }
+        let iso = with_progress(progress, user, || crate::voice_isolator::VoiceIsolator::load(model, &o))?;
+        Ok(Box::into_raw(Box::new(OxiIsolator {
+            cancel: iso.cancel_handle(),
+            iso,
+        })))
+    })
+}
+
+/// Frees an isolator (NULL is ignored). No call on it, nor any of its streams, may be running.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_isolator_free(i: *mut OxiIsolator) {
+    if !i.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(i) });
+            Ok(())
+        })
+    }
+}
+
+/// Stops a running `oxi_isolate_pcm` / `oxi_isolate_file` (from another thread).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_isolator_cancel(i: *const OxiIsolator) {
+    if let Some(i) = unsafe { i.as_ref() } {
+        i.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Model information as JSON (free with `oxi_string_free`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_isolator_info_json(i: *const OxiIsolator) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        Ok(out_string(serde_json::to_string(unsafe { isolator(i) }?.iso.info())?))
+    })
+}
+
+/// Isolates the voice of `n` mono samples at `sample_rate` Hz; the voice (48 kHz, free with
+/// `oxi_audio_free`) goes to `out`. `options_json` as `IsolateOptions` (NULL: defaults).
+/// Returns 0 or -1.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn oxi_isolate_pcm(
+    i: *const OxiIsolator,
+    samples: *const f32,
+    n: usize,
+    sample_rate: c_int,
+    options_json: *const c_char,
+    out: *mut *mut f32,
+    n_out: *mut usize,
+    out_rate: *mut c_int,
+) -> c_int {
+    guard(-1, || {
+        let i = unsafe { isolator(i) }?;
+        if samples.is_null() && n > 0 {
+            bail!("samples is NULL");
+        }
+        let x = if n == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(samples, n) }
+        };
+        let rate = u32::try_from(sample_rate)
+            .ok()
+            .filter(|&r| r > 0)
+            .context("sample_rate must be positive")?;
+        let v = i.iso.isolate(x, rate, &isolate_options(options_json)?)?;
+        unsafe {
+            if let Some(p) = out_rate.as_mut() {
+                *p = i.iso.sample_rate() as c_int;
+            }
+            samples_out(v, out, n_out);
+        }
+        Ok(0)
+    })
+}
+
+/// Isolates the voice of an audio file into a 48 kHz float32 WAV at `out_path`, and the removed
+/// background into `bg_path` when it is not NULL. Returns 0 or -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_isolate_file(
+    i: *const OxiIsolator,
+    path: *const c_char,
+    options_json: *const c_char,
+    out_path: *const c_char,
+    bg_path: *const c_char,
+) -> c_int {
+    guard(-1, || {
+        let i = unsafe { isolator(i) }?;
+        let path = unsafe { str_arg(path, "path") }?;
+        let out_path = unsafe { str_arg(out_path, "out_path") }?;
+        let bg = unsafe { opt_str_arg(bg_path, "bg_path") }?;
+        let (pcm, rate) = crate::voice_isolator::load_audio(std::path::Path::new(path))?;
+        let sr = i.iso.sample_rate();
+        let v = i.iso.isolate(&pcm, rate, &isolate_options(options_json)?)?;
+        std::fs::write(out_path, crate::tts::wav_bytes_f32(&v, sr)).with_context(|| format!("write {out_path}"))?;
+        if let Some(bg) = bg {
+            let x = crate::audio::resample_kaiser_best(&pcm, rate as usize, sr as usize);
+            let r: Vec<f32> = x.iter().zip(&v).map(|(a, b)| a - b).collect();
+            std::fs::write(bg, crate::tts::wav_bytes_f32(&r, sr)).with_context(|| format!("write {bg}"))?;
+        }
+        Ok(0)
+    })
+}
+
+/// Starts a streaming session (realtime checkpoint: `mode=streaming`). `options_json` as
+/// `IsolateOptions` (look-ahead, block, cache and window frames). Free with
+/// `oxi_isolator_stream_free` before the isolator.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_isolator_stream_new(i: *const OxiIsolator, options_json: *const c_char) -> *mut OxiIsolatorStream {
+    guard(std::ptr::null_mut(), || {
+        let i = unsafe { isolator(i) }?;
+        Ok(Box::into_raw(Box::new(OxiIsolatorStream(
+            i.iso.stream(&isolate_options(options_json)?)?,
+        ))))
+    })
+}
+
+/// Pushes `n` new 48 kHz mono samples; the samples that became final go to `out` (free with
+/// `oxi_audio_free`; possibly none). Returns 0 or -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_isolator_stream_push(
+    s: *mut OxiIsolatorStream,
+    samples: *const f32,
+    n: usize,
+    out: *mut *mut f32,
+    n_out: *mut usize,
+) -> c_int {
+    guard(-1, || {
+        let s = unsafe { s.as_mut() }.context("stream is NULL")?;
+        if samples.is_null() && n > 0 {
+            bail!("samples is NULL");
+        }
+        let x = if n == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(samples, n) }
+        };
+        let v = s.0.push(x);
+        unsafe { samples_out(v, out, n_out) };
+        Ok(0)
+    })
+}
+
+/// Ends the stream: every remaining output sample goes to `out` (free with `oxi_audio_free`).
+/// Returns 0 or -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_isolator_stream_flush(s: *mut OxiIsolatorStream, out: *mut *mut f32, n_out: *mut usize) -> c_int {
+    guard(-1, || {
+        let s = unsafe { s.as_mut() }.context("stream is NULL")?;
+        let v = s.0.flush();
+        unsafe { samples_out(v, out, n_out) };
+        Ok(0)
+    })
+}
+
+/// The stream's algorithmic latency in samples (the analysis window plus the look-ahead).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_isolator_stream_latency(s: *const OxiIsolatorStream) -> i64 {
+    unsafe { s.as_ref() }.map_or(-1, |s| s.0.latency_samples() as i64)
+}
+
+/// Frees a stream (NULL is ignored).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_isolator_stream_free(s: *mut OxiIsolatorStream) {
+    if !s.is_null() {
+        drop(unsafe { Box::from_raw(s) });
     }
 }
 

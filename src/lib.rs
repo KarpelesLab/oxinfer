@@ -160,6 +160,7 @@ pub mod update;
 pub mod vae_posterior;
 pub mod video;
 pub mod vision;
+pub mod voice_isolator;
 #[cfg(all(feature = "gpu", target_pointer_width = "64", not(target_arch = "wasm32")))]
 pub mod vulkan;
 #[cfg(all(feature = "web", target_arch = "wasm32", target_os = "unknown"))]

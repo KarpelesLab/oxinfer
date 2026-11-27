@@ -51,6 +51,7 @@ mod step1x_cli;
 #[cfg(feature = "media")]
 mod tts_cli;
 mod unlimited_ocr_cli;
+mod voice_isolator_cli;
 #[cfg(feature = "server")]
 mod web_cli;
 #[cfg(feature = "media")]
@@ -1542,6 +1543,10 @@ fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("web") {
         let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
         return web_cli::run(&rest, "web", true);
+    }
+    if std::env::args().nth(1).as_deref() == Some("isolate") {
+        let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
+        return voice_isolator_cli::run(&rest);
     }
     if std::env::args().nth(1).as_deref() == Some("models") {
         let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();

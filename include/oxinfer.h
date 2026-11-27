@@ -1177,6 +1177,45 @@ void oxi_video_cancel(const OxiVideo *v);
 /* Frees a video handle (NULL is ignored). */
 void oxi_video_free(OxiVideo *v);
 
+/* ---- Voice isolation (Inworld Voice Isolator, inworld/voice-isolator) ---------------------- */
+
+typedef struct OxiIsolator OxiIsolator;
+typedef struct OxiIsolatorStream OxiIsolatorStream;
+
+/* Loads a voice isolator: the repo id inworld/voice-isolator, a folder holding its files or a
+ * .safetensors checkpoint. `options`: key=value lines or ;-separated pairs: mode (offline, the
+ * default: voice-isolator-v1; streaming: voice-isolator-v1-realtime), precision (f32 default,
+ * bf16), device, threads, cache_dir. NULL on error. */
+OxiIsolator *oxi_isolator_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
+void oxi_isolator_free(OxiIsolator *i);
+void oxi_isolator_cancel(const OxiIsolator *i);
+/* {"path", "name", "mode", "params", "width", "blocks", "bands", "sample_rate",
+ *  "lookahead_choices", "default_lookahead", "attention_window_frames", "f32_weights",
+ *  "device", "load_secs"}; free with oxi_string_free. */
+char *oxi_isolator_info_json(const OxiIsolator *i);
+
+/* Isolates the voice of `n` mono samples at `sample_rate` Hz (resampled to 48 kHz with
+ * torchaudio's kaiser_best). The voice, at 48 kHz and aligned with the resampled input, goes to
+ * *out (free with oxi_audio_free), its length to *n_out and its rate to *out_rate. `options_json`
+ * (NULL for defaults): {"chunk_seconds", "overlap_seconds", "offline_passes" (offline);
+ * "lookahead_frames" (0, 2 or 4), "block_frames", "cache_frames", "window_frames" (0: off),
+ * "crossfade_frames" (realtime, run as a stream)}. Returns 0 or -1. */
+int oxi_isolate_pcm(const OxiIsolator *i, const float *samples, size_t n, int sample_rate, const char *options_json,
+                    float **out, size_t *n_out, int *out_rate);
+/* The same for an audio file: the voice to `out_path` (48 kHz float32 WAV), the removed
+ * background to `bg_path` unless NULL. Returns 0 or -1. */
+int oxi_isolate_file(const OxiIsolator *i, const char *path, const char *options_json, const char *out_path,
+                     const char *bg_path);
+
+/* A live session of the realtime checkpoint: push 48 kHz mono samples in pieces of any size,
+ * receive the samples that became final (the latency is oxi_isolator_stream_latency samples:
+ * 2048 + 480 x look-ahead); flush returns the rest. Free the stream before the isolator. */
+OxiIsolatorStream *oxi_isolator_stream_new(const OxiIsolator *i, const char *options_json);
+int oxi_isolator_stream_push(OxiIsolatorStream *s, const float *samples, size_t n, float **out, size_t *n_out);
+int oxi_isolator_stream_flush(OxiIsolatorStream *s, float **out, size_t *n_out);
+int64_t oxi_isolator_stream_latency(const OxiIsolatorStream *s);
+void oxi_isolator_stream_free(OxiIsolatorStream *s);
+
 /* ---- OpenAI-compatible server (cargo features `capi` + `server`) -----------------------------
  * The OpenAI API (GET /v1/models; POST /v1/chat/completions, /v1/completions, /v1/embeddings,
  * /v1/images/generations, /v1/images/edits, /v1/audio/transcriptions, /v1/audio/translations,

@@ -49,6 +49,79 @@ pub fn resample(x: &[f32], from: usize, to: usize) -> Vec<f32> {
         .collect()
 }
 
+/// The modified Bessel function of the first kind, order 0 (power series).
+fn bessel_i0(x: f64) -> f64 {
+    let (mut sum, mut term) = (1f64, 1f64);
+    let q = x * x / 4.0;
+    for k in 1..200 {
+        term *= q / (k * k) as f64;
+        sum += term;
+        if term < sum * 1e-17 {
+            break;
+        }
+    }
+    sum
+}
+
+/// torchaudio's `resample` with `sinc_interp_kaiser`, `lowpass_filter_width` 64, rolloff
+/// 0.9475937 and beta 14.7696566 (librosa's `kaiser_best`): the polyphase filter of the reduced
+/// rates over the zero-padded input, `ceil(to * len / from)` samples out.
+pub fn resample_kaiser_best(x: &[f32], from: usize, to: usize) -> Vec<f32> {
+    resample_kaiser(x, from, to, 64, 0.947_593_716_739_959_6, 14.769_656_459_379_492)
+}
+
+/// [`resample_kaiser_best`] with its parameters (torchaudio `resample`, `sinc_interp_kaiser`).
+pub fn resample_kaiser(x: &[f32], from: usize, to: usize, lowpass_filter_width: usize, rolloff: f64, beta: f64) -> Vec<f32> {
+    if from == to || x.is_empty() || from == 0 || to == 0 {
+        return x.to_vec();
+    }
+    fn gcd(a: usize, b: usize) -> usize {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let g = gcd(from, to);
+    let (orig, new) = (from / g, to / g);
+    let lw = lowpass_filter_width as f64;
+    let base = orig.min(new) as f64 * rolloff;
+    let width = (lw * orig as f64 / base).ceil() as usize;
+    let taps = 2 * width + orig;
+    let i0b = bessel_i0(beta);
+    let scale = base / orig as f64;
+    // kernels[j][i], for output phase j.
+    let kernels: Vec<f32> = (0..new)
+        .flat_map(|j| {
+            (0..taps).map(move |i| {
+                let idx = (i as f64 - width as f64) / orig as f64;
+                let t = ((-(j as f64) / new as f64 + idx) * base).clamp(-lw, lw);
+                let w = bessel_i0(beta * (1.0 - (t / lw) * (t / lw)).max(0.0).sqrt()) / i0b;
+                let t = t * std::f64::consts::PI;
+                let k = if t == 0.0 { 1.0 } else { t.sin() / t };
+                (k * w * scale) as f32
+            })
+        })
+        .collect();
+    let len = x.len();
+    let m_out = len / orig + 1;
+    let target = (new * len).div_ceil(orig);
+    let at = |p: usize| -> f32 {
+        // Position in the padded input (`width` zeros before).
+        if p >= width && p - width < len { x[p - width] } else { 0.0 }
+    };
+    let mut y = vec![0f32; m_out * new];
+    for_chunks(&mut y, new, m_out > 64, |m, row| {
+        for (j, o) in row.iter_mut().enumerate() {
+            let k = &kernels[j * taps..(j + 1) * taps];
+            let base = m * orig;
+            let mut acc = 0f32;
+            for (i, &kv) in k.iter().enumerate() {
+                acc += kv * at(base + i);
+            }
+            *o = acc;
+        }
+    });
+    y.truncate(target);
+    y
+}
+
 /// Number of mel frames the extractor produces for `n` samples.
 pub fn num_mel_frames(n: usize) -> usize {
     let pad_left = FRAME / 2;

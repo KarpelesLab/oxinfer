@@ -392,6 +392,32 @@ pub fn wav_bytes_channels(samples: &[f32], sample_rate: u32, channels: u16) -> V
     b
 }
 
+/// A 32-bit IEEE float mono WAV file of `samples` (written unchanged: no clipping).
+pub fn wav_bytes_f32(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+    let data = (samples.len() * 4) as u32;
+    let mut b = Vec::with_capacity(58 + data as usize);
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(50 + data).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&18u32.to_le_bytes());
+    b.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&sample_rate.to_le_bytes());
+    b.extend_from_slice(&(sample_rate * 4).to_le_bytes());
+    b.extend_from_slice(&4u16.to_le_bytes());
+    b.extend_from_slice(&32u16.to_le_bytes());
+    b.extend_from_slice(&0u16.to_le_bytes()); // cbSize
+    b.extend_from_slice(b"fact");
+    b.extend_from_slice(&4u32.to_le_bytes());
+    b.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data.to_le_bytes());
+    for &s in samples {
+        b.extend_from_slice(&s.to_le_bytes());
+    }
+    b
+}
+
 /// Reads a WAV file's samples (PCM 8/16/24/32-bit or IEEE float 32/64, channels averaged) and
 /// its sample rate.
 pub fn read_wav(bytes: &[u8]) -> Result<Audio> {

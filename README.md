@@ -153,6 +153,7 @@ optional.
 | [ZONOS3-Mini](docs/zonos.md) | text to speech at 44.1 kHz in 43 languages, default voices, cloning from a clip |
 | [Audio8 TTS](docs/audio8-tts.md) | text to speech at 44.1 kHz in 23 languages, cloning from a clip and its transcript, its codec |
 | [Haru-4B](docs/haru.md) | full-duplex speech to speech at 24 kHz: a recording of the user in, what the model says meanwhile out |
+| [Voice Isolator](docs/voice-isolation.md) | 48 kHz voice isolation (denoising), offline and as a live stream with 63 ms latency (`oxinfer isolate`) |
 | [Fish Audio Drama 3](docs/fish-drama.md) | text to speech at 44.1 kHz with a 35B MoE, several speakers per text, cloning from a clip and its transcript |
 
 **Under the hood**
