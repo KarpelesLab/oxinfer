@@ -120,11 +120,23 @@ operations as numpy; the detector pass, crops, router and recognizers, no page h
 - **The models, on the reference's own inputs**: the detector's probability map within 1.2e-6 (no
   cell on the other side of the threshold), the router's logits within 4.3e-6, the float
   recognizers (CJK, right-to-left, world) the same characters at every step and confidences within
-  6e-6. `rec_latin` against onnxruntime running its QDQ graph in float (optimizations off): the
-  same characters at 12,223 of 12,224 steps, confidences equal (6e-8) except where a sum lands on a
-  quantizer's rounding boundary (up to 0.13: a step of the 8-bit logits). Against onnxruntime's
-  default int8 kernels (`QLinearConv`, `QLinearAdd`): 5 of the 12,224 steps differ, confidences up
-  to 0.18 apart, as onnxruntime's own float and int8 runs of the graph differ (1 step, 0.22).
+  6e-6. `rec_latin` runs onnxruntime's int8 arithmetic (below): against its default CPU kernels
+  (`QLinearConv`, `QLinearAdd`) the same characters at all 12,224 steps and confidences within
+  6e-8 (the float tail after the last quantized layer). (As float fake quantization it differed on 5 steps,
+  confidences up to 0.18, as onnxruntime's own float and int8 runs of the graph differ: 1 step,
+  0.22; `OXINFER_ONNX_INT8=0` still runs it so.)
+- **rec_latin's integer arithmetic**, found by emulating onnxruntime 1.32's optimized graph
+  (29 `QLinearConv`, 11 `QLinearAdd`) layer by layer on its own intermediate tensors (the
+  emulation reproduces every uint8 tensor of the graph on the twelve images' batches): the input
+  quantized as `clamp(round(x / s) + zp)` (a division, rounded half to even); a convolution as
+  the int32 sum of `(q - zp)` times the int8 weights plus the int32 bias, then
+  `round(float(sum) * f32(s_in * w_scale[c] / s_out)) + zp` saturated (the ReLUs are the
+  saturation at a zero point of 0); an addition as `round(f32(f32(sa / sc) (qa - za)) +
+  f32(f32(sb / sc) (qb - zb)) + zc)` saturated. The usual alternatives (MLAS's `zc - (ra za +
+  rb zb)` folded constant, fused multiply-adds, dequantize-add-quantize) each miss one rounding
+  case (26 of 89.5 million values): `109.49999` where onnxruntime has `109.5`. Here the convolutions sum the
+  integers in f32 (exact: every partial sum stays below 2^24, checked per channel at load), so
+  they run on the same GEMMs as the float models.
 - **The pipeline** (`--plain`): 103 lines, the same boxes (within 2.4e-4 pixels) and the same
   recognizer for every line, the same text on 101. The other two are noise: an upside-down
   two-line page (too few lines to turn) read at 0.55-0.66. The line images differ by a few grey
@@ -166,5 +178,4 @@ request per model at a time).
 - LayoutNet (`tablenet.onnx` / `tablenet.bin`: tables and layout blocks), and the rest of
   LiteParse's document parsing (PDF rendering, merging the OCR with the PDF text layer, Markdown);
 - EXIF orientation of photos (the image is read as stored);
-- the GPU: the models are a few million parameters, run on the CPU's GEMM and vectorized loops;
-- `rec_latin` as int8 arithmetic: its QDQ graph runs as float fake quantization (see above).
+- the GPU: the models are a few million parameters, run on the CPU's GEMM and vectorized loops.

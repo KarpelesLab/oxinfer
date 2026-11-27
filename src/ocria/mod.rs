@@ -12,9 +12,8 @@
 //! filter and faint short tokens. [`OcrRunOptions::plain`] turns every page-level heuristic off
 //! (the models' own outputs, as the reference script `ref_ocr.py` gives them).
 //!
-//! `rec_latin` is quantized (QDQ, int8 weights, uint8 activations); it runs here as float fake
-//! quantization, so its confidences can differ from ONNX Runtime's int8 kernels by a few hundredths
-//! while the characters read are the same.
+//! `rec_latin` is quantized (QDQ, int8 weights, uint8 activations); it runs with ONNX Runtime's
+//! int8 arithmetic ([`crate::onnx`]), so it reads what LiteParse's ONNX Runtime reads.
 
 mod det;
 mod img;

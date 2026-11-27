@@ -1,8 +1,8 @@
 //! A small ONNX reader and interpreter: the protobuf decoded by hand (no dependency), the graph
 //! run node by node in f32. It covers the operators of small convolutional models (`Conv` 1D /
 //! 2D with groups, element-wise ops, reductions, nearest `Resize`, `Gemm`, `ArgMax`, and
-//! `QuantizeLinear` / `DequantizeLinear`, run as float fake quantization), which is what
-//! OCRia-nano's detector, router and recognizers use ([`crate::ocria`]).
+//! `QuantizeLinear` / `DequantizeLinear`), which is what OCRia-nano's detector, router and
+//! recognizers use ([`crate::ocria`]).
 //!
 //! At load time constant subgraphs (`Constant` nodes, weights through `DequantizeLinear`) are
 //! folded, a `QuantizeLinear` feeding one `DequantizeLinear` becomes one fake-quantization step,
@@ -12,8 +12,14 @@
 //! the channels, the others as im2col + GEMM; tensors go back to `NCHW` where an operator needs
 //! it, and every graph output is `NCHW`.
 //!
-//! Quantized graphs are computed in float: an int8 runtime (ONNX Runtime's `QLinearConv`
-//! kernels) rounds its accumulations differently, so its results can differ slightly.
+//! Quantized (QDQ) graphs run with ONNX Runtime's integer arithmetic where its CPU provider fuses
+//! them into `QLinearConv` / `QLinearAdd` ([`exactify`]): a convolution sums the integers
+//! behind its fake-quantized input (`q - zp`) times the int8 weights plus the int32 bias (exact
+//! in f32 below 2^24, which load time checks) and rounds `float(sum) * (s_in * w_scale /
+//! s_out)` half to even; an addition computes `f32(sa / sc) (qa - za) + f32(sb / sc) (qb - zb)
+//! + zc`, each product and sum rounded to f32, then rounds it (MLAS's `QLinearAdd`); the tensors
+//! between them stay fake-quantized floats `(q - zp) s`. Other quantized steps run as float
+//! fake quantization (`OXINFER_ONNX_INT8=0`: all of them).
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -342,6 +348,44 @@ enum Post {
         s2: f32,
         zp2: f32,
     },
+    /// The end of an integer step: `(clamp(round(v) + zp, lo, hi) - zp2) * s2`.
+    Requant(Requant),
+}
+
+/// The rounding of an integer step's output to its quantized value and back to float.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Requant {
+    zp: f32,
+    lo: f32,
+    hi: f32,
+    s2: f32,
+    zp2: f32,
+}
+
+/// A quantized `Conv` or `Add` computed as ONNX Runtime's int8 kernels (`QLinearConv`,
+/// `QLinearAdd` on its CPU provider) compute it, from the integer values behind the
+/// fake-quantized float tensors.
+#[derive(Clone, Debug)]
+enum Exact {
+    /// int32 sums of the integer inputs (`q - zp`) and int8 weights, plus the int32 bias, then
+    /// `round(float(sum) * mult[c]) + zp` saturated (`mult` = `s_in * w_scale[c] / s_out` in f32).
+    Conv {
+        w: Tensor,
+        bias: Vec<f32>,
+        mult: Vec<f32>,
+        s_in: f32,
+        out: Requant,
+    },
+    /// MLAS's `QLinearAdd`: `round(f32(sa / sc) (qa - za) + f32(sb / sc) (qb - zb) + zc)`
+    /// saturated, each product and sum rounded to f32.
+    Add {
+        sa: f32,
+        sb: f32,
+        rac: f32,
+        rbc: f32,
+        zc: f32,
+        out: Requant,
+    },
 }
 
 impl Post {
@@ -350,6 +394,7 @@ impl Post {
         match self {
             Post::Relu => v.max(0.0),
             Post::FakeQuant { s, zp, lo, hi, s2, zp2 } => (((v / s).round_ties_even() + zp).clamp(lo, hi) - zp2) * s2,
+            Post::Requant(r) => ((v.round_ties_even() + r.zp).clamp(r.lo, r.hi) - r.zp2) * r.s2,
         }
     }
 }
@@ -371,6 +416,8 @@ pub struct Node {
     pub outputs: Vec<String>,
     pub attrs: HashMap<String, Attr>,
     posts: Vec<Post>,
+    /// Integer arithmetic for a quantized `Conv` / `Add` (see [`exactify`]).
+    exact: Option<Box<Exact>>,
 }
 
 impl Node {
@@ -382,6 +429,7 @@ impl Node {
             outputs: Vec::new(),
             attrs: HashMap::new(),
             posts: Vec::new(),
+            exact: None,
         };
         let mut domain = String::new();
         while let Some((num, v)) = p.next()? {
@@ -485,6 +533,8 @@ struct ConvPlan {
     one_d: bool,
     bias: Vec<f32>,
     kind: ConvKind,
+    /// Integer arithmetic: the input's scale, the output multipliers per channel, the rounding.
+    exact: Option<(f32, Vec<f32>, Requant)>,
 }
 
 enum ConvKind {
@@ -593,16 +643,17 @@ impl ConvPlan {
             one_d,
             bias,
             kind,
+            exact: None,
         })
     }
 
-    fn run(&self, x: Tensor, posts: &[Post]) -> Result<Tensor> {
-        let x = x.into_cl();
-        let (nb, cin) = (x.shape[0], x.shape[1]);
-        let (h, w) = match (self.one_d, x.shape.len()) {
-            (true, 3) => (1, x.shape[2]),
-            (false, 4) => (x.shape[2], x.shape[3]),
-            _ => bail!("Conv: input of shape {:?} for {}D weights", x.shape, if self.one_d { 1 } else { 2 }),
+    /// `(batch, cin, h, w, oh, ow)` of an input shape.
+    fn dims(&self, shape: &[usize]) -> Result<(usize, usize, usize, usize, usize, usize)> {
+        let (nb, cin) = (shape[0], shape[1]);
+        let (h, w) = match (self.one_d, shape.len()) {
+            (true, 3) => (1, shape[2]),
+            (false, 4) => (shape[2], shape[3]),
+            _ => bail!("Conv: input of shape {shape:?} for {}D weights", if self.one_d { 1 } else { 2 }),
         };
         if cin != self.cpg * self.group {
             bail!("Conv: {cin} input channels, weights for {} x {}", self.group, self.cpg);
@@ -617,6 +668,21 @@ impl ConvPlan {
         };
         let oh = span(h, pt + pb, self.kh, self.dil[0], self.stride[0])?;
         let ow = span(w, pl + pr, self.kw, self.dil[1], self.stride[1])?;
+        Ok((nb, cin, h, w, oh, ow))
+    }
+
+    fn run(&self, x: Tensor, posts: &[Post]) -> Result<Tensor> {
+        let mut x = x.into_cl();
+        if let Some((s_in, ..)) = &self.exact {
+            // The integer values (q - zp) behind the fake-quantized input.
+            let s_in = *s_in;
+            let par = x.data.len() > 65536;
+            crate::kernels::for_chunks(&mut x.data, 16384, par, |_, c| {
+                c.iter_mut().for_each(|v| *v = (*v / s_in).round_ties_even())
+            });
+        }
+        let (nb, cin, h, w, oh, ow) = self.dims(&x.shape)?;
+        let [pt, pl, ..] = self.pads;
         let cout = self.cout;
         let npix = nb * oh * ow;
         let mut y = match &self.kind {
@@ -727,6 +793,17 @@ impl ConvPlan {
             }
         };
         y.truncate(npix * cout);
+        if let Some((_, mult, r)) = &self.exact {
+            // The sums are exact integers below 2^24 (checked at load): float(sum) * mult.
+            let post = [Post::Requant(*r)];
+            let rows = (16384 / cout).max(1) * cout;
+            crate::kernels::for_chunks(&mut y, rows, npix * cout > 32768, |_, out| {
+                for o in out.chunks_exact_mut(cout) {
+                    o.iter_mut().zip(mult).for_each(|(v, &m)| *v *= m);
+                }
+                apply_posts(out, &post);
+            });
+        }
         let shape = if self.one_d { vec![nb, cout, ow] } else { vec![nb, cout, oh, ow] };
         Ok(Tensor::new(shape, y).with_layout(true))
     }
@@ -820,8 +897,12 @@ impl Model {
         }
         // Graph inputs that are initializers are constants, not inputs.
         inputs.retain(|n| !consts.contains_key(n));
+        let qconsts = quantized_consts(&nodes, &consts);
         let nodes = fold(nodes, &mut consts)?;
-        let nodes = fuse(nodes, &consts, &outputs);
+        let mut nodes = fuse(nodes, &consts, &outputs);
+        if exact_int8() {
+            exactify(&mut nodes, &qconsts);
+        }
         // Constants only the folded nodes read (int8 weights, their scales) are dropped.
         let used: std::collections::HashSet<&String> = nodes.iter().flat_map(|n| &n.inputs).chain(&outputs).collect();
         consts.retain(|k, _| used.contains(k));
@@ -855,7 +936,15 @@ impl Model {
                 .map(|x| (!x.is_empty()).then(|| id(x, &mut slot, &mut const_slots)))
                 .collect();
             let outs: Vec<usize> = n.outputs.iter().map(|x| id(x, &mut slot, &mut const_slots)).collect();
-            convs.push(if n.op == "Conv" {
+            convs.push(if let (true, Some(e)) = (n.op == "Conv", n.exact.as_deref()) {
+                let Exact::Conv { w, bias, mult, s_in, out } = e else {
+                    bail!("Conv with the exact form of another operator")
+                };
+                let b = Tensor::new(vec![bias.len()], bias.clone());
+                let mut p = ConvPlan::new(n, w, Some(&b))?;
+                p.exact = Some((*s_in, mult.clone(), *out));
+                Some(p)
+            } else if n.op == "Conv" {
                 let w = ins.get(1).copied().flatten().and_then(|s| const_slots[s].as_ref());
                 let b = ins.get(2).copied().flatten().and_then(|s| const_slots[s].as_ref());
                 let w = w.context("Conv with computed weights is not supported")?;
@@ -1083,6 +1172,131 @@ fn fold(nodes: Vec<Node>, consts: &mut HashMap<String, Tensor>) -> Result<Vec<No
     Ok(keep)
 }
 
+/// Whether quantized graphs run with integer arithmetic (the default; `OXINFER_ONNX_INT8=0`:
+/// float fake quantization, for comparisons).
+fn exact_int8() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("OXINFER_ONNX_INT8").map_or(true, |v| v != "0"))
+}
+
+/// A constant behind a `DequantizeLinear`: its integer values, scales and zero points.
+struct QConst {
+    q: Tensor,
+    scale: Vec<f32>,
+    zp: Vec<f32>,
+}
+
+/// The `DequantizeLinear` nodes of constant integer tensors, by output name.
+fn quantized_consts(nodes: &[Node], consts: &HashMap<String, Tensor>) -> HashMap<String, QConst> {
+    let mut out = HashMap::new();
+    for n in nodes.iter().filter(|n| n.op == "DequantizeLinear") {
+        let get = |i: usize| n.inputs.get(i).filter(|x| !x.is_empty()).and_then(|x| consts.get(x));
+        let (Some(q), Some(s)) = (get(0), get(1)) else { continue };
+        if !matches!(q.dtype, INT8 | UINT8 | INT32) {
+            continue;
+        }
+        let zp = get(2).map_or_else(|| vec![0.0; s.len()], |z| z.data.clone());
+        out.insert(
+            n.outputs[0].clone(),
+            QConst {
+                q: q.clone(),
+                scale: s.data.clone(),
+                zp,
+            },
+        );
+    }
+    out
+}
+
+/// Marks the quantized `Conv` / `Add` nodes to run with integer arithmetic ([`Exact`]): a `Conv`
+/// (int8 weights per output channel with zero points 0, an int32 bias of scale `s_in *
+/// w_scale`, the input and output fake-quantized, a `Relu` only where the output's zero point
+/// is its minimum) or an `Add` of two fake-quantized tensors with a fake-quantized output.
+/// Sums that could reach 2^24 (where f32 stops being exact) keep the float path.
+fn exactify(nodes: &mut [Node], qc: &HashMap<String, QConst>) {
+    // (scale, zero point) of the values each fake-quantized tensor holds.
+    let mut qp: HashMap<String, (f32, f32)> = HashMap::new();
+    for n in nodes.iter_mut() {
+        let fq = match n.posts.last() {
+            Some(&Post::FakeQuant { s, zp, lo, hi, s2, zp2 }) if s == s2 && zp == zp2 => Some(Requant { zp, lo, hi, s2, zp2 }),
+            _ => None,
+        };
+        if let Some(out) = fq {
+            let posts_ok = match n.posts.as_slice() {
+                [Post::FakeQuant { .. }] => true,
+                [Post::Relu, Post::FakeQuant { .. }] => n.op == "Conv" && out.zp == out.lo,
+                _ => false,
+            };
+            let exact = match (posts_ok, n.op.as_str()) {
+                (true, "Conv") => conv_exact(n, qc, &qp, out),
+                (true, "Add") => match (qp.get(&n.inputs[0]), n.inputs.get(1).and_then(|b| qp.get(b))) {
+                    (Some(&(sa, _)), Some(&(sb, _))) => Some(Exact::Add {
+                        sa,
+                        sb,
+                        rac: sa / out.s2,
+                        rbc: sb / out.s2,
+                        zc: out.zp,
+                        out: Requant { zp: 0.0, ..out },
+                    }),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(e) = exact {
+                n.exact = Some(Box::new(e));
+                n.posts.clear();
+            }
+            for o in &n.outputs {
+                qp.insert(o.clone(), (out.s2, out.zp2));
+            }
+        }
+    }
+}
+
+/// [`Exact::Conv`] for a `Conv` node whose output rounds as `out`, when it qualifies.
+fn conv_exact(n: &Node, qc: &HashMap<String, QConst>, qp: &HashMap<String, (f32, f32)>, out: Requant) -> Option<Exact> {
+    let &(s_in, _) = qp.get(n.inputs.first()?)?;
+    let w = qc.get(n.inputs.get(1)?)?;
+    let cout = *w.q.shape.first()?;
+    if w.q.dtype != INT8 || w.scale.len() != cout || w.zp.iter().any(|&z| z != 0.0) {
+        return None;
+    }
+    let bias = match n.inputs.get(2).filter(|b| !b.is_empty()) {
+        None => vec![0.0; cout],
+        Some(b) => {
+            let b = qc.get(b)?;
+            let ok = b.q.dtype == INT32
+                && b.q.len() == cout
+                && b.zp.iter().all(|&z| z == 0.0)
+                && b.scale.len() == cout
+                && b.scale.iter().zip(&w.scale).all(|(&bs, &ws)| ((bs - s_in * ws) / bs).abs() < 1e-5);
+            if !ok {
+                return None;
+            }
+            b.q.data.clone()
+        }
+    };
+    // |sum| <= 255 sum|w| + |bias| per channel: exact in f32 below 2^24.
+    let k = w.q.len() / cout;
+    let max = (0..cout)
+        .map(|c| 255.0 * w.q.data[c * k..(c + 1) * k].iter().map(|v| v.abs() as f64).sum::<f64>() + bias[c].abs() as f64)
+        .fold(0f64, f64::max);
+    if max >= (1u32 << 24) as f64 {
+        return None;
+    }
+    let mult = w.scale.iter().map(|&ws| s_in * ws / out.s2).collect();
+    let mut wt = w.q.clone();
+    wt.ints = None;
+    wt.dtype = FLOAT;
+    Some(Exact::Conv {
+        w: wt,
+        bias,
+        mult,
+        s_in,
+        out,
+    })
+}
+
 /// A per-tensor quantization's (scale, zero point, range) from a node's constant inputs.
 fn qparams_const(n: &Node, consts: &HashMap<String, Tensor>) -> Option<(f32, f32, f32, f32)> {
     let s = consts.get(n.inputs.get(1)?)?;
@@ -1137,6 +1351,7 @@ fn fuse(nodes: Vec<Node>, consts: &HashMap<String, Tensor>, outputs: &[String]) 
                 outputs: nodes[j].outputs.clone(),
                 attrs: HashMap::new(),
                 posts: vec![Post::FakeQuant { s, zp, lo, hi, s2, zp2 }],
+                exact: None,
             });
             continue;
         }
@@ -1480,7 +1695,14 @@ fn run_node(n: &Node, mut ins: Vec<Arg>, conv: Option<&ConvPlan>) -> Result<Vec<
             a.dtype = FLOAT;
             return Ok(vec![a]);
         }
-        "Add" => return Ok(vec![binary(&mut ins, op, &n.posts, |a, b| a + b)?]),
+        "Add" => {
+            if let Some(Exact::Add { sa, sb, rac, rbc, zc, out }) = n.exact.as_deref() {
+                let (sa, sb, rac, rbc, zc) = (*sa, *sb, *rac, *rbc, *zc);
+                let f = move |a: f32, b: f32| rac * (a / sa).round_ties_even() + rbc * (b / sb).round_ties_even() + zc;
+                return Ok(vec![binary(&mut ins, op, &[Post::Requant(*out)], f)?]);
+            }
+            return Ok(vec![binary(&mut ins, op, &n.posts, |a, b| a + b)?]);
+        }
         "Sub" => binary(&mut ins, op, &[], |a, b| a - b)?,
         "Mul" => binary(&mut ins, op, &[], |a, b| a * b)?,
         "Div" => binary(&mut ins, op, &[], |a, b| a / b)?,
@@ -1756,10 +1978,40 @@ fn run_node(n: &Node, mut ins: Vec<Arg>, conv: Option<&ConvPlan>) -> Result<Vec<
 /// `Resize` in mode `nearest` (opset 11+ inputs: X, roi, scales, sizes) over the last two axes.
 fn resize_nearest(n: &Node, ins: &[Arg]) -> Result<Tensor> {
     let a = input(ins, 0, "Resize")?;
+    let (out_shape, ys, xs) = resize_plan(n, ins, &a.shape)?;
+    let (nb, c, h, w) = (a.shape[0], a.shape[1], a.shape[2], a.shape[3]);
+    let (oh, ow) = (out_shape[2], out_shape[3]);
+    let mut data = vec![0f32; nb * c * oh * ow];
+    if a.is_cl() {
+        let par = nb * oh > 1 && data.len() > 65536;
+        crate::kernels::for_chunks(&mut data, ow * c, par, |r, out| {
+            let (i, y) = (r / oh, r % oh);
+            let row = &a.data[(i * h + ys[y]) * w * c..(i * h + ys[y] + 1) * w * c];
+            for (x, &sx) in xs.iter().enumerate() {
+                out[x * c..(x + 1) * c].copy_from_slice(&row[sx * c..(sx + 1) * c]);
+            }
+        });
+        return Ok(Tensor::new(out_shape, data).with_layout(true));
+    }
+    let par = nb * c > 1 && data.len() > 65536;
+    crate::kernels::for_chunks(&mut data, oh * ow, par, |plane, out| {
+        let s = &a.data[plane * h * w..(plane + 1) * h * w];
+        for (y, &sy) in ys.iter().enumerate() {
+            for (x, &sx) in xs.iter().enumerate() {
+                out[y * ow + x] = s[sy * w + sx];
+            }
+        }
+    });
+    Ok(Tensor::new(out_shape, data))
+}
+
+/// A nearest `Resize` of an input of `shape`: the output shape and each output row's and
+/// column's source.
+fn resize_plan(n: &Node, ins: &[Arg], shape: &[usize]) -> Result<(Vec<usize>, Vec<usize>, Vec<usize>)> {
     if n.str("mode").unwrap_or("nearest") != "nearest" {
         bail!("Resize: only mode nearest is supported");
     }
-    let rank = a.shape.len();
+    let rank = shape.len();
     if rank != 4 {
         bail!("Resize: 4-D tensors only");
     }
@@ -1770,22 +2022,18 @@ fn resize_nearest(n: &Node, ins: &[Arg]) -> Result<Tensor> {
                 bail!("Resize: {} scales for rank {rank}", s.len());
             }
             (
-                a.shape
-                    .iter()
-                    .zip(&s.data)
-                    .map(|(&d, &k)| (d as f32 * k).floor() as usize)
-                    .collect(),
+                shape.iter().zip(&s.data).map(|(&d, &k)| (d as f32 * k).floor() as usize).collect(),
                 s.data.clone(),
             )
         }
         (_, Some(sz)) if sz.len() == rank => {
             let o: Vec<usize> = sz.ints().iter().map(|&v| v as usize).collect();
-            let sc = o.iter().zip(&a.shape).map(|(&o, &i)| o as f32 / i as f32).collect();
+            let sc = o.iter().zip(shape).map(|(&o, &i)| o as f32 / i as f32).collect();
             (o, sc)
         }
         _ => bail!("Resize without scales or sizes"),
     };
-    let (nb, c, h, w) = (a.shape[0], a.shape[1], a.shape[2], a.shape[3]);
+    let (nb, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
     let (oh, ow) = (out_shape[2], out_shape[3]);
     if out_shape[0] != nb || out_shape[1] != c {
         bail!("Resize: only spatial resizing is supported");
@@ -1814,28 +2062,7 @@ fn resize_nearest(n: &Node, ins: &[Arg]) -> Result<Tensor> {
     };
     let ys: Vec<usize> = (0..oh).map(|y| src(y, sc[2], h, oh)).collect::<Result<_>>()?;
     let xs: Vec<usize> = (0..ow).map(|x| src(x, sc[3], w, ow)).collect::<Result<_>>()?;
-    let mut data = vec![0f32; nb * c * oh * ow];
-    if a.is_cl() {
-        let par = nb * oh > 1 && data.len() > 65536;
-        crate::kernels::for_chunks(&mut data, ow * c, par, |r, out| {
-            let (i, y) = (r / oh, r % oh);
-            let row = &a.data[(i * h + ys[y]) * w * c..(i * h + ys[y] + 1) * w * c];
-            for (x, &sx) in xs.iter().enumerate() {
-                out[x * c..(x + 1) * c].copy_from_slice(&row[sx * c..(sx + 1) * c]);
-            }
-        });
-        return Ok(Tensor::new(out_shape, data).with_layout(true));
-    }
-    let par = nb * c > 1 && data.len() > 65536;
-    crate::kernels::for_chunks(&mut data, oh * ow, par, |plane, out| {
-        let s = &a.data[plane * h * w..(plane + 1) * h * w];
-        for (y, &sy) in ys.iter().enumerate() {
-            for (x, &sx) in xs.iter().enumerate() {
-                out[y * ow + x] = s[sy * w + sx];
-            }
-        }
-    });
-    Ok(Tensor::new(out_shape, data))
+    Ok((out_shape, ys, xs))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2238,6 +2465,65 @@ mod tests {
             for co in 0..2 {
                 let c = a * wq[co * 2] as f32 * ws[co] + b * wq[co * 2 + 1] as f32 * ws[co];
                 assert!((y.data[co * 3 + p] - fq(c, 0.05, 0.0)).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn qdq_integer_arithmetic() {
+        // A quantized conv (int8 weights, int32 bias) and a quantized add, run as ONNX Runtime's
+        // QLinearConv / QLinearAdd compute them: integer sums, float(sum) * (s_in * ws / s_out)
+        // rounded half to even; the add as rac (qa - za) + rbc (qb - zb) + zc in f32.
+        let wq = [10i64, -20, 30, -40];
+        let ws = [0.01f32, 0.02];
+        let (s, z, s2, z2, s3, z3) = (1.0f32 / 127.5, 128.0f32, 0.05f32, 3.0f32, 0.07f32, 1.0f32);
+        let bq = [7i64, -9];
+        let m = model(
+            &[
+                node("DequantizeLinear", &["wq", "ws", "wz"], &["w"], &[("axis", A::I(0))]),
+                node("DequantizeLinear", &["bq", "bs", "bz"], &["b"], &[("axis", A::I(0))]),
+                node("QuantizeLinear", &["x", "s", "z"], &["xq"], &[]),
+                node("DequantizeLinear", &["xq", "s", "z"], &["xd"], &[]),
+                node("Conv", &["xd", "w", "b"], &["c"], &[]),
+                node("QuantizeLinear", &["c", "s2", "z2"], &["cq"], &[]),
+                node("DequantizeLinear", &["cq", "s2", "z2"], &["cd"], &[]),
+                node("Add", &["cd", "cd"], &["a"], &[]),
+                node("QuantizeLinear", &["a", "s3", "z3"], &["aq"], &[]),
+                node("DequantizeLinear", &["aq", "s3", "z3"], &["y"], &[]),
+            ],
+            &[
+                tensor("wq", &[2, 2, 1, 1], 3, &[], &wq),
+                tensor("ws", &[2], 1, &ws, &[]),
+                tensor("wz", &[2], 3, &[], &[0, 0]),
+                tensor("bq", &[2], 6, &[], &bq),
+                tensor("bs", &[2], 1, &[s * ws[0], s * ws[1]], &[]),
+                tensor("bz", &[2], 6, &[], &[0, 0]),
+                tensor("s", &[], 1, &[s], &[]),
+                tensor("z", &[], 2, &[], &[128]),
+                tensor("s2", &[], 1, &[s2], &[]),
+                tensor("z2", &[], 2, &[], &[3]),
+                tensor("s3", &[], 1, &[s3], &[]),
+                tensor("z3", &[], 2, &[], &[1]),
+            ],
+            &["x"],
+            &["y"],
+        );
+        let m = Model::parse(&m).unwrap();
+        if !exact_int8() {
+            return;
+        }
+        let x = vec![0.3, -0.7, 0.9, 0.1, -1.0, 0.25];
+        let y = m.run(vec![("x", Tensor::new(vec![1, 2, 1, 3], x.clone()))]).unwrap().remove(0);
+        let q = |v: f32, s: f32, z: f32| ((v / s).round_ties_even() + z).clamp(0.0, 255.0);
+        for p in 0..3 {
+            let (a, b) = (q(x[p], s, z) - z, q(x[3 + p], s, z) - z);
+            for co in 0..2 {
+                let acc = a as i64 * wq[co * 2] + b as i64 * wq[co * 2 + 1] + bq[co];
+                let cq = ((acc as f32 * (s * ws[co] / s2)).round_ties_even() + z2).clamp(0.0, 255.0) - z2;
+                let r = s2 / s3;
+                let v = (r * cq + r * cq) + z3;
+                let want = (v.round_ties_even().clamp(0.0, 255.0) - z3) * s3;
+                assert_eq!(y.data[co * 3 + p], want, "pixel {p} channel {co}");
             }
         }
     }
