@@ -459,7 +459,9 @@ CUDA](#rtx-5080-cuda-november-2026).
 ## Comparison with llama.cpp
 
 (Speculative decoding with DSpark drafts against llama.cpp master: see
-[DSpark drafts for Qwen and Gemma 4](qwen.md#dspark-drafts-for-qwen-and-gemma-4).)
+[DSpark drafts for Qwen and Gemma 4](qwen.md#dspark-drafts-for-qwen-and-gemma-4). CUDA on a
+DGX Spark's GB10 against llama.cpp's CUDA backend, at 64 to 8192 prompt tokens with the CPU
+beside: [Prompts on the GB10](platforms.md#prompts-on-the-gb10).)
 
 #### llama-bench matrix (November 2026)
 

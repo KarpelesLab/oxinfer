@@ -410,8 +410,11 @@ and models whose weights do not all fit in VRAM. Gemma GGUF files go through the
 (their sandwich norm one token at a time in a prefill plan) and were not run: none is on this
 machine. Prefill plans exist for GGUF weights and for bf16 matrices (a safetensors checkpoint
 loaded without `--quant`: its rows are the ggml BF16 format's, read by that format's GEMM and
-matvec, the prompt's LM head included); oxinfer's Q8 / Q4 (`--quant`) and MLX affine Q4 prompts
-keep the op-by-op path.
+matvec, the prompt's LM head included). oxinfer's Q8 / Q4 (`--quant`) take the fast plans
+through the same kernels with their block scales read in place (`K_OQ8`, `K_OQ4`), and the
+prompt's LM head with them; with `gpu_exact=1`, with experts, a LoRA or a sandwich norm in the
+graph, and for MLX affine Q4, those prompts keep the op-by-op path (measured on a DGX Spark:
+[Prompts on the GB10](#prompts-on-the-gb10)).
 
 **Prompts of bf16 models, Gated DeltaNet layers, head dimension 256** (RTX 5080; the numbers and
 the commands are under [RTX 5080, CUDA](performance.md#rtx-5080-cuda-november-2026)). A prefill
@@ -731,6 +734,11 @@ logits on the three devices below, and the kernels match their f64 definitions i
 | Qwen3.5-0.8B bf16, one image (448 x 336, 140 image tokens) | CUDA / Vulkan | 6.4e-5 / 8.2e-5 (KL 2e-12) | yes / yes |
 | SD-Turbo, 512 x 512, one step | CUDA (convolutions, norms, attention) | image 79.8 dB against the CPU's (535 pixels differ, by 1); `OXINFER_GPU_CHECK=1` worst rel L2: attention 1.6e-6, conv+norm 1.4e-6, linear+norm 2.6e-7 | |
 
+(The CUDA rows for bf16, `--quant q8` and `--quant q4` are those of the op-by-op prompt path,
+which `OXINFER_PREFILL_GPU=0` still runs: by default their prompts of 32 tokens and more now
+take the prefill plans, f16 operands as the GGUF plans do. What that moves here is measured in
+[Prompts on the GB10](#prompts-on-the-gb10).)
+
 How to read the rows that are not bit-identical:
 
 - *The long bf16 prompt on CUDA.* CUDA also takes the first chunk's attention, which sums in
@@ -923,7 +931,202 @@ master and with the CPU, and what was not kept are in
 [inkling.md](inkling.md#dgx-spark-gb10-unified-memory).
 
 **Not run on this machine:** the affine-Q4 MLX checkpoints, MoE models other than Inkling-2
-Mini, GGUF files other than Llama-3.2-1B Q4_K_M, Qwen3.8-27B UD-Q3_K_XL / UD-Q4_K_M and
+Mini, GGUF files other than Llama-3.2-1B Q4_K_M / Q8_0, Qwen3.8-27B UD-Q3_K_XL / UD-Q4_K_M and
 Inkling-2 Mini's, Inkling-2 Small (MiniMax-H3 ran one clip, above), Whisper, the image and
 video pipelines other than SD-Turbo and that clip, speculative decoding, streamed weights and
 the server with a model.
+
+### Prompts on the GB10
+
+A second round on the same machine (November 27 and 28), on prompts. It ran beside the round on
+the RTX 5080 ([RTX 5080, CUDA](performance.md#rtx-5080-cuda-november-2026)), which gave the
+plans bf16 weights, the attention at head dimension 256, the Gated DeltaNet rule in separate
+launches and the keys' and values' room for a whole prompt; "master" below is the tree with
+that round (`f742f89`), measured here, and "first" the tree both rounds started from
+(`b36e8a1`). One GPU job ran at a time (the machine's lock; other agents' CPU jobs ran beside,
+load averages 1 to 20). Commands:
+
+```sh
+# tok/s at 64 / 512 / 2048 / 8192 prompt tokens and 128 decoded, median of 3 after a warm-up
+cargo run --release --example parity_bench -- MODEL device=cuda lookup=0 draft=none mtp=0 \
+    pp=64,512,2048,8192 tg=128            # device=cpu for the CPU rows; quant=q4 / q8 as said
+llama-bench -m FILE.gguf -ngl 99 -p 64,512,2048,8192 -n 128 -r 3      # llama.cpp master 94f3af3
+# where a 512-token step goes: every op synchronized, GPU time per kind of op, host time around
+OXINFER_CUDA_DECODE_TRACE=2 cargo run --release --example parity_bench -- MODEL device=cuda pp=512 tg=0 reps=1
+```
+
+`MODEL` was the file or folder under `~/.cache/oxinfer/hub` (a repository name asks the hub at
+every load, which the site's link did not always answer).
+
+**What this round changed**, each on master's tree:
+
+- *A read past the last Q8_0 block.* Qwen3.8-27B UD-Q4_K_M ran on the CPU with `device=cuda`,
+  without a message: 68 / 77 / 65 tok/s at 64 / 512 / 2048 prompt tokens on master (the GPU at
+  0%; the CPU alone 68 / 80 / 77, and 7.3 decoding). The int8 matvec of the decode plans loaded
+  nine aligned words around a block's 32 bytes, two to four bytes past a Q8_0 block's end; a
+  1024 x 5120 Q8_0 matrix is 1360 pages of 4 KiB, the page after it was not mapped, the first
+  decode step faulted (`CUDA_ERROR_ILLEGAL_ADDRESS`, which stays with the context) and every
+  later step was declined. The ninth word is now the block's last two bytes; a failed copy to
+  the device is a recorded warning, and `OXINFER_GPU_PLAN_DEBUG=1` names the first op after
+  which the device reports an error. The file then runs at 315 / 784 / 790 / 763 and 11.2.
+  (UD-Q3_K_XL has Q8_0 matrices of that size too and did not fault: where an allocation ends
+  is the driver's.)
+- *A plan for Q8 and Q4 weights* (`--quant`; master's plans take GGUF and bf16). Their prompts
+  ran op by op, an f32 GEMM without the tensor cores per matmul and every output through the
+  host. Fast plans now take them through the kernels the GGUF formats have (`K_OQ8`, `K_OQ4`:
+  the stored values with their block scales read in place, Q4's as the checkpoint's f16).
+  `gpu_exact=1`, affine Q4, and graphs with experts, a LoRA or a sandwich norm keep the
+  op-by-op path. Qwen3.5-9B `--quant q4` at 64 / 512 / 2048 / 8192 tokens: 344 / 415 / 391 /
+  306 -> 910 / 2290 / 2340 / 2246; `--quant q8` 343 / 424 / 401 / 311 -> 716 / 1970 / 2015 /
+  1966.
+- *The LM head after a Q8 or Q4 prompt* on the device (master's takes bf16 and GGUF): unless
+  `gpu_exact`, a matrix of 32768 outputs and more alone; a draft's layers in those formats stay
+  on the CPU. `--quant q4` 910 / 2290 / 2340 / 2246 -> 952 / 2355 / 2383 / 2265; `--quant q8`
+  716 / 1970 / 2015 / 1966 -> 767 / 2011 / 2065 / 1980.
+- *Weights read twice per step* (unified memory only). The stream-K GEMM's 256 x 128 tiles
+  read each weight once per 256 rows. For bf16 that read is the bound here (`ggml_bench`, 512
+  rows: BF16 17408 x 5120 at 36.6 TFLOP/s where Q4_K reaches 69.2), so matrices of 8 bits a
+  weight and more, of 16 MB and more, take 512 x 64 tiles (`gemmhk5_K`: a weight read once per
+  512 rows, the activations' tile for every 64 outputs; `OXINFER_CUDA_GEMM_512=0` / `1` never /
+  always). `ggml_bench`, 256 x 128 -> 512 x 64, TFLOP/s: BF16 17408 x 5120 36.6 -> 51.1, 5120
+  x 17408 38.9 -> 50.6, 8192 x 2048 31.6 -> 43.4; Q6_K 57.6 -> 57.9, 52.8 -> 53.9, 46.0 ->
+  49.1; Q4_K 69.2 -> 60.6, 52.7 -> 60.4, 56.2 -> 50.4; IQ4_XS 62.4 -> 51.9; IQ3_S 58.2 -> 49.2
+  (the tree before the rebase on master; the kernel is the same). Prompts with it off / by
+  default at 512 / 2048 / 8192 tokens: Qwen3.5-9B bf16 1665 / 1710 / 1693 -> 2014 / 2032 /
+  2001; `--quant q8` 1992 / 2004 / 1956 -> 2055 / 2095 / 2039; Llama-3.2-1B Q8_0 11917 / 13087
+  / 12385 -> 12081 / 13212 / 12457. On every format (`=1`, the earlier tree) the block formats
+  lost 5 to 10% (Llama-3.2-1B Q4_K_M 14529 -> 13826 at 512 tokens, Qwen3.5-9B `--quant q4`
+  2447 -> 2283, the 27B's UD-Q4_K_M 830 -> 769 and UD-Q3_K_XL 840 -> 759) and Qwen3.5-0.8B's
+  bf16 matrices, 13 MB and less, 2%. On an RTX 5080 (shared at the time) `ggml_bench` has the
+  tile 4 to 6% behind on Q4_K's six shapes: discrete cards keep 256 x 128.
+- *Steps of 512 tokens for every model* (unified memory only). A graph of at most 100,000
+  activation floats a token now takes steps of 1024 (`OXINFER_GPU_PLAN_DEBUG=1` prints the
+  figure: Llama-3.2-1B 29706, Qwen3.5-0.8B 35879, Qwen3.5-9B 79943, Qwen3.8-27B 109671).
+  `OXINFER_CUDA_PREFILL_TOKENS=512` / default, one build, 512 / 1024 / 2048 / 8192 tokens:
+  Qwen3.5-0.8B 11335 / 11888 / 12067 / 11513 -> 11467 / 13139 / 13557 / 12754; Llama-3.2-1B
+  Q4_K_M 13745 / 13986 / 13895 / 13131 -> 13647 / 14734 / 14900 / 14017; Qwen3.5-9B `--quant
+  q4` 2433 / 2466 / 2455 / 2354 -> 2429 / 2462 / 2453 / 2386. The 27B with steps of 512 / 1024
+  / 2048 (UD-Q3_K_XL at 2048 tokens, the earlier tree): 847 / 829 / 816, so it keeps 512.
+- *The delta rule's recurrence with many value heads* (unified memory only). Master's
+  recurrence runs a warp per column of a head's state, 32 x 48 blocks of 128 threads for the
+  27B on this GPU's 48 SMs. The rule of a 512-token step, by recurrence kernel, Qwen3.5-0.8B
+  (16 value heads, 18 layers) / Qwen3.5-9B (32, 24) / Qwen3.8-27B (48, 48), ms: a warp per
+  column 10.8 / 25.7 / 75, a thread per column (`OXINFER_CUDA_GDN_SPLIT=exact`) 19.2 / 28.6 /
+  66.8, the one kernel (`=0`) 23.6 / 36.6 / 80. `dgdn_seqb` keeps a block per value head, the
+  head's state over 512 threads' registers, three barriers a token and the token's normed
+  query and key in shared memory, the next token's rows prefetched, in the thread-per-column
+  kernel's order (its states and outputs bit for bit, `dgdn_rule_split_matches`): 15.4 ms on the 9B and 34 on the 27B.
+  It is taken here from 32 value heads on (`OXINFER_CUDA_GDN_SPLIT=warp` / `block` takes one
+  always; discrete cards keep the warps). With the warps / by default, one build, 512 / 2048 /
+  8192 tokens: Qwen3.5-9B `--quant q4` 2358 / 2391 / 2312 -> 2435 / 2491 / 2415; bf16 1988 /
+  1993 / 1987 -> 2038 / 2056 / 2009; the 27B's UD-Q3_K_XL 787 / 791 / 765 -> 830 / 844 / 817;
+  UD-Q4_K_M 776 / 781 / 762 -> 830 / 836 / 811.
+
+**Where it stands.** tok/s at 64 / 512 / 2048 / 8192 prompt tokens, then decoding 128 tokens;
+the CPU rows are oxinfer's (20 threads; `--quant q4` and the 27B: one pass, 32 tokens decoded).
+
+| | | pp64 | pp512 | pp2048 | pp8192 | decode |
+|---|---|---:|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | first | 4934 | 14636 | 14412 | 10256 | 220.9 |
+| | master | 4957 | 14607 | 14670 | 13412 | 220.7 |
+| | now | 5084 | 13834 | 15080 | 14204 | 215.6 |
+| | llama.cpp | 8203 | 21039 | 22293 | 20223 | 242.5 |
+| | CPU | 1208 | 1384 | 1073 | 526 | 126.6 |
+| Qwen3.5-0.8B bf16 | first | 794 | 2168 | 2108 | 1399 | 116.0 |
+| | master | 3102 | 11048 | 11806 | 11240 | 119.4 |
+| | now | 3123 | 11005 | 12720 | 12144 | 115.6 |
+| | CPU | 759 | 849 | 807 | 719 | 73.3 |
+| Qwen3.5-9B bf16 | first | 192 | 443 | 414 | 320 | 13.7 |
+| | master | 569 | 1650 | 1710 | 1653 | 13.8 |
+| | now | 588 | 2062 | 2080 | 2056 | 13.8 |
+| Qwen3.5-9B `--quant q4` | first | 342 | 412 | 390 | 303 | 43.2 |
+| | master | 344 | 415 | 391 | 306 | 41.9 |
+| | now | 965 | 2435 | 2509 | 2416 | 42.3 |
+| | CPU | 259 | 295 | 283 | | 25.2 |
+| Qwen3.5-9B `--quant q8` | master | 343 | 424 | 401 | 311 | 22.9 |
+| | now | 755 | 2142 | 2218 | 2155 | 23.0 |
+| Qwen3.8-27B UD-Q4_K_M | master (on the CPU, above) | 68 | 77 | 65 | | |
+| | now | 320 | 821 | 835 | 810 | 11.2 |
+| | llama.cpp | 552 | 1013 | 1012 | 984 | 13.2 |
+| | CPU | 68 | 80 | 77 | | 7.3 |
+| Qwen3.8-27B UD-Q3_K_XL | master | 284 | 791 | 794 | 772 | 12.7 |
+| | now | 285 | 832 | 845 | 817 | 12.8 |
+| | llama.cpp | 552 | 996 | 998 | 968 | 16.1 |
+| Inkling-2 Mini AD-Q4_K (its own engine, unchanged; the first tree) | | 238 | 836 | 949 | 879 | 42.2 |
+| | llama.cpp (`-fa 1`) | 512 | 812 | 634 | 511 | 36.0 |
+| | CPU (`prefill_gemm=fast`) | 84 | 142 | 143 | | 19.8 |
+
+(Master's 27B UD-Q4_K_M run was stopped during the 8192-token prompts. The "now" rows are one
+run of the tree that carries all of the above.) Against llama.cpp on the same
+files that is 0.62 / 0.66 / 0.68 / 0.70 on Llama-3.2-1B's prompts and 0.89 decoding, 0.58 /
+0.81 / 0.83 / 0.82 and 0.85 on the 27B's UD-Q4_K_M, 0.52 / 0.84 / 0.85 / 0.84 and 0.80 on its
+UD-Q3_K_XL. Master and this tree run in turn (three rounds
+on Llama-3.2-1B, two on Qwen3.5-0.8B, medians of 3): Llama-3.2-1B 13653-13925 / 13888-14012 at
+512 tokens, 14284-14538 / 15092-15342 at 2048, 13229-13361 / 14105-14357 at 8192;
+Qwen3.5-0.8B 11094-11129 / 10950-10994 at 512, 11730-11930 / 12765-12909 at 2048, 11264-11289
+/ 12093-12154 at 8192; at 64 tokens 4841-5282 / 4853-5211 and 3151-3175 / 3089-3094. The
+1024-token steps are what moves these two, from 1024 tokens on.
+
+**A 512-token step now** (ms of GPU time per kind of op, each op synchronized; then all of a
+prompt of that length in the same run):
+
+| | GEMMs | delta rule | its convolution | attention | activations | norms | RoPE | step | prompt |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | 24.0-24.7 | | | 0.8-0.9 | 3.4-3.5 | 1.1 | 0.8-0.9 | 32.0-33.0 | 36.2 |
+| Qwen3.5-0.8B bf16 | 22.2-22.3 | 10.3-10.5 | 2.2 | 0.7-0.8 | 1.2-1.3 | 1.0-1.1 | 0.3 | 38.5-38.9 | 44.8 |
+| Qwen3.5-9B `--quant q4` | 149-151 | 15.2-15.6 | 3.7-3.8 | 1.9 | 11.1-11.2 | 4.1 | 0.9 | 187-191 | 201 |
+| Qwen3.5-9B bf16 | 173-174 | 15.5 | 3.6 | 2.0-2.3 | 11.0 | 4.4-4.5 | 0.9 | 213-217 | 232 |
+| Qwen3.8-27B UD-Q4_K_M | 475-478 | 34.1-34.4 | 8.9-9.1 | 5.7-6.0 | 32.1-32.2 | 10.9 | 2.4-2.5 | 572-578 | 600 |
+| Qwen3.8-27B UD-Q3_K_XL | 473-474 | 33.8-34.1 | 8.9-9.0 | 5.8-6.1 | 32.1 | 10.9-11.3 | 2.4-2.7 | 565-571 | 592 |
+
+**Agreement** (`examples/pf_check.rs`: raw corpus text cut to 512 and to 1500 tokens, 32 greedy
+tokens, the top 20 log-probabilities of the first step, which is the prompt's; against the CPU
+with `prefill_gemm=exact`, its f32 prompt GEMM, and the same for `gpu_exact=1`, the exact plans
+for GGUF and bf16 weights and the op-by-op path for Q8 / Q4):
+
+| | default against the CPU's f32 prompt: first step, largest difference | 32 tokens | `gpu_exact=1` against the CPU's | 32 tokens |
+|---|---|---|---|---|
+| Qwen3.5-0.8B bf16 | 4.4e-3 / 3.6e-3 | same / same | 2.8e-5 / 2.5e-5 | same / same |
+| Qwen3.5-9B bf16 | 6.7e-3 / 2.9e-3 | same / same | 3.6e-5 / 3.5e-5 | same / same |
+| Qwen3.5-9B `--quant q4` | 3.8e-2 / 1.9e-2 | 2 of 32 / same | 5.3e-2 / 2.6e-2 | same / 1 of 32 |
+| Llama-3.2-1B Q4_K_M | 2.0e-2 / 3.7e-2 | same / 14 of 32 | 1.6e-2 / 3.5e-2 | same / 5 of 32 |
+| Qwen3.8-27B UD-Q4_K_M | 2.9e-2 / 1.9e-2 | same / same | 2.7e-2 / 2.0e-2 | 2 of 32 / same |
+
+Where the 32 tokens part, both paths do so on one prompt or the other: the decode steps after
+the prompt round differently on the two devices (f32 activations here, int8 on the CPU for
+quantized weights). The 29 CUDA tests of the library (`cargo test --profile ci --lib
+cuda::`) pass on the GB10 on this tree, among them the Q8 / Q4 plans against single-token steps
+(`quant_weights_prefill_plan_matches_single_token_steps`), their LM head's rows, the 512 x 64
+tile in every ggml format and the recurrence kernels against each other.
+
+**Measured and not kept, or left as it was** (the earlier tree, before the rebase).
+`OXINFER_CUDA_STREAM_K=0` (Llama-3.2-1B 14442 -> 13805 tok/s at 512 tokens, the 27B UD-Q3_K_XL
+844 -> 551), `OXINFER_CUDA_GEMM_256=0` (13381 and 564), `OXINFER_CUDA_KV_ASYNC=0` (13601) and
+steps of 256 tokens (12640): the defaults stay. Steps of 2048 tokens against 1024, at 2048 /
+8192 prompt tokens: Llama-3.2-1B 16172 against 15208 and 10602 against 10582, Qwen3.5-0.8B
+14004 against 13606 and 11141 against 11646; 1024 was taken, with half the arena. The 512 x 64
+tile for the 4-bit and 3-bit formats (above). This round's own attention at head dimension
+256, delta rule in three launches, convolution per token and bf16 plans were the same work as
+master's and gave way to it; of them only the recurrence kernel above came back, where it
+measured ahead.
+
+**What is left**, by size:
+
+- *The GEMM kernel.* It is 57 to 83% of a step (the table), at 40 to 69 TFLOP/s on Q4_K by
+  shape (`ggml_bench`: 2048 x 2048 40.6, 8192 x 2048 56.2, 2048 x 8192 64.3, 17408 x 5120 69.2;
+  the 512 x 2048 key and value projections 25.4). llama.cpp takes 24.3 ms for all of a
+  512-token Llama-3.2-1B prompt, these GEMMs alone 24 ms. That kernel is the same on a
+  discrete card and was not changed here.
+- *Short prompts.* A 64-token step reads and unpacks every weight as a 512-token one does:
+  Llama-3.2-1B 9.5 of its 10.7 ms in the GEMMs (0.6 of llama.cpp at 64 tokens), and Inkling-2
+  Mini 0.26 s for 64 tokens against 0.61 s for 512, its experts' `gemmi_12` 86 ms of a 64-token
+  pass and 205 ms of a 512-token one (238 tok/s against llama.cpp's 512, where it leads from
+  512 tokens on).
+- *The activations' passes.* SiLU(gate) x up reads two f32 rows and writes one and its f16
+  copy: 3.4 ms of Llama-3.2-1B's 32 (0.2 ms a layer over rows of 16.8 MB), 11 of the 9B's
+  189, 32 of the 27B's 575; the f32 row is written whether or not anything reads
+  it again.
+- *The host around a step*: the table's last two columns; the 27B's recurrent states take 6 ms
+  of a step up and down.
+- *Decoding* is where it was: 0.79 to 0.91 of llama.cpp, the matvecs at what the section above
+  measured.

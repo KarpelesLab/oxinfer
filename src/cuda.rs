@@ -64,7 +64,7 @@ pub(crate) const GEMMHK5_SHMEM: u32 = 2 * (512 + 64) * 40 * 2;
 /// f16, f32) of [`GEMM_512_BYTES`] and more: there the 256-row tiles are bound by reading the
 /// weights twice. Measured on a DGX Spark (docs/platforms.md, "Prompts on the GB10"): bf16
 /// gains 18 to 20% on Qwen3.5-9B's prompts and Q8 5 to 6%, the 4-bit and 3-bit block formats
-/// lose 5 to 10%, and Qwen3.5-0.8B's bf16 matrices (7 MB and less) 2 to 4%. Discrete cards keep
+/// lose 5 to 10%, and Qwen3.5-0.8B's bf16 matrices (13 MB and less) 2 to 4%. Discrete cards keep
 /// the 256-row tiles (on an RTX 5080 `ggml_bench` has the 512 x 64 tile 4 to 6% behind on Q4_K;
 /// the other formats were not timed there).
 fn gemm_512(n_out: u32, n_in: u32, rb: u64) -> bool {
