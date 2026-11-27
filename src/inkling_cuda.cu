@@ -314,6 +314,13 @@ __device__ __forceinline__ float4 dq(const u8* row, u32 b, u32 j) {
 
 // Kinds whose values are multiplied by per-block scales from `W::s`.
 #define BLOCK_SCALED(K) ((K) == K_F8 || (K) == K_OQ8 || (K) == K_OQ4)
+// Block scale `i` of `s`: floats, or halves with `SCALES_F16` (the language models' Q4 weights,
+// whose device copy keeps the checkpoint's f16 scales: `cuda_decode.rs`'s prefill plans).
+#ifdef SCALES_F16
+#define BSC(s, i) h2f(((const u16*)(s))[i])
+#else
+#define BSC(s, i) ((s)[i])
+#endif
 
 __device__ __forceinline__ float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -341,7 +348,7 @@ __device__ __forceinline__ float rowdot(const W& w, const u8* row, const float* 
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             float p = v[i].x * xv[i].x + v[i].y * xv[i].y + v[i].z * xv[i].z + v[i].w * xv[i].w;
-            if constexpr (BLOCK_SCALED(K)) p *= s[(r / w.sr) * w.ncb + (32 * (b + 4 * i)) / w.sc];
+            if constexpr (BLOCK_SCALED(K)) p *= BSC(s, (r / w.sr) * w.ncb + (32 * (b + 4 * i)) / w.sc);
             acc += p;
         }
     }
@@ -349,7 +356,7 @@ __device__ __forceinline__ float rowdot(const W& w, const u8* row, const float* 
         float4 v = dq<K>(row, b, j);
         float4 xv = *(const float4*)(x + 32 * b + 4 * j);
         float p = v.x * xv.x + v.y * xv.y + v.z * xv.z + v.w * xv.w;
-        if constexpr (BLOCK_SCALED(K)) p *= s[(r / w.sr) * w.ncb + (32 * b) / w.sc];
+        if constexpr (BLOCK_SCALED(K)) p *= BSC(s, (r / w.sr) * w.ncb + (32 * b) / w.sc);
         acc += p;
     }
     return warp_sum(acc);
@@ -373,8 +380,8 @@ __device__ __forceinline__ float2 rowdot2(const W& w, const u8* ra, const u8* rb
             float p1 = v[2 * i].x * xv[i].x + v[2 * i].y * xv[i].y + v[2 * i].z * xv[i].z + v[2 * i].w * xv[i].w;
             float p2 = v[2 * i + 1].x * xv[i].x + v[2 * i + 1].y * xv[i].y + v[2 * i + 1].z * xv[i].z + v[2 * i + 1].w * xv[i].w;
             if constexpr (BLOCK_SCALED(K)) {
-                p1 *= s[(r1 / w.sr) * w.ncb + (32 * (b + 4 * i)) / w.sc];
-                p2 *= s[(r2 / w.sr) * w.ncb + (32 * (b + 4 * i)) / w.sc];
+                p1 *= BSC(s, (r1 / w.sr) * w.ncb + (32 * (b + 4 * i)) / w.sc);
+                p2 *= BSC(s, (r2 / w.sr) * w.ncb + (32 * (b + 4 * i)) / w.sc);
             }
             a1 += p1;
             a2 += p2;
@@ -386,8 +393,8 @@ __device__ __forceinline__ float2 rowdot2(const W& w, const u8* ra, const u8* rb
         float p1 = v1.x * xv.x + v1.y * xv.y + v1.z * xv.z + v1.w * xv.w;
         float p2 = v2.x * xv.x + v2.y * xv.y + v2.z * xv.z + v2.w * xv.w;
         if constexpr (BLOCK_SCALED(K)) {
-            p1 *= s[(r1 / w.sr) * w.ncb + (32 * b) / w.sc];
-            p2 *= s[(r2 / w.sr) * w.ncb + (32 * b) / w.sc];
+            p1 *= BSC(s, (r1 / w.sr) * w.ncb + (32 * b) / w.sc);
+            p2 *= BSC(s, (r2 / w.sr) * w.ncb + (32 * b) / w.sc);
         }
         a1 += p1;
         a2 += p2;
@@ -454,7 +461,7 @@ __device__ __forceinline__ void blockdots(const W& w, const u8* const* rows, con
                 p += sm.x * q;
                 if constexpr (has_min<K>()) p += sm.y * sx[hf];
             }
-            if constexpr (BLOCK_SCALED(K)) p *= s[(ri[i] / w.sr) * w.ncb + (32 * b) / w.sc];
+            if constexpr (BLOCK_SCALED(K)) p *= BSC(s, (ri[i] / w.sr) * w.ncb + (32 * b) / w.sc);
             acc[i] += p;
         }
     }
@@ -598,7 +605,7 @@ __device__ __forceinline__ void mv_body(const W& w, const float* x, float* y, u3
             u32 row = min(r0 + i, n_out - 1);
             const u8* rp = w.q + (u64)row * w.rb;
             float p = blockdot<K>(rp, b, xv, sx);
-            if constexpr (BLOCK_SCALED(K)) p *= w.s[(row / w.sr) * w.ncb + (32 * b) / w.sc];
+            if constexpr (BLOCK_SCALED(K)) p *= BSC(w.s, (row / w.sr) * w.ncb + (32 * b) / w.sc);
             a[i] += p;
         }
     }
@@ -662,7 +669,7 @@ __device__ __forceinline__ void mvp_body(const W& w, const W& w2, const float* x
                 u32 row = min(r0 + i, n_out - 1);
                 const u8* rp = ww.q + (u64)row * ww.rb;
                 float p = blockdot<K>(rp, b, xv, sx);
-                if constexpr (BLOCK_SCALED(K)) p *= ww.s[(row / ww.sr) * ww.ncb + (32 * b) / ww.sc];
+                if constexpr (BLOCK_SCALED(K)) p *= BSC(ww.s, (row / ww.sr) * ww.ncb + (32 * b) / ww.sc);
                 a[m][i] += p;
             }
         }
@@ -716,7 +723,7 @@ __device__ __forceinline__ void gate_down_body(const W& w, const float* x, const
         float4 v = dq<K>(wr, b, j);
         float4 xv = c < h ? *(const float4*)(xr + c) : *(const float4*)(mr + c - h);
         float p = v.x * xv.x + v.y * xv.y + v.z * xv.z + v.w * xv.w;
-        if constexpr (BLOCK_SCALED(K)) p *= w.s[(row / w.sr) * w.ncb + c / w.sc];
+        if constexpr (BLOCK_SCALED(K)) p *= BSC(w.s, (row / w.sr) * w.ncb + c / w.sc);
         if (c < h)
             a += p;
         else
@@ -1081,7 +1088,7 @@ __device__ __forceinline__ void gemm_body(const W& w, const GemmP& p) {
         }
         if (wok) {
             float sc = 1.f;
-            if constexpr (BLOCK_SCALED(K)) sc = sbase[(wr / w.sr) * w.ncb + (32 * b) / w.sc];
+            if constexpr (BLOCK_SCALED(K)) sc = BSC(sbase, (wr / w.sr) * w.ncb + (32 * b) / w.sc);
 #pragma unroll
             for (int i = 0; i < 4; i++) {
                 float4 v = dq<K>(wrow, b, 4 * lh + i);
@@ -1567,7 +1574,7 @@ __device__ __forceinline__ void gemmi_body(const W& w, const GemmP& p) {
             }
             float2 sm = dqs<K>(wrow, b, lh);
             if constexpr (BLOCK_SCALED(K)) {
-                float bs = sbase[(wr / w.sr) * w.ncb + (32 * b) / w.sc];
+                float bs = BSC(sbase, (wr / w.sr) * w.ncb + (32 * b) / w.sc);
                 sm.x *= bs;
                 sm.y *= bs;
             }
@@ -2031,7 +2038,7 @@ __device__ __forceinline__ void gemmh_seg(const W& w, const GemmH& p, u32 m0, u3
             return;
         }
         if constexpr (BLOCK_SCALED(K)) {
-            float sc = w.s[(wr / w.sr) * w.ncb + (32 * b) / w.sc];
+            float sc = BSC(w.s, (wr / w.sr) * w.ncb + (32 * b) / w.sc);
 #pragma unroll
             for (int i = 0; i < VPT / 4; i++) {
                 float4 v = dq<K>(wrow, b, (VPT / 4) * bh + i);

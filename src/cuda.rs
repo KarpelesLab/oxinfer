@@ -1198,12 +1198,52 @@ impl CudaBackend {
     /// [`Self::gg_kernels`] with the matvec compiled for `rows` rows per warp (`MV_ROWS`; 0: the
     /// kernel with a warp per row and four values per lane).
     fn gg_compile(&self, kind: crate::ggml::GgmlType, rows: u32) -> Option<GgKernels> {
-        let id = kind.id();
-        let threads = mv_threads(integrated());
         let q8 = {
             use crate::ggml::GgmlType::*;
             matches!(kind, Q4_K | Q6_K | Q8_0)
         };
+        self.gg_compile_id(kind.id(), &kind.to_string(), rows, q8, "")
+    }
+
+    /// A Q8 or Q4 matrix (`--quant`, not affine Q4) as the ggml kernels take it, for the fast
+    /// prefill plans, as bf16 matrices go through ggml's BF16: Q8 as
+    /// `K_OQ8` (int8 values, an f32 scale per block of 32), Q4 as `K_OQ4` over the checkpoint's
+    /// f16 block scales (`SCALES_F16`). The kernels are compiled on first use; the matvec is the
+    /// one with a warp per row (a prefill plan takes it for steps of a few tokens only).
+    fn quant_wg(&self, w: &WeightRef, cw: &CudaWeight, n_in: usize) -> Option<(GgKernels, Wg)> {
+        let (id, name, defs, rb) = match w {
+            WeightRef::Q8(_) => (200u32, "Q8", "", n_in),
+            WeightRef::Q4(m) if m.offsets.is_none() => (201, "Q4", "#define SCALES_F16 1\n", n_in / 2),
+            _ => return None,
+        };
+        let cached = self.gg.lock().unwrap().get(&id).copied();
+        let k = match cached {
+            Some(k) => k,
+            None => {
+                let k = self.gg_compile_id(id, name, 0, false, defs);
+                self.gg.lock().unwrap().insert(id, k);
+                k
+            }
+        }?;
+        Some((
+            k,
+            Wg {
+                q: cw.data,
+                s: cw.scales,
+                rb: rb as u64,
+                f: 1.0,
+                sr: 1,
+                sc: 32,
+                ncb: (n_in / 32) as u32,
+                ..Wg::default()
+            },
+        ))
+    }
+
+    /// [`Self::gg_compile`] for kernel id `id` (`K_*` in `inkling_cuda.cu`; `name` for
+    /// messages), with `defs` defined before the source; `q8`: the format has int8 matvecs.
+    fn gg_compile_id(&self, id: u32, name: &str, rows: u32, q8: bool, defs: &str) -> Option<GgKernels> {
+        let threads = mv_threads(integrated());
         let body = include_str!("inkling_cuda.cu");
         // Tests may take the kernels from a file (`ggml_bench`: no rebuild per kernel edit).
         #[cfg(test)]
@@ -1215,7 +1255,7 @@ impl CudaBackend {
             0 => (String::new(), String::new()),
             n => (format!("#define MV_ROWS {n}\n"), format!("-r{n}")),
         };
-        let src = format!("#define GGML_ONLY 1\n#define HAS_{id} 1\n{def}{}{body}", ggml_tables_src());
+        let src = format!("#define GGML_ONLY 1\n#define HAS_{id} 1\n{defs}{def}{}{body}", ggml_tables_src());
         match self.cached_module(&src, &format!("ggml-{{sm}}-{id}{tag}"), "ggml.cu") {
             Ok(module) => {
                 let get = |name: String| -> Option<*mut c_void> {
@@ -1249,7 +1289,7 @@ impl CudaBackend {
                 })
             }
             Err(e) => {
-                eprintln!("[cuda: no kernels for {kind} weights ({e}): they stay on the CPU]");
+                eprintln!("[cuda: no kernels for {name} weights ({e}): they stay on the CPU]");
                 None
             }
         }
@@ -4629,6 +4669,195 @@ mod tests {
             assert!(!ok, "a step with a non-finite activation must be declined");
             assert!(cache.len == 0 && s0.iter().chain(&s1).all(|&v| v == 0.0));
         }
+    }
+
+    /// A decode graph over Q8 and Q4 weights, and over a mix of them with bf16 (an attention
+    /// layer with a gate / up pair), as a fast prefill plan: its steps (the fast GEMM over the
+    /// stored values, 40 tokens and 60 on top of them, then steps below the GEMM's size) give the
+    /// single-token plan's hidden states, keys and values to f16's rounding. The exact prefill
+    /// plan is declined (those prompts keep the op-by-op path), and so is one over affine Q4.
+    #[test]
+    fn quant_weights_prefill_plan_matches_single_token_steps() {
+        use crate::gpu::decode::{DecodePlan, Graph, LinMode, Op, Slot, Step};
+        use crate::model::LayerCache;
+        let Some(be) = backend() else { return };
+        let (h, nh, nkv, hd, inter) = (256usize, 4usize, 2usize, 64usize, 512usize);
+        let qw = nh * hd;
+        let mut seed = 7u64;
+        // Rows of small values (outputs near 1 for inputs near 1).
+        let mut mat = |n_out: usize, n_in: usize| -> Vec<u16> {
+            (0..n_out * n_in)
+                .map(|_| half::bf16::from_f32(rnd(&mut seed) * 0.25).to_bits())
+                .collect()
+        };
+        let shapes = [(qw, h), (nkv * hd, h), (nkv * hd, h), (h, qw), (inter, h), (inter, h), (h, inter)];
+        let ws: Vec<Vec<u16>> = shapes.iter().map(|&(o, i)| mat(o, i)).collect();
+        let q8: Vec<_> = ws.iter().zip(&shapes).map(|(w, &(o, i))| quantize_bf16(w, o, i)).collect();
+        let q4: Vec<_> = ws.iter().zip(&shapes).map(|(w, &(o, i))| quantize_q4(w, o, i)).collect();
+        // q bf16, k Q8, v Q4, out Q4, gate / up Q8, down bf16; then every matrix in one format.
+        let weight = |layout: usize, i: usize| match (layout, i) {
+            (0, 0 | 6) => WeightRef::Bf16(&ws[i]),
+            (0, 1 | 4 | 5) | (1, _) => WeightRef::Q8(&q8[i]),
+            _ => WeightRef::Q4(&q4[i]),
+        };
+        let ones = vec![1f32; h];
+        let qn: Vec<f32> = (0..hd).map(|_| 1.0 + rnd(&mut seed) * 0.2).collect();
+        let n = 107usize;
+        let xin: Vec<f32> = (0..n * h).map(|_| rnd(&mut seed) * 2.0).collect();
+        let half = hd / 2;
+        let cs: Vec<f32> = (0..n)
+            .flat_map(|p| {
+                let ang = move |j: usize| p as f32 * 0.37f32.powf(j as f32 / half as f32);
+                (0..half).map(move |j| ang(j).cos()).chain((0..half).map(move |j| ang(j).sin()))
+            })
+            .collect();
+        for (layout, name) in ["mixed", "q8", "q4"].into_iter().enumerate() {
+            let wref = |i: usize| weight(layout, i);
+            let devs: Vec<DeviceWeight> = (0..shapes.len())
+                .map(|i| be.upload(&wref(i), shapes[i].0, shapes[i].1).expect("device weight"))
+                .collect();
+            let mut g = Graph::new();
+            let x = g.buf(h);
+            let hn = g.buf(h);
+            let qkv = g.buf(qw + 2 * nkv * hd);
+            let qo = g.buf(nh * hd);
+            let att = g.buf(nh * hd);
+            let act = g.buf(inter);
+            let hidden = g.buf(h);
+            (g.input, g.hidden, g.n_hidden) = (x, hidden, h);
+            g.rope_halves = vec![hd / 2];
+            g.kv = vec![(nkv, hd)];
+            let lin = |i: usize, x, y, mode| Op::Linear {
+                w: wref(i),
+                dev: &devs[i],
+                w2: None,
+                n_out: shapes[i].0,
+                n_in: shapes[i].1,
+                x,
+                y,
+                mode,
+            };
+            g.ops.push(Op::norm(x, hn, &ones, h, 1e-6));
+            g.ops.push(lin(0, hn, qkv, LinMode::Store));
+            g.ops.push(lin(1, hn, qkv.at(qw), LinMode::Store));
+            g.ops.push(lin(2, hn, qkv.at(qw + nkv * hd), LinMode::Store));
+            g.ops.push(Op::QkRope {
+                qkv,
+                q_out: qo,
+                kv: 0,
+                nh,
+                nkv,
+                hd,
+                half_rot: hd / 2,
+                q_stride: hd,
+                k_off: qw,
+                v_off: qw + nkv * hd,
+                interleaved: false,
+                q_norm: Some(&qn),
+                k_norm: Some(&qn),
+                eps: 1e-6,
+                rope: 0,
+                v_norm: false,
+                v_from_k: false,
+            });
+            g.ops.push(Op::Attend {
+                q: qo,
+                out: att,
+                kv: 0,
+                nh,
+                nkv,
+                hd,
+                scale: 0.05,
+                window: None,
+                gate: None,
+                block: None,
+            });
+            g.ops.push(lin(3, att, x, LinMode::Add));
+            g.ops.push(Op::norm(x, hn, &ones, h, 1e-6));
+            g.ops.push(Op::Linear {
+                w: wref(4),
+                dev: &devs[4],
+                w2: Some((wref(5), &devs[5])),
+                n_out: inter,
+                n_in: h,
+                x: hn,
+                y: act,
+                mode: LinMode::SiluPair,
+            });
+            g.ops.push(lin(6, act, x, LinMode::Add));
+            g.ops.push(Op::norm(x, hidden, &ones, h, 1e-6));
+            g.head_from = g.ops.len();
+            let run = |plan: &dyn DecodePlan, steps: &[usize]| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+                let mut slot = Slot(None);
+                let mut cache = LayerCache::new(nkv, hd);
+                let mut hs = vec![0f32; n * h];
+                let mut pos = 0;
+                for &t in steps {
+                    let mut kv = [&mut cache];
+                    assert!(
+                        plan.step(
+                            &mut slot,
+                            Step {
+                                pos,
+                                t,
+                                rope_cs: &cs[pos * hd..(pos + t) * hd],
+                                x: &xin[pos * h..(pos + t) * h],
+                                x2: &[],
+                                kv: &mut kv,
+                                states: &mut [],
+                                hidden: &mut hs[pos * h..(pos + t) * h],
+                                logits: None,
+                                params: None,
+                                capture: None,
+                                scratch: false,
+                                states_kept: false,
+                            },
+                        ),
+                        "{name}: step of {t} tokens at {pos}"
+                    );
+                    pos += t;
+                }
+                assert_eq!(pos, n);
+                let (k, v) = cache.data();
+                (hs, k.to_vec(), v.to_vec())
+            };
+            let one = decode::with_pf_exact(true, || be.build_plan(&g, 1)).expect("single-token plan");
+            assert!(
+                decode::with_pf_exact(true, || be.build_plan_pf(&g, 2048)).is_none(),
+                "{name}: an exact prefill plan over these formats"
+            );
+            let pf = decode::with_pf_exact(false, || be.build_plan_pf(&g, 2048)).expect("fast prefill plan");
+            let r1 = run(&one, &vec![1; n]);
+            assert!(r1.0.iter().all(|v| v.is_finite()) && r1.0.iter().any(|&v| v.abs() > 0.1));
+            // GEMMs, then steps under the GEMM's size (the matvec, a grid row per token).
+            let rf = run(&pf, &[40, 60, 4, 3]);
+            for (what, a, b) in [("hidden", &r1.0, &rf.0), ("keys", &r1.1, &rf.1), ("values", &r1.2, &rf.2)] {
+                let scale = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let worst = a.iter().zip(b).fold(0f32, |m, (p, q)| m.max((p - q).abs()));
+                assert!(
+                    worst <= 1e-2 * scale,
+                    "{name}, fast prefill plan: {what} differ by {worst:.2e} (largest value {scale:.2e})"
+                );
+            }
+        }
+        // Affine Q4 has no such kernel: no plan (its prompts keep the op-by-op path).
+        let (m, _) = affine(nkv * hd, h, 64, &mut seed);
+        let dev = be.upload(&WeightRef::Q4(&m), nkv * hd, h).expect("device weight");
+        let mut g = Graph::new();
+        let (x, y) = (g.buf(h), g.buf(nkv * hd));
+        (g.input, g.hidden, g.n_hidden) = (x, y, nkv * hd);
+        g.ops.push(Op::Linear {
+            w: WeightRef::Q4(&m),
+            dev: &dev,
+            w2: None,
+            n_out: nkv * hd,
+            n_in: h,
+            x,
+            y,
+            mode: LinMode::Store,
+        });
+        g.head_from = g.ops.len();
+        assert!(decode::with_pf_exact(false, || be.build_plan_pf(&g, 2048)).is_none());
     }
 
     /// A model's GGUF device weights, its decode and prefill plans and a session's device state

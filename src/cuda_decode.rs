@@ -1008,6 +1008,8 @@ impl CudaBackend {
         let mut ops: Vec<COp> = Vec::new();
         let mut head_from = usize::MAX;
         let mut failed = String::new();
+        // A Q8 or Q4 matrix went to the ggml kernels (fast prefill plans).
+        let quant = std::cell::Cell::new(false);
         let built: Option<()> = (|| {
             for (i, op) in g.ops.iter().enumerate() {
                 failed = format!("{i} ({})", op_name(op));
@@ -1075,6 +1077,14 @@ impl CudaBackend {
                                         ..Wg::default()
                                     },
                                 )),
+                                // Q8 and Q4 (not affine) through the fast GEMM only.
+                                WeightRef::Q8(_) | WeightRef::Q4(_) if fast_gemm => match self.quant_wg(w, cw, n_in) {
+                                    Some(g) => {
+                                        quant.set(true);
+                                        Some(g)
+                                    }
+                                    None => None,
+                                },
                                 _ => None,
                             })
                         };
@@ -1175,7 +1185,8 @@ impl CudaBackend {
                             }
                             continue;
                         }
-                        // Prefill plans have GEMMs for the GGUF formats (and bf16) only.
+                        // Prefill plans have GEMMs for the GGUF formats, bf16 and (fast plans) Q8
+                        // and Q4 only.
                         if pf {
                             return None;
                         }
@@ -1662,6 +1673,27 @@ impl CudaBackend {
             debug(&format!(
                 "plan of {tokens} token(s) declined at graph op {failed} of {}",
                 g.ops.len()
+            ));
+            free(&owned);
+            return None;
+        }
+        // Q8 and Q4 weights have an op-by-op prompt path with batched kernels for every op (their
+        // experts' among them): their plan is taken only when each of its ops runs a step's
+        // tokens in one launch (`launch_pf`), not token by token.
+        let batched = |op: &COp| match op {
+            COp::Gmv { w2: None, .. }
+            | COp::Norm { rows: 1, .. }
+            | COp::Glu { .. }
+            | COp::Ew { .. }
+            | COp::QkRope { .. }
+            | COp::GdnConv { .. }
+            | COp::GdnRule { .. } => true,
+            COp::Attn { fa, ft, p, .. } => (!fa.is_null() || !ft.is_null()) && p.block == 0,
+            _ => false,
+        };
+        if quant.get() && !ops.iter().all(batched) {
+            debug(&format!(
+                "plan of {tokens} token(s) declined: an op without a kernel over a step's tokens"
             ));
             free(&owned);
             return None;
