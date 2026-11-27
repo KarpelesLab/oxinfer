@@ -127,7 +127,11 @@ butterflies in the CPU's order (the same values), once per input shared by the m
 it, and `Q2_0` / `PQ2_0` / `PTQ1_0` have matvec dots of their own (`MQ2_0`, `MPQ2_0`,
 `MPTQ1_0`; the trits of a `PTQ1_0` chunk picked by selects, not branches, so the lanes of a
 SIMD-group, which read different chunks of a block, stay on the same instructions: 9.5 -> 16.6
-tok/s) and GEMM loaders (`load` in `GGUF_SHADER_SRC`, the matrix-unit GEMMs too). CUDA keeps
+tok/s) and GEMM loaders (`load` / `loadh` in `GGUF_SHADER_SRC`, the matrix-unit GEMMs too;
+`PTQ1_0`'s reads a 32-value quarter of a block as eight runs of one base-3 digit of four bytes,
+the runs' byte offsets and digits from tables, so the two quarters a SIMD-group loads at a K
+step run the same instructions, with the same values as before: pp512 ~270 -> 480-640 tok/s,
+about 0.9x `PQ2_0` in the same rounds). CUDA keeps
 these models on the CPU (`Op::Fold` is declined). The folded token embedding is still read on
 the host (the greedy chain is off for these models). On ARM `Q2_0`, `PQ2_0` and `PTQ1_0` have
 NEON dots (`q2_0`, `pq2_0`, `ptq1_0` in `kernels_ggml.rs`, the trits unpacked with byte
@@ -143,11 +147,14 @@ the corpus raw, 128 tokens of the prose and code prompts; llama.cpp mainline `de
 |---|---|---|---|---|---|
 | `PQ2_0` / `PQ2_0-mtp` | 508-728 | 442-637 | 29-37 | 51-61 | 9-12 |
 | `Q2_0` / `Q2_0-mtp` | 616-710 | 544-605 | 32-35 | 49-62 | 11 (4 in one round under load) |
-| `PTQ1_0` / `PTQ1_0-mtp` | 279-334 | 275-303 | 24-26 | 55-61 | 9-11 |
+| `PTQ1_0` / `PTQ1_0-mtp` | 480-642 (was 245-334) | 487-615 (was 255-304) | 22-26 | 55-61 | 9-11 |
 | llama.cpp `Q2_0` | 417 | 523 | 36.8 | 23 (12 threads) | 8.4 |
 
 The `PTQ1_0` decode is ALU-bound (five trits a byte unpacked with multiplies) where the 2-bit
-files are bandwidth-bound; its GEMM loader decodes trit by trit, hence the slower prompts. With
+files are bandwidth-bound. Its prompts ran at half the 2-bit files' speed while the GEMM loader
+decoded trit by trit (a division and a branch per value); the run loader closes most of that
+(four alternated rounds: 480-642 tok/s at 512 tokens, `PQ2_0` 549-584 in the same rounds,
+logits identical to the old loader's). With
 `--mtp` (the files' Q4_0 MTP layer; PrismML's Metal preset drafts one token at p >= 0.6) the
 drafts were accepted 42-57% of the time on Metal, and `--mtp-cost` then drafts in few rounds: 30-33 tok/s,
 no faster than plain decoding (a verification pass costs about a plain step plus the drafts'

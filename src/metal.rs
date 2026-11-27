@@ -911,12 +911,32 @@ inline float ptq1_at(device const uchar* B, uint e) {
     return trit(B[24 + (e - 120) % 2], p3[(e - 120) / 2]);
 }
 struct PTQ1_0W { GgW g; };
+// The GEMM loaders read a 32-block (quarter s of a block) as 8 runs of four values, each run one
+// base-3 digit (3^n = PTQ1_P[s][i]) of the four bytes at PTQ1_OFF[s][i], except the last two
+// runs of quarter 3 (values 120..127), digits (n, n, n + 1, n + 1) of bytes (24, 25, 24, 25).
+// Tables rather than branches: the two quarters a SIMD-group's lanes load at a K step then run
+// the same instructions (`ptq1_at` value by value ran the prompts at half the 2-bit files' speed).
+constant uchar PTQ1_OFF[4][8] = {{0, 4, 8, 12, 0, 4, 8, 12}, {0, 4, 8, 12, 0, 4, 8, 12},
+                                 {0, 4, 8, 12, 16, 20, 16, 20}, {16, 20, 16, 20, 16, 20, 24, 24}};
+constant uchar PTQ1_P[4][8] = {{1, 1, 1, 1, 3, 3, 3, 3}, {9, 9, 9, 9, 27, 27, 27, 27},
+                               {81, 81, 81, 81, 1, 1, 3, 3}, {9, 9, 27, 27, 81, 81, 1, 9}};
+// The trits (-1, 0, 1) of quarter `s` of the block at B, the values `ptq1_at` reads.
+inline void ptq1_trits(device const uchar* B, uint s, thread int4* t) {
+    for (uint i = 0; i < 8; i++) {
+        uint4 q = uint4(ld4(B + PTQ1_OFF[s][i]));
+        uint p = PTQ1_P[s][i];
+        bool tail = s == 3 && i >= 6;
+        q = tail ? q.xyxy : q;
+        uint4 pv = tail ? uint4(p, p, 3 * p, 3 * p) : uint4(p);
+        t[i] = int4((((q * pv) & 255u) * 3u) >> 8) - 1;
+    }
+}
 inline void load(PTQ1_0W w, uint row, uint b, thread float4* out) {
     device const uchar* B = gblk(w.g, row, b / 4, 28);
     float d = h2f(B + 26);
-    uint e = 32 * (b % 4);
-    for (uint i = 0; i < 8; i++)
-        out[i] = float4(ptq1_at(B, e + 4 * i), ptq1_at(B, e + 4 * i + 1), ptq1_at(B, e + 4 * i + 2), ptq1_at(B, e + 4 * i + 3)) * d;
+    int4 t[8];
+    ptq1_trits(B, b % 4, t);
+    for (uint i = 0; i < 8; i++) out[i] = float4(t[i]) * d;
 }
 struct F16W { GgW g; };
 inline void load(F16W w, uint row, uint b, thread float4* out) {
@@ -1052,6 +1072,14 @@ inline void loadh(Q4_0W w, uint row, uint b, thread half4* out) {
         out[i] = (half4(v & uchar(15)) - 8.h) * d;
         out[i + 4] = (half4(v >> uchar(4)) - 8.h) * d;
     }
+}
+// PTQ1_0 in half: +-d or 0, the same values.
+inline void loadh(PTQ1_0W w, uint row, uint b, thread half4* out) {
+    device const uchar* B = gblk(w.g, row, b / 4, 28);
+    half d = as_type<half>(ushort(rd16(B + 26)));
+    int4 t[8];
+    ptq1_trits(B, b % 4, t);
+    for (uint i = 0; i < 8; i++) out[i] = half4(t[i]) * d;
 }
 #if MMA_UNITS
 #define MMA_WS threadgroup half Ws[64 * MKB];

@@ -322,7 +322,7 @@ const PARAMS: &str = "bytes per token and layers from the parameter count";
 /// Ternary-Bonsai 2.5 27B (measured on an M5 Max, see docs/weights.md).
 const BONSAI25: &str = "agentic Qwen3.8-27B in Hadamard-folded ternary weights with an MTP head (--mtp) and the mmproj \
      for images (also :Q2_0-mtp, and :PQ2_0 / :PTQ1_0 / :Q2_0 without the head); M5 Max Metal: PQ2_0 / Q2_0 32-37 tok/s \
-     decoding, 600-700 tok/s prefill at 512 tokens, PTQ1_0 24-26 and ~300; CPU 9-12 tok/s";
+     decoding, 600-700 tok/s prefill at 512 tokens, PTQ1_0 24-26 and 480-640; CPU 9-12 tok/s";
 const NEMO_IMAGE_F32: &str = "autoregressive (4,176 tokens a 1024x1024 image), rendered by its ViT tokenizer; the float32 \
      release is converted at load (--quant q4: 23 GB peak, 3.9 min); M5 Max CPU 24 tok/s, 3 min an image; the GGUFs load \
      faster; source images experimental";
