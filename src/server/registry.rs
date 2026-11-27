@@ -723,9 +723,21 @@ impl Registry {
     pub fn check(&self, id: &str, want: Kind) -> ApiResult<()> {
         let e = self.find(id)?;
         match e.kind() {
-            Some(k) if k != want => Err(wrong_kind(id, k, want)),
+            Some(k) if k != want => Err(self.wrong_kind(e, k, want)),
             _ => Ok(()),
         }
+    }
+
+    /// [`wrong_kind`], and for a chat request to an Orpheus checkpoint (a Llama that the server
+    /// lists as a speech model) what to do instead.
+    fn wrong_kind(&self, e: &Entry, kind: Kind, want: Kind) -> ApiError {
+        let mut err = wrong_kind(&e.spec.id, kind, want);
+        if kind == Kind::Speech && want == Kind::Chat && is_orpheus_source(&e.spec.source, self.cache_dir.as_deref()) {
+            err.message.push_str(
+                " (Orpheus is served as text to speech: POST /v1/audio/speech; the model option kind=chat serves its language model as text instead)",
+            );
+        }
+        err
     }
 
     /// Waits for the model, loads it if needed, and checks its kind.
@@ -779,7 +791,7 @@ impl Registry {
             let load = || -> ApiResult<Loaded> {
                 let (kind, image) = self.detect(entry).map_err(|e| ApiError::new(500, format!("model {id}: {e:#}")))?;
                 if kind != want {
-                    return Err(wrong_kind(id, kind, want));
+                    return Err(self.wrong_kind(entry, kind, want));
                 }
                 self.load(entry, kind, image)
                     .map_err(|e| ApiError::new(500, format!("load {id}: {e:#}")))
@@ -831,7 +843,7 @@ impl Registry {
         }
         let kind = guard.as_ref().unwrap().kind();
         if kind != want {
-            return Err(wrong_kind(id, kind, want));
+            return Err(self.wrong_kind(entry, kind, want));
         }
         if let Some(t) = &task {
             if let Some(h) = guard.as_ref().unwrap().cancel_hook() {
@@ -1104,7 +1116,22 @@ impl Registry {
             _ if !Path::new(&e.spec.source).exists() && crate::voice_isolator::is_repo_id(&e.spec.source) => (Kind::Isolation, None),
             _ if !Path::new(&e.spec.source).exists() && crate::ocria::is_repo_id(&e.spec.source) => (Kind::Ocr, None),
             _ => {
+                // A GGUF repository named without a file has nothing its kind is told from
+                // (it would be called a chat model, whatever it is): the error of its load.
+                if let Some(names) = cached_ggufs(&e.spec.source, self.cache_dir.as_deref()) {
+                    let s = &e.spec.source;
+                    bail!(
+                        "{s} holds GGUF files; pick one as {s}:QUANT (e.g. {s}:Q4_K_M): {}",
+                        names.join(", ")
+                    );
+                }
                 let path = self.probe_path(&e.spec)?;
+                // The same for a repository not fetched yet that has none of those files: what
+                // a fetch of it would say (nothing is downloaded for this).
+                #[cfg(feature = "hf")]
+                if !Path::new(&e.spec.source).exists() && !e.spec.source.contains(':') && !PROBE.iter().any(|f| path.join(f).is_file()) {
+                    crate::hf::plan(&e.spec.source, self.cache_dir.as_deref())?;
+                }
                 let (k, img) = detect_path(&path, &e.spec.source);
                 match given {
                     Some(Kind::Image) if img.is_none() => bail!("{}: not an image pipeline oxinfer knows", e.spec.source),
@@ -1129,15 +1156,6 @@ impl Registry {
         }
         #[cfg(feature = "hf")]
         {
-            const PROBE: [&str; 7] = [
-                "model_index.json",
-                "config.json",
-                "modules.json",
-                "llm_config.json",
-                "vit_config.json",
-                "meta.yaml",
-                "tokenizer_config.json",
-            ];
             crate::hf::resolve_files(source, &PROBE, self.cache_dir.as_deref())
         }
         #[cfg(not(feature = "hf"))]
@@ -1552,6 +1570,17 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// The small files of a repository that its kind is told from.
+const PROBE: [&str; 7] = [
+    "model_index.json",
+    "config.json",
+    "modules.json",
+    "llm_config.json",
+    "vit_config.json",
+    "meta.yaml",
+    "tokenizer_config.json",
+];
+
 /// The kind of the model at `path` (a directory or a GGUF file).
 pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>) {
     let img = |k| (Kind::Image, Some(k));
@@ -1625,6 +1654,45 @@ fn is_orpheus(dir: &Path) -> bool {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
     cfg.is_some_and(|c| c["model_type"] == "llama" && c["vocab_size"].as_u64().is_some_and(|v| v >= 156_000))
+}
+
+/// Whether `source` is an Orpheus checkpoint on disk (a folder with its configuration, or a GGUF
+/// file told by its name, as [`detect_path`] does).
+fn is_orpheus_source(source: &str, cache_dir: Option<&Path>) -> bool {
+    local_path(source, cache_dir).is_some_and(|p| {
+        if crate::gguf::is_gguf(&p) {
+            detect_path(&p, source).0 == Kind::Speech && !crate::zonos::is_zonos(&p) && !crate::fish::is_drama(&p)
+        } else {
+            is_orpheus(&p)
+        }
+    })
+}
+
+/// The GGUF files in the cache folder of `source` when it is a repo id without `:QUANT` whose
+/// folder holds them and none of the files a kind is told from (None otherwise: a path, a repo
+/// with its configuration, a repo not fetched).
+fn cached_ggufs(source: &str, cache_dir: Option<&Path>) -> Option<Vec<String>> {
+    if Path::new(source).exists() || source.contains(':') || local_path(source, cache_dir).is_some() {
+        return None;
+    }
+    if source.split('/').count() != 2 || source.starts_with('/') || source.contains("..") {
+        return None;
+    }
+    let dir = cache_dir
+        .map(Path::to_path_buf)
+        .or_else(cache_root)?
+        .join(source.replace('/', "--"));
+    if PROBE.iter().any(|f| dir.join(f).is_file()) {
+        return None;
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.to_ascii_lowercase().ends_with(".gguf"))
+        .collect();
+    names.sort();
+    (!names.is_empty()).then_some(names)
 }
 
 /// The model's files when they are on disk: a local path, or a repo in the cache (with its
@@ -1768,6 +1836,66 @@ mod tests {
         assert_eq!(detect_path(&h3, "h3"), (Kind::Video, None));
         let haru = sub("haru", "config.json", r#"{"model_type": "haru"}"#);
         assert_eq!(detect_path(&haru, "haru").0, Kind::Speech);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A chat request to an Orpheus checkpoint says where its speech is served and how to serve
+    /// its language model as text; a GGUF repository named without `:QUANT` is not called a
+    /// chat model (which sent `/v1/audio/speech` requests away as meant for another kind).
+    #[test]
+    fn orpheus_kinds_and_bare_gguf_repo() {
+        // (A GGUF file is told by `orpheus` anywhere in its path: none in the folder's name.)
+        let dir = std::env::temp_dir().join(format!("oxinfer-speech-kind-{}", std::process::id()));
+        let file = |folder: &str, name: &str, body: &[u8]| {
+            let d = dir.join(folder);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(name), body).unwrap();
+            d.join(name)
+        };
+        let cfg = file("st", "config.json", br#"{"model_type": "llama", "vocab_size": 156940}"#);
+        let gguf = file("org--orpheus-3b-GGUF", "orpheus-3b-q4_k_m.gguf", b"GGUF\x03\0\0\0");
+        let llama = file("org--llama-GGUF", "llama-q4_k_m.gguf", b"GGUF\x03\0\0\0");
+        let spec = |s: String| ModelSpec::parse(&s).unwrap();
+        let specs = [
+            spec(format!("st={}", cfg.parent().unwrap().display())),
+            spec(format!("file={}", gguf.display())),
+            spec(format!("text={},kind=chat", gguf.display())),
+            spec(format!("llama={}", llama.display())),
+            spec("quant=org/orpheus-3b-GGUF:Q4_K_M".into()),
+            spec("bare=org/orpheus-3b-GGUF".into()),
+        ];
+        let r = Registry::new(&specs, None, Some(dir.clone()), false);
+        let kinds: Vec<Option<Kind>> = r.list().into_iter().map(|m| m.1).collect();
+        let (speech, chat) = (Some(Kind::Speech), Some(Kind::Chat));
+        assert_eq!(kinds, [speech, speech, chat, chat, speech, None]);
+        for id in ["st", "file", "quant"] {
+            let e = r.check(id, Kind::Chat).unwrap_err();
+            assert!(
+                e.message.contains("is a speech model; this endpoint needs a chat model"),
+                "{}",
+                e.message
+            );
+            assert!(
+                e.message.contains("POST /v1/audio/speech") && e.message.contains("kind=chat"),
+                "{}",
+                e.message
+            );
+            r.check(id, Kind::Speech).unwrap();
+        }
+        r.check("text", Kind::Chat).unwrap();
+        let e = r.check("llama", Kind::Speech).unwrap_err();
+        assert!(e.message.ends_with("this endpoint needs a speech model"), "{}", e.message);
+        // The bare repo id: no kind, and the same error at either endpoint (found in the cache,
+        // without asking the hub).
+        for want in [Kind::Speech, Kind::Chat] {
+            r.check("bare", want).unwrap();
+            let e = r.acquire("bare", want).err().unwrap();
+            assert!(
+                e.message.contains("pick one as org/orpheus-3b-GGUF:QUANT") && e.message.contains("orpheus-3b-q4_k_m.gguf"),
+                "{}",
+                e.message
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

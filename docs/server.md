@@ -18,7 +18,9 @@ served by [httpsd](https://crates.io/crates/httpsd) (its thread-pool runtime, no
   --model sd=stabilityai/sd-turbo \
   --model whisper=openai/whisper-small \
   --model tts=unsloth/orpheus-3b-0.1-ft,quant=q8
-# [serving qwen (chat), gemma (chat), bge (embedding), sd (image), whisper (transcription), tts (speech) on http://127.0.0.1:8080/v1]
+# [models: qwen (chat), gemma (chat), bge (embedding), sd (image), whisper (transcription), tts (speech)]
+# [API: http://127.0.0.1:8080/v1 (OpenAI-compatible)]
+# (a model's kind is shown at start once its files are in the cache; `GET /v1/models` has it too)
 
 curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "qwen", "messages": [{"role": "user", "content": "Why is the sky blue?"}], "stream": true}'
@@ -575,7 +577,7 @@ of the loader for the other kinds (Whisper `encoder` / `decoder` precision, Orph
 
 | Key | Meaning |
 |---|---|
-| `kind` | `chat`, `embedding`, `image`, `transcription`, `speech`, `video`, `isolation` or `ocr` (default: detected) |
+| `kind` | `chat`, `embedding`, `image`, `transcription`, `speech`, `video`, `isolation` or `ocr` (default: detected). An Orpheus checkpoint is detected as `speech` (a GGUF file by the `orpheus` in its name) and answers chat requests with a 400 that says so; `kind=chat` serves its Llama as a text model on the chat endpoints instead (checked with the Q4_K_M GGUF). A GGUF repository is named with its file, `org/name:QUANT`: without it the model's requests fail with the list of the repository's GGUF files |
 | `system` | system prompt when a request has none (default none; `default` for the CLI's prompt with the local date, weekday and time zone, the same all day; a conversation keeps the one of its first turn) |
 | `think` | thinking by default (`1`); requests override it |
 | `max_tokens` | reply length when a request sets none (default 4096) |

@@ -159,7 +159,15 @@ pub fn run(args: &[String], command: &str, open: bool) -> Result<()> {
             running.addr()
         );
     }
-    let models: Vec<String> = api.models().into_iter().map(|(id, _, _)| id).collect();
+    // Each with its kind when its files tell it already: a speech model takes no chat requests.
+    let models: Vec<String> = api
+        .models()
+        .into_iter()
+        .map(|(id, kind, _)| match kind {
+            Some(k) => format!("{id} ({})", k.as_str()),
+            None => id,
+        })
+        .collect();
     if !models.is_empty() {
         eprintln!("[models: {}]", models.join(", "));
     }
