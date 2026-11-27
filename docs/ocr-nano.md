@@ -33,7 +33,8 @@ the models on first use (only the files of `--scripts`; 14 MB for all four scrip
 all), `--long-side N` (detector input, default 1600), `--json`, `--plain` (no page-level
 heuristics, see below), `--no-adaptive`, `--no-gutter`, `--no-orient`, `--no-rescue`, `--no-junk`,
 `--no-faint`, `--no-clean`, `--no-bidi`, `--no-layout`, `--no-exif`, `--thresh T`, `--merge G`,
-`--repeat N` (timing), `--threads`, `--cache-dir`, `-q`.
+`--repeat N` (timing), `--device auto|cpu|metal` (where the models run, see [Speed](#speed)),
+`--threads`, `--cache-dir`, `-q`.
 
 `--json` prints the page: `lines` (each with `text`, `confidence`, `box`: the four corners in
 reading order, `bbox`: its extent, `script`: the recognizer that read it, `words`: word boxes on
@@ -57,7 +58,7 @@ let page = ocr.ocr_rgb(&rgb, width, height, &OcrRunOptions::default())?;
 
 `Ocria` is `Sync`: one instance serves pages from several threads.
 
-C: `oxi_ocria_load` (`scripts=latin,cjk`, `det_long_side`, `threads`, `cache_dir`),
+C: `oxi_ocria_load` (`scripts=latin,cjk`, `det_long_side`, `threads`, `cache_dir`, `device`),
 `oxi_ocria_rgb` (pixels, 1 or 3 channels, a row stride) and `oxi_ocria_file` return the page as
 JSON (`options_json`: the switches below), `oxi_ocria_info_json`, `oxi_ocria_free` (see
 `include/oxinfer.h`).
@@ -153,14 +154,17 @@ operations as numpy; the detector pass, crops, router and recognizers, no page h
   machine differs from both by as much. Confidences: within 1.2e-4 for the float recognizers; Latin
   lines within a few hundredths, except very short ones ("12" of the table: 0.69 here, 0.92 in the
   reference), which the junk filter (one or two characters under 0.8) then treats differently.
-- **What LiteParse reads**: its crops (this code) fed to onnxruntime's int8 kernels: the same text on
-  every line but one (the upside-down noise again: 'e įxə o əl eцouy' for 'e xə o l eщouy') and
-  confidences within 0.011, the "12" included (0.6863 both).
+- **What LiteParse reads**: its crops (this code) fed to onnxruntime's int8 kernels, measured
+  before rec_latin had their arithmetic: the same text on every line but one (the upside-down
+  noise again: 'e įxə o əl eцouy' for 'e xə o l eщouy') and confidences within 0.011. With it,
+  the Latin lines read as there to the confidence: the "12" is 0.6863 here as in LiteParse.
+- **The GPU** (`device=metal`): the same text, boxes and scripts as the CPU on the twelve images,
+  confidences within 2.1e-7; the models against onnxruntime as on the CPU (below).
 
 ## Speed
 
 M5 Max (the machine shared with other work; `tools/bench/with-lock.sh`), best of 10 runs, image
-decoding excluded (`oxinfer ocr --repeat 10`):
+decoding excluded (`oxinfer ocr --repeat 10`), on the CPU (`--device cpu`; the GPU [below](#the-gpu)):
 
 | image | lines | default | `--plain` | `--plain`, one thread |
 |---|---|---|---|---|
@@ -181,8 +185,43 @@ channels (12 to 32), where onnxruntime is about twice as fast; the recognizers r
 One page uses every core; `Ocria` reads pages from several threads at once (the server runs one
 request per model at a time).
 
+### The GPU
+
+`device=metal` (`--device metal`, the load option `device`) runs the detector, the router and
+the recognizers on the GPU through the interpreter's Metal operators (`crate::gpu::onnx`,
+`metal_onnx.metal`: a direct convolution kernel, pointwise convolutions on 8 x 8 SIMD-group f32
+GEMMs, additions, nearest resizes, channel concatenations, the fused ReLU / fake-quantization /
+integer-requantization steps; the models' constants uploaded once, a run's tensors in shared
+buffers, every operator of a run in one command buffer; the operators it has none for, the
+recognizers' CTC heads and the router's pooling, on the CPU in between). rec_latin keeps
+onnxruntime's int8 arithmetic there too (its integer sums are exact on the GPU as well). Its
+fixed cost per run (a submission, about a millisecond) makes it slower than the CPU on small
+inputs, so `device=auto` (the default) takes it only for detector inputs of 1.5 M values and
+more (about a 700 x 700 RGB image) and router / recognizer batches of 128 K values and more
+(eight 512-pixel lines); `cpu` never.
+
+Same machine and conditions, best of 10, `--plain` in brackets:
+
+| image | `device=cpu` | `metal` | `auto` (default) |
+|---|---|---|---|
+| 2000 x 2600 page | 77.7 ms (69.6) | 50.4 ms (48.9) | 50.4 ms (50.5) |
+| 1200 x 900, seven scripts | 31.8 ms (25.4) | 25.8 ms (22.2) | 29.2 ms (23.0) |
+| 900 x 200, two lines | 5.8 ms (5.7) | 7.3 ms (7.2) | 5.8 ms (5.6) |
+
+The page's models (`--plain --profile`): detector 25.3 ms on the CPU, 17.0 ms on the GPU;
+recognizers 38.1 and 25.1 ms; router 6.1 and 5.4 ms. (The CPU figures here are a few
+milliseconds above the table before: the machine was busier.) The first GPU load compiles the
+Metal library (seconds, once per OS shader cache).
+
 ## Not implemented
 
-- LayoutNet (`tablenet.onnx` / `tablenet.bin`: tables and layout blocks), and the rest of
-  LiteParse's document parsing (PDF rendering, merging the OCR with the PDF text layer, Markdown);
-- the GPU: the models are a few million parameters, run on the CPU's GEMM and vectorized loops.
+- LayoutNet (`tablenet.onnx` / `tablenet.bin`: tables, rows, columns, spanning cells and 13
+  layout-block classes). Its input is 66 features per text unit, most of them signals of
+  LiteParse's text projection (flowing prose, left / right / centre anchor counts, column snap,
+  line blocks, XY-cut leaves: `projection.rs`, 7,100 lines) and of the page render (ruling lines,
+  the image branch's canvas), and its pair logits become tables through LiteParse's decoder
+  (`table_model/`, 6,400 lines). Without that projection the network would see inputs it was not
+  trained on and nothing could be checked against LiteParse, so it waits for a port of the
+  projection itself;
+- the rest of LiteParse's document parsing (PDF rendering, merging the OCR with the PDF text
+  layer, Markdown).

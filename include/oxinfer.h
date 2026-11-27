@@ -1271,7 +1271,8 @@ typedef struct OxiOcria OxiOcria;
 /* Loads OCRia-nano-1 (line detector, script router, Latin / CJK / right-to-left / world line
  * recognizers): the repo id llamaindex/OCRia-nano-1 or a folder of its files. `options`: key=value
  * lines or ;-separated pairs: scripts (latin,cjk,rtl,world or all; default all), det_long_side
- * (default 1600), threads, cache_dir. NULL on error. */
+ * (default 1600), threads, cache_dir, device (auto: the GPU for large pages and batches of lines,
+ * cpu, metal: always the GPU). NULL on error. */
 OxiOcria *oxi_ocria_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
 void oxi_ocria_free(OxiOcria *o);
 /* {"name", "path", "scripts", "det_thresh", "det_merge", "det_long_side", "params", "device",

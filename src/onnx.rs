@@ -12,6 +12,10 @@
 //! the channels, the others as im2col + GEMM; tensors go back to `NCHW` where an operator needs
 //! it, and every graph output is `NCHW`.
 //!
+//! With [`Model::set_device`] the nodes an accelerator has operators for run there
+//! ([`crate::gpu::onnx`]; Metal), the others on the CPU, tensors moving between them in shared
+//! memory.
+//!
 //! Quantized (QDQ) graphs run with ONNX Runtime's integer arithmetic where its CPU provider fuses
 //! them into `QLinearConv` / `QLinearAdd` ([`exactify`]): a convolution sums the integers
 //! behind its fake-quantized input (`q - zp`) times the int8 weights plus the int32 bias (exact
@@ -535,6 +539,8 @@ struct ConvPlan {
     kind: ConvKind,
     /// Integer arithmetic: the input's scale, the output multipliers per channel, the rounding.
     exact: Option<(f32, Vec<f32>, Requant)>,
+    /// The weights as given (`[cout][cpg][kh][kw]`), for an accelerator.
+    w_onnx: Vec<f32>,
 }
 
 enum ConvKind {
@@ -644,6 +650,7 @@ impl ConvPlan {
             bias,
             kind,
             exact: None,
+            w_onnx: w.data.clone(),
         })
     }
 
@@ -839,6 +846,11 @@ pub struct Model {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub opset: i64,
+    /// Runs go to the accelerator ([`Model::set_device`]), from this many input values on.
+    want_dev: std::sync::atomic::AtomicBool,
+    dev_min: std::sync::atomic::AtomicUsize,
+    /// The constants on the accelerator (made on the first run there).
+    dev: std::sync::OnceLock<Option<DevModel>>,
 }
 
 impl Model {
@@ -1010,6 +1022,9 @@ impl Model {
             inputs,
             outputs,
             opset,
+            want_dev: std::sync::atomic::AtomicBool::new(false),
+            dev_min: std::sync::atomic::AtomicUsize::new(0),
+            dev: std::sync::OnceLock::new(),
         })
     }
 
@@ -1030,6 +1045,18 @@ impl Model {
 
     /// Runs the graph on `inputs` (by name); returns the graph's outputs in order (`NCHW`).
     pub fn run(&self, inputs: Vec<(&str, Tensor)>) -> Result<Vec<Tensor>> {
+        if self.want_dev.load(std::sync::atomic::Ordering::Relaxed)
+            && inputs.iter().map(|(_, t)| t.len()).sum::<usize>() >= self.dev_min.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(dm) = self.dev_model()
+        {
+            match self.run_dev(dm, &inputs) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    // The CPU from the start (a failed device run leaves no partial state).
+                    crate::gpu::warn(format!("onnx: a run on the device failed ({e:#}); this run is on the CPU"));
+                }
+            }
+        }
         let mut vals: Vec<Option<Tensor>> = vec![None; self.consts.len()];
         for (k, t) in inputs {
             let i = self
@@ -2066,6 +2093,463 @@ fn resize_plan(n: &Node, ins: &[Arg], shape: &[usize]) -> Result<(Vec<usize>, Ve
 }
 
 // ---------------------------------------------------------------------------------------------
+// Accelerator.
+
+/// A model's constants on the device: per node, a convolution's weights (as given, and padded
+/// to 32 rows for a pointwise GEMM), bias and requantization multipliers.
+struct DevModel {
+    dev: std::sync::Arc<dyn crate::gpu::onnx::Device>,
+    convs: Vec<Option<DevConv>>,
+}
+
+struct DevConv {
+    w: usize,
+    wp: usize,
+    b: usize,
+    mult: Option<usize>,
+}
+
+/// A value of a run on the device: on the host, or in a session buffer (channels-last).
+enum DVal {
+    Host(Tensor),
+    Dev(usize, Vec<usize>),
+}
+
+/// The [`crate::gpu::onnx::Post`] of a node's fused steps, when the device runs them.
+fn dev_post(posts: &[Post]) -> Option<crate::gpu::onnx::Post> {
+    let mut p = crate::gpu::onnx::Post::default();
+    let fq = |q: &Post| match *q {
+        Post::FakeQuant { s, zp, lo, hi, s2, zp2 } => Some([s, zp, lo, hi, s2, zp2]),
+        _ => None,
+    };
+    match posts {
+        [] => {}
+        [Post::Relu] => p.relu = true,
+        [q @ Post::FakeQuant { .. }] => p.fq = fq(q),
+        [Post::Relu, q @ Post::FakeQuant { .. }] => {
+            p.relu = true;
+            p.fq = fq(q);
+        }
+        _ => return None,
+    }
+    Some(p)
+}
+
+impl Model {
+    /// Runs this model on the accelerator (when one is active) or not; off by default.
+    pub fn set_device(&self, on: bool) {
+        self.want_dev.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Runs with fewer input values than `values` stay on the CPU (where the device's fixed
+    /// cost per run outweighs its speed); 0, the default: every run.
+    pub fn set_device_min(&self, values: usize) {
+        self.dev_min.store(values, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether runs go to the accelerator ([`Self::set_device`] and an active backend that has
+    /// the operators).
+    pub fn on_device(&self) -> bool {
+        self.want_dev.load(std::sync::atomic::Ordering::Relaxed) && self.dev_model().is_some()
+    }
+
+    fn dev_model(&self) -> Option<&DevModel> {
+        self.dev
+            .get_or_init(|| {
+                let dev = crate::gpu::active()?.onnx_device()?;
+                let mut convs = Vec::with_capacity(self.convs.len());
+                for c in &self.convs {
+                    convs.push(match c {
+                        None => None,
+                        Some(c) => {
+                            let k = c.w_onnx.len() / c.cout.max(1);
+                            let mut wp = c.w_onnx.clone();
+                            wp.resize(c.cout.next_multiple_of(32) * k, 0.0);
+                            Some(DevConv {
+                                w: dev.constant(&c.w_onnx)?,
+                                wp: dev.constant(&wp)?,
+                                b: dev.constant(&c.bias)?,
+                                mult: match &c.exact {
+                                    Some((_, m, _)) => Some(dev.constant(m)?),
+                                    None => None,
+                                },
+                            })
+                        }
+                    });
+                }
+                Some(DevModel { dev, convs })
+            })
+            .as_ref()
+    }
+
+    /// [`Self::run`] with the nodes the device has operators for on it, the others on the CPU,
+    /// the tensors moved (copied in shared memory) where they are used.
+    fn run_dev(&self, dm: &DevModel, inputs: &[(&str, Tensor)]) -> Result<Vec<Tensor>> {
+        use crate::gpu::onnx::{ConvGeom, Step};
+        let mut sess = dm.dev.session().context("no device session")?;
+        let mut vals: Vec<Option<DVal>> = (0..self.consts.len()).map(|_| None).collect();
+        for (k, t) in inputs {
+            let i = self
+                .inputs
+                .iter()
+                .position(|n| n == k)
+                .with_context(|| format!("the model has no input {k}"))?;
+            vals[self.input_slots[i]] = Some(DVal::Host(t.clone().with_layout(false)));
+        }
+        for (i, &s) in self.input_slots.iter().enumerate() {
+            if vals[s].is_none() {
+                bail!("input {} is missing", self.inputs[i]);
+            }
+        }
+        let mut last = vec![0usize; self.consts.len()];
+        for (i, ins) in self.slots_in.iter().enumerate() {
+            for s in ins.iter().flatten() {
+                last[*s] = i;
+            }
+        }
+        for &s in &self.output_slots {
+            last[s] = usize::MAX;
+        }
+        let mut steps: Vec<Step> = Vec::new();
+        let flush = |sess: &mut Box<dyn crate::gpu::onnx::Session + '_>, steps: &mut Vec<Step>| -> Result<()> {
+            if !sess.run(steps) {
+                bail!("the device failed a run");
+            }
+            steps.clear();
+            Ok(())
+        };
+        for (i, n) in self.nodes.iter().enumerate() {
+            let ins = &self.slots_in[i];
+            let on_dev = |s: Option<usize>, vals: &[Option<DVal>]| s.is_some_and(|s| matches!(vals[s], Some(DVal::Dev(..))));
+            // Whether the device takes this node, and its steps and output.
+            let mut out: Option<(usize, Vec<usize>)> = None;
+            let wants = match n.op.as_str() {
+                "Conv" => self.convs[i].is_some(),
+                "Add" => ins.len() == 2,
+                "Relu" | "FakeQuant" | "Sigmoid" | "Resize" | "Squeeze" | "Identity" => true,
+                "Concat" => n.int("axis", 0) == 1,
+                _ => false,
+            } && (on_dev(ins.first().copied().flatten(), &vals) || n.op == "Conv");
+            // The value of input k on the device (uploaded from the host if need be).
+            let mut dev_in = |k: usize, sess: &mut Box<dyn crate::gpu::onnx::Session + '_>| -> Result<Option<(usize, Vec<usize>)>> {
+                let Some(Some(s)) = ins.get(k) else { return Ok(None) };
+                match vals[*s].as_ref() {
+                    Some(DVal::Dev(b, sh)) => Ok(Some((*b, sh.clone()))),
+                    Some(DVal::Host(t)) => {
+                        if t.ints.is_some() {
+                            return Ok(None);
+                        }
+                        let t = t.clone().into_cl();
+                        let b = sess.alloc(t.len()).context("device buffer")?;
+                        sess.data(b).copy_from_slice(&t.data);
+                        let sh = t.shape.clone();
+                        vals[*s] = Some(DVal::Dev(b, sh.clone()));
+                        Ok(Some((b, sh)))
+                    }
+                    None => match &self.consts[*s] {
+                        Some(t) if t.ints.is_none() && !t.is_empty() => {
+                            let t = t.clone().into_cl();
+                            let b = sess.alloc(t.len()).context("device buffer")?;
+                            sess.data(b).copy_from_slice(&t.data);
+                            Ok(Some((b, t.shape.clone())))
+                        }
+                        _ => Ok(None),
+                    },
+                }
+            };
+            if wants {
+                match n.op.as_str() {
+                    "Conv" => {
+                        let plan = self.convs[i].as_ref().unwrap();
+                        let dc = dm.convs[i].as_ref().unwrap();
+                        let post = match &plan.exact {
+                            Some((_, _, r)) => Some(crate::gpu::onnx::Post {
+                                requant: Some((dc.mult.unwrap(), [r.zp, r.lo, r.hi, r.s2, r.zp2])),
+                                ..Default::default()
+                            }),
+                            None => dev_post(&n.posts),
+                        };
+                        if let Some(post) = post
+                            && let Some((x, sh)) = dev_in(0, &mut sess)?
+                        {
+                            let (nb, cin, h, w, oh, ow) = plan.dims(&sh)?;
+                            let cout = plan.cout;
+                            let y = sess.alloc(nb * oh * ow * cout).context("device buffer")?;
+                            let s_in = plan.exact.as_ref().map_or(0.0, |e| e.0);
+                            if matches!(plan.kind, ConvKind::Pointwise(_)) && cin.is_multiple_of(8) && cin <= 1024 {
+                                let npix = nb * oh * ow;
+                                let src = if s_in > 0.0 {
+                                    let t = sess.alloc(npix * cin).context("device buffer")?;
+                                    steps.push(Step::Round {
+                                        x,
+                                        y: t,
+                                        n: npix * cin,
+                                        s: s_in,
+                                    });
+                                    t
+                                } else {
+                                    x
+                                };
+                                steps.push(Step::Pointwise {
+                                    x: src,
+                                    y,
+                                    w: dc.wp,
+                                    b: dc.b,
+                                    npix,
+                                    cin,
+                                    cout,
+                                    post,
+                                });
+                                if src != x {
+                                    sess.release(src);
+                                }
+                            } else {
+                                steps.push(Step::Conv {
+                                    x,
+                                    y,
+                                    w: dc.w,
+                                    b: dc.b,
+                                    g: ConvGeom {
+                                        n: nb,
+                                        h,
+                                        w,
+                                        cin,
+                                        oh,
+                                        ow,
+                                        cout,
+                                        kh: plan.kh,
+                                        kw: plan.kw,
+                                        stride: plan.stride,
+                                        dil: plan.dil,
+                                        pad: [plan.pads[0], plan.pads[1]],
+                                        groups: plan.group,
+                                    },
+                                    s_in,
+                                    post,
+                                });
+                            }
+                            let shape = if plan.one_d { vec![nb, cout, ow] } else { vec![nb, cout, oh, ow] };
+                            out = Some((y, shape));
+                        }
+                    }
+                    "Add" => {
+                        let (exact, post) = match n.exact.as_deref() {
+                            Some(Exact::Add {
+                                sa,
+                                sb,
+                                rac,
+                                rbc,
+                                zc,
+                                out: r,
+                            }) => (
+                                Some([*sa, *sb, *rac, *rbc, *zc]),
+                                Some(crate::gpu::onnx::Post {
+                                    round: Some([r.zp, r.lo, r.hi, r.s2, r.zp2]),
+                                    ..Default::default()
+                                }),
+                            ),
+                            _ => (None, dev_post(&n.posts)),
+                        };
+                        if let Some(post) = post
+                            && let (Some((a, sa)), Some((b, sb))) = (dev_in(0, &mut sess)?, dev_in(1, &mut sess)?)
+                            && sa == sb
+                        {
+                            let len = sa.iter().product();
+                            let y = sess.alloc(len).context("device buffer")?;
+                            steps.push(Step::Add {
+                                a,
+                                b,
+                                y,
+                                n: len,
+                                exact,
+                                post,
+                            });
+                            out = Some((y, sa));
+                        }
+                    }
+                    "Relu" | "FakeQuant" | "Sigmoid" => {
+                        let post = match n.op.as_str() {
+                            "Relu" if n.posts.is_empty() => dev_post(&[Post::Relu]),
+                            "FakeQuant" => dev_post(&n.posts),
+                            "Sigmoid" if n.posts.is_empty() => Some(crate::gpu::onnx::Post {
+                                sigmoid: true,
+                                ..Default::default()
+                            }),
+                            _ => None,
+                        };
+                        if let Some(post) = post
+                            && let Some((x, sh)) = dev_in(0, &mut sess)?
+                        {
+                            let len = sh.iter().product();
+                            let y = sess.alloc(len).context("device buffer")?;
+                            steps.push(Step::Unary { x, y, n: len, post });
+                            out = Some((y, sh));
+                        }
+                    }
+                    "Resize" => {
+                        if let Some((x, sh)) = dev_in(0, &mut sess)?
+                            && sh.len() == 4
+                            && n.posts.is_empty()
+                        {
+                            let cargs: Vec<Arg> = ins
+                                .iter()
+                                .map(|s| match s.and_then(|s| self.consts[s].as_ref()) {
+                                    Some(t) => Arg::Ref(t),
+                                    None => Arg::None,
+                                })
+                                .collect();
+                            if let Ok((osh, ys, xs)) = resize_plan(n, &cargs, &sh) {
+                                let len = osh.iter().product();
+                                let y = sess.alloc(len).context("device buffer")?;
+                                steps.push(Step::Resize {
+                                    x,
+                                    y,
+                                    ys: ys.iter().map(|&v| v as u32).collect(),
+                                    xs: xs.iter().map(|&v| v as u32).collect(),
+                                    n: sh[0],
+                                    h: sh[2],
+                                    w: sh[3],
+                                    c: sh[1],
+                                });
+                                out = Some((y, osh));
+                            }
+                        }
+                    }
+                    "Concat" => {
+                        let mut parts = Vec::new();
+                        for k in 0..ins.len() {
+                            match dev_in(k, &mut sess)? {
+                                Some(p) if p.1.len() >= 3 => parts.push(p),
+                                _ => break,
+                            }
+                        }
+                        let same = |a: &[usize], b: &[usize]| a.len() == b.len() && a[0] == b[0] && a[2..] == b[2..];
+                        if parts.len() == ins.len() && parts.iter().all(|p| same(&p.1, &parts[0].1)) && n.posts.is_empty() {
+                            let mut shape = parts[0].1.clone();
+                            shape[1] = parts.iter().map(|p| p.1[1]).sum();
+                            let npix = shape[0] * shape[2..].iter().product::<usize>();
+                            let y = sess.alloc(npix * shape[1]).context("device buffer")?;
+                            let mut off = 0;
+                            for (src, sh) in &parts {
+                                steps.push(Step::Cat {
+                                    src: *src,
+                                    dst: y,
+                                    npix,
+                                    cs: sh[1],
+                                    cd: shape[1],
+                                    off,
+                                });
+                                off += sh[1];
+                            }
+                            out = Some((y, shape));
+                        }
+                    }
+                    "Squeeze" | "Identity" => {
+                        if let Some(Some(s)) = ins.first()
+                            && let Some(DVal::Dev(x, sh)) = vals[*s].as_ref()
+                            && n.posts.is_empty()
+                        {
+                            let axes = n.ints("axes").or_else(|| {
+                                ins.get(1)
+                                    .copied()
+                                    .flatten()
+                                    .and_then(|a| self.consts[a].as_ref())
+                                    .map(Tensor::ints)
+                            });
+                            let shape = match (n.op.as_str(), axes) {
+                                ("Identity", _) => Some(sh.clone()),
+                                (_, Some(ax)) => {
+                                    let r = sh.len() as i64;
+                                    let ax: Vec<usize> = ax.iter().map(|&a| (if a < 0 { a + r } else { a }) as usize).collect();
+                                    (ax.iter().all(|&a| a >= 2 && a < sh.len() && sh[a] == 1))
+                                        .then(|| sh.iter().enumerate().filter(|(k, _)| !ax.contains(k)).map(|(_, &d)| d).collect())
+                                }
+                                _ => None,
+                            };
+                            if let Some(shape) = shape {
+                                // An alias: channels-last memory is the same without a spatial 1.
+                                out = Some((*x, shape));
+                                if last[*s] == i {
+                                    // The buffer passes on to the output.
+                                    vals[*s] = None;
+                                } else {
+                                    // Keep both: copy so each has its own buffer.
+                                    let len: usize = sh.iter().product();
+                                    let y = sess.alloc(len).context("device buffer")?;
+                                    steps.push(Step::Unary {
+                                        x: *x,
+                                        y,
+                                        n: len,
+                                        post: Default::default(),
+                                    });
+                                    out = Some((y, out.unwrap().1));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match out {
+                Some((b, shape)) => {
+                    vals[self.slots_out[i][0]] = Some(DVal::Dev(b, shape));
+                }
+                None => {
+                    // The CPU: its inputs on the host.
+                    flush(&mut sess, &mut steps)?;
+                    for s in ins.iter().flatten() {
+                        if let Some(DVal::Dev(b, sh)) = &vals[*s] {
+                            let data = sess.data(*b).to_vec();
+                            let t = Tensor::new(sh.clone(), data).with_layout(true);
+                            sess.release(*b);
+                            vals[*s] = Some(DVal::Host(t));
+                        }
+                    }
+                    let args: Vec<Arg> = ins
+                        .iter()
+                        .map(|s| match s {
+                            Some(s) => match vals[*s].as_ref() {
+                                Some(DVal::Host(t)) => Arg::Ref(t),
+                                _ => self.consts[*s].as_ref().map_or(Arg::None, Arg::Ref),
+                            },
+                            None => Arg::None,
+                        })
+                        .collect();
+                    let outs = run_node(n, args, self.convs[i].as_ref()).with_context(|| format!("{} -> {:?}", n.op, n.outputs))?;
+                    if outs.len() < self.slots_out[i].len() {
+                        bail!("{}: {} outputs computed, {} expected", n.op, outs.len(), self.slots_out[i].len());
+                    }
+                    for (&s, t) in self.slots_out[i].iter().zip(outs) {
+                        vals[s] = Some(DVal::Host(t));
+                    }
+                }
+            }
+            // Values used for the last time here give their buffers back.
+            for s in ins.iter().flatten() {
+                if last[*s] == i
+                    && let Some(DVal::Dev(b, _)) = vals[*s].take()
+                {
+                    sess.release(b);
+                }
+            }
+        }
+        flush(&mut sess, &mut steps)?;
+        self.output_slots
+            .iter()
+            .zip(&self.outputs)
+            .map(|(&s, name)| {
+                let t = match vals[s].take() {
+                    Some(DVal::Host(t)) => t,
+                    Some(DVal::Dev(b, sh)) => Tensor::new(sh, sess.data(b).to_vec()).with_layout(true),
+                    None => self.consts[s].clone().with_context(|| format!("output {name} not computed"))?,
+                };
+                Ok(t.into_nchw())
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Building models (tests and tools).
 
 /// Writes a small ONNX model: for tests, which build graphs in code.
@@ -2576,6 +3060,13 @@ mod tests {
             .iter()
             .map(|g| (g.to_string(), Model::load(&md.join(format!("rec_{g}.onnx"))).unwrap()))
             .collect();
+        // `OXINFER_ONNX_DEVICE=1`: the models on the GPU (when there is one).
+        if std::env::var_os("OXINFER_ONNX_DEVICE").is_some() {
+            let _ = crate::gpu::ensure(crate::platform::DevicePref::Auto);
+            for m in [&det, &router].into_iter().chain(recs.iter().map(|r| &r.1)) {
+                m.set_device(true);
+            }
+        }
         let mut dirs: Vec<_> = std::fs::read_dir(&dd)
             .unwrap()
             .map(|e| e.unwrap().path())

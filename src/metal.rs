@@ -56,6 +56,8 @@ pub(crate) mod ds41;
 pub(crate) mod inkling;
 #[path = "metal_inkling_draft.rs"]
 pub(crate) mod inkling_draft;
+#[path = "metal_onnx.rs"]
+mod onnx;
 #[path = "metal_prefill.rs"]
 mod prefill;
 #[path = "metal_unet.rs"]
@@ -2487,7 +2489,8 @@ impl MetalBackend {
             dit::SRC
         ) + dit::LTX_SRC
             + dit::H3_SRC
-            + vi::SRC;
+            + vi::SRC
+            + onnx::SRC;
         let compile = |src: &str, metal4: bool| -> Result<Id> {
             let src = CString::new(src)?;
             let ns_src = unsafe { msg_str(nsstring_cls, o.sel(c"stringWithUTF8String:"), src.as_ptr()) };
@@ -4510,6 +4513,10 @@ impl Backend for MetalBackend {
 
     fn unet_session(&'static self) -> Option<Box<dyn crate::gpu::unet::Session>> {
         self.unet_session_impl()
+    }
+
+    fn onnx_device(&'static self) -> Option<std::sync::Arc<dyn crate::gpu::onnx::Device>> {
+        self.onnx_device_impl()
     }
 
     fn whisper_session(&'static self) -> Option<Box<dyn crate::gpu::whisper::Session>> {

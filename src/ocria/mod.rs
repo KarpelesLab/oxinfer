@@ -12,6 +12,9 @@
 //! filter and faint short tokens. [`OcrRunOptions::plain`] turns every page-level heuristic off
 //! (the models' own outputs, as the reference script `ref_ocr.py` gives them).
 //!
+//! The models run on the CPU, or on the GPU (Metal) for large inputs or when asked
+//! ([`OcrOptions::device`]).
+//!
 //! `rec_latin` is quantized (QDQ, int8 weights, uint8 activations); it runs with ONNX Runtime's
 //! int8 arithmetic ([`crate::onnx`]), so it reads what LiteParse's ONNX Runtime reads.
 
@@ -51,6 +54,11 @@ const DET_ADAPTIVE: det::Adaptive = det::Adaptive {
 };
 const DET_FAINT: det::Faint = det::Faint { thresh: 0.1, max: 24 };
 
+/// The smallest inputs (values) `device=auto` runs on an active GPU, for the detector (about a
+/// 700 x 700 RGB image: below it the GPU's fixed cost per run outweighs it), the router and the
+/// recognizers (eight lines at 512 pixels).
+pub const AUTO_MIN: [usize; 3] = [1_500_000, 131_072, 131_072];
+
 /// The files a model folder holds for the scripts in `scripts`.
 pub fn files_for(scripts: &[bool; 4]) -> Vec<String> {
     let mut v: Vec<String> = ["det.onnx", "det.meta.json", "router.onnx", "config.json"]
@@ -79,7 +87,9 @@ pub struct OcrOptions {
     pub threads: Option<usize>,
     /// Where the repo id is downloaded.
     pub cache_dir: Option<PathBuf>,
-    /// Accepted for symmetry with the other models: OCRia runs on the CPU.
+    /// Where the models run: `cpu`, a GPU (`metal`: the detector, the router and the
+    /// recognizers on it, the page heuristics on the CPU), or `auto` (the GPU for the inputs it
+    /// runs faster than the CPU, see [`AUTO_MIN`]).
     pub device: crate::platform::DevicePref,
 }
 
@@ -478,6 +488,38 @@ impl Ocria {
             bail!("no recognizer to load");
         }
         let params = det.params() + router.model.params() + recs.iter().flatten().map(|r| r.model.params()).sum::<usize>();
+        // The models on the GPU: all of them asked for by name, those it runs faster with `auto`.
+        let gpu = crate::gpu::ensure(opts.device)?;
+        let (on, min) = match opts.device {
+            crate::platform::DevicePref::Cpu => (false, [0; 3]),
+            crate::platform::DevicePref::Gpu(_) => (true, [0; 3]),
+            crate::platform::DevicePref::Auto => (true, AUTO_MIN),
+        };
+        det.set_device(on);
+        det.set_device_min(min[0]);
+        router.model.set_device(on);
+        router.model.set_device_min(min[1]);
+        for r in recs.iter().flatten() {
+            r.model.set_device(on);
+            r.model.set_device_min(min[2]);
+        }
+        let actual = [
+            det.on_device(),
+            router.model.on_device(),
+            recs.iter().flatten().any(|r| r.model.on_device()),
+        ];
+        let device = match gpu.filter(|_| actual.iter().any(|&b| b)) {
+            Some(b) => {
+                let parts: Vec<&str> = ["detector", "router", "recognizers"]
+                    .iter()
+                    .zip(actual)
+                    .filter(|(_, o)| *o)
+                    .map(|(n, _)| *n)
+                    .collect();
+                format!("{} ({})", b.name(), parts.join(", "))
+            }
+            None => "cpu".into(),
+        };
         let thresh = from_meta("thresh").unwrap_or(DET_THRESH);
         let merge = from_meta("merge").unwrap_or(DET_MERGE);
         let info = OcriaInfo {
@@ -493,7 +535,7 @@ impl Ocria {
             det_merge: merge,
             det_long_side: opts.det_long_side,
             params,
-            device: "cpu".into(),
+            device,
             load_secs: t0.elapsed().as_secs_f64(),
         };
         Ok(Self {

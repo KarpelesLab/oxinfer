@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 pub mod decode;
 #[path = "gpu_dit.rs"]
 pub mod dit;
+#[path = "gpu_onnx.rs"]
+pub mod onnx;
 #[path = "gpu_unet.rs"]
 pub mod unet;
 #[path = "gpu_vi.rs"]
@@ -298,6 +300,11 @@ pub trait Backend: Send + Sync {
     /// A session running whole convolutional UNet passes on the device (see [`unet`]); None
     /// when the backend has none.
     fn unet_session(&'static self) -> Option<Box<dyn unet::Session>> {
+        None
+    }
+    /// The ONNX interpreter's operators on the device (see [`onnx`]); None when the backend has
+    /// none.
+    fn onnx_device(&'static self) -> Option<std::sync::Arc<dyn onnx::Device>> {
         None
     }
     /// A session running whole Whisper encoder passes on the device (see [`whisper`]); None when

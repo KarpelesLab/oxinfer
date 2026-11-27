@@ -25,6 +25,8 @@ Prints each image's text in reading order, or its lines as JSON.\n\
   --thresh T            detector threshold (default det.meta.json's, 0.55)\n\
   --merge G             collinear merge gap in line heights (default 0.6; 0 off)\n\
   --repeat N            run each image N times (timing)\n\
+  --device D            where the models run: auto (default: on the GPU for large pages and\n\
+                        batches of lines), cpu, metal (always the GPU)\n\
   --threads N           CPU threads\n\
   --cache-dir DIR       download cache\n\
   --profile             time per stage and per operator kind\n\
@@ -71,6 +73,7 @@ pub fn run(args: &[String]) -> Result<()> {
             "--merge" => ro.set("det_merge", &val()?)?,
             "--repeat" => repeat = val()?.parse::<usize>().context("--repeat")?.max(1),
             "--threads" => lo.set("threads", &val()?)?,
+            "--device" => lo.set("device", &val()?)?,
             "--cache-dir" => lo.set("cache_dir", &val()?)?,
             "-q" | "--quiet" => quiet = true,
             "--profile" => profile = true,
