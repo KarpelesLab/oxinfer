@@ -786,6 +786,10 @@ impl Conv {
         self.pad.0
     }
 
+    #[cfg_attr(
+        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
+        allow(dead_code)
+    )]
     /// Zero padding before and after the input.
     #[cfg_attr(
         not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
@@ -795,6 +799,10 @@ impl Conv {
         self.pad
     }
 
+    #[cfg_attr(
+        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
+        allow(dead_code)
+    )]
     /// The kernel as float32 rows `[cout][ky][kx][cin]` and the bias, for an engine that keeps
     /// its own copy on a device (None for split float32 layers and rows that cannot be read).
     #[cfg_attr(
