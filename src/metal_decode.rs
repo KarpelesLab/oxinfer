@@ -9573,6 +9573,10 @@ impl DecodePlan for MetalPlan<'_> {
                     pf_note(kind, g);
                 }
                 from = end;
+                // Each chunk's GPU time by kind of op.
+                eprintln!("[prefill chunk of {t} tokens on the GPU, op by op:]");
+                pf_report();
+                pf_reset();
             }
             // (Routed on the device: no stops.)
             let stops: Vec<(usize, usize)> = (from..end)

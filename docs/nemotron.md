@@ -85,7 +85,14 @@ ggml-org's Q4_0 GGUF of Lightning on the M5 Max (greedy, the machine shared with
 | decoding after a 3,056-token prompt | 136 tok/s (70) | |
 | prefill | 1,848 tok/s at 3,056 tokens (596 with the matmuls alone on the GPU) | `llama-bench` pp512 3,390, pp2048 2,761 |
 
-Decoding is ahead of llama.cpp; prompts run at about two thirds of its speed.
+Decoding is ahead of llama.cpp; prompts run at about two thirds of its speed. Where a chunk's
+GPU time goes (`OXINFER_PF_PROFILE=1` prints each prefill chunk's by kind of op, every op in a
+command buffer of its own): of 266 ms for 1,024 tokens, the Mamba-2 scan 88 ms (a third: each
+layer's tokens one after the other, a SIMD-group per state row), the routed experts' grouped
+GEMMs 84 ms, the Mamba-2 input projections 27 ms, the rest under 17 ms each. Giving each
+SIMD-group 8 rows (B and C loaded once for them, the next token's inputs loaded ahead) was 2.2x
+slower and one row with the inputs loaded ahead 1.1x slower (fewer SIMD-groups in flight); a
+chunked scan as matrix products (Mamba-2's SSD form) is what is left to try.
 
 The squared-ReLU experts had run on the pair kernels with the up matrix in both slots, reading
 it twice; they now skip the second matrix (mode 9 of `mvx_*_pair` / `mvxt_*_pair`), the same
