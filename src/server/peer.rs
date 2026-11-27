@@ -882,6 +882,14 @@ impl Peers {
             }
         }
         cands.sort();
+        if std::env::var_os("OXINFER_PEER_DEBUG").is_some() {
+            let r = lock(&self.routes);
+            eprintln!(
+                "[peers: {model}: (class, requests, machine) {cands:?}, conversation {key:x?} last on {:?}, running {}]",
+                key.and_then(|k| r.last.get(&k).map(|v| v.0)),
+                key.is_some_and(|k| r.inflight.contains_key(&k))
+            );
+        }
         // The machine that holds the conversation's cache, while it can take it now and no
         // request of the same conversation is running (which would hold that cache).
         if let Some(k) = key {
@@ -978,7 +986,7 @@ impl Peers {
     /// Forwards the request to peer `at - 1`. `Err(None)`: the peer could not be reached (or
     /// refused the key) before anything of a response arrived, so another machine may take the
     /// request.
-    pub fn forward(self: &Arc<Self>, at: usize, req: &ApiRequest, path: &str) -> Result<Output, Option<ApiError>> {
+    pub fn forward(self: &Arc<Self>, plan: &Plan, at: usize, req: &ApiRequest, path: &str) -> Result<Output, Option<ApiError>> {
         let peer = self.list[at - 1].clone();
         let unreachable = |e: &dyn std::fmt::Display| {
             let msg = format!("unreachable ({e})");
@@ -1067,6 +1075,13 @@ impl Peers {
             return Err(None);
         }
         peer.forwarded.fetch_add(1, Ordering::Relaxed);
+        // It ran the model: loaded there now, whatever the last poll said.
+        if reply.status == 200
+            && let Some(info) = lock(&peer.st).info.as_mut()
+            && let Some(m) = info.models.iter_mut().find(|m| m.id == plan.model)
+        {
+            m.loaded = true;
+        }
         let streamed = reply.status == 200 && !matches!(reply.framing, Framing::Length(_));
         if !streamed {
             let body = match reply.read_all(1 << 30) {

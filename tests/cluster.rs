@@ -76,8 +76,13 @@ fn dechunk(head: &str, rest: &str) -> String {
 
 /// One HTTP/1.1 request with an optional key; the status and the body.
 fn request(addr: SocketAddr, method: &str, path: &str, key: Option<&str>, body: &str) -> (u16, String) {
+    request_as(addr, method, path, key.map(|k| format!("Authorization: Bearer {k}\r\n")), body)
+}
+
+/// [`request`] with its own header lines (each ending with CRLF).
+fn request_as(addr: SocketAddr, method: &str, path: &str, headers: Option<String>, body: &str) -> (u16, String) {
     let mut s = std::net::TcpStream::connect(addr).unwrap();
-    let auth = key.map(|k| format!("Authorization: Bearer {k}\r\n")).unwrap_or_default();
+    let auth = headers.unwrap_or_default();
     write!(
         s,
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -421,6 +426,26 @@ fn balancing_and_cancel() {
             a.api.requests().is_empty() && b.api.requests().is_empty()
         });
     }
+
+    // A conversation (named by its client) that started on the peer, this machine being busy,
+    // goes back there when this machine is idle again; a request without the name runs here.
+    let quick = json!({"model": "sd3", "prompt": "a fox", "size": "64x64", "steps": 2, "seed": 1}).to_string();
+    let named = |body: &str| request_as(addr, "POST", "/v1/images/generations", Some("X-Session-Id: ses_1\r\n".into()), body);
+    let forwarded = || a.api.status()["peers"][0]["forwarded"].as_u64().unwrap();
+    let hold = spawn(slow(false));
+    wait_for("a request denoising here", || running(&a.api) == 1 && b.api.requests().is_empty());
+    let n = forwarded();
+    assert_eq!(named(&quick).0, 200);
+    assert_eq!(forwarded(), n + 1, "this machine was busy");
+    for r in a.api.requests() {
+        assert!(a.api.cancel(&r.id));
+    }
+    assert_eq!(hold.join().unwrap().0, 499);
+    wait_for("this machine idle", || a.api.requests().is_empty());
+    assert_eq!(named(&quick).0, 200);
+    assert_eq!(forwarded(), n + 2, "the conversation's machine");
+    assert_eq!(request(addr, "POST", "/v1/images/generations", None, &quick).0, 200);
+    assert_eq!(forwarded(), n + 2, "no conversation: this machine first");
     std::fs::remove_dir_all(&dir).ok();
 }
 

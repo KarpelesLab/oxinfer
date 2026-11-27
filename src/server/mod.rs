@@ -1131,7 +1131,7 @@ impl Api {
                 return self.dispatch(req, path).map(|o| (o, Some(guard)));
             }
             let guard = self.peers.begin(plan, at);
-            match self.peers.forward(at, req, path) {
+            match self.peers.forward(plan, at, req, path) {
                 Ok(Output::Full(r)) if more && pass(r.status) => {
                     let msg = serde_json::from_slice::<Value>(&r.body)
                         .ok()
