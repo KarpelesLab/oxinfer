@@ -1,7 +1,8 @@
 //! LTX-2.5 for the server and the C API: loading from a name with `KEY=VALUE` options, and the
 //! generation parameters from a JSON object (the same fields everywhere).
 
-use super::{FetchOptions, ImageCond, Noise, Params, Paths, Pipeline, Variant};
+use super::dit::Blocks;
+use super::{FetchOptions, Guidance, GuidanceMode, ImageCond, Noise, Params, Paths, Pipeline, Variant};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -81,7 +82,7 @@ pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Pa
             .and_then(|p| p.parent())
             .map(Path::to_path_buf)
             .unwrap_or_default();
-        paths.loras.push((root.join(super::files::DISTILLED_LORA), 1.0));
+        paths.distilled_lora = Some(root.join(super::files::DISTILLED_LORA));
     }
     let mut pipe = Pipeline::load(paths)?;
     pipe.dit.device = device;
@@ -104,11 +105,92 @@ fn floats(v: &serde_json::Value) -> Option<Vec<f32>> {
     }
 }
 
+/// The guidance keys ([`guidance_option`]).
+pub const GUIDANCE_KEYS: [&str; 14] = [
+    "cfg",
+    "audio_cfg",
+    "stg",
+    "audio_stg",
+    "stg_blocks",
+    "audio_stg_blocks",
+    "rescale",
+    "audio_rescale",
+    "modality",
+    "audio_modality",
+    "skip_step",
+    "audio_skip_step",
+    "steps",
+    "negative_prompt",
+];
+
+/// `all`, `none` or a comma list of block indices.
+pub fn parse_blocks(v: &str) -> Result<Blocks> {
+    Ok(match v.trim() {
+        "all" => Blocks::All,
+        "" | "none" => Blocks::None,
+        l => Blocks::List(
+            l.split(',')
+                .map(|x| x.trim().parse().with_context(|| format!("block index {x:?}")))
+                .collect::<Result<_>>()?,
+        ),
+    })
+}
+
+/// Sets one guidance setting of `g` (the release's names: `cfg` / `audio_cfg` (1: off),
+/// `stg` / `audio_stg` (0: off), `stg_blocks` / `audio_stg_blocks` (`all`, `none` or a list),
+/// `rescale` / `audio_rescale`, `modality` / `audio_modality` (the a2v / v2a scale, 1: off),
+/// `skip_step` / `audio_skip_step`, `steps`, `negative_prompt`); false when `key` is not one.
+pub fn guidance_option(g: &mut Guidance, key: &str, v: &str) -> Result<bool> {
+    let f = || -> Result<f32> { v.trim().parse().with_context(|| format!("{key}: not a number: {v}")) };
+    let n = || -> Result<usize> { v.trim().parse().with_context(|| format!("{key}: not a count: {v}")) };
+    match key {
+        "cfg" | "guidance_scale" | "video_cfg" => g.video.cfg = f()?,
+        "audio_cfg" | "audio_guidance_scale" => g.audio.cfg = f()?,
+        "stg" | "stg_scale" | "video_stg" => g.video.stg = f()?,
+        "audio_stg" | "audio_stg_scale" => g.audio.stg = f()?,
+        "stg_blocks" | "video_stg_blocks" => g.video.stg_blocks = parse_blocks(v)?,
+        "audio_stg_blocks" => g.audio.stg_blocks = parse_blocks(v)?,
+        "rescale" | "video_rescale" => g.video.rescale = f()?,
+        "audio_rescale" => g.audio.rescale = f()?,
+        "modality" | "modality_scale" | "a2v_scale" => g.video.modality = f()?,
+        "audio_modality" | "audio_modality_scale" | "v2a_scale" => g.audio.modality = f()?,
+        "skip_step" | "video_skip_step" => g.video.skip_step = n()?,
+        "audio_skip_step" => g.audio.skip_step = n()?,
+        "steps" | "num_inference_steps" => g.steps = n()?.max(1),
+        "negative_prompt" | "negative" => g.negative_prompt = v.to_string(),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// The guidance mode of `mode` (`auto` / none, `on`, `off`) and the release's guidance with
+/// `opts` ([`guidance_option`]) on top; a scale or block setting (not `steps` or
+/// `negative_prompt`) turns `auto` into `on`.
+pub fn guidance_from(mode: Option<&str>, opts: &[(&str, String)]) -> Result<(GuidanceMode, Guidance)> {
+    let mut m = match mode {
+        None => GuidanceMode::Auto,
+        Some(x) => GuidanceMode::parse(x).with_context(|| format!("guidance {x:?}: auto, on or off"))?,
+    };
+    let mut g = Guidance::default();
+    for (k, v) in opts {
+        if !guidance_option(&mut g, k, v)? {
+            bail!("unknown guidance setting {k:?}");
+        }
+        if m == GuidanceMode::Auto && !matches!(*k, "steps" | "num_inference_steps" | "negative_prompt" | "negative") {
+            m = GuidanceMode::On;
+        }
+    }
+    Ok((m, g))
+}
+
 /// [`Params`] from a JSON object: `prompt` (required), `size` (`"WxH"`) or `width` / `height`,
 /// `frames` or `seconds`, `fps`, `seed`, `one_stage`, `temporal_upscale`, `audio` (false: no
 /// soundtrack), `eta`, `sigmas` / `stage2_sigmas` (arrays or comma lists), `noise`
-/// (`oxinfer` / `torch`), `strength` (of the first frame). Images are the caller's to load
-/// ([`images_from_json`]).
+/// (`oxinfer` / `torch`), `strength` (of the first frame), `guidance` (`auto`, `on`, `off`) and
+/// the guidance settings of [`guidance_option`] (`cfg`, `stg`, `steps`, `negative_prompt`, ...;
+/// any of them but `steps` and `negative_prompt` turns guidance on), `refine_audio`, `image_crf`
+/// (the H.264 CRF conditioning images are re-compressed at; 0: as they are). Images are the
+/// caller's to load ([`images_from_json`]).
 pub fn params_from_json(o: &serde_json::Value) -> Result<Params> {
     let prompt = o["prompt"].as_str().context("no prompt")?;
     let mut p = Params::new(prompt);
@@ -141,20 +223,46 @@ pub fn params_from_json(o: &serde_json::Value) -> Result<Params> {
         p.audio = x;
     }
     if let Some(e) = num("eta") {
-        p.eta = e as f32;
+        p.eta = Some(e as f32);
     }
     if let Some(s) = floats(&o["sigmas"]) {
-        p.stage1_sigmas = s;
+        p.stage1_sigmas = Some(s);
+    }
+    let mut gopts: Vec<(&str, String)> = Vec::new();
+    for k in GUIDANCE_KEYS {
+        match &o[k] {
+            serde_json::Value::Null => {}
+            serde_json::Value::String(v) => gopts.push((k, v.clone())),
+            serde_json::Value::Array(a) => gopts.push((
+                k,
+                a.iter()
+                    .map(|x| x.to_string().trim_matches('"').to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )),
+            v => gopts.push((k, v.to_string())),
+        }
+    }
+    let gmode = match &o["guidance"] {
+        serde_json::Value::Bool(b) => Some(if *b { "on".to_string() } else { "off".to_string() }),
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => None,
+    };
+    (p.guidance_mode, p.guidance) = guidance_from(gmode.as_deref(), &gopts)?;
+    if let Some(x) = b("refine_audio") {
+        p.refine_audio = x;
+    }
+    if let Some(c) = num("image_crf") {
+        p.image_crf = Some(c.max(0.0) as u32);
     }
     if let Some(s) = floats(&o["stage2_sigmas"]) {
         p.stage2_sigmas = s;
     }
     p.noise = match o["noise"].as_str() {
-        None | Some("") | Some("oxinfer") => Noise::Oxinfer,
-        Some("torch") => Noise::Torch,
-        Some(n) => bail!("noise {n:?}: oxinfer or torch"),
+        None => Noise::Oxinfer,
+        Some(n) => Noise::parse(n)?,
     };
-    for s in [&p.stage1_sigmas, &p.stage2_sigmas] {
+    for s in p.stage1_sigmas.iter().chain([&p.stage2_sigmas]) {
         if s.len() < 2 || s.last() != Some(&0.0) {
             bail!("a sigma schedule needs at least two values and ends at 0");
         }

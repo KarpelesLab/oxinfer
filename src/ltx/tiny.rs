@@ -593,6 +593,54 @@ mod tests {
     }
 
     #[test]
+    fn guided_dev() {
+        use super::super::{Guidance, GuidanceMode};
+        let d = TempDir::new("guided");
+        write_tiny_release(&d.0).unwrap();
+        // The tiny transformer under a dev name: guided by default.
+        let dev = d.0.join(super::super::files::DEV_BF16);
+        std::fs::copy(d.0.join(super::super::files::DISTILLED_BF16), &dev).unwrap();
+        let mut paths = Paths::resolve(&d.0).unwrap();
+        paths.transformer = dev;
+        let pipe = Pipeline::load(paths.clone()).unwrap();
+        assert!(pipe.dev);
+        let mut progress = |_: &str, _: usize, _: usize| {};
+        let mut p = Params::new("a test prompt");
+        (p.width, p.height, p.frames) = (64, 64, Some(9));
+        p.guidance.steps = 4;
+        assert!(pipe.guidance_of(&p).is_some());
+        // No distilled LoRA: one stage at the full size.
+        let guided = pipe.generate(&p, &mut progress).unwrap();
+        assert_eq!((guided.width, guided.height, guided.frames.len()), (64, 64, 9));
+        // The same schedule without the guidance passes differs.
+        p.guidance = Guidance {
+            steps: 4,
+            ..Guidance::off()
+        };
+        p.guidance_mode = GuidanceMode::On;
+        let plain = pipe.generate(&p, &mut progress).unwrap();
+        assert_ne!(guided.frames, plain.frames);
+        drop(pipe);
+        // With a LoRA as the distilled one: two stages, the LoRA off in the first.
+        let lora = d.0.join("distilled.safetensors");
+        let mut t = Tensors::new(23);
+        t.meta("lora_alpha", json!(4));
+        t.uni("diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight", &[4, D], 0.5, 0.0);
+        t.uni("diffusion_model.transformer_blocks.0.attn1.to_q.lora_B.weight", &[D, 4], 0.5, 0.0);
+        t.write(&lora).unwrap();
+        paths.distilled_lora = Some(lora);
+        let pipe = Pipeline::load(paths).unwrap();
+        let mut p = Params::new("a test prompt");
+        (p.width, p.height, p.frames) = (64, 64, Some(9));
+        p.guidance.steps = 3;
+        let v = pipe.generate(&p, &mut progress).unwrap();
+        assert_eq!((v.width, v.height), (64, 64));
+        // One stage with the distilled LoRA: the distilled schedule, no guidance.
+        p.two_stage = false;
+        assert!(pipe.guidance_of(&p).is_none());
+    }
+
+    #[test]
     fn frames_and_positions() {
         assert_eq!(super::super::snap_frames(121), 121);
         assert_eq!(super::super::snap_frames(128), 121);

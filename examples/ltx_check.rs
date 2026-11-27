@@ -9,6 +9,8 @@
 //! ltx_check audio FILE REF_DIR      # ref_audio.py (FILE: the audio VAE)
 //! ltx_check upsample FILE VAE REF_DIR  # ref_upsample.py
 //! ltx_check text FILE REF_DIR       # ref_text.py (FILE: the text encoder)
+//! ltx_check guider - REF_DIR        # ref_guider.py (guidance arithmetic, the dev schedule)
+//! ltx_check crf IMAGE QP OUT_DIR    # the H.264 round trip of a conditioning image
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -95,6 +97,87 @@ fn main() -> Result<()> {
             println!("forward {:.2}s", t0.elapsed().as_secs_f64());
             compare("video velocity", &vo, &r("vout")?);
             compare("audio velocity", &ao, &r("aout")?);
+            // The guidance passes (ref_dit_ptb.py): STG (video self-attention skipped in block 1,
+            // audio in block 0) and the isolated-modality pass (no audio-video cross-attention).
+            if dir.join("vout_ptb.f32").exists() {
+                fn si<'s>(
+                    x: &'s [f32],
+                    t: &'s [f32],
+                    sigma: f32,
+                    pos: &'s [f32],
+                    ctx: &'s [f32],
+                    keyframe_rows: usize,
+                ) -> ltx::dit::StreamIn<'s> {
+                    ltx::dit::StreamIn {
+                        x,
+                        t,
+                        sigma,
+                        pos,
+                        ctx,
+                        keyframe_rows,
+                    }
+                }
+                use ltx::dit::{Blocks, Perturb};
+                let ptb = Perturb {
+                    video_self: Blocks::List(vec![1]),
+                    audio_self: Blocks::List(vec![0]),
+                    cross: false,
+                };
+                let (vo, ao) = dit.forward_with(
+                    &si(&vx, &vt, sigma, &pos, &vctx, lh * lw),
+                    &si(&ax, &at, sigma, &apos, &actx, 0),
+                    &ptb,
+                );
+                compare("video velocity, STG pass", &vo, &r("vout_ptb")?);
+                compare("audio velocity, STG pass", &ao, &r("aout_ptb")?);
+                let iso = Perturb {
+                    cross: true,
+                    ..Perturb::default()
+                };
+                let (vo, ao) = dit.forward_with(
+                    &si(&vx, &vt, sigma, &pos, &vctx, lh * lw),
+                    &si(&ax, &at, sigma, &apos, &actx, 0),
+                    &iso,
+                );
+                compare("video velocity, isolated pass", &vo, &r("vout_mod")?);
+                compare("audio velocity, isolated pass", &ao, &r("aout_mod")?);
+            }
+        }
+        "crf" => {
+            // ltx_check crf IMAGE QP OUT_DIR: the image cropped to even sides, through H.264 at
+            // constant QP and back (what LTX-2.5 conditions on), as raw RGB `crf.rgb` (and the
+            // cropped original `orig.rgb`), for comparison with x264's CRF encode.
+            #[cfg(feature = "media")]
+            {
+                let img = oxinfer::minimax_h3::encode::load_image(file)?;
+                let qp: u32 = a[3].parse()?;
+                let (w, h) = (img.width / 2 * 2, img.height / 2 * 2);
+                let rgb: Vec<u8> = (0..h).flat_map(|y| img.rgb[y * img.width * 3..][..w * 3].to_vec()).collect();
+                let t0 = std::time::Instant::now();
+                let out = oxinfer::minimax_h3::encode::h264_roundtrip(&rgb, w, h, qp)?;
+                println!("{w}x{h} at QP {qp}: {:.2}s", t0.elapsed().as_secs_f64());
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(dir.join("crf.rgb"), &out)?;
+                std::fs::write(dir.join("orig.rgb"), &rgb)?;
+                std::fs::write(dir.join("meta.json"), serde_json::json!({"w": w, "h": h}).to_string())?;
+            }
+            #[cfg(not(feature = "media"))]
+            bail!("built without the media feature");
+        }
+        "guider" => {
+            // ref_guider.py: MultiModalGuider.calculate with the release's video / audio params,
+            // and LTX2Scheduler's 30-step schedule (FILE is unused).
+            let m = meta(dir)?;
+            let w = m["width"].as_u64().unwrap_or(128) as usize;
+            let (cond, un, ptb, md, mask) = (r("cond")?, r("uncond")?, r("ptb")?, r("mod")?, r("mask")?);
+            for (name, g, want) in [
+                ("video guidance", ltx::GuiderParams::video(), "gv"),
+                ("audio guidance", ltx::GuiderParams::audio(), "ga"),
+            ] {
+                let out = g.calculate(&cond, Some(&un), Some(&ptb), Some(&md), &mask, w);
+                compare(name, &out, &r(want)?);
+            }
+            compare("LTX2Scheduler(30)", &ltx::guidance::ltx2_sigmas(30), &r("sigmas30")?);
         }
         "connector" => {
             let files = ModelFiles::open_file(file, false)?;

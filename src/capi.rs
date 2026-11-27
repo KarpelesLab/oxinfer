@@ -2882,8 +2882,11 @@ pub unsafe extern "C" fn oxi_video_load(
 /// ref2va), `ref_image_edge`, the MiniMax-H3 motion / structure guidance of
 /// [`crate::minimax_h3::video::MotionGuidance`] (`still_prompt`, `motion_scale`, `stg_scale`,
 /// `stg_layers`, `guidance_until`); LTX-2.5 also `fps`, `one_stage`, `temporal_upscale`, `audio`,
-/// `eta`, `sigmas`, `stage2_sigmas`, `noise`, `strength` and `images` (`{"path", "frame",
-/// "strength"}` objects or `FILE@FRAME[:STRENGTH]`). `progress` gets each denoising step
+/// `eta`, `sigmas`, `stage2_sigmas`, `noise`, `strength`, `image_crf`, `images` (`{"path",
+/// "frame", "strength"}` objects or `FILE@FRAME[:STRENGTH]`) and the guidance of the dev
+/// transformer (`crate::ltx::api::params_from_json`: `guidance`, `negative_prompt`, `cfg`,
+/// `stg`, `rescale`, `modality`, their `audio_` forms, `stg_blocks`, `skip_step`,
+/// `refine_audio`; `steps` its steps). `progress` gets each denoising step
 /// (non-zero cancels). Writes the
 /// video (the `media` feature) to `out_video` in the format of its extension (`.mp4`: H.264 and
 /// AAC, also for other names; `.webm`: VP9 and Opus; `.avi`: Motion JPEG and PCM) and the

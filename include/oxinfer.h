@@ -1156,9 +1156,13 @@ OxiVideo *oxi_video_load(const char *model, const char *options, oxi_progress_fn
  *    "references": ["a.png", "voice.wav", "motion.mp4"], "ref_image_edge": 2048}   (ref2va)
  * LTX-2.5: "size" in multiples of 64 (32 with "one_stage": true), "frames" rounded down to
  * 8 k + 1 (none: the duration head's prediction), "fps": 24, "temporal_upscale": false,
- * "audio": true, "eta": 1, "sigmas" / "stage2_sigmas" (arrays ending at 0), "noise": "torch",
- * "first_frame" with "strength", "last_frame", "images": [{"path": "a.png", "frame": 40,
- * "strength": 1}] (or "a.png@40:1"); "steps" is not read (the distilled schedules). */
+ * "audio": true, "eta": 1, "sigmas" / "stage2_sigmas" (arrays ending at 0), "noise": "torch"
+ * (or "files:DIR"), "first_frame" with "strength", "last_frame", "images": [{"path": "a.png",
+ * "frame": 40, "strength": 1}] (or "a.png@40:1"), "image_crf": 18 (0: images as they are);
+ * guidance (the dev transformer's, by default): "guidance": "auto" | "on" | "off", "steps": 30,
+ * "negative_prompt", "cfg" / "audio_cfg", "stg" / "audio_stg", "stg_blocks" / "audio_stg_blocks"
+ * ([28], "all"), "rescale" / "audio_rescale", "modality" / "audio_modality", "skip_step" /
+ * "audio_skip_step", "refine_audio": false. */
  * `progress` gets each denoising step (non-zero cancels). Writes the video (needs the `media`
  * feature) to `out_video` in the format of its extension: .mp4 (H.264 + AAC; also for other
  * names), .webm (VP9 + Opus), .avi (Motion JPEG + 16-bit PCM); and the soundtrack to `out_wav`,

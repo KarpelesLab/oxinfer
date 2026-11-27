@@ -475,9 +475,15 @@ fn usage() -> ! {
          \x20 --one-stage          the distilled schedule at the full size (no spatial upsampler)\n\
          \x20 --temporal-upscale   twice the frames and rate after the last stage\n\
          \x20 --transformer int8|bf16|nvfp4|dev|dev-bf16|FILE   the transformer (default int8)\n\
-         \x20 --distilled-lora     the release's distilled LoRA on the dev transformer\n\
+         \x20 --distilled-lora     the release's distilled LoRA on the dev transformer (its 2nd stage)\n\
+         \x20 the dev transformer is guided (ti2vid: 30 Euler steps, CFG / STG / modality; one stage\n\
+         \x20 without --distilled-lora): --steps N, --cfg F, --negative TEXT, --audio-cfg F, --stg F,\n\
+         \x20 --audio-stg F, --stg-blocks L|all, --audio-stg-blocks L, --rescale F, --audio-rescale F,\n\
+         \x20 --modality-scale F, --audio-modality-scale F, --skip-step N, --audio-skip-step N,\n\
+         \x20 --guidance-mode auto|on|off (--no-guidance: off), --refine-audio (denoise audio in stage 2)\n\
+         \x20 --image-crf N        H.264 CRF images are re-compressed at first (default 18; 0: off)\n\
          \x20 --text-encoder FILE, --vae FILE, --audio-vae FILE, --upsampler FILE, --duration-head FILE\n\
-         \x20 --sigmas a,b,..,0, --stage2-sigmas a,..,0, --eta F (ancestral noise, default 1), --noise torch\n\
+         \x20 --sigmas a,b,..,0, --stage2-sigmas a,..,0, --eta F (ancestral noise; 1 distilled, 0 guided), --noise torch\n\
          \x20 --exact-attention    the GPU's video attention on float32 operands (else half)\n\
          \n\
          MOSS-Image (lodestones/Kromoss, OpenMOSS-Team/MOSS-Image-*; see docs/moss-image.md): text to\n\

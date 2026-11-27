@@ -30,6 +30,7 @@ pub mod audio;
 pub(crate) mod device;
 pub mod dit;
 pub mod duration;
+pub mod guidance;
 pub mod lora;
 pub(crate) mod nn;
 pub mod text;
@@ -43,7 +44,8 @@ use crate::minimax_h3::video::{Soundtrack, Video};
 use crate::safetensors::ModelFiles;
 pub use crate::sd::Image;
 use anyhow::{Context, Result, bail};
-use dit::{Dit, StreamIn};
+use dit::{Dit, Perturb, StreamIn};
+pub use guidance::{DEFAULT_NEGATIVE_PROMPT, Guidance, GuidanceMode, GuiderParams};
 use std::path::{Path, PathBuf};
 
 /// The distilled stage-1 schedule (`DISTILLED_SIGMA_VALUES`).
@@ -202,8 +204,17 @@ pub struct Paths {
     pub spatial_upsampler: Option<PathBuf>,
     pub temporal_upsampler: Option<PathBuf>,
     pub duration_head: Option<PathBuf>,
-    /// LoRA files and their strengths (the distilled LoRA on the dev transformer).
+    /// LoRA files and their strengths, on for every stage.
     pub loras: Vec<(PathBuf, f32)>,
+    /// The release's distilled LoRA (on the dev transformer): on for every stage of the distilled
+    /// schedule; with guidance (the dev pipeline), off in the first stage and on in the second
+    /// (`ti2vid_two_stages`).
+    pub distilled_lora: Option<PathBuf>,
+}
+
+/// Whether `path` names a dev (non-distilled) transformer file of the release (`*-dev-*`).
+pub fn is_dev_file(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n.to_string_lossy().contains("-dev-"))
 }
 
 impl Paths {
@@ -245,6 +256,7 @@ impl Paths {
             temporal_upsampler: first(&[files::TEMPORAL_UPSAMPLER]),
             duration_head: first(&[files::DURATION_HEAD]),
             loras: Vec::new(),
+            distilled_lora: None,
         })
     }
 }
@@ -258,13 +270,31 @@ pub struct ImageCond {
 }
 
 /// The noise generator.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum Noise {
     /// oxinfer's generator ([`crate::sd::ops::Rng`]).
     #[default]
     Oxinfer,
     /// PyTorch's CPU generator ([`crate::torch_rng`]), as `torch.Generator("cpu")`.
     Torch,
+    /// Normals read from files: the generator seeded `s` reads `noise_{s}.f32` in this folder
+    /// (little-endian float32) from its start, in the order it draws (for comparisons with the
+    /// reference fed the same files).
+    Files(PathBuf),
+}
+
+impl Noise {
+    /// `oxinfer`, `torch` or `files:DIR`.
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s {
+            "" | "oxinfer" => Self::Oxinfer,
+            "torch" => Self::Torch,
+            _ => match s.strip_prefix("files:") {
+                Some(d) => Self::Files(PathBuf::from(d)),
+                None => bail!("noise {s:?}: oxinfer, torch or files:DIR"),
+            },
+        })
+    }
 }
 
 /// What [`Pipeline::generate`] needs.
@@ -278,17 +308,32 @@ pub struct Params {
     pub fps: f32,
     pub seed: u64,
     /// Half-size stage, spatial upsampler, full-size stage (the release's pipeline); else one
-    /// stage at the full size.
+    /// stage at the full size. The dev transformer without the distilled LoRA always runs one
+    /// stage (`ti2vid_one_stage`).
     pub two_stage: bool,
-    pub stage1_sigmas: Vec<f32>,
+    /// The first (or only) stage's schedule; none: [`DISTILLED_SIGMAS`], or with guidance
+    /// [`guidance::ltx2_sigmas`] of its steps.
+    pub stage1_sigmas: Option<Vec<f32>>,
     pub stage2_sigmas: Vec<f32>,
+    /// Whether the first (or only) stage is guided (`ti2vid_*`: by default with a dev
+    /// transformer), and how ([`Guidance`], the release's by default).
+    pub guidance_mode: GuidanceMode,
+    pub guidance: Guidance,
+    /// Denoise the soundtrack again in the guided pipeline's second stage (`--refine-audio`;
+    /// otherwise the first stage's is kept).
+    pub refine_audio: bool,
     /// Double the frame count and rate with the temporal upsampler after the last stage.
     pub temporal_upscale: bool,
     pub images: Vec<ImageCond>,
     /// Decode the soundtrack (the audio stream is denoised either way: the model is joint).
     pub audio: bool,
-    /// Ancestral noise: 1 is the release's sampler, 0 plain Euler.
-    pub eta: f32,
+    /// Ancestral noise: 1 is the distilled pipeline's sampler, 0 plain Euler (the guided
+    /// pipeline's); none: the pipeline's.
+    pub eta: Option<f32>,
+    /// The H.264 CRF conditioning images are re-compressed at before they are encoded (the
+    /// compression the model was trained against); none: the model's ([`Pipeline::image_crf`]:
+    /// 18 for LTX-2.4 and later, 33 before), 0: as they are.
+    pub image_crf: Option<u32>,
     pub noise: Noise,
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -303,12 +348,16 @@ impl Params {
             fps: DEFAULT_FPS,
             seed: 42,
             two_stage: true,
-            stage1_sigmas: DISTILLED_SIGMAS.to_vec(),
+            stage1_sigmas: None,
             stage2_sigmas: STAGE_2_SIGMAS.to_vec(),
+            guidance_mode: GuidanceMode::Auto,
+            guidance: Guidance::default(),
+            refine_audio: false,
             temporal_upscale: false,
             images: Vec::new(),
             audio: true,
-            eta: 1.0,
+            eta: None,
+            image_crf: None,
             noise: Noise::Oxinfer,
             cancel: None,
         }
@@ -394,13 +443,22 @@ pub fn unpatchify(rows: &[f32], c: usize, t: usize, h: usize, w: usize) -> Vec<f
 pub enum NoiseGen {
     Ox(crate::sd::ops::Rng),
     Torch(Box<crate::torch_rng::TorchGenerator>),
+    /// A file's values and the next one to give.
+    File(Vec<f32>, usize, PathBuf),
 }
 
 impl NoiseGen {
-    pub fn new(kind: Noise, seed: u64) -> Self {
+    pub fn new(kind: &Noise, seed: u64) -> Self {
         match kind {
             Noise::Oxinfer => Self::Ox(crate::sd::ops::Rng::new(seed)),
             Noise::Torch => Self::Torch(Box::new(crate::torch_rng::TorchGenerator::new(seed))),
+            Noise::Files(dir) => {
+                let f = dir.join(format!("noise_{seed}.f32"));
+                let v = std::fs::read(&f)
+                    .map(|b| b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
+                    .unwrap_or_default();
+                Self::File(v, 0, f)
+            }
         }
     }
 
@@ -408,6 +466,11 @@ impl NoiseGen {
         match self {
             Self::Ox(r) => r.normals(n),
             Self::Torch(g) => g.randn(n),
+            Self::File(v, at, f) => {
+                assert!(*at + n <= v.len(), "{}: {} values, {} drawn", f.display(), v.len(), *at + n);
+                *at += n;
+                v[*at - n..*at].to_vec()
+            }
         }
     }
 }
@@ -463,6 +526,20 @@ fn ancestral_step(s: &mut State, denoised: &[f32], sigma: f32, next: f32, eta: f
         s.x.copy_from_slice(denoised);
         return;
     }
+    // Without noise (the plain Euler loop), the denoised rows are blended with the clean ones by
+    // the mask first (`post_process_latent`); with it, the stepped rows after.
+    let blended: Vec<f32>;
+    let denoised = if noise.is_none() && s.mask.iter().any(|&m| m != 1.0) {
+        blended = (0..s.x.len())
+            .map(|i| {
+                let m = s.mask[i / w];
+                denoised[i] * m + s.clean[i] * (1.0 - m)
+            })
+            .collect();
+        &blended[..]
+    } else {
+        denoised
+    };
     let down = next * (1.0 + (next / sigma - 1.0) * eta);
     let r = down / sigma;
     let (an, ad) = (1.0 - next, 1.0 - down);
@@ -492,7 +569,23 @@ pub struct PromptContext {
 pub struct Pipeline {
     pub paths: Paths,
     pub dit: Dit<'static>,
+    /// A dev (non-distilled) transformer: guided by default ([`Params::guidance`]).
+    pub dev: bool,
+    /// The distilled LoRA's switch (when [`Paths::distilled_lora`] is loaded).
+    distilled_switch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     vae_files: Option<&'static ModelFiles>,
+}
+
+/// How one denoising stage runs.
+struct Run<'a> {
+    sigmas: &'a [f32],
+    /// The ancestral sampler's noise seed.
+    seed: u64,
+    eta: f32,
+    /// The audio rows are kept as they are (conditioning, timestep 0).
+    frozen_audio: bool,
+    guidance: Option<&'a Guidance>,
+    name: &'a str,
 }
 
 fn open_static(p: &Path) -> Result<&'static ModelFiles> {
@@ -511,12 +604,104 @@ impl Pipeline {
         if !paths.loras.is_empty() {
             lora::apply(&mut dit, &paths.loras)?;
         }
+        let distilled_switch = match &paths.distilled_lora {
+            Some(l) => {
+                let sw = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                lora::apply_switched(&mut dit, &[(l.clone(), 1.0)], Some(&sw))?;
+                dit.lora_switch = Some(sw.clone());
+                Some(sw)
+            }
+            None => None,
+        };
         let vae_files = paths.video_vae.as_deref().map(open_static).transpose()?;
-        Ok(Self { paths, dit, vae_files })
+        Ok(Self {
+            dev: is_dev_file(&paths.transformer),
+            paths,
+            dit,
+            distilled_switch,
+            vae_files,
+        })
+    }
+
+    /// The guidance a run gets (none: the distilled pipeline): by [`Params::guidance_mode`];
+    /// automatically for a dev transformer, except with the distilled LoRA on one stage.
+    pub fn guidance_of(&self, p: &Params) -> Option<Guidance> {
+        let on = match p.guidance_mode {
+            GuidanceMode::On => true,
+            GuidanceMode::Off => false,
+            GuidanceMode::Auto => self.dev && !(self.distilled_switch.is_some() && !p.two_stage),
+        };
+        on.then(|| p.guidance.clone())
+    }
+
+    /// The H.264 CRF conditioning images are re-compressed at for this model (`detect_params`
+    /// on the VAE's `model_version`: 18 from LTX-2.4 on, 33 before).
+    pub fn image_crf(&self) -> u32 {
+        let version = self
+            .vae_files
+            .and_then(|f| f.metadata("model_version"))
+            .map(|v| {
+                v.replace('-', ".")
+                    .split('.')
+                    .map_while(|x| x.parse::<u32>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if version.as_slice() >= [2, 4].as_slice() { 18 } else { 33 }
+    }
+
+    /// `p`'s images re-compressed as the reference does (`load_conditioning_still`: cropped to
+    /// even sides, one H.264 intra picture at the run's CRF, decoded back). oxideav's encoder has
+    /// constant-QP rate control only: the picture is coded at QP `crf + 5`, the frame QP x264
+    /// (`-preset veryfast`, the reference's) gives a lone intra picture at that CRF (its
+    /// MB-tree offset) before adaptive quantization moves single macroblocks.
+    fn recompress_images(&self, p: &Params) -> Result<Vec<ImageCond>> {
+        let crf = p.image_crf.unwrap_or_else(|| self.image_crf());
+        if crf == 0 || p.images.is_empty() {
+            return Ok(p.images.clone());
+        }
+        #[cfg(feature = "media")]
+        {
+            p.images
+                .iter()
+                .map(|im| {
+                    let (w, h) = (im.image.width / 2 * 2, im.image.height / 2 * 2);
+                    if w < 2 || h < 2 {
+                        return Ok(im.clone());
+                    }
+                    let mut rgb = Vec::with_capacity(w * h * 3);
+                    for y in 0..h {
+                        let r = &im.image.rgb[y * im.image.width * 3..];
+                        rgb.extend_from_slice(&r[..w * 3]);
+                    }
+                    let rgb = crate::minimax_h3::encode::h264_roundtrip(&rgb, w, h, crf + 5)?;
+                    Ok(ImageCond {
+                        image: Image { width: w, height: h, rgb },
+                        ..im.clone()
+                    })
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            eprintln!("[LTX-2.5: built without the `media` feature: conditioning images are not re-compressed (CRF {crf})]");
+            Ok(p.images.clone())
+        }
+    }
+
+    fn set_distilled_lora(&self, on: bool) {
+        if let Some(s) = &self.distilled_switch {
+            s.store(on, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// The context rows of `prompt` (text encoder, then the connectors).
     pub fn encode_prompt(&self, prompt: &str) -> Result<PromptContext> {
+        Ok(self.encode_prompts(&[prompt])?.remove(0))
+    }
+
+    /// The context rows of each of `prompts` (the text encoder loaded once).
+    pub fn encode_prompts(&self, prompts: &[&str]) -> Result<Vec<PromptContext>> {
         let te = self
             .paths
             .text_encoder
@@ -524,9 +709,9 @@ impl Pipeline {
             .context("LTX-2.5 needs its text encoder (text_encoders/gemma4-12b-with-proj-ltx-2.5-*.safetensors)")?;
         let files = ModelFiles::open_file(te, false).with_context(|| format!("open {}", te.display()))?;
         let enc = text::TextEncoder::load(&files)?;
-        let f = enc.encode(prompt)?;
+        let feats = prompts.iter().map(|p| enc.encode(p)).collect::<Result<Vec<_>>>()?;
         drop(enc);
-        Ok(self.context(&f))
+        Ok(feats.iter().map(|f| self.context(f)).collect())
     }
 
     /// The connectors over prompt features.
@@ -568,20 +753,19 @@ impl Pipeline {
         enc.encode(&v).to_cthw()
     }
 
-    /// Denoises one stage: the video state (`lt x lh x lw` rows) and the audio state over
-    /// `sigmas`; returns both.
+    /// Denoises one stage: the video state (`lt x lh x lw` rows, then any guide rows) and the
+    /// audio state over `run.sigmas`, with the guidance passes (`neg`: the negative prompt's
+    /// context) when there is guidance.
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
         ctx: &PromptContext,
+        neg: Option<&PromptContext>,
         video: &mut State,
         audio: &mut State,
         (lt, lh, lw): (usize, usize, usize),
-        sigmas: &[f32],
         p: &Params,
-        seed: u64,
-        frozen_audio: bool,
-        stage: &str,
+        run: &Run,
         progress: Progress,
     ) -> Result<()> {
         let mut pos = video_positions(lt, lh, lw, p.fps);
@@ -589,47 +773,108 @@ impl Pipeline {
             pos.extend(guide_positions(im.frame, lh, lw, p.fps));
         }
         let apos = audio_positions(audio.rows());
-        let mut g = NoiseGen::new(p.noise, seed);
+        let mut g = NoiseGen::new(&p.noise, run.seed);
+        let sigmas = run.sigmas;
         let steps = sigmas.len() - 1;
+        let frozen = run.frozen_audio;
+        let mut last: Option<(Vec<f32>, Vec<f32>)> = None;
         for i in 0..steps {
             if p.cancelled() {
                 bail!("cancelled");
             }
             let (s, next) = (sigmas[i], sigmas[i + 1]);
             let vt = video.timesteps(s);
-            let at = audio.timesteps(if frozen_audio { 0.0 } else { s });
-            let (vv, av) = self.dit.forward(
-                &StreamIn {
-                    x: &video.x,
-                    t: &vt,
-                    sigma: s,
-                    pos: &pos,
-                    ctx: &ctx.video,
-                    keyframe_rows: lh * lw,
-                },
-                &StreamIn {
-                    x: &audio.x,
-                    t: &at,
-                    sigma: if frozen_audio { 0.0 } else { s },
-                    pos: &apos,
-                    ctx: &ctx.audio,
-                    keyframe_rows: 0,
-                },
-            );
-            let x0 = |st: &State, v: &[f32], t: &[f32]| -> Vec<f32> {
-                let w = st.width;
-                (0..st.x.len()).map(|i| st.x[i] - v[i] * t[i / w]).collect()
+            let at = audio.timesteps(if frozen { 0.0 } else { s });
+            // One transformer pass: both streams' denoised rows (`X0Model`: `x - t v`).
+            let pass = |c: &PromptContext, ptb: &Perturb| -> (Vec<f32>, Vec<f32>) {
+                let (vv, av) = self.dit.forward_with(
+                    &StreamIn {
+                        x: &video.x,
+                        t: &vt,
+                        sigma: s,
+                        pos: &pos,
+                        ctx: &c.video,
+                        keyframe_rows: lh * lw,
+                    },
+                    &StreamIn {
+                        x: &audio.x,
+                        t: &at,
+                        sigma: if frozen { 0.0 } else { s },
+                        pos: &apos,
+                        ctx: &c.audio,
+                        keyframe_rows: 0,
+                    },
+                    ptb,
+                );
+                let x0 = |st: &State, v: &[f32], t: &[f32]| -> Vec<f32> {
+                    let w = st.width;
+                    (0..st.x.len()).map(|i| st.x[i] - v[i] * t[i / w]).collect()
+                };
+                (x0(video, &vv, &vt), x0(audio, &av, &at))
             };
-            let vd = x0(video, &vv, &vt);
-            let ad = x0(audio, &av, &at);
-            let draw = p.eta > 0.0 && next != 0.0;
+            let (vd, ad) = match run.guidance {
+                None => pass(ctx, &Perturb::default()),
+                Some(gd) => {
+                    let (vskip, askip) = (gd.video.skips(i), gd.audio.skips(i));
+                    match &last {
+                        Some(l) if vskip && askip => l.clone(),
+                        _ => {
+                            let cond = pass(ctx, &Perturb::default());
+                            let un = match gd.uses_uncond() {
+                                true => Some(pass(
+                                    neg.context("guidance needs the negative prompt's context")?,
+                                    &Perturb::default(),
+                                )),
+                                false => None,
+                            };
+                            let pt = gd.perturbed().map(|q| pass(ctx, &q));
+                            let iso = gd.uses_isolated().then(|| {
+                                pass(
+                                    ctx,
+                                    &Perturb {
+                                        cross: true,
+                                        ..Perturb::default()
+                                    },
+                                )
+                            });
+                            let vd = match (&last, vskip) {
+                                (Some(l), true) => l.0.clone(),
+                                _ => gd.video.calculate(
+                                    &cond.0,
+                                    un.as_ref().map(|u| &u.0[..]),
+                                    pt.as_ref().map(|u| &u.0[..]),
+                                    iso.as_ref().map(|u| &u.0[..]),
+                                    &video.mask,
+                                    video.width,
+                                ),
+                            };
+                            let ad = match (&last, askip) {
+                                (Some(l), true) => l.1.clone(),
+                                _ => gd.audio.calculate(
+                                    &cond.1,
+                                    un.as_ref().map(|u| &u.1[..]),
+                                    pt.as_ref().map(|u| &u.1[..]),
+                                    iso.as_ref().map(|u| &u.1[..]),
+                                    &audio.mask,
+                                    audio.width,
+                                ),
+                            };
+                            (vd, ad)
+                        }
+                    }
+                }
+            };
+            if run.guidance.is_some_and(|g| g.video.skip_step != 0 || g.audio.skip_step != 0) {
+                last = Some((vd.clone(), ad.clone()));
+            }
+            let draw = run.eta > 0.0 && next != 0.0;
             let vn = draw.then(|| g.normals(video.x.len()));
             let an = draw.then(|| g.normals(audio.x.len()));
-            ancestral_step(video, &vd, s, next, p.eta, vn.as_deref());
-            if !frozen_audio {
-                ancestral_step(audio, &ad, s, next, p.eta, an.as_deref());
+            ancestral_step(video, &vd, s, next, run.eta, vn.as_deref());
+            if !frozen {
+                ancestral_step(audio, &ad, s, next, run.eta, an.as_deref());
             }
-            progress(stage, i + 1, steps);
+            progress(run.name, i + 1, steps);
         }
         Ok(())
     }
@@ -637,13 +882,48 @@ impl Pipeline {
     /// Text (and images) to video.
     pub fn generate(&self, p: &Params, progress: Progress) -> Result<Video> {
         let t0 = Instant::now();
-        let ctx = self.encode_prompt(&p.prompt)?;
+        let guidance = self.guidance_of(p);
+        let neg = guidance.as_ref().filter(|g| g.uses_uncond()).map(|g| g.negative_prompt.as_str());
+        let mut ctxs = self.encode_prompts(&[&p.prompt, neg.unwrap_or_default()][..1 + neg.is_some() as usize])?;
+        let neg = (ctxs.len() > 1).then(|| ctxs.pop().unwrap());
         let t_text = t0.elapsed().as_secs_f64();
-        self.generate_with(p, &ctx, t_text, progress)
+        self.generate_guided(p, &ctxs[0], neg.as_ref(), t_text, progress)
     }
 
-    /// [`Self::generate`] from context rows already made.
+    /// [`Self::generate`] from context rows already made (the negative prompt's encoded here when
+    /// the guidance needs it).
     pub fn generate_with(&self, p: &Params, ctx: &PromptContext, t_text: f64, progress: Progress) -> Result<Video> {
+        let neg = match self.guidance_of(p).filter(|g| g.uses_uncond()) {
+            Some(g) => Some(self.encode_prompt(&g.negative_prompt)?),
+            None => None,
+        };
+        self.generate_guided(p, ctx, neg.as_ref(), t_text, progress)
+    }
+
+    /// [`Self::generate`] from the prompt's and the negative prompt's context rows.
+    pub fn generate_guided(
+        &self,
+        p: &Params,
+        ctx: &PromptContext,
+        neg: Option<&PromptContext>,
+        t_text: f64,
+        progress: Progress,
+    ) -> Result<Video> {
+        let guidance = self.guidance_of(p);
+        dump("ctx_video", &ctx.video);
+        dump("ctx_audio", &ctx.audio);
+        // The dev transformer's second stage needs the distilled LoRA (`ti2vid_two_stages`);
+        // without it, one stage at the full size (`ti2vid_one_stage`).
+        let two_stage = p.two_stage && !(guidance.is_some() && self.dev && self.distilled_switch.is_none());
+        if p.two_stage && !two_stage {
+            eprintln!("[LTX-2.5: the dev transformer without the distilled LoRA runs one stage at the full size]");
+        }
+        let images = self.recompress_images(p)?;
+        let p = &Params {
+            two_stage,
+            images,
+            ..p.clone()
+        };
         let div = if p.two_stage { 2 * SPACE_SCALE } else { SPACE_SCALE };
         if p.width == 0 || p.height == 0 || !p.width.is_multiple_of(div) || !p.height.is_multiple_of(div) {
             bail!(
@@ -663,7 +943,7 @@ impl Pipeline {
         let ac = self.dit.cfg.audio_in_channels;
         let lt = (frames - 1) / TIME_SCALE + 1;
         let na = audio_latents(frames, p.fps);
-        let mut rng = NoiseGen::new(p.noise, p.seed);
+        let mut rng = NoiseGen::new(&p.noise, p.seed);
         let vfiles = self.vae_files()?;
         let encoder = if p.images.is_empty() {
             None
@@ -709,19 +989,52 @@ impl Pipeline {
         video.noise(&mut rng, 1.0);
         let mut audio = State::zeros(na, ac);
         audio.noise(&mut rng, 1.0);
-        self.denoise(
+        let guided = guidance.is_some();
+        let sig1 = match (&p.stage1_sigmas, &guidance) {
+            (Some(s), _) => s.clone(),
+            (None, Some(g)) => guidance::ltx2_sigmas(g.steps),
+            (None, None) => DISTILLED_SIGMAS.to_vec(),
+        };
+        let eta = p.eta.unwrap_or(if guided { 0.0 } else { 1.0 });
+        if let Some(g) = &guidance {
+            eprintln!(
+                "[LTX-2.5 guidance: {} steps, {} passes each (video cfg {} stg {} rescale {} modality {}; audio cfg {} stg {} rescale {} modality {})]",
+                sig1.len() - 1,
+                g.passes(),
+                g.video.cfg,
+                g.video.stg,
+                g.video.rescale,
+                g.video.modality,
+                g.audio.cfg,
+                g.audio.stg,
+                g.audio.rescale,
+                g.audio.modality
+            );
+        }
+        // The distilled LoRA is off while the guided first stage runs.
+        self.set_distilled_lora(!guided);
+        let r = self.denoise(
             ctx,
+            neg,
             &mut video,
             &mut audio,
             (lt, lh, lw),
-            &p.stage1_sigmas,
             p,
-            p.seed + STAGE_1_NOISE_OFFSET,
-            false,
-            "stage 1",
+            &Run {
+                sigmas: &sig1,
+                seed: p.seed + STAGE_1_NOISE_OFFSET,
+                eta,
+                frozen_audio: false,
+                guidance: guidance.as_ref(),
+                name: "stage 1",
+            },
             progress,
-        )?;
+        );
+        self.set_distilled_lora(true);
+        r?;
         clip(&mut video, lt * lh * lw);
+        dump("stage1_video", &video.x);
+        dump("stage1_audio", &audio.x);
         let (mut lh, mut lw) = (lh, lw);
         let t_s1 = t1.elapsed().as_secs_f64();
         let mut t_s2 = 0.0;
@@ -737,6 +1050,7 @@ impl Pipeline {
             let ups = upsample::LatentUpsampler::load(&uf)?;
             let x = upsample_rows(&ups, &vfiles_stats, &video.x, c, (lt, lh, lw));
             drop(ups);
+            dump("upsampled_video", &x);
             lh *= 2;
             lw *= 2;
             let mut v2 = State::zeros(lt * lh * lw, c);
@@ -746,20 +1060,37 @@ impl Pipeline {
             v2.noise(&mut rng, s0);
             let mut a2 = State::zeros(na, ac);
             a2.x = audio.x.clone();
-            a2.noise(&mut rng, s0);
+            // The guided pipeline keeps the first stage's soundtrack (frozen: noised at scale 0,
+            // which still draws its noise, then timestep 0) unless asked to refine it.
+            let frozen = guided && !p.refine_audio;
+            a2.noise(&mut rng, if frozen { 0.0 } else { s0 });
+            if frozen {
+                a2.clean = a2.x.clone();
+                a2.mask.fill(0.0);
+            }
             self.denoise(
                 ctx,
+                None,
                 &mut v2,
                 &mut a2,
                 (lt, lh, lw),
-                &p.stage2_sigmas,
                 p,
-                p.seed + STAGE_2_NOISE_OFFSET,
-                false,
-                "stage 2",
+                &Run {
+                    sigmas: &p.stage2_sigmas,
+                    seed: p.seed + STAGE_2_NOISE_OFFSET,
+                    eta,
+                    frozen_audio: frozen,
+                    guidance: None,
+                    name: "stage 2",
+                },
                 progress,
             )?;
+            if frozen {
+                a2.x = audio.x.clone();
+            }
             clip(&mut v2, lt * lh * lw);
+            dump("stage2_video", &v2.x);
+            dump("stage2_audio", &a2.x);
             video = v2;
             audio = a2;
             t_s2 = t2.elapsed().as_secs_f64();
@@ -793,14 +1124,19 @@ impl Pipeline {
             };
             self.denoise(
                 ctx,
+                None,
                 &mut v3,
                 &mut a3,
                 (lt, lh, lw),
-                &sig,
                 &pt,
-                p.seed + TEMPORAL_NOISE_OFFSET,
-                true,
-                "temporal",
+                &Run {
+                    sigmas: &sig,
+                    seed: p.seed + TEMPORAL_NOISE_OFFSET,
+                    eta: p.eta.unwrap_or(1.0),
+                    frozen_audio: true,
+                    guidance: None,
+                    name: "temporal",
+                },
                 progress,
             )?;
             video = v3;
@@ -812,6 +1148,7 @@ impl Pipeline {
         let mut on_vae = |d: usize, t: usize| progress("vae", d, t);
         let px = dec.decode(&lat, lt, lh, lw, &mut on_vae);
         drop(dec);
+        dump("pixels", &px.data);
         let n_frames = px.t.min(frames);
         let (w, h) = (px.w, px.h);
         let frames_rgb: Vec<Vec<u8>> = (0..n_frames)
@@ -832,6 +1169,8 @@ impl Pipeline {
                 let t_mel = mel.len() / (2 * dec.mel_bins);
                 let voc = audio::Vocoder::load(&af)?;
                 let mut ch = voc.forward(&mel, t_mel);
+                dump("mel", &mel);
+                dump("waveform", &ch.concat());
                 let keep = ((n_frames as f64 / fps as f64) * voc.output_rate as f64).round() as usize;
                 for c in ch.iter_mut() {
                     c.truncate(keep);
@@ -854,6 +1193,19 @@ impl Pipeline {
             fps: fps.round() as usize,
             audio: soundtrack,
         })
+    }
+}
+
+/// Writes `v` as `name.f32` (little-endian float32) into the folder `OXINFER_LTX_DUMP` names, if
+/// any: a run's intermediate states, for comparisons with the reference.
+fn dump(name: &str, v: &[f32]) {
+    if let Some(d) = std::env::var_os("OXINFER_LTX_DUMP") {
+        let d = PathBuf::from(d);
+        let _ = std::fs::create_dir_all(&d);
+        let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        if let Err(e) = std::fs::write(d.join(format!("{name}.f32")), b) {
+            eprintln!("[OXINFER_LTX_DUMP: {name}: {e}]");
+        }
     }
 }
 

@@ -223,6 +223,13 @@ impl<'a> Attn<'a> {
         }
         self.o.forward(&out, n)
     }
+
+    /// The attention skipped (STG's perturbation, `all_perturbed`): the value projection of `x`
+    /// straight through the output projection, no per-head gate.
+    pub fn passthrough(&self, x: &[f32], n: usize) -> Vec<f32> {
+        let v = self.v.forward(x, n);
+        self.o.forward(&v, n)
+    }
 }
 
 /// `FeedForward`: GELU (tanh) between two linear layers (`ff.net.0.proj`, `ff.net.2`).

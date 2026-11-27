@@ -10,7 +10,7 @@
 use super::super::decode::{Fns, run_concurrent};
 use super::super::*;
 use super::{DBuf, Enc, U4, Xh, grow, release_all, runnable};
-use crate::gpu::dit::{Lin, LtxAttn, LtxIn, LtxModel, LtxSession};
+use crate::gpu::dit::{Lin, LtxAttn, LtxIn, LtxModel, LtxPerturb, LtxSession};
 
 /// Blocks per command buffer.
 const BLOCKS_PER_CB: usize = 4;
@@ -252,7 +252,7 @@ impl MetalLtx {
 }
 
 impl LtxSession for MetalLtx {
-    fn forward(&mut self, m: &LtxModel, v: &LtxIn, a: &LtxIn, vout: &mut Vec<f32>, aout: &mut Vec<f32>) -> bool {
+    fn forward(&mut self, m: &LtxModel, v: &LtxIn, a: &LtxIn, ptb: &LtxPerturb, vout: &mut Vec<f32>, aout: &mut Vec<f32>) -> bool {
         let be = self.be;
         let (dv, da) = (m.dim, m.audio_dim);
         if m.blocks.is_empty() || v.rows == 0 || a.rows == 0 {
@@ -593,7 +593,21 @@ impl LtxSession for MetalLtx {
             gemm(en, &at_.o, xo, rq, at(B::Tmp, 0), at_.o.n_out);
         };
 
+        // A skipped self-attention (STG): out_proj(v_proj(x) + bias) into Tmp, no gate.
+        let passthrough = |en: &Enc, at_: &LtxAttn, c: &AttnConsts, src: B, n: usize, r: usize| {
+            let inner = at_.heads * at_.hd;
+            let xv = input(en, &at_.v, src, at_.v.n_in, r, B::Xh, B::Rs);
+            gemm(en, &at_.v, xv, r, at(B::V, 0), inner);
+            heads(en, B::V, B::Att, inner, at_.hd, c.bv, None, None, false, n, r);
+            en.e.barrier();
+            let xo = input(en, &at_.o, B::Att, inner, r, B::Xh, B::Rs);
+            gemm(en, &at_.o, xo, r, at(B::Tmp, 0), at_.o.n_out);
+        };
         let nb = m.blocks.len();
+        let skip_self = |vid: bool, i: usize| {
+            let s = if vid { &ptb.video_self } else { &ptb.audio_self };
+            s.get(i).copied().unwrap_or(false)
+        };
         let parts: Vec<std::ops::Range<usize>> = (0..nb.div_ceil(BLOCKS_PER_CB))
             .map(|c| c * BLOCKS_PER_CB..((c + 1) * BLOCKS_PER_CB).min(nb))
             .collect();
@@ -616,7 +630,11 @@ impl LtxSession for MetalLtx {
                     // Self-attention.
                     rms(&en, h, B::Xf, d, r, tab, ld, d, 0, cls, true);
                     e.barrier();
-                    attention(&en, &s.attn1, &sc.attn1, B::Xf, n, r, None, Some(rope), Some(rope));
+                    if skip_self(vid, i) {
+                        passthrough(&en, &s.attn1, &sc.attn1, B::Xf, n, r);
+                    } else {
+                        attention(&en, &s.attn1, &sc.attn1, B::Xf, n, r, None, Some(rope), Some(rope));
+                    }
                     gated(&en, h, d, n, sc.attn1.bo, tab, ld, 2 * d, cls);
                     // Text cross-attention: the context's own shift and scale.
                     rms(&en, h, B::Xf, d, r, tab, ld, 7 * d, 6 * d, cls, true);
@@ -639,36 +657,38 @@ impl LtxSession for MetalLtx {
                     gated(&en, h, d, n, sc.attn2.bo, tab, ld, 8 * d, cls);
                 }
                 // Audio-video cross-attention over both streams as they are now.
-                let (tv, ta) = ((B::AvV, i * v.classes * 4 * dv * 4), (B::AvA, i * a.classes * 4 * da * 4));
-                rms(&en, B::Hv, B::AvQv, dv, rv, tv, 4 * dv, 0, dv, Some(B::ClsV), true);
-                rms(&en, B::Ha, B::AvKa, da, ra, ta, 4 * da, 0, da, Some(B::ClsA), true);
-                rms(&en, B::Ha, B::AvQa, da, ra, ta, 4 * da, 2 * da, 3 * da, Some(B::ClsA), true);
-                rms(&en, B::Hv, B::AvKv, dv, rv, tv, 4 * dv, 2 * dv, 3 * dv, Some(B::ClsV), true);
-                e.barrier();
-                attention(
-                    &en,
-                    &b.a2v,
-                    &bc.a2v,
-                    B::AvQv,
-                    v.rows,
-                    rv,
-                    Some((B::AvKa, a.rows, ra)),
-                    Some((B::VCcos, B::VCsin)),
-                    Some((B::ACcos, B::ACsin)),
-                );
-                gated(&en, B::Hv, dv, v.rows, bc.a2v.bo, (B::GateV, i * dv * 4), dv, 0, None);
-                attention(
-                    &en,
-                    &b.v2a,
-                    &bc.v2a,
-                    B::AvQa,
-                    a.rows,
-                    ra,
-                    Some((B::AvKv, v.rows, rv)),
-                    Some((B::ACcos, B::ACsin)),
-                    Some((B::VCcos, B::VCsin)),
-                );
-                gated(&en, B::Ha, da, a.rows, bc.v2a.bo, (B::GateA, i * da * 4), da, 0, None);
+                if !ptb.cross {
+                    let (tv, ta) = ((B::AvV, i * v.classes * 4 * dv * 4), (B::AvA, i * a.classes * 4 * da * 4));
+                    rms(&en, B::Hv, B::AvQv, dv, rv, tv, 4 * dv, 0, dv, Some(B::ClsV), true);
+                    rms(&en, B::Ha, B::AvKa, da, ra, ta, 4 * da, 0, da, Some(B::ClsA), true);
+                    rms(&en, B::Ha, B::AvQa, da, ra, ta, 4 * da, 2 * da, 3 * da, Some(B::ClsA), true);
+                    rms(&en, B::Hv, B::AvKv, dv, rv, tv, 4 * dv, 2 * dv, 3 * dv, Some(B::ClsV), true);
+                    e.barrier();
+                    attention(
+                        &en,
+                        &b.a2v,
+                        &bc.a2v,
+                        B::AvQv,
+                        v.rows,
+                        rv,
+                        Some((B::AvKa, a.rows, ra)),
+                        Some((B::VCcos, B::VCsin)),
+                        Some((B::ACcos, B::ACsin)),
+                    );
+                    gated(&en, B::Hv, dv, v.rows, bc.a2v.bo, (B::GateV, i * dv * 4), dv, 0, None);
+                    attention(
+                        &en,
+                        &b.v2a,
+                        &bc.v2a,
+                        B::AvQa,
+                        a.rows,
+                        ra,
+                        Some((B::AvKv, v.rows, rv)),
+                        Some((B::ACcos, B::ACsin)),
+                        Some((B::VCcos, B::VCsin)),
+                    );
+                    gated(&en, B::Ha, da, a.rows, bc.v2a.bo, (B::GateA, i * da * 4), da, 0, None);
+                }
                 // Feed-forwards.
                 for (vid, s, sc, sin) in [(true, &b.v, &bc.v, v), (false, &b.a, &bc.a, a)] {
                     let (h, d, r, n) = if vid {

@@ -304,10 +304,20 @@ pub struct LtxIn<'a> {
     pub csin: &'a [f32],
 }
 
+/// The attention perturbations of a guidance pass: per block, whether each stream's
+/// self-attention is skipped (its value projection passed straight to the output projection, no
+/// gate), and whether the audio-video cross-attention is skipped in every block.
+#[derive(Clone, Debug, Default)]
+pub struct LtxPerturb {
+    pub video_self: Vec<bool>,
+    pub audio_self: Vec<bool>,
+    pub cross: bool,
+}
+
 /// LTX-2.5 transformer passes on the device: every block of both streams, the activations kept
 /// in device buffers.
 pub trait LtxSession: Send {
     /// The rows of both streams after the last block (`[rows, dim]` each) into `vout` / `aout`;
     /// false when the device declined or failed (the caller runs the CPU path).
-    fn forward(&mut self, m: &LtxModel, v: &LtxIn, a: &LtxIn, vout: &mut Vec<f32>, aout: &mut Vec<f32>) -> bool;
+    fn forward(&mut self, m: &LtxModel, v: &LtxIn, a: &LtxIn, p: &LtxPerturb, vout: &mut Vec<f32>, aout: &mut Vec<f32>) -> bool;
 }

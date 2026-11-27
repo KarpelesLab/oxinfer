@@ -17,6 +17,9 @@ files: `src/ltx/`.
 ./target/release/oxinfer --model Lightricks/LTX-2.5 -p "..." -o clip.mp4
 # one stage at the full size (no spatial upsampler; sides multiples of 32)
 ./target/release/oxinfer --model Lightricks/LTX-2.5 -p "..." --size 384x256 --frames 25 --one-stage -o small.mp4
+# the dev transformer, guided (ti2vid_two_stages: 30 guided steps at half the size, then the
+# distilled LoRA's 3 steps at the full size; without --distilled-lora one guided stage)
+./target/release/oxinfer --model Lightricks/LTX-2.5 --transformer dev --distilled-lora -p "..." -o dev.mp4
 ```
 
 The release repository is gated (accepting its terms shares the account's contact details), so
@@ -54,8 +57,19 @@ files (the other parts from the folder above it).
 | `--exact-attention` | the video self-attention in float32 on Metal (slower; default half operands) |
 | `--text-bf16` | fetch the bf16 text encoder (26.3 GB) instead of the int8 one |
 | `--text-encoder FILE`, `--vae FILE`, `--audio-vae FILE`, `--upsampler FILE`, `--temporal-upsampler FILE`, `--duration-head FILE` | parts from elsewhere |
-| `--sigmas a,b,..,0`, `--stage2-sigmas a,..,0` | other schedules than the distilled ones |
-| `--eta F` | the ancestral sampler's noise (1, the release's sampler for LTX-2.5; 0: plain Euler) |
+| `--sigmas a,b,..,0`, `--stage2-sigmas a,..,0` | other schedules than the distilled ones (or the guided `--steps`) |
+| `--eta F` | the ancestral sampler's noise (1, the distilled pipeline's for LTX-2.5; 0: plain Euler, the guided pipeline's) |
+| `--steps N` | the guided first stage's steps (default 30, `LTX2Scheduler`) |
+| `--cfg F`, `--audio-cfg F` | classifier-free guidance of each stream (default 3 and 7; 1: off) |
+| `--negative TEXT` | the CFG pass's prompt (default the release's `DEFAULT_NEGATIVE_PROMPT`) |
+| `--stg F`, `--audio-stg F`, `--stg-blocks L\|all`, `--audio-stg-blocks L` | spatio-temporal guidance: the self-attention of blocks `L` skipped (default 1 on block 28; 0: off) |
+| `--rescale F`, `--audio-rescale F` | rescale toward the prompt pass's spread (default 0.7) |
+| `--modality-scale F`, `--audio-modality-scale F` | guidance away from the pass without audio-video cross-attention (default 3; 1: off) |
+| `--skip-step N`, `--audio-skip-step N` | guide one step in `N + 1` (default every step) |
+| `--guidance-mode auto\|on\|off`, `--no-guidance` | guidance on or off whatever the transformer (auto: the dev transformer's) |
+| `--refine-audio` | the guided pipeline's second stage denoises the soundtrack again (default: the first stage's kept, as the reference) |
+| `--image-crf N` | the H.264 CRF conditioning images are re-compressed at first (default the model's: 18 for LTX-2.5; 0: as they are) |
+| `--noise oxinfer\|torch\|files:DIR` | the noise source (`files:DIR`: the generator seeded `s` reads `DIR/noise_{s}.f32`, for comparisons with the reference) |
 | `--device cpu` | everything on the CPU |
 | `-o FILE` | `.mp4` (H.264 and AAC), `.webm` (VP9 and Opus), `.avi`, `.webp` or a PNG sequence with a WAV, as for [MiniMax-H3](video.md) |
 
@@ -91,13 +105,46 @@ over all heads and scales each head by `2 sigmoid(to_gate_logits(x))`. Rows of a
 image conditions have timestep `(1 - strength) sigma` and keep their clean latents after each
 step. The first latent frame's rows get the learned keyframe embedding.
 
-Images are resized to cover the canvas (bilinear) and center-cropped, then encoded by the VAE
+Images are first re-compressed as the reference does (`load_conditioning_still`: cropped to even
+sides, one H.264 intra picture, decoded back; the compression the model was trained against),
+then resized to cover the canvas (bilinear) and center-cropped, then encoded by the VAE
 encoder. Frame 0 replaces the first latent frame, as the reference's `ImageReplace`; an image for
 any other frame (`--last-image`, `--image FILE@FRAME`) is appended as guide rows, as the
 reference's `VideoConditionByKeyframeIndex`: its clean latents at that frame's time, with the
-image's strength, dropped after each stage. The reference also re-compresses a conditioning
-image as H.264 at CRF 33 before encoding it (the compression it was trained against); oxinfer
-encodes the image as it is.
+image's strength, dropped after each stage.
+
+The re-compression's CRF comes from the VAE's `model_version` as in the reference (`detect_params`:
+LTX-2.4 and later 18, earlier 33). oxideav's H.264 encoder has constant-QP rate control only, so
+the picture is coded at QP `CRF + 5`: the frame QP x264 (`-preset veryfast`, the reference's
+PyAV encode) gives a lone intra picture at that CRF (measured: CRF 10 / 18 / 25 / 33 give QP
+15 / 23 / 30 / 38 with adaptive quantization off, on any content); x264's adaptive quantization
+then moves single macroblocks' QP, which oxideav's encoder does not do. On three test images the
+result is as far from the original as x264's (PSNR 39.1 / 44.2 / 26.6 dB against x264's 38.4 /
+39.1 / 26.4) and 38.6 / 39.6 / 36.5 dB from x264's own output.
+
+### The dev transformer: guidance
+
+A dev transformer (`--transformer dev`, `dev-bf16`, or a `*-dev-*` file) runs the release's
+`ti2vid_*` pipelines: the first stage takes `--steps` (30) plain Euler steps on `LTX2Scheduler`'s
+schedule, each step guided (`MultiModalGuider`): besides the prompt's pass, a pass on the negative
+prompt (CFG), one with the self-attention of block 28 skipped (STG: the value projection straight
+to the output projection, no gate) and one without the audio-video cross-attention (modality),
+four transformer passes a step; per stream
+
+```text
+pred = cond + (cfg - 1) (cond - uncond) + stg (cond - perturbed) + (modality - 1) (cond - isolated)
+pred *= rescale std(cond) / std(pred) + 1 - rescale     (std over the rows being denoised)
+```
+
+with the release's parameters for LTX-2.3 and later (which LTX-2.5's `model_version` selects):
+video CFG 3, audio CFG 7, STG 1 on block 28, rescale 0.7, modality 3. With the distilled LoRA
+(`--distilled-lora`) the first stage runs at half the size with the LoRA off, then the spatial
+upsampler and the LoRA's 3 unguided steps at the full size, the first stage's soundtrack kept
+(`ti2vid_two_stages`; `--refine-audio` denoises it again); without it, one guided stage at the
+full size (`ti2vid_one_stage`). The dev transformer with the distilled LoRA and `--one-stage`
+runs the distilled schedule instead (the LoRA makes it a distilled model). The distilled LoRA
+is switched per stage: on the GPU its side paths exist only in the second stage's view of the
+layers.
 
 `--temporal-upscale` doubles the latent frames with the temporal upsampler and refines the video
 with `[0.975, 0.909375, 0.725, 0.421875, 0]` (audio kept as it was): a simplified form of the
@@ -161,10 +208,31 @@ are `ref_*.py` beside `examples/ltx_check.rs`'s checks):
 | video VAE decoder (3 x 4 x 6 latents) / encoder | 3.5e-6 / 6.0e-6 | `ConvVideoDecoder` / `VideoEncoder` |
 | audio decoder (20 latents) / vocoder with BWE | 6.3e-7 / 1.0e-5 | `AudioDecoder`, `VocoderWithBWE` |
 | spatial / temporal upsampler | 1.2e-5 / 2.2e-5 | `LatentUpsampler` with the VAE's statistics |
+| the guidance passes, 2 blocks (dev int8; STG: video self-attention skipped in block 1, audio in block 0; modality: no AV cross-attention), CPU / Metal | 2.3e-6 / 1.6e-6, 2.2e-6 / 1.5e-6; 9.7e-5 / 1.1e-4, 8.9e-5 / 7.7e-5 | `LTXModel` with a `BatchedPerturbationConfig` (`ref_dit_ptb.py`) |
+| guidance arithmetic (video / audio params, masked rescale) | 0 (bit-identical) | `MultiModalGuider.calculate` (`ref_guider.py`, `ltx_check guider`) |
+| `LTX2Scheduler(30)` | 6e-8 (one float32 ulp) | the dev schedule |
 
-Positions (video and audio) are bit-identical to the reference's. The whole pipeline was not
-compared with the reference's output (its noise comes from its device's generator); runs are
-checked by looking at their frames and transcribing their soundtracks ([Runs and speed](#runs-and-speed)).
+Positions (video and audio) are bit-identical to the reference's.
+
+### The whole pipeline
+
+`ref_pipeline.py` runs the release's own pipeline classes (`DistilledPipeline`,
+`TI2VidOneStagePipeline`) on the CPU in float32 on the same int8 files (their builders' load
+replaced: int8 ConvRot layers keep their int8 rows and multiply the Hadamard-rotated input), with
+the noise read from files: the generator seeded `s` reads `noise_{s}.f32`, in both programs
+(`--noise files:DIR`; oxinfer's `OXINFER_LTX_DUMP=DIR` writes its intermediate states). Text,
+transformer passes, sampler, guidance, upsampler, decoders: all of it compared at once.
+
+| run | text context (video / audio) | stage 1 video / audio | upsampled | stage 2 video / audio | frames | soundtrack |
+|---|---|---|---|---|---|---|
+| distilled, 384x256, 25 frames, two stages (8 + 3 steps, ancestral), CPU | 1.1e-6 / 1.4e-6 | 3.9e-4 / 2.7e-5 | 5.9e-4 | 2.7e-3 / 1.8e-4 | PSNR 57.8 dB | SNR 61.3 dB |
+| the same on Metal | 8.4e-5 / 1.4e-6 | 3.4e-2 / 1.6e-3 | 5.1e-2 | 0.16 / 1.8e-2 | 27.6 dB | 19.7 dB |
+| dev, guided, one stage, 256x160, 17 frames, 6 steps (4 passes each), CPU | 1.1e-6 / 4.8e-6 | 6.1e-4 / 1.6e-4 | | | 65.6 dB | 54.7 dB |
+
+(rel L2 of the latents.) On the CPU the whole pipeline follows the reference's to float rounding,
+amplified by the ancestral sampler's steps. On Metal the half-precision GEMM inputs and attention
+(1e-4 a pass) grow over the steps into a different sample of the same video: the same scene,
+motion and sound, details apart (the dog's legs, `side_distilled.png` in the scratch notes).
 
 The other transformer files, on one-block copies (block 0 and connector block 0 of the real files,
 fetched by HTTP ranges) against the reference on bf16 weights: the bf16 file 6.7e-7 / 8.7e-7 on
@@ -173,10 +241,11 @@ quantization) and the NVFP4 file 2.7e-2 / 1.6e-2 (its rows correlate 0.9956 with
 
 ## Not done
 
-- Guidance for the dev transformer (the release's CFG / STG / modality guidance of
-  `ti2vid_two_stages`): the dev file runs only with the distilled LoRA or its own schedule
-  without guidance.
-- The H.264 CRF 33 re-compression of conditioning images (encoded as they are).
+- x264's adaptive quantization of the re-compressed conditioning images (oxideav's H.264 encoder
+  has constant QP only: the frame QP x264 picks is used).
+- The guided pipelines' `skip_step` with only one stream skipping a step runs both streams (the
+  reference leaves the skipped stream out of that pass); off by default.
+- `ti2vid_two_stages_hq` (the res2s sampler) and the guidance factories by sigma.
 - The temporal upscaler's DFR rounds (tiled, with keyframes): a single refinement pass instead.
 - NVFP4 on the GPU (CPU only), the DiffVAE decoder, the prompt enhancer, audio-to-video and
   video-to-video (IC-LoRA) pipelines.

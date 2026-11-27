@@ -45,6 +45,15 @@ pub struct LtxArgs {
     pub distilled_lora: bool,
     /// `--exact-attention`: the GPU's video attention on float32 operands.
     pub exact_attention: bool,
+    /// `--guidance-mode auto|on|off` (`--no-guidance`: off).
+    pub guidance: Option<String>,
+    /// Guidance settings from `--audio-cfg`, `--stg`, `--stg-blocks`, ... (as
+    /// `ltx::api::guidance_option` names them).
+    pub guidance_opts: Vec<(&'static str, String)>,
+    /// `--refine-audio`: denoise the soundtrack again in the guided pipeline's second stage.
+    pub refine_audio: bool,
+    /// `--image-crf N`: the H.264 CRF conditioning images are re-compressed at (0: not).
+    pub image_crf: Option<u32>,
 }
 
 fn floats(v: &str) -> Result<Vec<f32>> {
@@ -71,6 +80,31 @@ impl LtxArgs {
             "--duration-head" => self.duration_head = Some(PathBuf::from(val()?)),
             "--distilled-lora" => self.distilled_lora = true,
             "--exact-attention" => self.exact_attention = true,
+            "--guidance-mode" => self.guidance = Some(val()?),
+            "--no-guidance" => self.guidance = Some("off".into()),
+            "--refine-audio" => self.refine_audio = true,
+            "--image-crf" => self.image_crf = Some(val()?.parse()?),
+            "--audio-cfg"
+            | "--stg"
+            | "--audio-stg"
+            | "--stg-blocks"
+            | "--audio-stg-blocks"
+            | "--rescale"
+            | "--audio-rescale"
+            | "--modality-scale"
+            | "--audio-modality-scale"
+            | "--skip-step"
+            | "--audio-skip-step" => {
+                let key = match flag {
+                    "--modality-scale" => "modality",
+                    "--audio-modality-scale" => "audio_modality",
+                    f => ltx::api::GUIDANCE_KEYS
+                        .into_iter()
+                        .find(|k| k.replace('_', "-") == f[2..])
+                        .context("guidance flag")?,
+                };
+                self.guidance_opts.push((key, val()?));
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -154,7 +188,7 @@ pub fn run(args: &Args) -> Result<()> {
         if !l.exists() {
             bail!("--distilled-lora: {} is missing", l.display());
         }
-        paths.loras.push((l, 1.0));
+        paths.distilled_lora = Some(l);
     }
     for l in &args.loras {
         paths.loras.push((l.path.clone(), l.scale));
@@ -173,20 +207,26 @@ pub fn run(args: &Args) -> Result<()> {
     p.two_stage = !a.one_stage;
     p.temporal_upscale = a.temporal_upscale;
     p.audio = !a.no_audio;
-    if let Some(e) = a.eta {
-        p.eta = e;
+    p.eta = a.eta;
+    p.stage1_sigmas = a.sigmas.clone();
+    // Guidance: the shared `--cfg`, `--steps`, `--negative` and the LTX-2.5 flags.
+    let mut gopts = a.guidance_opts.clone();
+    if let Some(c) = args.guidance {
+        gopts.push(("cfg", c.to_string()));
     }
-    if let Some(s) = &a.sigmas {
-        p.stage1_sigmas = s.clone();
+    if let Some(s) = args.steps {
+        gopts.push(("steps", s.to_string()));
     }
+    if !args.negative.is_empty() {
+        gopts.push(("negative_prompt", args.negative.clone()));
+    }
+    (p.guidance_mode, p.guidance) = ltx::api::guidance_from(a.guidance.as_deref(), &gopts)?;
+    p.refine_audio = a.refine_audio;
+    p.image_crf = a.image_crf;
     if let Some(s) = &a.stage2_sigmas {
         p.stage2_sigmas = s.clone();
     }
-    p.noise = match args.moss.noise.as_deref() {
-        None | Some("oxinfer") => Noise::Oxinfer,
-        Some("torch") => Noise::Torch,
-        Some(n) => bail!("--noise {n}: oxinfer or torch"),
-    };
+    p.noise = Noise::parse(args.moss.noise.as_deref().unwrap_or(""))?;
     if let Some(f) = args.init_images.first() {
         p.images.push(ImageCond {
             image: load_image(f)?,
@@ -210,7 +250,7 @@ pub fn run(args: &Args) -> Result<()> {
             strength: 1.0,
         });
     }
-    for s in [&p.stage1_sigmas, &p.stage2_sigmas] {
+    for s in p.stage1_sigmas.iter().chain([&p.stage2_sigmas]) {
         if s.len() < 2 || s.last() != Some(&0.0) {
             bail!("a sigma schedule needs at least two values and ends at 0");
         }

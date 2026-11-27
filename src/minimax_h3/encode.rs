@@ -250,6 +250,87 @@ fn av(e: oxideav_core::Error) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
+/// An RGB8 image (`w` x `h`, both even) through H.264 and back: one intra picture at constant
+/// QP `qp` (4:2:0, BT.601 limited range, CABAC), decoded by oxideav's decoder. What a still
+/// looks like after a video codec (LTX-2.5 conditions on images re-compressed so). oxideav's
+/// encoder takes sides that are multiples of 16 only: the picture is padded by repeating its
+/// last column and row, as x264 pads its macroblocks, and cropped back.
+pub fn h264_roundtrip(rgb: &[u8], w: usize, h: usize, qp: u32) -> Result<Vec<u8>> {
+    use oxideav_core::{CodecId, CodecParameters, Frame, PixelFormat, Rational, VideoFrame, VideoPlane};
+    if w == 0 || h == 0 || !w.is_multiple_of(2) || !h.is_multiple_of(2) || rgb.len() != w * h * 3 {
+        bail!("h264_roundtrip: a {w}x{h} image (even sides) of {} bytes", rgb.len());
+    }
+    let (ow, oh) = (w, h);
+    let (w, h) = (w.next_multiple_of(16), h.next_multiple_of(16));
+    let padded: Vec<u8> = if (w, h) == (ow, oh) {
+        rgb.to_vec()
+    } else {
+        let mut v = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            let row = &rgb[y.min(oh - 1) * ow * 3..][..ow * 3];
+            v.extend_from_slice(row);
+            for _ in ow..w {
+                v.extend_from_slice(&row[(ow - 1) * 3..]);
+            }
+        }
+        v
+    };
+    let rgb = &padded[..];
+    let media = crate::media::Media::new();
+    let ctx = media.context();
+    let mut vp = CodecParameters::video(CodecId::new("h264"));
+    vp.width = Some(w as u32);
+    vp.height = Some(h as u32);
+    vp.pixel_format = Some(PixelFormat::Yuv420P);
+    vp.frame_rate = Some(Rational::new(1, 1));
+    vp.options = oxideav_core::CodecOptions::new()
+        .set("format", "avcc")
+        .set("cabac", "true")
+        .set("rc", "cqp")
+        .set("qp", qp.min(51).to_string())
+        .set("gop", "1");
+    let mut enc = ctx.codecs.first_encoder(&vp).map_err(av).context("the h264 encoder")?;
+    let [y, u, v] = rgb_to_yuv420(rgb, w, h);
+    let cw = w / 2;
+    enc.send_frame(&Frame::Video(VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane { stride: w, data: y },
+            VideoPlane { stride: cw, data: u },
+            VideoPlane { stride: cw, data: v },
+        ],
+    }))
+    .map_err(av)?;
+    enc.flush().map_err(av)?;
+    let mut packets = Vec::new();
+    while let Ok(p) = enc.receive_packet() {
+        packets.push(p);
+    }
+    let mut dec = ctx
+        .codecs
+        .first_decoder(enc.output_params())
+        .map_err(av)
+        .context("the h264 decoder")?;
+    let mut out = None;
+    let mut take = |d: &mut Box<dyn oxideav_core::Decoder>| {
+        while let Ok(Frame::Video(vf)) = d.receive_frame() {
+            let p = vf.image_planes();
+            out.get_or_insert_with(|| yuv420_to_rgb([&p[0].data, &p[1].data, &p[2].data], [p[0].stride, p[1].stride, p[2].stride], w, h));
+        }
+    };
+    for p in &packets {
+        dec.send_packet(p).map_err(av)?;
+        take(&mut dec);
+    }
+    let _ = dec.flush();
+    take(&mut dec);
+    let out = out.context("the h264 decoder gave no picture")?;
+    if (w, h) == (ow, oh) {
+        return Ok(out);
+    }
+    Ok((0..oh).flat_map(|y| out[y * w * 3..][..ow * 3].to_vec()).collect())
+}
+
 /// Frames per independently encoded chunk of the video: H.264's IDR period and VP9's keyframe
 /// interval (one second). Each chunk starts with an IDR picture / keyframe, so the chunks are
 /// encoded in parallel, by one encoder each, and their packets concatenated. VP9's encoder codes

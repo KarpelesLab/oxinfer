@@ -224,6 +224,49 @@ pub struct StreamIn<'a> {
     pub keyframe_rows: usize,
 }
 
+/// Blocks a perturbation applies to (`Perturbation.blocks`: none means all of them).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Blocks {
+    #[default]
+    None,
+    All,
+    List(Vec<usize>),
+}
+
+impl Blocks {
+    pub fn has(&self, i: usize) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::List(l) => l.contains(&i),
+        }
+    }
+
+    pub fn is_none(&self) -> bool {
+        match self {
+            Self::None => true,
+            Self::All => false,
+            Self::List(l) => l.is_empty(),
+        }
+    }
+}
+
+/// The attention perturbations of a guidance pass (`PerturbationConfig`): the self-attention of
+/// each stream skipped in some blocks (STG: the value projection passed straight through), the
+/// audio-video cross-attention skipped in every block (the isolated-modality pass).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Perturb {
+    pub video_self: Blocks,
+    pub audio_self: Blocks,
+    pub cross: bool,
+}
+
+impl Perturb {
+    pub fn is_none(&self) -> bool {
+        self.video_self.is_none() && self.audio_self.is_none() && !self.cross
+    }
+}
+
 /// A stream's modulation for one forward: the distinct timesteps of its rows and their tables.
 struct Mods {
     /// Each row's index into the tables.
@@ -265,7 +308,10 @@ pub struct Dit<'a> {
     pub device: bool,
     /// On the device, 128-wide heads' attention with float32 operands (else half-precision).
     pub exact_attention: bool,
-    twins: std::sync::OnceLock<super::device::Twins<'a>>,
+    /// The switch of the LoRA that changes between stages (the distilled LoRA of the two-stage
+    /// dev pipeline): the device twins are kept for each of its states.
+    pub lora_switch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    twins: [std::sync::OnceLock<super::device::Twins<'a>>; 2],
     session: std::sync::Mutex<Option<Box<dyn crate::gpu::dit::LtxSession>>>,
 }
 
@@ -365,7 +411,8 @@ impl<'a> Dit<'a> {
             cfg,
             device: true,
             exact_attention: false,
-            twins: std::sync::OnceLock::new(),
+            lora_switch: None,
+            twins: [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
             session: std::sync::Mutex::new(None),
         })
     }
@@ -450,12 +497,17 @@ impl<'a> Dit<'a> {
         ax: &mut Vec<f32>,
         v: (&StreamIn, &Mods, &Rope, &Rope),
         a: (&StreamIn, &Mods, &Rope, &Rope),
+        ptb: &Perturb,
     ) -> bool {
         if !self.device || std::env::var("OXINFER_LTX_GPU").is_ok_and(|v| v == "0") {
             return false;
         }
         let Some(be) = crate::gpu::active() else { return false };
-        let twins = self.twins.get_or_init(|| super::device::Twins::build(self));
+        let on = self
+            .lora_switch
+            .as_ref()
+            .is_none_or(|s| s.load(std::sync::atomic::Ordering::Relaxed));
+        let twins = self.twins[on as usize].get_or_init(|| super::device::Twins::build(self));
         let Some(model) = twins.model(self, !self.exact_attention) else {
             return false;
         };
@@ -469,7 +521,13 @@ impl<'a> Dit<'a> {
         }
         let Some(s) = sess.as_mut() else { return false };
         let (mut vo, mut ao) = (Vec::new(), Vec::new());
-        if !s.forward(&model, &vin, &ain, &mut vo, &mut ao) {
+        let nb = self.blocks.len();
+        let p = crate::gpu::dit::LtxPerturb {
+            video_self: (0..nb).map(|i| ptb.video_self.has(i)).collect(),
+            audio_self: (0..nb).map(|i| ptb.audio_self.has(i)).collect(),
+            cross: ptb.cross,
+        };
+        if !s.forward(&model, &vin, &ain, &p, &mut vo, &mut ao) {
             return false;
         }
         *vx = vo;
@@ -522,6 +580,11 @@ impl<'a> Dit<'a> {
 
     /// The velocities of both streams (`[n_video, in_channels]`, `[n_audio, audio_in_channels]`).
     pub fn forward(&self, v: &StreamIn, a: &StreamIn) -> (Vec<f32>, Vec<f32>) {
+        self.forward_with(v, a, &Perturb::default())
+    }
+
+    /// [`Self::forward`] with attention perturbations (a guidance pass).
+    pub fn forward_with(&self, v: &StreamIn, a: &StreamIn, ptb: &Perturb) -> (Vec<f32>, Vec<f32>) {
         let cfg = &self.cfg;
         let (d, ad) = (cfg.dim(), cfg.audio_dim());
         let nv = v.x.len() / cfg.in_channels;
@@ -552,9 +615,17 @@ impl<'a> Dit<'a> {
             }
         }
         let mut ax = self.a_patchify.forward(a.x, na);
-        if nv == 0 || na == 0 || !self.blocks_device(&mut vx, &mut ax, (v, &mv, &vpe, &vcpe), (a, &ma, &ape, &acpe)) {
-            for b in &self.blocks {
-                self.block(b, &mut vx, &mut ax, (v, &mv, &vpe, &vcpe, n_ctx), (a, &ma, &ape, &acpe, na_ctx));
+        if nv == 0 || na == 0 || !self.blocks_device(&mut vx, &mut ax, (v, &mv, &vpe, &vcpe), (a, &ma, &ape, &acpe), ptb) {
+            for (i, b) in self.blocks.iter().enumerate() {
+                let skip = (ptb.video_self.has(i), ptb.audio_self.has(i), ptb.cross);
+                self.block(
+                    b,
+                    &mut vx,
+                    &mut ax,
+                    (v, &mv, &vpe, &vcpe, n_ctx),
+                    (a, &ma, &ape, &acpe, na_ctx),
+                    skip,
+                );
             }
         }
         let vo = self.head(&vx, nv, d, &mv, &self.sst_out, &self.proj_out);
@@ -570,14 +641,15 @@ impl<'a> Dit<'a> {
         ax: &mut [f32],
         (v, mv, vpe, vcpe, n_ctx): (&StreamIn, &Mods, &Rope, &Rope, usize),
         (a, ma, ape, acpe, na_ctx): (&StreamIn, &Mods, &Rope, &Rope, usize),
+        (skip_v, skip_a, skip_cross): (bool, bool, bool),
     ) {
         let eps = self.cfg.eps;
         let (d, ad) = (self.cfg.dim(), self.cfg.audio_dim());
         let (nv, na) = (vx.len() / d, ax.len() / ad);
-        self_and_text(&b.v, vx, nv, d, mv, vpe, v.ctx, n_ctx, eps);
-        self_and_text(&b.a, ax, na, ad, ma, ape, a.ctx, na_ctx, eps);
+        self_and_text(&b.v, vx, nv, d, mv, (vpe, skip_v), v.ctx, n_ctx, eps);
+        self_and_text(&b.a, ax, na, ad, ma, (ape, skip_a), a.ctx, na_ctx, eps);
         // Audio-video cross-attention over the streams as they are now.
-        if nv > 0 && na > 0 {
+        if nv > 0 && na > 0 && !skip_cross {
             let vn = rms_rows(vx, d, eps);
             let an = rms_rows(ax, ad, eps);
             // Rows of the AV tables: [0] scale, [1] shift (a2v), [2] scale, [3] shift (v2a), [4] gate.
@@ -659,7 +731,17 @@ fn ada_sets(s: &Stream, m: &Mods, js: &[usize], dim: usize) -> Vec<Vec<Vec<f32>>
 }
 
 #[allow(clippy::too_many_arguments)]
-fn self_and_text(s: &Stream, x: &mut [f32], n: usize, dim: usize, m: &Mods, pe: &Rope, ctx: &[f32], n_ctx: usize, eps: f32) {
+fn self_and_text(
+    s: &Stream,
+    x: &mut [f32],
+    n: usize,
+    dim: usize,
+    m: &Mods,
+    (pe, skip): (&Rope, bool),
+    ctx: &[f32],
+    n_ctx: usize,
+    eps: f32,
+) {
     if n == 0 {
         return;
     }
@@ -672,7 +754,11 @@ fn self_and_text(s: &Stream, x: &mut [f32], n: usize, dim: usize, m: &Mods, pe: 
             *v = *v * (1.0 + st[1][c]) + st[0][c];
         }
     });
-    let y = s.attn1.forward(&h, n, None, Some(pe), None);
+    let y = if skip {
+        s.attn1.passthrough(&h, n)
+    } else {
+        s.attn1.forward(&h, n, None, Some(pe), None)
+    };
     gated_add(x, &y, dim, |r| &sets[m.idx[r]][2]);
     // Text cross-attention: rows 6 (shift), 7 (scale), 8 (gate); the context's own shift / scale.
     let mut h = rms_rows(x, dim, eps);

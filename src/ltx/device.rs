@@ -130,7 +130,7 @@ impl<'a> Twins<'a> {
     /// `d` as the device sees it: None when the device has no state for it or its input
     /// transform is not ConvRot's.
     fn lin<'s>(&'s self, d: &'s DLin<'a>) -> Option<DevLin<'s>> {
-        if d.w.has_lora() && !self.sides.contains_key(&key(d)) {
+        if d.w.active_lora().is_some() && !self.sides.contains_key(&key(d)) {
             return None;
         }
         let rot = match &d.w.fold {

@@ -135,6 +135,12 @@ impl LoraDelta {
         }
     }
 
+    /// This update switched on and off by `on` (shared by the updates of one adapter).
+    pub fn with_switch(mut self, on: Arc<AtomicBool>) -> Self {
+        self.active = on;
+        self
+    }
+
     /// The strength this update alone is applied with now (0 when its adapter is off).
     #[inline]
     pub(crate) fn strength(&self) -> f32 {

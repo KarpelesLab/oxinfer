@@ -15,6 +15,8 @@ use crate::safetensors::SafeTensors;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 const PREFIXES: [&str; 4] = ["model.diffusion_model.", "diffusion_model.", "base_model.model.", "transformer."];
 const DOWN: [&str; 3] = [".lora_A.default.weight", ".lora_A.weight", ".lora_down.weight"];
@@ -24,6 +26,12 @@ type Parts = (Option<String>, Option<String>, Option<String>);
 
 /// Applies `(file, strength)` LoRAs to `dit`; returns the number of layers updated.
 pub fn apply(dit: &mut Dit, loras: &[(PathBuf, f32)]) -> Result<usize> {
+    apply_switched(dit, loras, None)
+}
+
+/// [`apply`] with the updates switched on and off by `switch` (the distilled LoRA, on only in
+/// the second stage of the dev pipeline).
+pub fn apply_switched(dit: &mut Dit, loras: &[(PathBuf, f32)], switch: Option<&Arc<AtomicBool>>) -> Result<usize> {
     let mut total = 0;
     for (path, strength) in loras {
         let st = SafeTensors::open(path, false).with_context(|| format!("open LoRA {}", path.display()))?;
@@ -74,7 +82,11 @@ pub fn apply(dit: &mut Dit, loras: &[(PathBuf, f32)]) -> Result<usize> {
                 };
                 let s = strength * alpha / r as f32;
                 let down: Vec<f32> = down.iter().map(|v| v * s).collect();
-                lin.w.add_lora(Box::new(LoraDelta::fixed(down, &up, r, lin.n_in, lin.n_out)));
+                let mut d = LoraDelta::fixed(down, &up, r, lin.n_in, lin.n_out);
+                if let Some(sw) = switch {
+                    d = d.with_switch(sw.clone());
+                }
+                lin.w.add_lora(Box::new(d));
                 Ok(())
             };
             match run() {
