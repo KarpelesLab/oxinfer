@@ -293,7 +293,7 @@ onUnmounted(() => {
                     <span class="badge">{{ KIND_LABEL[r.kind] || r.kind }}</span>
                     <span v-if="r.stream" class="badge">stream</span>
                   </td>
-                  <td class="mono">{{ r.model || '—' }}</td>
+                  <td class="mono">{{ r.model || '—' }}<div v-if="r.peer" class="hint">on {{ r.peer }}</div></td>
                   <td>
                     <span :class="['state', r.cancelling ? 'warn-text' : '']">{{ r.cancelling ? 'Stopping…' : stageLine(r) }}</span>
                     <div v-if="r.step?.total || r.prompt?.total" class="bar thin">
@@ -427,6 +427,44 @@ onUnmounted(() => {
           </template>
           <p v-if="opencode.error" class="error" role="alert">{{ opencode.error }}</p>
           <p v-else-if="opencode.message" class="hint" role="status">{{ opencode.message }}</p>
+        </section>
+
+        <section v-if="st.peers?.length" class="block-section" aria-labelledby="peers-h">
+          <h2 id="peers-h">Peers <span class="count">{{ st.peers.filter((p) => p.up).length }} of {{ st.peers.length }} up</span></h2>
+          <div class="table-wrap">
+            <table class="cache">
+              <thead>
+                <tr>
+                  <th scope="col">Server</th>
+                  <th scope="col">State</th>
+                  <th scope="col">Models</th>
+                  <th scope="col" class="num-col">Free memory</th>
+                  <th scope="col" class="num-col">Forwarded</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="p in st.peers" :key="p.addr">
+                  <td>
+                    <span class="mono">{{ p.addr }}</span>
+                    <div v-if="p.version" class="hint">oxinfer {{ p.version }}</div>
+                  </td>
+                  <td>
+                    <span :class="['badge', 'flat', p.up ? 'good' : 'warn']">{{ p.up ? 'Up' : 'Not used' }}</span>
+                    <div v-if="p.error" class="hint">{{ p.error }}</div>
+                  </td>
+                  <td>
+                    <div v-for="m in p.models" :key="m.id">
+                      <span class="mono">{{ m.id }}</span>
+                      <span class="hint"> {{ m.loaded ? 'loaded' : 'not loaded' }}{{ m.requests ? `, ${m.requests} running` : '' }}</span>
+                    </div>
+                    <span v-if="!p.models.length">—</span>
+                  </td>
+                  <td class="num-col">{{ p.memory_free != null ? fmtBytes(p.memory_free) : '—' }}</td>
+                  <td class="num-col">{{ p.forwarded }}<div v-if="p.inflight" class="hint">{{ p.inflight }} running</div></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </section>
 
         <section class="block-section" aria-labelledby="pc-h">

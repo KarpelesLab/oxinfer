@@ -67,6 +67,9 @@ options:\n\
 \x20 --tls-cert FILE --tls-key FILE  HTTPS with this certificate chain and key (PEM)\n\
 \x20 --self-signed         HTTPS with a generated self-signed certificate\n\
 \x20 --workers N           connections served at once (default 32)\n\
+\x20 --peer HOST:PORT[,key=KEY]  another oxinfer server whose models are listed with this\n\
+\x20                       one's and take requests through it (repeatable; KEY is that server's\n\
+\x20                       --api-key, default this server's own); see docs/cluster.md\n\
 \x20 --thinking-key KEY    key of the signatures of /v1/messages thinking blocks (default: random\n\
 \x20                       per start; set it to keep them valid across restarts)\n\
 \x20 --no-update-check     do not ask GitHub for the latest release (the GUI tells when a newer\n\

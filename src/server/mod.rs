@@ -997,10 +997,10 @@ impl Api {
             Err(e) if openai::is_anthropic_path(&req.path) => Output::Full(openai::anthropic_error_response(&e)),
             Err(e) => Output::Full(e.response()),
         };
-        // The GUI's files and its polling would drown the log.
-        let quiet = self.web.is_some()
-            && req.method.eq_ignore_ascii_case("GET")
-            && !req.path.starts_with("/v1/")
+        // The GUI's files and its polling would drown the log; so would a front's polls of this
+        // peer (every two seconds).
+        let quiet = req.method.eq_ignore_ascii_case("GET")
+            && ((self.web.is_some() && !req.path.starts_with("/v1/")) || req.path.trim_end_matches('/') == "/v1/cluster")
             && !matches!(&out, Output::Full(r) if r.status >= 400);
         if self.opts.log && !quiet {
             let status = match &out {

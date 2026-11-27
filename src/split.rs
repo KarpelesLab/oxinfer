@@ -294,6 +294,7 @@ impl Client {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn request(conn: &mut Conn, op: u32, flags: u32, pos: usize, t: usize, spans: &[VisionSpan], aux: u64, rows: &[f32]) -> Result<()> {
     let mut head = Vec::with_capacity(32 + spans.len() * 24);
     head.extend_from_slice(&op.to_le_bytes());

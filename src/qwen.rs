@@ -588,7 +588,7 @@ pub struct QwenSession {
     pub(crate) checkpoints: Vec<std::sync::Arc<Checkpoint>>,
     /// The session's other half on a worker, when the model is the front of a split one
     /// ([`crate::split`]).
-    pub(crate) split: Option<crate::split::Sess>,
+    pub(crate) split: Option<Box<crate::split::Sess>>,
 }
 
 /// What a session with recurrent layers cannot rebuild of an earlier position once it has gone
@@ -1448,7 +1448,7 @@ impl<'a> QwenModel<'a> {
             exp: self.exp.as_ref().map(|e| Box::new(e.new_session(cfg))),
             checkpoints: Vec::new(),
             split: match &self.part {
-                Part::Front { client, recurrent } => Some(crate::split::Sess::new(client, *recurrent)),
+                Part::Front { client, recurrent } => Some(Box::new(crate::split::Sess::new(client, *recurrent))),
                 _ => None,
             },
         }
