@@ -1206,7 +1206,7 @@ impl CudaBackend {
     }
 
     /// A Q8 or Q4 matrix (`--quant`, not affine Q4) as the ggml kernels take it, for the fast
-    /// prefill plans, as bf16 matrices go through ggml's BF16: Q8 as
+    /// prefill plans and the prompt's LM head, as bf16 matrices go through ggml's BF16: Q8 as
     /// `K_OQ8` (int8 values, an f32 scale per block of 32), Q4 as `K_OQ4` over the checkpoint's
     /// f16 block scales (`SCALES_F16`). The kernels are compiled on first use; the matvec is the
     /// one with a warp per row (a prefill plan takes it for steps of a few tokens only).
@@ -1883,6 +1883,10 @@ impl CudaBackend {
     }
 }
 
+/// Outputs from which `matvec_rows` takes a Q8 or Q4 matrix: a vocabulary's (the LM head after a
+/// prompt), not a layer's.
+const QUANT_ROWS_MIN: usize = 32768;
+
 /// Dynamic shared memory of `dfattn2_D` (`DFA2_SHM` in `cuda_decode.cu`): f32 staging and f16
 /// tiles of 64 keys and values.
 pub(crate) const fn dfattn2_shmem(d: usize) -> u32 {
@@ -2363,7 +2367,10 @@ impl Backend for CudaBackend {
 
     /// GGUF weights, and bf16 matrices as the ggml BF16 format (the LM head of a prompt's last
     /// token, a draft's few rows): the decode plans' matvec (`mv_K`, a grid row per input row;
-    /// `mvp_K` for a gate / up pair, SiLU).
+    /// `mvp_K` for a gate / up pair, SiLU). Over Q8 and Q4 weights, unless `gpu::exact`, a matrix
+    /// of [`QUANT_ROWS_MIN`] outputs or more alone (an LM head) through the same kernel
+    /// ([`Self::quant_wg`]: f32 sums, where the CPU's head rounds the activations to int8); a
+    /// draft's layers in those formats stay on the CPU.
     fn matvec_rows(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [crate::gpu::RowsJob]) -> bool {
         if jobs.is_empty() || !(1..=4).contains(&t) || !n_in.is_multiple_of(32) || x.len() < t * n_in || !self.bind() {
             return false;
@@ -2371,6 +2378,11 @@ impl Backend for CudaBackend {
         let mut ws = Vec::with_capacity(jobs.len());
         let mut y_total = 0usize;
         for j in jobs.iter() {
+            let head = jobs.len() == 1
+                && j.up.is_none()
+                && j.n_out >= QUANT_ROWS_MIN
+                && !crate::gpu::exact()
+                && crate::qwen::prefill_gpu(usize::MAX, "plan");
             let gg = |w: &WeightRef, d: &DeviceWeight| match w {
                 WeightRef::Gguf(_) => d.downcast_ref::<CudaWeightBox>().and_then(|b| Wg::of(&b.0)),
                 // (With the prefill plans off, `OXINFER_PREFILL_GPU=0`, the CPU's head too: the
@@ -2390,6 +2402,11 @@ impl Backend for CudaBackend {
                             ..Wg::default()
                         },
                     ))
+                }
+                // Q8 and Q4 (not affine): a vocabulary's matrix alone, unless exact.
+                WeightRef::Q8(_) | WeightRef::Q4(_) if head => {
+                    let b = d.downcast_ref::<CudaWeightBox>()?;
+                    self.quant_wg(w, &b.0, n_in)
                 }
                 _ => None,
             };
@@ -3278,6 +3295,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `matvec_rows` over Q8 and Q4 weights (the prompt's LM head of a model in those formats):
+    /// 1 to 4 rows of a vocabulary-sized matrix against the dense values in f64; a layer-sized
+    /// matrix, a gate / up pair and affine Q4 are declined (the caller's CPU path).
+    #[test]
+    fn quant_matvec_rows_match_definition() {
+        let Some(be) = backend() else { return };
+        let (n_out, n_in) = (QUANT_ROWS_MIN + 40, 96usize);
+        let mut seed = 21;
+        let w = bf16(n_out * n_in, &mut seed);
+        let (q8, q4) = (quantize_bf16(&w, n_out, n_in), quantize_q4(&w, n_out, n_in));
+        let formats = [("q8", WeightRef::Q8(&q8), dense_q8(&q8)), ("q4", WeightRef::Q4(&q4), dense_q4(&q4))];
+        for (fmt, wr, dense) in &formats {
+            let dev = be.upload(wr, n_out, n_in).unwrap();
+            for t in 1..=4usize {
+                let x: Vec<f32> = (0..t * n_in).map(|_| rnd(&mut seed) * 2.0).collect();
+                let mut y = vec![0f32; t * n_out];
+                let mut jobs = [crate::gpu::RowsJob {
+                    w: wref(wr),
+                    dev: &dev,
+                    up: None,
+                    n_out,
+                    y: &mut y,
+                }];
+                assert!(be.matvec_rows(&x, t, n_in, &mut jobs), "{fmt}: matvec_rows declined {t} rows");
+                for j in 0..t {
+                    for o in 0..n_out {
+                        let (row, xr) = (&dense[o * n_in..(o + 1) * n_in], &x[j * n_in..(j + 1) * n_in]);
+                        let v: f64 = row.iter().zip(xr).map(|(&a, &b)| a as f64 * b as f64).sum();
+                        let m: f64 = row.iter().zip(xr).map(|(&a, &b)| (a as f64 * b as f64).abs()).sum();
+                        assert!((y[j * n_out + o] as f64 - v).abs() < 2e-6 * (m + 1e-3), "{fmt}: row {j} {o}");
+                    }
+                }
+            }
+            // A layer's matrix, and a pair: not here.
+            let small = 256usize;
+            let x: Vec<f32> = (0..n_in).map(|_| rnd(&mut seed)).collect();
+            let (mut y, mut y2) = (vec![0f32; small], vec![0f32; n_out]);
+            let mut jobs = [crate::gpu::RowsJob {
+                w: wref(wr),
+                dev: &dev,
+                up: None,
+                n_out: small,
+                y: &mut y,
+            }];
+            assert!(!be.matvec_rows(&x, 1, n_in, &mut jobs), "{fmt}: a layer-sized matrix");
+            let mut jobs = [crate::gpu::RowsJob {
+                w: wref(wr),
+                dev: &dev,
+                up: Some((wref(wr), &dev)),
+                n_out,
+                y: &mut y2,
+            }];
+            assert!(!be.matvec_rows(&x, 1, n_in, &mut jobs), "{fmt}: a gate / up pair");
+        }
+        let (m, _) = affine(n_out, 128, 64, &mut seed);
+        let dev = be.upload(&WeightRef::Q4(&m), n_out, 128).unwrap();
+        let x: Vec<f32> = (0..128).map(|_| rnd(&mut seed)).collect();
+        let mut y = vec![0f32; n_out];
+        let mut jobs = [crate::gpu::RowsJob {
+            w: WeightRef::Q4(&m),
+            dev: &dev,
+            up: None,
+            n_out,
+            y: &mut y,
+        }];
+        assert!(!be.matvec_rows(&x, 1, 128, &mut jobs), "affine Q4 has no matvec_rows kernel");
     }
 
     /// Timing of the prefill attention kernels (`FATTN_SHAPES=d:nh:nkv:t:pos0,...`, default
