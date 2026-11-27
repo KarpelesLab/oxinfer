@@ -238,6 +238,56 @@ pub fn write_draft(dir: &Path, seed: u64) -> Result<()> {
     t.write(dir)
 }
 
+/// Writes a tiny random dense checkpoint into the folder `dir`, in the Hugging Face layout of
+/// Qwen3 (`llama` false: per-head query / key norms) or Llama 3 (`llama` true: none): three
+/// full-attention layers of width 64 (4 heads over 2 key / value heads of 16), SiLU MLPs of 128,
+/// tied embeddings, [`write`]'s tokenizer. The models the LoRA trainer's tests run
+/// (`crate::lora_train`).
+pub fn write_dense(dir: &Path, llama: bool) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
+    let (h, heads, kv, hd, inter, layers) = (64usize, 4usize, 2usize, 16usize, 128usize, 3usize);
+    let config = json!({
+        "architectures": [if llama { "LlamaForCausalLM" } else { "Qwen3ForCausalLM" }],
+        "model_type": if llama { "llama" } else { "qwen3" },
+        "hidden_size": h, "intermediate_size": inter, "num_hidden_layers": layers,
+        "num_attention_heads": heads, "num_key_value_heads": kv, "head_dim": hd, "vocab_size": VOCAB,
+        "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu", "attention_bias": false,
+        "max_position_embeddings": 4096, "tie_word_embeddings": true, "eos_token_id": SPECIAL_BASE + 2,
+    });
+    std::fs::write(dir.join("config.json"), serde_json::to_vec_pretty(&config)?)?;
+    let tok = crate::inkling::tiny::byte_tokenizer(&SPECIAL, SPECIAL_BASE);
+    std::fs::write(dir.join("tokenizer.json"), serde_json::to_vec(&tok)?)?;
+    let mut t = Tensors {
+        list: Vec::new(),
+        seed: 11,
+    };
+    let s = |n: usize| 2.0 / (n as f32).sqrt();
+    t.add("model.embed_tokens.weight".into(), &[VOCAB, h], 0.6, 0.0);
+    t.add("model.norm.weight".into(), &[h], 0.4, 1.0);
+    for l in 0..layers {
+        let p = format!("model.layers.{l}.");
+        for (n, o, i) in [
+            ("self_attn.q_proj", heads * hd, h),
+            ("self_attn.k_proj", kv * hd, h),
+            ("self_attn.v_proj", kv * hd, h),
+            ("self_attn.o_proj", h, heads * hd),
+            ("mlp.gate_proj", inter, h),
+            ("mlp.up_proj", inter, h),
+            ("mlp.down_proj", h, inter),
+        ] {
+            t.add(format!("{p}{n}.weight"), &[o, i], s(i), 0.0);
+        }
+        if !llama {
+            t.add(format!("{p}self_attn.q_norm.weight"), &[hd], 0.4, 1.0);
+            t.add(format!("{p}self_attn.k_norm.weight"), &[hd], 0.4, 1.0);
+        }
+        for n in ["input_layernorm", "post_attention_layernorm"] {
+            t.add(format!("{p}{n}.weight"), &[h], 0.4, 1.0);
+        }
+    }
+    t.write(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::QwenConfig;

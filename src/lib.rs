@@ -96,6 +96,7 @@ pub mod longcat_avatar;
 pub mod longcat_chat;
 pub mod lookup;
 pub mod lora;
+pub mod lora_train;
 pub mod ltx;
 #[cfg(feature = "media")]
 pub mod media;

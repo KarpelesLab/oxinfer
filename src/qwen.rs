@@ -225,10 +225,10 @@ impl<'a> Attn<'a> {
 
 pub(crate) struct QLayer<'a> {
     pub(crate) mixer: Mixer<'a>,
-    ln_in: Vec<f32>,   // 1 + w
-    ln_post: Vec<f32>, // 1 + w
+    pub(crate) ln_in: Vec<f32>,   // 1 + w
+    pub(crate) ln_post: Vec<f32>, // 1 + w
     /// LFM3's sandwich norms: on the mixer's output and on the MLP's, before the residual.
-    post: Option<[Vec<f32>; 2]>,
+    pub(crate) post: Option<[Vec<f32>; 2]>,
     pub(crate) ffn: Ffn<'a>,
 }
 
@@ -237,7 +237,7 @@ pub struct QwenModel<'a> {
     pub quant: Quant,
     pub(crate) embed: Table<'a>,
     pub(crate) layers: Vec<QLayer<'a>>,
-    final_norm: Vec<f32>,
+    pub(crate) final_norm: Vec<f32>,
     pub(crate) lm_head: Lin<'a>,
     pub(crate) inv_freq: Vec<f32>,
     /// M-RoPE: the position axis (0 time, 1 height, 2 width) of each rotary frequency.
