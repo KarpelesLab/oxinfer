@@ -7,8 +7,12 @@
 //! (channel RMS norm, then SiLU). What has no kernel here (a mid block's attention) goes through
 //! the host with [`Pass::download`] / [`Pass::upload`].
 //!
-//! The weights are float32 on the device (a copy of the layer's rows, made at first use), the
-//! products float32 FMAs, so a pass differs from the host's by the order of the sums. The
+//! The products run on the tensor cores: the weights as float16 (times a power of two per layer:
+//! exact for the bf16-rounded kernels these VAEs run with, which the upload checks), an
+//! activation as two halves `hi + lo 2^-11` after a power of two per frame, two products per
+//! step accumulated in float32 (about 1e-6 of the float32 result). A layer whose weights are not
+//! exact in float16, and every layer with `OXINFER_VAE_GPU_F32=1`, runs the float32 FMA kernel
+//! on float32 weights instead, which differs from the host only by the order of the sums. The
 //! buffers of a pass are handed out again by size while it runs and freed at its end (so are the
 //! weights on a discrete card, whose memory a transformer wants). A pass that cannot run (out
 //! of device memory, a kernel error) returns `None`: the caller's host path runs.
@@ -84,13 +88,40 @@ struct VConvP {
     pad2: u32,
 }
 
-/// A convolution's weights on the device: rows of `taps * cin` floats (`cin`: the layer's
+/// `VConvHP` of `cuda_vae.cu`.
+#[repr(C)]
+struct VConvHP {
+    x: [u64; 3],
+    m: [u64; 3],
+    w: u64,
+    bias: u64,
+    add: u64,
+    y: u64,
+    winv: f32,
+    h: u32,
+    wd: u32,
+    cin: u32,
+    xstride: u32,
+    xoff: u32,
+    k: u32,
+    kt: u32,
+    stride: u32,
+    pad: u32,
+    up: u32,
+    ow: u32,
+    npix: u32,
+    cout: u32,
+}
+
+/// A convolution's weights on the device: rows of `taps * cin` values (`cin`: the layer's
 /// channels per frame rounded up to a multiple of 32), a multiple of 64 of them (zero rows after
 /// the real ones, and between the two halves of a layer whose outputs are read as two frames),
-/// and a bias per row.
+/// and a bias per row. The values are float16 times `1 / winv`, or float32 (`half` false).
 #[derive(Clone, Copy)]
 struct DConv {
     w: u64,
+    half: bool,
+    winv: f32,
     bias: u64,
     cin: usize,
     /// Floats per pixel of the output: the outputs rounded up to a multiple of 32 (each half).
@@ -110,7 +141,11 @@ pub(crate) struct Engine {
     module: F,
     stream: F,
     conv: F,
+    conv_h: F,
+    max: F,
     rms: F,
+    /// Float32 products only.
+    f32_only: bool,
     state: Mutex<State>,
 }
 
@@ -145,6 +180,10 @@ struct Pool {
 struct Buf<'p> {
     p: u64,
     bytes: usize,
+    /// The floats written.
+    floats: usize,
+    /// Where the largest |value| is, once a convolution asked.
+    max: RefCell<Option<Rc<Buf<'p>>>>,
     pool: &'p Pool,
 }
 
@@ -218,7 +257,7 @@ impl Engine {
             }
             Ok(f)
         };
-        let (conv, rms) = (get("vconv")?, get("vrms")?);
+        let (conv, conv_h, max, rms) = (get("vconv")?, get("vconv_h")?, get("vmax")?, get("vrms")?);
         let mut stream = std::ptr::null_mut();
         if unsafe { x.cuStreamCreate(&mut stream, 1) } != 0 {
             bail!("cuStreamCreate failed");
@@ -229,7 +268,10 @@ impl Engine {
             module,
             stream,
             conv,
+            conv_h,
+            max,
             rms,
+            f32_only: std::env::var("OXINFER_VAE_GPU_F32").is_ok_and(|v| v != "0"),
             state: Mutex::new(State::default()),
         })
     }
@@ -249,12 +291,16 @@ impl Engine {
 
     /// `v` in a buffer of its own that the engine keeps.
     fn keep(&self, st: &mut State, v: &[f32]) -> Result<u64> {
+        self.keep_bytes(st, bytes_of(v))
+    }
+
+    fn keep_bytes(&self, st: &mut State, v: &[u8]) -> Result<u64> {
         let mut d = 0u64;
-        if unsafe { self.x.cuMemAlloc_v2(&mut d, (v.len() * 4).max(256)) } != 0 {
+        if unsafe { self.x.cuMemAlloc_v2(&mut d, v.len().max(256)) } != 0 {
             bail!("out of device memory for the weights");
         }
         st.owned.push(d);
-        self.htod(d, bytes_of(v))?;
+        self.htod(d, v)?;
         Ok(d)
     }
 
@@ -321,7 +367,13 @@ impl<'p> Pass<'p, '_> {
             }
         };
         Ok(DFrame {
-            buf: Rc::new(Buf { p, bytes, pool: self.pool }),
+            buf: Rc::new(Buf {
+                p,
+                bytes,
+                floats,
+                max: RefCell::new(None),
+                pool: self.pool,
+            }),
             off: 0,
             stride,
         })
@@ -365,14 +417,14 @@ impl<'p> Pass<'p, '_> {
         Ok(v)
     }
 
-    fn go(&self, f: F, grid: (u32, u32), args: &mut [*mut c_void]) -> Result<()> {
+    fn go(&self, f: F, grid: (u32, u32), threads: u32, args: &mut [*mut c_void]) -> Result<()> {
         let rc = unsafe {
             self.e.x.cuLaunchKernel(
                 f,
                 grid.0.max(1),
                 grid.1.max(1),
                 1,
-                256,
+                threads,
                 1,
                 1,
                 0,
@@ -422,8 +474,27 @@ impl<'p> Pass<'p, '_> {
             }
             b[row(o)] = bias.map_or(0.0, |b| b[o]);
         }
+        // Float16 after a power of two that brings the largest weight into [2^13, 2^14), when
+        // that is every weight exactly.
+        let max = w.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let (f, winv) = if max > 0.0 && max.is_finite() {
+            let s = (13 - max.log2().floor() as i32).clamp(-100, 100);
+            (2f32.powi(s), 2f32.powi(-s))
+        } else {
+            (1.0, 1.0)
+        };
+        let halves: Vec<u16> = w.iter().map(|&v| half::f16::from_f32(v * f).to_bits()).collect();
+        let half = !self.e.f32_only && halves.iter().zip(&w).all(|(&h, &v)| half::f16::from_bits(h).to_f32() == v * f);
         let d = DConv {
-            w: self.e.keep(self.st, &w)?,
+            w: if half {
+                // SAFETY: plain numeric slices.
+                let bytes = unsafe { std::slice::from_raw_parts(halves.as_ptr() as *const u8, halves.len() * 2) };
+                self.e.keep_bytes(self.st, bytes)?
+            } else {
+                self.e.keep(self.st, &w)?
+            },
+            half,
+            winv,
             bias: self.e.keep(self.st, &b)?,
             cin: cp,
             cout,
@@ -490,8 +561,65 @@ impl<'p> Pass<'p, '_> {
             bail!("a residual of another layout");
         }
         let grid = ((oh * ow).div_ceil(64) as u32, ys.div_ceil(64) as u32);
-        self.go(self.e.conv, grid, &mut [&p as *const _ as *mut c_void])?;
+        if !d.half {
+            self.go(self.e.conv, grid, 256, &mut [&p as *const _ as *mut c_void])?;
+            return Ok((y, oh, ow));
+        }
+        let mut m = [0u64; 3];
+        for (m, f) in m.iter_mut().zip(taps) {
+            if let Some(f) = f {
+                *m = self.max_of(f)?;
+            }
+        }
+        let p = VConvHP {
+            x: p.x,
+            m,
+            w: p.w,
+            bias: p.bias,
+            add: p.add,
+            y: p.y,
+            winv: d.winv,
+            h: p.h,
+            wd: p.wd,
+            cin: p.cin,
+            xstride: p.xstride,
+            xoff: p.xoff,
+            k: p.k,
+            kt: p.kt,
+            stride: p.stride,
+            pad: p.pad,
+            up: p.up,
+            ow: p.ow,
+            npix: p.npix,
+            cout: p.cout,
+        };
+        self.go(self.e.conv_h, grid, 128, &mut [&p as *const _ as *mut c_void])?;
         Ok((y, oh, ow))
+    }
+
+    /// Where the largest |value| of `f`'s buffer is (computed at the first call).
+    fn max_of(&mut self, f: &DFrame<'p>) -> Result<u64> {
+        if let Some(m) = f.buf.max.borrow().as_ref() {
+            return Ok(m.p);
+        }
+        const CHUNK: usize = 1 << 16;
+        let n = f.buf.floats;
+        let nb = n.div_ceil(CHUNK).max(1);
+        let (part, out) = (self.alloc(nb, 1)?, self.alloc(1, 1)?);
+        let launch = |x: u64, n: usize, chunk: usize, to: u64, blocks: usize| {
+            let (n, chunk) = (n as u64, chunk as u64);
+            let mut args = [
+                &x as *const _ as *mut c_void,
+                &n as *const _ as *mut c_void,
+                &chunk as *const _ as *mut c_void,
+                &to as *const _ as *mut c_void,
+            ];
+            self.go(self.e.max, (blocks as u32, 1), 256, &mut args)
+        };
+        launch(f.buf.p, n, CHUNK, part.buf.p, nb)?;
+        launch(part.buf.p, nb, nb, out.buf.p, 1)?;
+        *f.buf.max.borrow_mut() = Some(out.buf.clone());
+        Ok(out.buf.p)
     }
 
     /// `x / max(|x|, 1e-12) * g` per pixel (`g`: a gain per channel), then SiLU with `silu`.
@@ -522,7 +650,7 @@ impl<'p> Pass<'p, '_> {
             &nu as *const _ as *mut c_void,
             &su as *const _ as *mut c_void,
         ];
-        self.go(self.e.rms, (npix.div_ceil(8) as u32, 1), &mut args)?;
+        self.go(self.e.rms, (npix.div_ceil(8) as u32, 1), 256, &mut args)?;
         Ok(y)
     }
 }
