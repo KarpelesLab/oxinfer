@@ -381,7 +381,17 @@ const EXTRA_KEYS: &[&str] = &[
 ];
 
 /// The keys of [`EXTRA_KEYS`] that Nemotron-Labs-Image reads (the others are MOSS-Image's).
-const NEMO_KEYS: &[&str] = &["temperature", "top_p", "top_k", "structure", "system_prompt", "max_tokens"];
+const NEMO_KEYS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "top_k",
+    "structure",
+    "system_prompt",
+    "max_tokens",
+    "image_guidance",
+    "source_layout",
+    "source_prompt",
+];
 
 /// A JSON value as a `key=value` setting (arrays comma-joined).
 fn setting(v: &Value) -> String {
@@ -570,14 +580,18 @@ fn generate_images(
     }
     let mut out = Vec::new();
     if let ImageModel::NemotronImage(nm) = m {
-        // Source images (edits) go into the prompt; the size is the request's, else 1024x1024.
+        // Source images (edits) go into the prompt; the size is the request's, else the first
+        // source's, else 1024x1024.
         let mut o = crate::nemotron_image::GenerateOptions {
             seed,
             num_images: job.n,
+            guidance: job.guidance,
             ..Default::default()
         };
         if let (Some(w), Some(h)) = (w, h) {
             (o.width, o.height) = (w, h);
+        } else if !job.images.is_empty() {
+            (o.width, o.height) = (0, 0);
         }
         for (k, v) in job.extra.iter().filter(|(k, _)| NEMO_KEYS.contains(&k.as_str())) {
             o.set(k, &setting(v))?;

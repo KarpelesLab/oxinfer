@@ -50,20 +50,78 @@ reference samples everything and rejects a generation whose header or grid is of
 (`structure: free`) samples every token as the reference does, up to `<|img_end|>`, and decodes the
 grid the model wrote at the size its header announces (rows cut or padded to the header's width).
 
-**Source images** (`--image FILE`, the server's image edits, `images_json` in the C API): the
-model was trained with 10% text-and-image-to-image data (editing, reference images, multi-turn),
-which NVIDIA reports as trained but not evaluated, and whose prompt layout the release does not
-document. oxinfer encodes each source image with the tokenizer's encoder (resized to at most
-1024x1024 pixels in area, sides rounded down to multiples of 16) into the same block
-(`<|img_start|>height=H width=W<|vis_row|>...<|img_end|>`), placed in the user turn before the
-instruction. This is experimental: asked to make the red car of a generated image blue, the
-model keeps the car's outline and wire wheels and paints it blue, but the images come out
-washed out and blurred, with the block before the instruction, after it, without the
-`Generate a WxH image.` line or with a line break before it alike (the release's RL stage used
-text-to-image prompts only).
+**Source images** (`--image FILE`, the server's image edits, `images_json` in the C API) are
+encoded with the tokenizer's encoder (resized to at most 1024x1024 pixels in area, sides rounded
+down to multiples of 16) into the same block, and by default given as earlier turns of the
+conversation, then the instruction guided against the same prompt without it; the output keeps
+the first source's size unless one is asked for. See [Editing](#editing) for what works and
+what does not.
 
 The model does not describe images: it was trained to write visual tokens, and was not tested
 here as a text model.
+
+## Editing
+
+The model was trained with 10% text-and-image-to-image data ("TI2I": editing, generation from
+reference images, multi-turn generation) in its three mid-training stages and none in its
+reinforcement-learning stage; the paper (section 5.2, table 4) reports it as "included in
+training but not evaluated". The release documents no prompt layout for it: the model card,
+`infer.py`, the paper (`paper.pdf` in the repository), the chat template (no image content
+type), `tokenization_unitron_lazy_vision.py` (it only maps `<|vis_i|>` / framing tokens to ids),
+`generation_config.json` (empty) and the Hugging Face demo Space are all text to image; the
+harness and VisionCode code are "releasing upon legal clearance".
+
+oxinfer's layout and sampling for sources (the defaults; `source_layout`, `source_prompt`,
+`guidance`, `image_guidance` change them):
+
+```text
+<|im_start|>system\n{system}<|im_end|>\n
+<|im_start|>user\nGenerate a {w}x{h} image.\n\n{source_prompt}<|im_end|>\n      (per source)
+<|im_start|>assistant\n<think></think>\n<|img_start|>height={h} width={w}<|vis_row|>...<|img_end|><|im_end|>\n
+<|im_start|>user\nGenerate a {W}x{H} image.\n\n{instruction}<|im_end|>\n<|im_start|>assistant\n<think></think>
+```
+
+(the chat template's rendering of a past reply; `source_layout=inline` puts the blocks at the
+start of the user turn instead), and classifier-free guidance on the instruction: logits
+`u + 2 (c - u)`, `u` from the same prompt with an empty instruction, which shares the prompt's
+prefix (one prefill of it, then two sequences: about half the tokens per second).
+
+What was checked (Q4_0 GGUF, M5 Max), and why edits are still not clean:
+
+- The encoder is right: oxinfer's codes equal the reference's (above), and encoding then
+  decoding a generated 1184x880 image gives it back with no visible loss.
+- The model reads the sources: teacher-forced with the source's own codes as the reply
+  ("Keep the image exactly the same."), it predicts 64% of them as its top choice (mean
+  log-probability -2.8 over the visual vocabulary, entropy 4.5 nats; without the source 6%,
+  -7.4, 7.9 nats). The inline layout scores -2.80, the turn layout -3.16 to -3.25, about
+  equal; a source block without its `height=H width=W` header drops to -5.2, and a source
+  encoded at half or 0.7 times the size to -7.7 / -8.0 (worse than none: the model copies by
+  position, so a source of another size misleads it).
+- The decoding is right: the GPU decode plan agrees with a one-pass CPU prefill at 8,342 tokens
+  (largest logit difference 0.37, same top token), and the same edits sampled on the CPU come
+  out the same way.
+- Yet sampled at the card's temperature 0.9 without guidance, even "Keep the image exactly the
+  same." returns a darker, foggy copy, and edits come out washed out (darker or whiter, low
+  contrast, smeared). The visual vocabulary is 196,560 unit vectors of a Leech-lattice code
+  whose nearest neighbours are 51 degrees apart (cosine 0.625, 128 of them per code): a code
+  sampled off the source's is a large step, not a small one, and at a 36% miss rate the
+  decoder averages them into haze. Text to image does not show this because reinforcement
+  learning concentrated that distribution; the TI2I one was never tuned.
+- Sharpening by truncation does not help: temperature 0.7 or 0.5, top-k 20 / 100 and top-p
+  0.7 / 0.9 give horizontal streaks and repeated rows (the model copies its own last row
+  instead of the source). Guidance does: at 2 the car of the test image comes out bright
+  blue with its pose, the cliff and the road kept, and "add a golden retriever sitting on the
+  road in front of the car" adds a dog; 3 follows the instruction more and the source less;
+  image guidance (`image_guidance`, InstructPix2Pix's second scale, a third sequence) did not
+  improve on it.
+
+What remains: tones drift (the sunset sky of the car image comes out dark, the snowy fox scene
+whiter and foggy), fine detail of the source is redrawn rather than kept, style changes
+("turn this photo into a watercolor painting") are not followed, and results vary a lot between
+seeds; generate several (`--num-images`) and pick. These are properties of the released
+weights' untuned TI2I behaviour as far as the checks above can tell, not of the prompt layout
+(no layout tried changed them: before or after the instruction, with or without the
+`Generate a WxH image.` line or the system prompt, the source's own description in its turn).
 
 ## The tokenizer
 
@@ -85,13 +143,17 @@ points elsewhere).
 
 | CLI | library (`GenerateOptions` / `LoadOptions`), C API and server keys | default |
 |---|---|---|
-| `--size WxH` | `width`, `height` (the server's `size`) | 1024x1024 |
+| `--size WxH` | `width`, `height` (the server's `size`; 0 x 0: the first source's size) | 1024x1024; with source images, the first one's size |
 | `--temp`, `--top-p`, `--top-k` | `temperature`, `top_p`, `top_k` | 0.9, 1, 0 |
 | `--seed`, `--num-images N` | `seed`, `num_images` (the server's `n`; seeds `seed`, `seed + 1`, ...) | 42, 1 |
 | `--system TEXT`, `--no-system` | `system_prompt` | the card's |
 | `--unconstrained` | `structure` (`grid`, `free`) | `grid` |
 | `--max-tokens N` | `max_tokens` (`free` only) | the grid plus slack |
 | `--image FILE` | source images (server: image edits; C API: `images_json`) | none |
+| `--nemo-image guidance=G` | `guidance` (the server's `guidance`): classifier-free guidance on the instruction | 1 (off); 2 with source images |
+| `--nemo-image image_guidance=S` | `image_guidance`: guidance on the source images (a third sequence) | 1 (off) |
+| `--nemo-image source_layout=L` | `source_layout`: `turn` (sources as earlier replies), `inline` (in the user turn) | `turn` |
+| `--nemo-image source_prompt=TEXT` | `source_prompt`: the request the sources answer (`turn`) | empty |
 | `--quant q8\|q4` | `quant` (the float32 release; GGUF files keep their own) | bf16 |
 | `--image-tokenizer PATH\|REPO` | `tokenizer` | the checkpoint's, else NVIDIA's |
 | `--nemo-image KEY=VALUE` | any of the keys above, and `vit_precision` (`bf16`, `f32`), `encoder` | |
@@ -126,6 +188,8 @@ CPU (`tools/bench/with-lock.sh` held for the GPU):
 | 2 x 1024x1024, Metal (`--num-images 2`, both images in each GPU step) | 8,350 | 47.3 s (176 tok/s) | 50.4 s |
 | 4 x 1024x1024, Metal (`--num-images 4`) | 16,700 | 70-76 s (219-238 tok/s) | 74-80 s |
 | 1024x1024, CPU (`--device cpu`) | 4,175 | 102 s (41 tok/s) | 107 s |
+| edit of a 1184x880 image (4,230 prompt tokens), guidance 2, Metal | 4,139 | 54.7 s (76 tok/s) | 68 s, prefill 12 s |
+| edit of a 1024x1024 image (4,275 prompt tokens), guidance 2, Metal | 4,175 | 63 to 66 s (63 to 66 tok/s) | 78 to 82 s |
 | 1024x1024, the float32 release with `--quant q4`, CPU | 4,175 | 173 s (24 tok/s) | 3.1 min, after 3.9 min of loading |
 
 Before the batched steps and the experts fix below (the first Metal plan): 1024x1024 in 33.7 s

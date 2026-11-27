@@ -21,8 +21,10 @@
 //! wrote, at the size its header announced.
 //!
 //! Source images (the model's text-and-image-to-image training, which NVIDIA reports as trained
-//! but not evaluated) are encoded by the tokenizer's encoder into the same blocks and placed in
-//! the user turn before the instruction.
+//! but not evaluated, with an undocumented prompt layout) are encoded by the tokenizer's encoder
+//! into the same blocks and given as earlier replies of the conversation
+//! ([`SourceLayout::Turn`]); the instruction is then guided against the same prompt without it
+//! ([`SOURCE_GUIDANCE`]), since plain sampling of this part of the model comes out hazy.
 //!
 //! Checkpoints: nvidia/Nemotron-Labs-Image-30B-A3B (float32 safetensors, 130 GB, converted at
 //! load to bf16 / `--quant q8` / `q4`) and its llama.cpp GGUF conversions (`nemotron_h_moe` with
@@ -246,13 +248,42 @@ impl Structure {
     }
 }
 
+/// Where source images go in the prompt (the release does not document its text-and-image
+/// layout; see `docs/nemotron-image.md`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceLayout {
+    /// As earlier turns of the conversation: for each source a user turn
+    /// `Generate a {w}x{h} image.\n\n{source_prompt}` answered by the source's image block,
+    /// then the instruction as the next user turn (`Generate a {W}x{H} image.\n\n{prompt}`).
+    #[default]
+    Turn,
+    /// The sources' blocks at the start of the user turn, each followed by a line break,
+    /// before `Generate a {W}x{H} image.\n\n{prompt}`.
+    Inline,
+}
+
+impl SourceLayout {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "turn" => Ok(Self::Turn),
+            "inline" => Ok(Self::Inline),
+            _ => bail!("source_layout: expected turn or inline, got {s:?}"),
+        }
+    }
+}
+
+/// The guidance scale used with source images when [`GenerateOptions::guidance`] is not set.
+pub const SOURCE_GUIDANCE: f32 = 2.0;
+
 /// Text-to-image options; the defaults are the model card's. Deserializes from JSON with every
 /// key optional.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GenerateOptions {
     /// Image size in pixels: positive multiples of 16 (default 1024 x 1024; see
-    /// [`RECOMMENDED_SIZES`]).
+    /// [`RECOMMENDED_SIZES`]). 0 x 0: the first source image's size (as encoded), else
+    /// 1024 x 1024.
     pub width: usize,
     pub height: usize,
     /// Sampling temperature (0.9); 0 picks the most likely token.
@@ -270,6 +301,18 @@ pub struct GenerateOptions {
     /// [`Structure::Free`]: the most tokens generated (0: the grid of the size asked for plus
     /// some slack, at least the card's 4,352).
     pub max_tokens: usize,
+    /// Classifier-free guidance on the instruction: logits `u + g (c - u)`, `u` from the same
+    /// prompt with an empty instruction (a second sequence: twice the work per token). None:
+    /// 1 (off) without source images, [`SOURCE_GUIDANCE`] with them (unguided, edits come out
+    /// hazy).
+    pub guidance: Option<f32>,
+    /// Guidance on the source images (InstructPix2Pix's image scale): 1 is off; otherwise a
+    /// third sequence with neither sources nor instruction, `n + s (u - n) + g (c - u)`.
+    pub image_guidance: f32,
+    /// Where source images go in the prompt.
+    pub source_layout: SourceLayout,
+    /// [`SourceLayout::Turn`]: the request each source image answers (default empty).
+    pub source_prompt: String,
 }
 
 impl Default for GenerateOptions {
@@ -285,13 +328,18 @@ impl Default for GenerateOptions {
             system_prompt: None,
             structure: Structure::Grid,
             max_tokens: 0,
+            guidance: None,
+            image_guidance: 1.0,
+            source_layout: SourceLayout::Turn,
+            source_prompt: String::new(),
         }
     }
 }
 
 impl GenerateOptions {
     /// Sets an option by name (`width`, `height`, `size` as `WxH`, `temperature`, `top_p`,
-    /// `top_k`, `seed`, `num_images`, `system_prompt`, `structure` (grid, free), `max_tokens`).
+    /// `top_k`, `seed`, `num_images`, `system_prompt`, `structure` (grid, free), `max_tokens`,
+    /// `guidance`, `image_guidance`, `source_layout` (turn, inline), `source_prompt`).
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         let num = |v: &str| -> Result<usize> { v.trim().parse().with_context(|| format!("{key}: not a number: {v:?}")) };
         match key {
@@ -311,8 +359,12 @@ impl GenerateOptions {
             "system_prompt" | "system" => self.system_prompt = Some(value.to_string()),
             "structure" => self.structure = Structure::parse(value)?,
             "max_tokens" => self.max_tokens = num(value)?,
+            "guidance" => self.guidance = Some(value.parse().with_context(|| format!("guidance: {value:?}"))?),
+            "image_guidance" => self.image_guidance = value.parse().with_context(|| format!("image_guidance: {value:?}"))?,
+            "source_layout" => self.source_layout = SourceLayout::parse(value)?,
+            "source_prompt" => self.source_prompt = value.to_string(),
             _ => bail!(
-                "unknown option {key:?} (width, height, size, temperature, top_p, top_k, seed, num_images, system_prompt, structure, max_tokens)"
+                "unknown option {key:?} (width, height, size, temperature, top_p, top_k, seed, num_images, system_prompt, structure, max_tokens, guidance, image_guidance, source_layout, source_prompt)"
             ),
         }
         Ok(())
@@ -328,6 +380,9 @@ impl GenerateOptions {
         }
         if !(self.temperature >= 0.0 && self.top_p > 0.0 && self.top_p <= 1.0) {
             bail!("temperature must be >= 0 and top_p in (0, 1]");
+        }
+        if !self.guidance.unwrap_or(1.0).is_finite() || !self.image_guidance.is_finite() {
+            bail!("guidance and image_guidance must be finite numbers");
         }
         Ok(())
     }
@@ -608,13 +663,33 @@ impl NemotronImage {
     }
 
     /// The prompt's token ids: the chat template with thinking off, the source images' blocks
-    /// then `Generate a {W}x{H} image.\n\n{prompt}` in the user turn.
+    /// laid out as [`GenerateOptions::source_layout`] says, then
+    /// `Generate a {W}x{H} image.\n\n{prompt}` in the user turn.
     pub fn prompt_ids(&self, prompt: &str, sources: &[(Vec<u32>, (usize, usize))], o: &GenerateOptions) -> Result<Vec<u32>> {
         let system = o.system_prompt.as_deref().unwrap_or(SYSTEM_PROMPT);
-        let mut ids = self.encode_text(&format!("<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n"))?;
-        for (codes, grid) in sources {
-            ids.extend(self.image_block(codes, *grid)?);
-            ids.extend(self.encode_text("\n")?);
+        let mut ids = self.encode_text(&format!("<|im_start|>system\n{system}<|im_end|>\n"))?;
+        match o.source_layout {
+            SourceLayout::Turn => {
+                // Earlier turns: the chat template renders a past reply as
+                // `<think></think>` + its content (the line break and the block).
+                for (codes, grid) in sources {
+                    let (w, h) = (grid.1 * PATCH, grid.0 * PATCH);
+                    ids.extend(self.encode_text(&format!(
+                        "<|im_start|>user\nGenerate a {w}x{h} image.\n\n{}<|im_end|>\n<|im_start|>assistant\n<think></think>\n",
+                        o.source_prompt
+                    ))?);
+                    ids.extend(self.image_block(codes, *grid)?);
+                    ids.extend(self.encode_text("<|im_end|>\n")?);
+                }
+                ids.extend(self.encode_text("<|im_start|>user\n")?);
+            }
+            SourceLayout::Inline => {
+                ids.extend(self.encode_text("<|im_start|>user\n")?);
+                for (codes, grid) in sources {
+                    ids.extend(self.image_block(codes, *grid)?);
+                    ids.extend(self.encode_text("\n")?);
+                }
+            }
         }
         ids.extend(self.encode_text(&format!(
             "Generate a {}x{} image.\n\n{}<|im_end|>\n<|im_start|>assistant\n<think></think>",
@@ -647,17 +722,37 @@ impl NemotronImage {
         o: &GenerateOptions,
         progress: &mut dyn FnMut(Progress) -> Flow,
     ) -> Result<(Vec<Generated>, Stats)> {
-        o.check()?;
         self.cancel.store(false, Ordering::Relaxed);
         let src: Vec<_> = sources.iter().map(|s| self.encode_image(s)).collect::<Result<_>>()?;
+        let mut o = o.clone();
+        if o.width == 0 || o.height == 0 {
+            (o.width, o.height) = src.first().map_or((1024, 1024), |(_, g)| (g.1 * PATCH, g.0 * PATCH));
+        }
+        let o = &o;
+        o.check()?;
         let ids = self.prompt_ids(prompt, &src, o)?;
+        // Guidance: the same prompt without the instruction, and (image guidance) without the
+        // sources either.
+        let g = o.guidance.unwrap_or(if src.is_empty() { 1.0 } else { SOURCE_GUIDANCE });
+        let mut guide = Vec::new();
+        if g != 1.0 || o.image_guidance != 1.0 {
+            let u = self.prompt_ids("", &src, o)?;
+            if u != ids {
+                guide.push((g, u));
+            }
+            if o.image_guidance != 1.0 && !src.is_empty() {
+                guide.push((o.image_guidance, self.prompt_ids("", &[], o)?));
+            }
+        }
         let mut st = Stats {
             prompt_tokens: ids.len(),
             ..Default::default()
         };
         let n = o.num_images.max(1);
+        // (With guidance each image's prompts take its steps together instead, see `advance`.)
         if n > 1
             && o.structure == Structure::Grid
+            && guide.is_empty()
             && let Some(out) = self.generate_batch(&ids, o, n, &mut st, progress)?
         {
             return Ok((out, st));
@@ -665,7 +760,7 @@ impl NemotronImage {
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let seed = o.seed.wrapping_add(i as u64);
-            let g = self.generate_one(&ids, o, seed, &mut st, &mut |step, steps| {
+            let g = self.generate_one(&ids, &guide, o, seed, &mut st, &mut |step, steps| {
                 if self.cancel.load(Ordering::Relaxed) {
                     return Flow::Stop;
                 }
@@ -800,10 +895,82 @@ impl NemotronImage {
         Ok(Some(out))
     }
 
-    /// One image from the prompt `ids`.
+    /// Runs the prompts `ids` and `guide` (each with its scale), sharing their common prefix,
+    /// then `tail` after each; returns the guided logits and the sessions (`ids`' first).
+    /// `full`: logits over the whole vocabulary rather than the visual rows.
+    fn start(&self, ids: &[u32], guide: &[(f32, Vec<u32>)], tail: &[u32], full: bool) -> (Vec<f32>, Vec<crate::nemotron::NemotronSession>) {
+        let common = guide
+            .iter()
+            .map(|(_, u)| ids.iter().zip(u).take_while(|(a, b)| a == b).count())
+            .min()
+            .unwrap_or(0)
+            // Each sequence keeps at least one token of its own to run.
+            .min(ids.len() - 1)
+            .min(guide.iter().map(|(_, u)| u.len()).min().unwrap_or(usize::MAX) - 1);
+        let mut base = self.lm.new_session();
+        if !guide.is_empty() && common > 0 {
+            self.lm.forward_hidden(&mut base, &ids[..common]);
+        }
+        let prompts: Vec<&[u32]> = std::iter::once(ids).chain(guide.iter().map(|(_, u)| u.as_slice())).collect();
+        let mut sessions = Vec::with_capacity(prompts.len());
+        let mut all = Vec::with_capacity(prompts.len());
+        for p in prompts {
+            let mut s = base.clone();
+            let start = if guide.is_empty() { 0 } else { common };
+            let mut seq = p[start..].to_vec();
+            seq.extend(tail);
+            all.push(if full {
+                self.lm.forward(&mut s, &seq)
+            } else {
+                self.step(&mut s, &seq)
+            });
+            sessions.push(s);
+        }
+        (mix(all, guide), sessions)
+    }
+
+    /// Runs `tokens` in every session and returns the guided logits. Inside the grid the
+    /// sessions (the prompt's and its guidance prompts') take each token in one GPU step that
+    /// reads the weights once for all (`NemotronModel::forward_rows_batch`, the same bits as one
+    /// session at a time).
+    fn advance(
+        &self,
+        sessions: &mut [crate::nemotron::NemotronSession],
+        guide: &[(f32, Vec<u32>)],
+        tokens: &[u32],
+        full: bool,
+    ) -> Vec<f32> {
+        let n = sessions.len();
+        if n > 1 && !full {
+            let (last, first) = tokens.split_last().expect("a token");
+            let mut ran = 0;
+            for &tk in first {
+                if self.lm.gpu_step_batch(sessions, &vec![tk; n], false, false).is_none() {
+                    break;
+                }
+                ran += 1;
+            }
+            if ran == first.len()
+                && let Some(all) = self.lm.forward_rows_batch(sessions, &vec![*last; n])
+            {
+                return mix(all, guide);
+            }
+            // The rest one session at a time.
+            let all = sessions.iter_mut().map(|s| self.step(s, &tokens[ran..])).collect();
+            return mix(all, guide);
+        }
+        let all = sessions
+            .iter_mut()
+            .map(|s| if full { self.lm.forward(s, tokens) } else { self.step(s, tokens) })
+            .collect();
+        mix(all, guide)
+    }
+
+    /// One image from the prompt `ids` (and the guidance prompts).
     fn generate_one(
         &self,
         ids: &[u32],
+        guide: &[(f32, Vec<u32>)],
         o: &GenerateOptions,
         seed: u64,
         st: &mut Stats,
@@ -811,21 +978,18 @@ impl NemotronImage {
     ) -> Result<Generated> {
         let v = self.vocab;
         let mut sampler = Sampler::new(o.temperature, o.top_k, o.top_p, seed);
-        let mut sess = self.lm.new_session();
         let (gw, gh) = (o.width / PATCH, o.height / PATCH);
         let stopped = || anyhow!("generation stopped");
         match o.structure {
             Structure::Grid => {
                 // The prompt, the opening marker, the header and the first row marker in one pass.
-                let mut pre = ids.to_vec();
                 // The model opens its reply with a line break before the block.
                 let mut out_ids = self.encode_text("\n")?;
                 out_ids.push(v.img_start);
                 out_ids.extend(self.encode_text(&size_header(o.width, o.height))?);
                 out_ids.push(v.vis_row);
-                pre.extend(&out_ids);
                 let t = Instant::now();
-                let mut logits = self.step(&mut sess, &pre);
+                let (mut logits, mut sessions) = self.start(ids, guide, &out_ids, false);
                 st.prefill += t.elapsed().as_secs_f64();
                 let t = Instant::now();
                 let steps = gh * gw;
@@ -840,9 +1004,9 @@ impl NemotronImage {
                             return Err(stopped());
                         }
                         if c + 1 < gw {
-                            logits = self.step(&mut sess, &[tk]);
+                            logits = self.advance(&mut sessions, guide, &[tk], false);
                         } else if r + 1 < gh {
-                            logits = self.step(&mut sess, &[tk, v.vis_row]);
+                            logits = self.advance(&mut sessions, guide, &[tk, v.vis_row], false);
                             out_ids.push(v.vis_row);
                         } else {
                             out_ids.push(v.img_end);
@@ -868,7 +1032,7 @@ impl NemotronImage {
                     (gh * (gw + 1) + 192).max(4352)
                 };
                 let t = Instant::now();
-                let mut logits = self.lm.forward(&mut sess, ids);
+                let (mut logits, mut sessions) = self.start(ids, guide, &[], true);
                 st.prefill += t.elapsed().as_secs_f64();
                 let t = Instant::now();
                 let mut out_ids = Vec::new();
@@ -886,7 +1050,7 @@ impl NemotronImage {
                     if tk == v.img_end || tk == v.im_end {
                         break;
                     }
-                    logits = self.lm.forward(&mut sess, &[tk]);
+                    logits = self.advance(&mut sessions, guide, &[tk], true);
                 }
                 st.token_secs += t.elapsed().as_secs_f64();
                 st.tokens += out_ids.len();
@@ -907,6 +1071,33 @@ impl NemotronImage {
     /// The grid of an image block among generated ids (see [`parse_block`]).
     pub fn parse_block(&self, ids: &[u32]) -> Result<(Vec<u32>, (usize, usize))> {
         parse_block(&self.vocab, ids, &|t| self.tok.decode(t, false).unwrap_or_default())
+    }
+}
+
+/// Guided logits: `all[0]` the prompt's, then one per guidance prompt. One guide (`g`, the
+/// prompt without its instruction `u`): `u + g (c - u)`; two (`s`, also without the sources
+/// `n`): `n + s (u - n) + g (c - u)`.
+fn mix(mut all: Vec<Vec<f32>>, guide: &[(f32, Vec<u32>)]) -> Vec<f32> {
+    match (all.len(), guide) {
+        (1, _) => all.pop().unwrap_or_default(),
+        (2, [(g, _)]) => {
+            let u = all.pop().unwrap_or_default();
+            let mut c = all.pop().unwrap_or_default();
+            for (c, u) in c.iter_mut().zip(&u) {
+                *c = u + g * (*c - u);
+            }
+            c
+        }
+        (3, [(g, _), (s, _)]) => {
+            let n = all.pop().unwrap_or_default();
+            let u = all.pop().unwrap_or_default();
+            let mut c = all.pop().unwrap_or_default();
+            for ((c, u), n) in c.iter_mut().zip(&u).zip(&n) {
+                *c = n + s * (u - n) + g * (*c - u);
+            }
+            c
+        }
+        _ => unreachable!("guidance prompts and logits disagree"),
     }
 }
 
@@ -992,6 +1183,16 @@ mod tests {
     }
 
     #[test]
+    fn guidance_mix() {
+        let g = |s: f32| (s, Vec::new());
+        assert_eq!(mix(vec![vec![1.0, 2.0]], &[]), [1.0, 2.0]);
+        // u + g (c - u)
+        assert_eq!(mix(vec![vec![3.0, 1.0], vec![1.0, 1.0]], &[g(2.0)]), [5.0, 1.0]);
+        // n + s (u - n) + g (c - u)
+        assert_eq!(mix(vec![vec![3.0], vec![2.0], vec![0.0]], &[g(2.0), g(1.5)]), [5.0]);
+    }
+
+    #[test]
     fn options_by_name() {
         let mut o = GenerateOptions::default();
         o.set("size", "1184x880").unwrap();
@@ -1006,6 +1207,21 @@ mod tests {
             ..Default::default()
         };
         assert!(bad.check().is_err());
+        o.set("guidance", "2.5").unwrap();
+        o.set("image_guidance", "1.5").unwrap();
+        o.set("source_layout", "inline").unwrap();
+        o.set("source_prompt", "a red car").unwrap();
+        assert_eq!(
+            (o.guidance, o.image_guidance, o.source_layout),
+            (Some(2.5), 1.5, SourceLayout::Inline)
+        );
+        assert_eq!(o.source_prompt, "a red car");
+        assert!(o.set("source_layout", "before").is_err());
+        let j: GenerateOptions = serde_json::from_str(r#"{"guidance": 3, "source_layout": "turn", "source_prompt": "x"}"#).unwrap();
+        assert_eq!(
+            (j.guidance, j.source_layout, j.image_guidance),
+            (Some(3.0), SourceLayout::Turn, 1.0)
+        );
         let mut l = LoadOptions::default();
         l.set("vit_precision", "f32").unwrap();
         l.set("quant", "q4").unwrap();

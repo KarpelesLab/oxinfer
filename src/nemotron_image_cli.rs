@@ -61,6 +61,9 @@ pub fn run(args: &Args) -> Result<()> {
     let mut o = GenerateOptions::default();
     if let Some((w, h)) = args.size {
         (o.width, o.height) = (w, h);
+    } else if !args.images.is_empty() {
+        // An edit keeps the source's size.
+        (o.width, o.height) = (0, 0);
     }
     o.seed = args.seed;
     o.num_images = args.num_images.max(1);
@@ -124,22 +127,35 @@ pub fn run(args: &Args) -> Result<()> {
         m.language_model().quant.as_str(),
         m.load_secs
     );
+    let g = o.guidance.unwrap_or(if sources.is_empty() {
+        1.0
+    } else {
+        oxinfer::nemotron_image::SOURCE_GUIDANCE
+    });
     eprintln!(
-        "[{} image(s), {}x{}, temperature {}, top-p {}, seed {}{}{}]",
+        "[{} image(s), {}, temperature {}, top-p {}, seed {}{}{}{}]",
         o.num_images,
-        o.width,
-        o.height,
+        if o.width == 0 || o.height == 0 {
+            "the source's size".to_string()
+        } else {
+            format!("{}x{}", o.width, o.height)
+        },
         o.temperature,
         o.top_p,
         o.seed,
         if o.structure == Structure::Free { ", free structure" } else { "" },
+        if g != 1.0 || o.image_guidance != 1.0 {
+            format!(", guidance {g} (image {})", o.image_guidance)
+        } else {
+            String::new()
+        },
         if sources.is_empty() {
             String::new()
         } else {
             format!(", {} source image(s)", sources.len())
         }
     );
-    if o.width * o.height < 640 * 640 {
+    if o.width * o.height > 0 && o.width * o.height < 640 * 640 {
         eprintln!(
             "[note: the model was trained toward 1024x1024-class areas; smaller sizes tend to come out as a blurred corner of a larger picture]"
         );

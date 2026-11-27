@@ -634,10 +634,15 @@ void oxi_nemotron_image_cancel(const OxiNemotronImage *m);
  * (editing; NULL or [] for none). `options_json` (NULL or {} for the model card's defaults, every
  * key optional):
  *   {"width": 1024, "height": 1024 (multiples of 16; recommended 1024x1024, 1184x880, 1248x832,
- *    880x1184), "temperature": 0.9, "top_p": 1, "top_k": 0, "seed": 42,
- *    "num_images": 1 (seeds seed, seed + 1, ...), "system_prompt": null (the card's),
- *    "structure": "grid" (header and rows written for the size asked for) | "free" (every token
- *    sampled, the size the model writes), "max_tokens": 0 ("free": the grid plus slack)}
+ *    880x1184; 0 and 0: the first source image's size), "temperature": 0.9, "top_p": 1,
+ *    "top_k": 0, "seed": 42, "num_images": 1 (seeds seed, seed + 1, ...),
+ *    "system_prompt": null (the card's), "structure": "grid" (header and rows written for the
+ *    size asked for) | "free" (every token sampled, the size the model writes),
+ *    "max_tokens": 0 ("free": the grid plus slack), "guidance": null (classifier-free guidance
+ *    against the prompt without its instruction; null: 1 = off for text to image, 2 with source
+ *    images), "image_guidance": 1 (guidance on the source images; a third sequence when not 1),
+ *    "source_layout": "turn" (sources as earlier replies of the conversation) | "inline" (in the
+ *    user turn before the instruction), "source_prompt": "" (the request the sources answer)}
  * Each image is passed to `on_image`; `on_step` (may be NULL) is called after every visual token
  * (step counts over all the images), non-zero cancels. Returns the number of images, or -1. */
 int oxi_nemotron_image_generate(OxiNemotronImage *m, const char *prompt, const char *images_json, const char *options_json,
