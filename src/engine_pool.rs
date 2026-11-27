@@ -63,6 +63,7 @@ impl Engine {
             fingerprint: self.fingerprint.clone(),
             fingerprint_source: self.fingerprint_source.clone(),
             loras: self.loras.clone(),
+            adapter_tag: String::new(),
             group: self.group.clone(),
             _arena: self._arena.clone(),
         })
@@ -121,7 +122,44 @@ struct Slot {
     used: AtomicU64,
     /// [`Engine::cache_bytes`] when it was last released (0: empty or not measured).
     bytes: AtomicU64,
+    /// The adapter of the last conversation it ran ([`EnginePool::acquire_with`]; empty: none).
+    adapter: Mutex<String>,
 }
+
+/// An adapter attached to a pool's model while it is loaded ([`EnginePool::attach_adapter`]).
+#[derive(Clone, Debug)]
+pub struct PoolAdapter {
+    /// The name requests select it by ([`EnginePool::acquire_with`]).
+    pub name: String,
+    /// The caller's mark of the file's state when it was attached (its modification time, say).
+    pub version: String,
+    /// The adapter as loaded: path, format, rank, alpha, strength, updates, bytes.
+    pub info: crate::lora::Attached,
+    switch: crate::lora::Switched,
+}
+
+impl PoolAdapter {
+    /// What sessions and the prompt cache tell this adapter's conversations apart by
+    /// ([`Engine::set_adapter_tag`]).
+    fn tag(&self) -> String {
+        format!("{}|{}|{}", self.info.path.display(), self.version, self.info.strength)
+    }
+}
+
+/// Which adapter the requests running now use: all the same one (or none), since the switches
+/// are the model's. A request for another waits for those to end; the requests arriving after
+/// it wait behind it.
+#[derive(Default)]
+struct Gate {
+    /// The adapter switched on (None: none). [`EXCLUSIVE`] while the adapters change.
+    mode: Option<String>,
+    running: usize,
+    /// What the waiting requests want.
+    waiters: Vec<Option<String>>,
+}
+
+/// [`Gate::mode`] while the set of adapters changes (no adapter has this name).
+const EXCLUSIVE: &str = "\0exclusive";
 
 /// Up to [`EnginePool::len`] conversations of one model at a time: engines sharing the weights
 /// ([`Engine::fork`]) and a [`crate::batch::Group`]. A request takes the idle session whose last
@@ -134,6 +172,9 @@ pub struct EnginePool {
     free: (Mutex<()>, Condvar),
     /// [`EnginePool::set_cache_budget`] (`u64::MAX`: none).
     budget: AtomicU64,
+    /// The adapters attached since the load, by name.
+    adapters: Mutex<Vec<PoolAdapter>>,
+    gate: (Mutex<Gate>, Condvar),
 }
 
 /// An idle session's cache ([`EnginePool::idle_caches`]).
@@ -154,6 +195,8 @@ pub struct PoolGuard<'a> {
     pool: &'a EnginePool,
     index: usize,
     engine: MutexGuard<'a, Engine>,
+    /// The adapter its request runs with.
+    adapter: Option<PoolAdapter>,
 }
 
 impl std::ops::Deref for PoolGuard<'_> {
@@ -179,6 +222,12 @@ impl PoolGuard<'_> {
     pub fn remember(&self, messages: &[Message]) {
         *self.pool.slots[self.index].last.lock().unwrap_or_else(|p| p.into_inner()) = messages.to_vec();
     }
+
+    /// The adapter switched on while this session is held ([`EnginePool::acquire_with`]; None:
+    /// none, also when the one asked for was not attached).
+    pub fn adapter(&self) -> Option<&PoolAdapter> {
+        self.adapter.as_ref()
+    }
 }
 
 impl Drop for PoolGuard<'_> {
@@ -192,9 +241,15 @@ impl Drop for PoolGuard<'_> {
         if budget != u64::MAX {
             self.pool.trim(budget);
         }
+        *lock(&s.adapter) = self.engine.adapter_tag().to_string();
+        self.pool.leave();
         let _g = self.pool.free.0.lock().unwrap_or_else(|p| p.into_inner());
         self.pool.free.1.notify_all();
     }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// The common start of two differing messages that counts in [`shared`] (bytes): below it, the
@@ -252,12 +307,168 @@ impl EnginePool {
                     last: Mutex::new(Vec::new()),
                     used: AtomicU64::new(0),
                     bytes: AtomicU64::new(0),
+                    adapter: Mutex::new(String::new()),
                 })
                 .collect(),
             group,
             free: (Mutex::new(()), Condvar::new()),
             budget: AtomicU64::new(u64::MAX),
+            adapters: Mutex::new(Vec::new()),
+            gate: (Mutex::new(Gate::default()), Condvar::new()),
         }
+    }
+
+    /// Enters the gate for requests running with adapter `want` (None: none), setting the
+    /// switches when no request runs: at once when it can (`wait` None: false otherwise), else
+    /// waiting, `wait.1` called about every `wait.0` and giving up (false) when it returns
+    /// false. [`EnginePool::leave`] must follow a true.
+    fn enter(&self, want: Option<&str>, mut wait: Option<(std::time::Duration, &mut dyn FnMut() -> bool)>) -> bool {
+        let want = want.map(str::to_string);
+        let mut g = lock(&self.gate.0);
+        let mut queued = false;
+        loop {
+            // The same adapter as the running requests, unless a request for another waits.
+            if g.running == 0 || (g.mode == want && !g.waiters.iter().any(|w| *w != g.mode)) {
+                break;
+            }
+            let Some((every, more)) = wait.as_mut() else { return false };
+            if !queued {
+                g.waiters.push(want.clone());
+                queued = true;
+            }
+            g = self.gate.1.wait_timeout(g, *every).unwrap_or_else(|p| p.into_inner()).0;
+            if g.running != 0 && !more() {
+                if let Some(i) = g.waiters.iter().position(|w| *w == want) {
+                    g.waiters.remove(i);
+                }
+                self.gate.1.notify_all();
+                return false;
+            }
+        }
+        if queued && let Some(i) = g.waiters.iter().position(|w| *w == want) {
+            g.waiters.remove(i);
+        }
+        if g.running == 0 {
+            for a in lock(&self.adapters).iter() {
+                a.switch.set(Some(a.name.as_str()) == want.as_deref());
+            }
+            g.mode = want;
+        }
+        g.running += 1;
+        true
+    }
+
+    fn leave(&self) {
+        let mut g = lock(&self.gate.0);
+        g.running = g.running.saturating_sub(1);
+        drop(g);
+        self.gate.1.notify_all();
+    }
+
+    /// `f` on every session while no request runs (waiting for those in flight to end; the
+    /// requests arriving meanwhile wait): where the model's adapters change.
+    fn exclusive<R>(&self, f: impl FnOnce(&mut [MutexGuard<'_, Engine>]) -> R) -> R {
+        self.enter(Some(EXCLUSIVE), Some((std::time::Duration::from_secs(1), &mut || true)));
+        let mut engines: Vec<MutexGuard<'_, Engine>> = self.slots.iter().map(|s| lock(&s.engine)).collect();
+        let r = f(&mut engines);
+        for s in &self.slots {
+            lock(&s.last).clear();
+            lock(&s.adapter).clear();
+            s.bytes.store(0, Ordering::Relaxed);
+        }
+        drop(engines);
+        self.leave();
+        r
+    }
+
+    /// Attaches the LoRA adapter at `path` (a PEFT folder or a llama.cpp GGUF adapter, see
+    /// [`crate::lora`]) to the loaded model as `name`, without reloading its weights: runtime
+    /// updates of `strength`, switched off but for the requests that select it
+    /// ([`EnginePool::acquire_with`]). `version` is the caller's mark of the file's state
+    /// ([`PoolAdapter::version`]). An adapter of that name is replaced.
+    ///
+    /// Waits for the requests in flight to end (none sees the change); then every session
+    /// starts again (their conversations are read again, or restored from the prompt cache) and
+    /// the GPU plans are compiled again on their next use. For Qwen-path and Gemma models
+    /// decoded without MTP or a DSpark draft and not streamed from disk
+    /// (`Engine::change_adapters`); others return an error and stay as they were. When the
+    /// adapter does not load or fit, the model computes what it did before, and an adapter it
+    /// was to replace is gone.
+    ///
+    /// A replaced or detached adapter's updates leave the GPU plans and add nothing on the CPU,
+    /// but stay in memory until the model is unloaded.
+    pub fn attach_adapter(&self, name: &str, path: &std::path::Path, strength: f32, version: &str) -> Result<PoolAdapter> {
+        if name.is_empty() || name == EXCLUSIVE {
+            bail!("adapter name {name:?}");
+        }
+        self.exclusive(|engines| {
+            self.retire(name);
+            for e in engines.iter_mut() {
+                if let Err(err) = e.flush_prompt_cache() {
+                    eprintln!("[prompt cache: {err:#}]");
+                }
+            }
+            // SAFETY: every session of the model is held here, and the others are rebound below.
+            let r = unsafe { engines[0].change_adapters(Some((path, strength))) };
+            for e in engines[1..].iter_mut() {
+                e.rebind();
+            }
+            let switch = r?.context("no adapter attached")?;
+            let a = PoolAdapter {
+                name: name.to_string(),
+                version: version.to_string(),
+                info: switch.adapter.clone(),
+                switch,
+            };
+            lock(&self.adapters).push(a.clone());
+            Ok(a)
+        })
+    }
+
+    /// Takes adapter `name` off the model ([`EnginePool::attach_adapter`] tells what that
+    /// frees); false when there is none. Waits for the requests in flight, as attaching does.
+    pub fn detach_adapter(&self, name: &str) -> bool {
+        if !lock(&self.adapters).iter().any(|a| a.name == name) {
+            return false;
+        }
+        self.exclusive(|engines| {
+            if !self.retire(name) {
+                return false;
+            }
+            for e in engines.iter_mut() {
+                if let Err(err) = e.flush_prompt_cache() {
+                    eprintln!("[prompt cache: {err:#}]");
+                }
+            }
+            // SAFETY: as in `attach_adapter`.
+            if let Err(err) = unsafe { engines[0].change_adapters(None) } {
+                eprintln!("[detach adapter {name}: {err:#}]");
+            }
+            for e in engines[1..].iter_mut() {
+                e.rebind();
+            }
+            true
+        })
+    }
+
+    /// Removes adapter `name` from the list and retires its updates.
+    fn retire(&self, name: &str) -> bool {
+        let mut list = lock(&self.adapters);
+        let Some(i) = list.iter().position(|a| a.name == name) else {
+            return false;
+        };
+        list.remove(i).switch.retire();
+        true
+    }
+
+    /// The adapters attached since the load ([`EnginePool::attach_adapter`]).
+    pub fn adapters(&self) -> Vec<PoolAdapter> {
+        lock(&self.adapters).clone()
+    }
+
+    /// Adapter `name`, when attached.
+    pub fn adapter(&self, name: &str) -> Option<PoolAdapter> {
+        lock(&self.adapters).iter().find(|a| a.name == name).cloned()
     }
 
     /// The memory the sessions' caches may hold together (None: no limit, the default for a
@@ -363,6 +574,21 @@ impl EnginePool {
     /// The idle session best for a conversation of `messages` (None: all are busy): the one whose
     /// last conversation shares the most of its beginning, else the least recently used.
     pub fn try_acquire(&self, messages: &[Message]) -> Option<PoolGuard<'_>> {
+        if !self.enter(None, None) {
+            return None;
+        }
+        let g = self.take(messages, None);
+        if g.is_none() {
+            self.leave();
+        }
+        g
+    }
+
+    /// The idle session best for `messages` run with `adapter`, the gate entered: the sessions
+    /// whose last conversation ran with the same adapter first.
+    fn take(&self, messages: &[Message], adapter: Option<&str>) -> Option<PoolGuard<'_>> {
+        let adapter = adapter.and_then(|n| self.adapter(n));
+        let tag = adapter.as_ref().map(PoolAdapter::tag).unwrap_or_default();
         let mut best: Option<(usize, u64, usize, MutexGuard<'_, Engine>)> = None;
         for (i, s) in self.slots.iter().enumerate() {
             let g = match s.engine.try_lock() {
@@ -370,24 +596,60 @@ impl EnginePool {
                 Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
                 Err(std::sync::TryLockError::WouldBlock) => continue,
             };
-            let score = shared(&s.last.lock().unwrap_or_else(|p| p.into_inner()), messages);
+            // (A session that ran another adapter starts over: it shares nothing.)
+            let score = if *lock(&s.adapter) == tag {
+                1 + shared(&s.last.lock().unwrap_or_else(|p| p.into_inner()), messages)
+            } else {
+                0
+            };
             let used = s.used.load(Ordering::Relaxed);
             // More shared first; among equals the least recently used.
             if best.as_ref().is_none_or(|b| score > b.0 || (score == b.0 && used < b.1)) {
                 best = Some((score, used, i, g));
             }
         }
-        best.map(|(_, _, index, engine)| PoolGuard { pool: self, index, engine })
+        let (_, _, index, mut engine) = best?;
+        if let Err(e) = engine.set_adapter_tag(&tag) {
+            eprintln!("[prompt cache: {e:#}]");
+        }
+        Some(PoolGuard {
+            pool: self,
+            index,
+            engine,
+            adapter,
+        })
     }
 
     /// [`EnginePool::try_acquire`], waiting for a session to be free; `wait` is called about
     /// every `every` while all are busy and stops the wait (None) when it returns false.
     pub fn acquire(&self, messages: &[Message], every: std::time::Duration, wait: &mut dyn FnMut() -> bool) -> Option<PoolGuard<'_>> {
+        self.acquire_with(messages, None, every, wait)
+    }
+
+    /// [`EnginePool::acquire`] for a request run with adapter `adapter`
+    /// ([`EnginePool::attach_adapter`]; None, or a name that is not attached: none, the base
+    /// model): it is switched on for the request, and off for the requests without it. The
+    /// switches are the model's, so the requests running at one time all use the same adapter (or
+    /// none): a request for another one waits for them to end, and those arriving after it wait
+    /// behind it. [`PoolGuard::adapter`] tells what the request got.
+    pub fn acquire_with(
+        &self,
+        messages: &[Message],
+        adapter: Option<&str>,
+        every: std::time::Duration,
+        wait: &mut dyn FnMut() -> bool,
+    ) -> Option<PoolGuard<'_>> {
+        // (An adapter detached since counts as none from here on.)
+        let adapter = adapter.filter(|n| self.adapter(n).is_some());
+        if !self.enter(adapter, Some((every, &mut *wait))) {
+            return None;
+        }
         loop {
-            if let Some(g) = self.try_acquire(messages) {
+            if let Some(g) = self.take(messages, adapter) {
                 return Some(g);
             }
             if !wait() {
+                self.leave();
                 return None;
             }
             let g = self.free.0.lock().unwrap_or_else(|p| p.into_inner());
@@ -398,10 +660,16 @@ impl EnginePool {
 
     /// Session `i`, waiting for it.
     pub fn slot(&self, i: usize) -> PoolGuard<'_> {
+        self.enter(None, Some((std::time::Duration::from_secs(1), &mut || true)));
+        let mut engine = self.slots[i].engine.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = engine.set_adapter_tag("") {
+            eprintln!("[prompt cache: {e:#}]");
+        }
         PoolGuard {
             pool: self,
             index: i,
-            engine: self.slots[i].engine.lock().unwrap_or_else(|p| p.into_inner()),
+            engine,
+            adapter: None,
         }
     }
 
@@ -482,6 +750,109 @@ mod tests {
         pool.set_cache_budget(None);
         turn(&b);
         assert_eq!(pool.idle_caches().len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An adapter attached to a loaded model: off for the requests without it (the replies of
+    /// before), on for those that select it (the replies of a model loaded with it), per request
+    /// on the same weights; replaced and detached without a reload.
+    #[test]
+    fn adapters_attach_to_a_loaded_model_and_switch_per_request() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-pool-adapters-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (model, ad1, ad2) = (dir.join("model"), dir.join("a1"), dir.join("a2"));
+        crate::qwen::tiny::write(&model, false, false).unwrap();
+        crate::qwen::tiny::write_adapter(&ad1, 11, 0.6).unwrap();
+        crate::qwen::tiny::write_adapter(&ad2, 12, 0.6).unwrap();
+        let mut o = EngineOptions::default();
+        o.set("device", "cpu").unwrap();
+        let load = |o: &EngineOptions| {
+            let mut e = Engine::load(model.to_str().unwrap(), o).unwrap();
+            e.config_mut().max_tokens = 12;
+            e
+        };
+        let m = vec![Message::user("Hello there, how are you?")];
+        let alone = |lora: Option<&std::path::Path>| {
+            let mut o = o.clone();
+            if let Some(l) = lora {
+                o.set("lora", l.to_str().unwrap()).unwrap();
+            }
+            load(&o).chat(&m, &mut quiet).unwrap().tokens
+        };
+        let (base, with1, with2) = (alone(None), alone(Some(&ad1)), alone(Some(&ad2)));
+        assert_ne!(base, with1, "the adapter changes nothing");
+        assert_ne!(with1, with2);
+        let pool = EnginePool::new(load(&o), 2, BatchOptions::default());
+        let turn = |adapter: Option<&str>| -> (Vec<u32>, Option<String>) {
+            let mut g = pool
+                .acquire_with(&m, adapter, std::time::Duration::from_millis(50), &mut || true)
+                .unwrap();
+            let r = g.chat(&m, &mut quiet).unwrap();
+            g.remember(&m);
+            (r.tokens, g.adapter().map(|a| a.version.clone()))
+        };
+        assert_eq!(turn(None).0, base);
+        // A name that is not attached is the base model.
+        assert_eq!(turn(Some("p")), (base.clone(), None));
+        let a = pool.attach_adapter("p", &ad1, 1.0, "v1").unwrap();
+        assert_eq!((a.info.rank, a.info.modules, a.info.merged), (4, 12, 0));
+        assert_eq!(turn(None).0, base);
+        assert_eq!(turn(Some("p")), (with1.clone(), Some("v1".into())));
+        assert_eq!(turn(None).0, base);
+        // A second adapter beside it, each on for its own requests only.
+        pool.attach_adapter("q", &ad2, 1.0, "v1").unwrap();
+        assert_eq!(turn(Some("q")).0, with2);
+        assert_eq!(turn(Some("p")).0, with1);
+        assert_eq!(turn(None).0, base);
+        // Replaced: the old one is gone.
+        pool.attach_adapter("p", &ad2, 1.0, "v2").unwrap();
+        assert_eq!(turn(Some("p")), (with2.clone(), Some("v2".into())));
+        assert_eq!(pool.adapters().len(), 2);
+        // An adapter that does not load leaves the model as it was, without the one it replaced.
+        assert!(pool.attach_adapter("p", &dir.join("missing"), 1.0, "v3").is_err());
+        assert_eq!(turn(Some("p")), (base.clone(), None));
+        assert_eq!(turn(Some("q")).0, with2);
+        assert!(pool.detach_adapter("q"));
+        assert!(!pool.detach_adapter("q"));
+        assert_eq!(turn(Some("q")), (base.clone(), None));
+        assert!(pool.adapters().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Requests with different adapters do not overlap: one waits for the other to end.
+    #[test]
+    fn requests_with_different_adapters_take_turns() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-pool-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::qwen::tiny::write(&dir.join("model"), false, false).unwrap();
+        crate::qwen::tiny::write_adapter(&dir.join("a"), 11, 0.6).unwrap();
+        let mut o = EngineOptions::default();
+        o.set("device", "cpu").unwrap();
+        let pool = EnginePool::new(
+            Engine::load(dir.join("model").to_str().unwrap(), &o).unwrap(),
+            2,
+            BatchOptions::default(),
+        );
+        pool.attach_adapter("p", &dir.join("a"), 1.0, "v1").unwrap();
+        let m = [Message::user("Hi")];
+        let every = std::time::Duration::from_millis(10);
+        let base = pool.acquire_with(&m, None, every, &mut || true).unwrap();
+        // Another base request runs beside it; one with the adapter does not (a session is free).
+        let base2 = pool.acquire_with(&m, None, every, &mut || true).unwrap();
+        drop(base2);
+        let mut tries = 0;
+        let none = pool.acquire_with(&m, Some("p"), every, &mut || {
+            tries += 1;
+            tries < 3
+        });
+        assert!(none.is_none());
+        assert!(pool.try_acquire(&m).is_some(), "the request that gave up still holds the gate");
+        drop(base);
+        let with = pool.acquire_with(&m, Some("p"), every, &mut || true).unwrap();
+        assert!(with.adapter().is_some());
+        assert!(pool.try_acquire(&m).is_none());
+        drop(with);
+        assert!(pool.try_acquire(&m).is_some());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -2004,6 +2004,12 @@ impl<'a> Model<'a> {
         })
     }
 
+    /// Forgets the compiled GPU plans (built again on their next use): after the set of
+    /// attached adapters changed, since the plans hold their side paths.
+    pub(crate) fn reset_gpu_plans(&mut self) {
+        self.gpu_plans = Default::default();
+    }
+
     /// Attaches the modules of a runtime LoRA adapter (see `crate::lora`) to the attention and
     /// MLP projections, the routed experts (26B-A4B), the token embedding and the LM head, by
     /// Hugging Face module name. Returns the number patched.

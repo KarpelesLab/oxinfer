@@ -673,7 +673,7 @@ impl<'a> Graph<'a> {
     /// components).
     pub fn lora_side(&mut self, d: &'a crate::lora::LoraDelta) -> Option<LoraSide<'a>> {
         let (n_out, n_in) = d.shape();
-        let links: Vec<&crate::lora::LoraDelta> = d.links().filter(|l| l.factors().2 > 0).collect();
+        let links: Vec<&crate::lora::LoraDelta> = d.links().filter(|l| l.factors().2 > 0 && !l.retired()).collect();
         let mut scale = Vec::new();
         for l in &links {
             let id = self.strength_id(l.strength_handle());
@@ -742,7 +742,7 @@ impl<'a> Graph<'a> {
         let mut dn: Vec<Vec<(&crate::lora::LoraDelta, usize)>> = Vec::with_capacity(ne);
         let chain = |l: &'a crate::model::Lin, row0: usize| -> Vec<(&'a crate::lora::LoraDelta, usize)> {
             l.lora_delta()
-                .map(|d| d.links().filter(|l| l.factors().2 > 0).map(|l| (l, row0)).collect())
+                .map(|d| d.links().filter(|l| l.factors().2 > 0 && !l.retired()).map(|l| (l, row0)).collect())
                 .unwrap_or_default()
         };
         for (g, d) in ex.gate_up.iter().zip(&ex.down) {

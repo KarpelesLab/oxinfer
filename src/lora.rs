@@ -100,6 +100,17 @@ pub(crate) fn unit_gain() -> Arc<AtomicU32> {
     Arc::new(AtomicU32::new(1f32.to_bits()))
 }
 
+/// The gain of an adapter taken off a loaded model ([`retire`]): a NaN no strength is set to.
+const RETIRED: u32 = 0x7fc0_dead;
+
+/// Takes an adapter attached with `switch` and `gain` off its model for good: its updates stay
+/// chained to their layers (and in memory) until the model is dropped, add nothing on the CPU
+/// and are left out of the GPU plans built from then on ([`LoraDelta::retired`]).
+pub(crate) fn retire(switch: &AtomicBool, gain: &AtomicU32) {
+    switch.store(false, Ordering::SeqCst);
+    gain.store(RETIRED, Ordering::SeqCst);
+}
+
 /// The strength `on` and `gain` give an update of `scale` now.
 #[inline]
 fn strength(on: &AtomicBool, gain: &AtomicU32, scale: f32) -> f32 {
@@ -151,6 +162,11 @@ impl LoraDelta {
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
         self.strength() != 0.0 || self.next.as_ref().is_some_and(|n| n.is_active())
+    }
+
+    /// Whether this update's adapter was taken off the model ([`retire`]).
+    pub(crate) fn retired(&self) -> bool {
+        self.gain.load(Ordering::Relaxed) == RETIRED
     }
 
     /// This update and those chained after it.
@@ -1384,6 +1400,74 @@ pub fn attach_specs<M: Adaptable + ?Sized>(model: &mut M, specs: &[LoraSpec], ba
         });
     }
     Ok(out)
+}
+
+/// An adapter attached to a model after its load, behind a switch of its own
+/// ([`attach_switched`]): off until [`Switched::set`] turns it on.
+#[derive(Clone, Debug)]
+pub struct Switched {
+    pub adapter: Attached,
+    switch: Arc<AtomicBool>,
+}
+
+impl Switched {
+    /// Turns the adapter's updates on or off (off: exactly the base model on the CPU; the GPU
+    /// plans read the switch before every step).
+    pub fn set(&self, on: bool) {
+        if !self.retired() {
+            self.switch.store(on, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether the adapter is on.
+    pub fn is_on(&self) -> bool {
+        self.switch.load(Ordering::SeqCst)
+    }
+
+    /// Takes the adapter off the model for good (see [`retire`]).
+    pub(crate) fn retire(&self) {
+        retire(&self.switch, &self.adapter.gain);
+    }
+
+    fn retired(&self) -> bool {
+        self.adapter.gain.load(Ordering::Relaxed) == RETIRED
+    }
+}
+
+/// Loads the adapter at `path` (see [`LoraAdapter::open`]) for the base model at `base` and
+/// attaches it to `model` as runtime updates of `strength`, switched off. When the adapter does
+/// not fit the model, the updates attached before the failure are retired ([`retire`]): the
+/// model computes what it did before.
+pub fn attach_switched<M: Adaptable + ?Sized>(model: &mut M, path: &Path, base: &Path, strength: f32) -> Result<Switched> {
+    if !strength.is_finite() {
+        bail!("LoRA strength {strength} is not a finite number");
+    }
+    let mut ad = LoraAdapter::open(path, base).with_context(|| format!("LoRA {}", path.display()))?;
+    ad.set_strength(strength);
+    let switch = ad.switch();
+    switch.store(false, Ordering::SeqCst);
+    let n = match model.attach_lora(&mut ad) {
+        Ok(n) => n,
+        Err(e) => {
+            retire(&switch, &ad.gain);
+            return Err(e.context(format!("attach LoRA {}", path.display())));
+        }
+    };
+    Ok(Switched {
+        adapter: Attached {
+            path: ad.dir.clone(),
+            format: ad.format,
+            rank: ad.rank,
+            alpha: ad.alpha,
+            strength,
+            modules: n,
+            merged: 0,
+            bytes: ad.bytes,
+            skipped: ad.skipped.clone(),
+            gain: ad.gain(),
+        },
+        switch,
+    })
 }
 
 /// Resolves the path of a language-model LoRA spec: a local file or folder as it is; with the

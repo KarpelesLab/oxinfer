@@ -47,6 +47,10 @@ impl Tensors {
     }
 
     fn write(self, dir: &Path) -> Result<()> {
+        self.write_as(&dir.join("model.safetensors"))
+    }
+
+    fn write_as(self, path: &Path) -> Result<()> {
         let mut head = serde_json::Map::new();
         let mut data = Vec::new();
         for (name, shape, vals) in self.list {
@@ -63,8 +67,7 @@ impl Tensors {
         let mut file = (head.len() as u64).to_le_bytes().to_vec();
         file.extend_from_slice(head.as_bytes());
         file.extend(data);
-        let path = dir.join("model.safetensors");
-        std::fs::write(&path, file).with_context(|| path.display().to_string())
+        std::fs::write(path, file).with_context(|| path.display().to_string())
     }
 }
 
@@ -161,6 +164,29 @@ pub fn write(dir: &Path, moe: bool, mtp: bool) -> Result<()> {
         ffn(&mut t, "mtp.layers.0.");
     }
     t.write(dir)
+}
+
+/// Writes a random PEFT LoRA adapter for [`write`]'s dense models into the folder `dir`
+/// (`adapter_config.json`, `adapter_model.safetensors`): rank 4, alpha 8, on the MLP projections
+/// of every layer, `A` and `B` noise of width `scale` from `seed`.
+pub fn write_adapter(dir: &Path, seed: u64, scale: f32) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
+    let (r, inter, layers) = (4usize, 512usize, 4usize);
+    let mut t = Tensors { list: Vec::new(), seed };
+    for l in 0..layers {
+        for (m, n_out, n_in) in [("gate_proj", inter, H), ("up_proj", inter, H), ("down_proj", H, inter)] {
+            let p = format!("base_model.model.model.layers.{l}.mlp.{m}");
+            t.add(format!("{p}.lora_A.weight"), &[r, n_in], scale, 0.0);
+            t.add(format!("{p}.lora_B.weight"), &[n_out, r], scale, 0.0);
+        }
+    }
+    t.write_as(&dir.join("adapter_model.safetensors"))?;
+    let config = json!({
+        "peft_type": "LORA", "r": r, "lora_alpha": 2 * r,
+        "target_modules": ["gate_proj", "up_proj", "down_proj"],
+    });
+    let path = dir.join("adapter_config.json");
+    std::fs::write(&path, config.to_string()).with_context(|| path.display().to_string())
 }
 
 /// Writes a tiny random DSpark draft for [`write`]'s models into the folder `dir` (`config.json`

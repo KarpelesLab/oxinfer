@@ -1169,6 +1169,12 @@ impl<'a> QwenModel<'a> {
         self.mtp_loras.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
+    /// Forgets the compiled GPU plans (built again on their next use): after the set of
+    /// attached adapters changed, since the plans hold their side paths.
+    pub(crate) fn reset_gpu_plans(&mut self) {
+        self.gpu_plans = Default::default();
+    }
+
     /// Attaches the modules of a runtime LoRA adapter (see `crate::lora`) to the layers they
     /// target, by Hugging Face module name (whatever the checkpoint format; GGUF's tiled Gated
     /// DeltaNet value heads are reordered to match), and to the token embedding. Errors when a

@@ -1262,6 +1262,14 @@ impl Arena {
     }
 }
 
+impl Arena {
+    /// The pointer the arena keeps the value behind `r` under (None: not one of its values).
+    fn raw_of<T>(&self, r: &T) -> Option<*mut T> {
+        let p = r as *const T as *mut ();
+        self.0.iter().find(|e| e.0 == p).map(|e| e.0 as *mut T)
+    }
+}
+
 impl Drop for Arena {
     fn drop(&mut self) {
         while let Some((p, d)) = self.0.pop() {
@@ -1803,10 +1811,14 @@ fn fingerprint_source(info: &ModelInfo, opts: &EngineOptions) -> String {
 
 /// The fingerprint of a loaded model for snapshots: [`fingerprint_source`] and the LoRA
 /// adapters (each one's file and strength now), hashed.
-fn fingerprint(source: &str, loras: &[crate::lora::Attached]) -> String {
+fn fingerprint(source: &str, loras: &[crate::lora::Attached], tag: &str) -> String {
     let mut s = source.to_string();
     for l in loras {
         s += &format!("|lora:{}:{}:{}", l.path.display(), l.strength_now(), l.merged);
+    }
+    // The adapter switched on for the session's requests ([`Engine::set_adapter_tag`]).
+    if !tag.is_empty() {
+        s += &format!("|adapter:{tag}");
     }
     format!("{:016x}", crate::snapshot::hash64(&[s.as_bytes()]))
 }
@@ -1904,6 +1916,9 @@ pub struct Engine {
     fingerprint_source: String,
     /// The LoRA adapters attached at load ([`EngineOptions::loras`]).
     loras: Vec<crate::lora::Attached>,
+    /// What tells the adapter switched on for this session's requests apart
+    /// ([`Engine::set_adapter_tag`]; empty: none).
+    adapter_tag: String,
     /// LFM3-Omni's speech head and codec, loaded on the first [`Engine::speak_omni`].
     omni_voice: Option<Box<crate::lfm3_omni::voice::Voice>>,
     /// The scheduler shared with the other sessions of the model ([`EnginePool`]).
@@ -2829,13 +2844,14 @@ impl Engine {
             omni_voice: None,
             fingerprint: String::new(),
             fingerprint_source: String::new(),
+            adapter_tag: String::new(),
             loras,
             group: None,
             _arena: Arc::new(arena),
         })
         .map(|mut e| {
             e.fingerprint_source = fingerprint_source(&e.info, opts);
-            e.fingerprint = fingerprint(&e.fingerprint_source, &e.loras);
+            e.fingerprint = fingerprint(&e.fingerprint_source, &e.loras, &e.adapter_tag);
             e
         })
         .and_then(|mut e| {
@@ -2909,6 +2925,7 @@ impl Engine {
             omni_voice: None,
             fingerprint: String::new(),
             fingerprint_source: String::new(),
+            adapter_tag: String::new(),
             loras: Vec::new(),
             group: None,
             _arena: Arc::new(arena),
@@ -3218,9 +3235,118 @@ impl Engine {
         }
         self.flush_prompt_cache()?;
         l.set_strength(strength)?;
-        self.fingerprint = fingerprint(&self.fingerprint_source, &self.loras);
+        self.fingerprint = fingerprint(&self.fingerprint_source, &self.loras, &self.adapter_tag);
         self.reset();
         Ok(())
+    }
+
+    /// Tells the session which adapter its following requests run with, among those attached
+    /// to the model after its load and switched per request ([`EnginePool::attach_adapter`]):
+    /// any string that differs when the adapter, its file or its strength does (empty: none).
+    /// When it changes, the conversation starts again (its cache was computed with the other
+    /// adapter), after the prompt cache got what was pending; the prompt cache keys its
+    /// snapshots by it, with the adapters attached at load.
+    pub fn set_adapter_tag(&mut self, tag: &str) -> Result<()> {
+        if self.adapter_tag == tag {
+            return Ok(());
+        }
+        let flushed = self.flush_prompt_cache();
+        self.adapter_tag = tag.to_string();
+        self.fingerprint = fingerprint(&self.fingerprint_source, &self.loras, &self.adapter_tag);
+        self.reset();
+        flushed.map(|_| ())
+    }
+
+    /// [`Engine::set_adapter_tag`]'s value.
+    pub fn adapter_tag(&self) -> &str {
+        &self.adapter_tag
+    }
+
+    /// Changes the adapters of the loaded model itself, for every session of it: forgets its
+    /// GPU plans (they hold the adapters' side paths), attaches the adapter at `path` when one
+    /// is given ([`crate::lora::attach_switched`]: runtime updates, switched off) and starts this
+    /// session again ([`Engine::rebind`]). For Qwen-path and Gemma models decoded without MTP or
+    /// a DSpark draft, not streamed from disk, without interventions or decision assets.
+    ///
+    /// # Safety
+    /// The model is shared with this engine's forks ([`Engine::fork`]): none of them may be
+    /// running, and each must be rebound ([`Engine::rebind`]) before it is used again.
+    pub(crate) unsafe fn change_adapters(&mut self, attach: Option<(&Path, f32)>) -> Result<Option<crate::lora::Switched>> {
+        if self.streamer.is_some() {
+            bail!("adapters are not attached to a model streamed from disk");
+        }
+        if self.iv.spec.is_some() || self.decision.is_some() {
+            bail!("adapters are not attached to an engine with interventions or decision assets");
+        }
+        let base = self.info.path.clone();
+        let arena = self._arena.clone();
+        fn change<M: crate::lora::Adaptable>(
+            m: &mut M,
+            reset: impl FnOnce(&mut M),
+            attach: Option<(&Path, f32)>,
+            base: &Path,
+        ) -> Result<Option<crate::lora::Switched>> {
+            reset(m);
+            attach
+                .map(|(path, strength)| crate::lora::attach_switched(m, path, base, strength))
+                .transpose()
+        }
+        let missing = || anyhow!("internal error: the model is not in the engine's arena");
+        let r = match &mut self.lm {
+            Lm::Qwen { model, .. } => {
+                let p = arena.raw_of(*model).ok_or_else(missing)?;
+                // SAFETY: the pointer is the arena's own (a `Box::into_raw`), and by this
+                // function's contract nothing reads the model while it is changed; the shared
+                // references taken before are replaced (here and by `rebind`) before any use.
+                let r = change(unsafe { &mut *p }, QwenModel::reset_gpu_plans, attach, &base);
+                *model = unsafe { &*p };
+                r
+            }
+            Lm::Gemma { model, .. } => {
+                let p = arena.raw_of(*model).ok_or_else(missing)?;
+                // SAFETY: as above.
+                let r = change(unsafe { &mut *p }, Model::reset_gpu_plans, attach, &base);
+                *model = unsafe { &*p };
+                r
+            }
+            _ => bail!(
+                "adapters are attached to a loaded model for Qwen-path and Gemma models decoded without MTP or a DSpark draft, not {}{}",
+                self.info.model_type,
+                if matches!(self.info.family, Family::Qwen | Family::Llama | Family::Gemma4 | Family::Gemma3) {
+                    " with speculative decoding"
+                } else {
+                    ""
+                }
+            ),
+        };
+        self.rebind();
+        r
+    }
+
+    /// Starts the session again on the model as [`Engine::change_adapters`] left it (called on
+    /// each fork of the engine it ran on): a fresh session (the old one's device state belongs to
+    /// plans that are gone) and no conversation.
+    pub(crate) fn rebind(&mut self) {
+        let arena = self._arena.clone();
+        match &mut self.lm {
+            Lm::Qwen { model, sess } => {
+                if let Some(p) = arena.raw_of(*model) {
+                    // SAFETY: the arena's own pointer; the model outlives the engine.
+                    *model = unsafe { &*p };
+                }
+                *sess = model.new_session();
+            }
+            Lm::Gemma { model, sess, .. } => {
+                if let Some(p) = arena.raw_of(*model) {
+                    // SAFETY: as above.
+                    *model = unsafe { &*p };
+                }
+                *sess = model.new_session();
+            }
+            _ => {}
+        }
+        self.pcache_pending = false;
+        self.reset();
     }
 
     // ---- runtime interventions (crate::intervene) ----
