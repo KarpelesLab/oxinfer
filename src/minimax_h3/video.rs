@@ -1486,8 +1486,8 @@ fn video_part(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
 /// `s3_corrector.safetensors`: [`super::corrector`]) and its `corrector_strength`,
 /// `corrector_budget`, `corrector_floor`, `corrector_start`, `corrector_end`
 /// ([`CorrectorSettings::set`]), `device` (`cpu`: the transformer, its VAE decoder and the corrector on the CPU
-/// even with a GPU) and `attention` (the Metal transformer's attention operands: `split`, the
-/// default, `half` or `f32`). Returns the pipeline and the step count a turbo LoRA
+/// even with a GPU) and `attention` (the Metal transformer's attention operands: `f32`, the
+/// default, `split` or `half`). Returns the pipeline and the step count a turbo LoRA
 /// is distilled for.
 pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Path>) -> Result<(VideoPipeline, Option<usize>)> {
     use crate::model::Quant;

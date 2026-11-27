@@ -539,9 +539,8 @@ fn usage() -> ! {
          \x20                      s3_corrector.safetensors); --corrector-strength F (1),\n\
          \x20                      --corrector-budget F (0.5), --corrector-floor F (0.001),\n\
          \x20                      --corrector-start N (0), --corrector-end N (-1: the last step)\n\
-         \x20 --attention MODE     the Metal transformer's attention operands: split (default:\n\
-         \x20                      queries and keys as half pairs; f32 with a --lora), half or f32\n\
-         \x20                      (--device cpu: CPU)\n\
+         \x20 --attention MODE     the Metal transformer's attention operands: f32 (default), split\n\
+         \x20                      (queries and keys as half pairs) or half (--device cpu: CPU)\n\
          \x20 --inputs MODE        the Metal transformer's projection inputs: half (default) or\n\
          \x20                      split (hi + lo half pairs: two GEMMs; the default with a --lora)\n\
          \x20 --still-prompt TEXT  motion guidance (Sulphur-3's ComfyUI pack): the prompt's scene\n\

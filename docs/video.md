@@ -967,11 +967,11 @@ server; `Dit::gpu`, `VaeDecoder::gpu`, `Corrector::gpu` in the library) or with
 `OXINFER_H3_GPU=0` everything runs on the CPU as before. MiniMax-H3-Image (the same blocks, and
 the image VAE's) takes the same path ([below](#minimax-h3-image-on-metal)).
 
-Attention: 128-wide heads on the fused matrix-unit kernels, by default with queries and keys as
-hi + lo half pairs (`--attention split`, load option `attention`, `Dit::gpu_attention`): as exact
-as float32 operands at the speed of half ones; `--attention half` (half operands) and
-`--attention f32` are the others (with a LoRA applied `f32` is the default: below). The VAE's and
-the corrector's 64-wide heads run in float32.
+Attention: 128-wide heads on the fused matrix-unit kernels, by default on float32 operands
+(`--attention f32`, load option `attention`, `Dit::gpu_attention`); `--attention split` (queries
+and keys as hi + lo half pairs, the default before the measurements [below](#attention-precision-without-a-lora))
+and `--attention half` (half operands) are the others. The VAE's and the corrector's 64-wide heads
+run in float32.
 
 M5 Max, a `--profile ci` build, the kept Sulphur-3 caption embedding, 448x256, 22 frames (1208
 rows), seed 60, 20 Euler forwards at shifts 12 / 3, one run each under the benchmark lock (the
@@ -1059,6 +1059,21 @@ in every frame (side by side) while pose and motion are the same. That run preda
 precision below (with which the Metal transformer is 25x closer to the CPU's at this size); a
 124-frame clip at 1344x768 was not run on Metal (it would hold the shared GPU for half an hour).
 
+With that precision (the defaults with a LoRA: hi + lo projection inputs, float32 attention, the
+text refined on the CPU), the same request again on the pruned int8 ConvRot transformer (the FP8
+file was no longer on disk), one run each under the benchmark lock, the machine otherwise quiet:
+
+| | CPU | Metal |
+|---|---|---|
+| 4 forwards | 1027.7 s (252-258 s each) | 124.5 s (30-33 s each) |
+| video VAE decode, 22 frames | 144.2 s | 11.7 s |
+| the clip | 1205.8 s, 9.5 GB peak footprint | 172.2 s, 14.2 GB |
+
+The two clips are now the same clip: 40.3 dB apart (every frame 40.2-40.4 dB; luma 38.7,
+chroma 49.8 / 50.6), against 26.1 dB before. Side by side, every seventh frame: the same framing,
+pose, hands and hair in each, the kettle, mug, knife block and the plant on the sill in the same
+places, no artifact on either; what differs is below what the frame sheets show.
+
 #### LoRA and precision
 
 The turbo LoRA makes the sampling far more sensitive to rounding than the base model: at
@@ -1075,9 +1090,9 @@ the Metal transformer by default
   weight tile dequantized once for both (bf16, Q8, scaled FP8, NVFP4, F16; two GEMMs for other
   formats), the LoRA side paths' inner rows too (`--inputs split`, load option `inputs`,
   `Dit::gpu_inputs`; `half` otherwise);
-- runs attention on float32 operands (`--attention f32`: at 1344x768 as fast as `split`, whose
-  half values and probabilities leave 1.6e-3 at 448x256; values and probabilities as hi + lo
-  pairs too gave 4.9e-5 at twice the attention's time);
+- runs attention on float32 operands (`--attention f32`, now the default with or without a LoRA:
+  at 1344x768 as fast as `split`, whose half values and probabilities leave 1.6e-3 at 448x256;
+  values and probabilities as hi + lo pairs too gave 4.9e-5 at twice the attention's time);
 - refines the text rows on the CPU (`gpu::on_cpu`; once per clip, a fraction of a second): on
   the GPU's half products they were 3.7e-4 from the CPU's, which moved the first forward by
   2.8e-3 and the clip to 22.6 dB.
@@ -1104,6 +1119,27 @@ At 1344x768: `--inputs half` 9.0e-3 (`f32`) / 1.0e-2 (`split`) at 19 to 20 s; `-
 scales: the int8 ConvRot file's two forwards go from 7.8e-4 / 1.7e-3 to 5.9e-4 / 1.1e-3 at the
 same 1.5 to 1.6 s. The Metal clip's video decoded on the CPU is 45.7 dB from its own GPU decode,
 so what is left between the clips is the transformer's trajectory.
+
+#### Attention precision without a LoRA
+
+Without a LoRA the attention ran on hi + lo half queries and keys (`split`) by default. Measured
+against float32 (and half) on the pruned int8 ConvRot transformer, no LoRA, the CPU's velocities
+on the same inputs (relative L2 of the video / audio velocities; `h3_forward_bench`, steady
+forwards, two rounds under the benchmark lock, the same in both):
+
+| attention | 448x256 x 22 (1208 rows): time, forward 1 | forward 2 | 1344x768 x 22 (7480 rows): time, forward 1 |
+|---|---|---|---|
+| `split` (the old default) | 1.56-1.64 s; 5.9e-4 / 1.9e-4 | 1.1e-3 / 2.4e-4 | 23.5-24.5 s; 6.2e-4 / 2.3e-4 |
+| `f32` | 1.64-1.74 s; 4.7e-4 / 1.7e-4 | 1.1e-3 / 1.7e-4 | 18.9-20.1 s; 3.9e-4 / 2.0e-4 |
+| `half` | 1.50-1.60 s; 8.8e-4 / 7.7e-4 | 2.7e-3 / 1.4e-3 | 13.8-14.0 s; 1.7e-3 / 4.1e-4 |
+
+(The 1344x768 reference is a CPU forward of 272 s on the kept inputs of a 1344x768 request's
+first forward; the 448x256 ones the kept two-forward run.) Float32 operands are the closer to the CPU everywhere and,
+at the size the model is made for, 18% faster than `split` (whose queries and keys take two
+products each, which a long sequence pays for); at 448x256 they cost 0.1 s a forward. So `f32`
+is now the default with or without a LoRA (`Dit::gpu_precision`; `--attention split` / `half` and
+the `attention` load option still choose the others), for MiniMax-H3-Image's transformer too
+(the same blocks; its 1024x1024 images are 4,096+ rows, past the crossover).
 
 ### MiniMax-H3-Image on Metal
 

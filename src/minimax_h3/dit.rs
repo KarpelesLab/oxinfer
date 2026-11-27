@@ -421,7 +421,7 @@ pub struct Dit<'a> {
     /// Run the block stack on the accelerator's whole-pass session when it has one (Metal; else,
     /// or when it declines, on `device` or the CPU).
     pub gpu: bool,
-    /// The operands of that session's attention (none: `Split`, or `F32` with a LoRA applied).
+    /// The operands of that session's attention (none: `F32`).
     pub gpu_attention: Option<crate::gpu::dit::AttnPrecision>,
     /// The inputs of that session's projections (none: `Half`, or `Split` with a LoRA applied:
     /// a turbo LoRA amplifies the half inputs' rounding about tenfold).
@@ -718,17 +718,17 @@ impl<'a> Dit<'a> {
     }
 
     /// The device session's projection inputs and attention operands: [`Dit::gpu_inputs`] and
-    /// [`Dit::gpu_attention`], by default half / split, or with a LoRA applied (the turbo
-    /// LoRAs amplify the rounding of the half inputs, values and probabilities about tenfold)
-    /// hi + lo pairs / float32.
+    /// [`Dit::gpu_attention`], by default half inputs, or with a LoRA applied (the turbo LoRAs
+    /// amplify the rounding of the half inputs about tenfold) hi + lo pairs, and float32
+    /// attention (closer to the CPU's than hi + lo queries and keys, and 18% faster at 1344x768,
+    /// 5% slower at 448x256: docs/video.md).
     pub fn gpu_precision(&self) -> (crate::gpu::dit::InputPrecision, crate::gpu::dit::AttnPrecision) {
         use crate::gpu::dit::{AttnPrecision, InputPrecision};
         let lora = self.lora_applied();
         (
             self.gpu_inputs
                 .unwrap_or(if lora { InputPrecision::Split } else { InputPrecision::Half }),
-            self.gpu_attention
-                .unwrap_or(if lora { AttnPrecision::F32 } else { AttnPrecision::Split }),
+            self.gpu_attention.unwrap_or(AttnPrecision::F32),
         )
     }
 
