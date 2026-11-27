@@ -748,6 +748,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::AttendSel { .. } => "qsa-attention",
         Op::LoraDown { .. } => "lora-down",
         Op::LoraUp { .. } => "lora-up",
+        Op::Fold { .. } => "hadamard-fold",
     }
 }
 
@@ -1499,7 +1500,7 @@ impl CudaBackend {
                         });
                     }
                     Op::Steer { .. } | Op::NeuronEdit { .. } | Op::HcPre { .. } | Op::HcPost { .. } | Op::PleGate { .. } => return None,
-                    Op::QsaKey { .. } | Op::QsaSelect { .. } | Op::AttendSel { .. } => return None,
+                    Op::QsaKey { .. } | Op::QsaSelect { .. } | Op::AttendSel { .. } | Op::Fold { .. } => return None,
                 }
             }
             Some(())

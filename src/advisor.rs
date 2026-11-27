@@ -295,6 +295,10 @@ const STT: &[Cap] = &[SpeechToText, Translation];
 const EDIT: &[Cap] = &[ImageEdit];
 const JANUS: &[Cap] = &[TextToImage, ImageInput, Text];
 const PARAMS: &str = "bytes per token and layers from the parameter count";
+/// Ternary-Bonsai 2.5 27B (measured on an M5 Max, see docs/weights.md).
+const BONSAI25: &str = "agentic Qwen3.8-27B in Hadamard-folded ternary weights with an MTP head (--mtp) and the mmproj \
+     for images (also :Q2_0-mtp, and :PQ2_0 / :PTQ1_0 / :Q2_0 without the head); M5 Max Metal: PQ2_0 / Q2_0 32-37 tok/s \
+     decoding, 600-700 tok/s prefill at 512 tokens, PTQ1_0 24-26 and ~300; CPU 9-12 tok/s";
 const GLM_TINY: &str = "text only (no vision tower, no MTP); only its header was loaded, not its weights";
 
 /// The models oxinfer was run with (the README's model table), by kind and size. What each can
@@ -316,7 +320,7 @@ pub const CATALOG: &[Model] = &[
         .speed(1.31, 16),
     Model::new("prism-ml/Ternary-Bonsai-2-2B-gguf:PTQ1_0", Kind::Chat, 1.9, 0.43, AGENT)
         .fixed(Format::GgufLow, "GGUF PTQ1_0 (ternary)")
-        .note("Hadamard-folded ternary weights (also :PQ2_0, :Q2_0); decodes on the CPU"),
+        .note("Hadamard-folded ternary weights (also :PQ2_0, :Q2_0); the Metal decode graph (CUDA: the CPU)"),
     Model::new("KRAFTON/Raon-1-nano", Kind::Chat, 3.1, 7.1, AGENT)
         .speed(3.06, 24)
         .note("half of its parameters are a per-layer embedding table read one row a token"),
@@ -378,7 +382,15 @@ pub const CATALOG: &[Model] = &[
         .note("the prompt enhancer of MiniMax-H3-Image (Qwen3.5-27B)"),
     Model::new("prism-ml/Ternary-Bonsai-2-27B-gguf:PTQ1_0", Kind::Chat, 27.4, 5.9, AGENT)
         .fixed(Format::GgufLow, "GGUF PTQ1_0 (ternary)")
-        .note("Qwen3.8-27B in Hadamard-folded ternary weights (also :PQ2_0, :Q2_0); decodes on the CPU"),
+        .note("Qwen3.8-27B in Hadamard-folded ternary weights (also :PQ2_0, :Q2_0); the Metal decode graph (CUDA: the CPU)"),
+    Model::new("prism-ml/Ternary-Bonsai-2.5-27B-GGUF:PQ2_0-mtp", Kind::Chat, 27.3, 8.1, &[Text, ImageInput, Thinking, Tools])
+        .fixed(Format::GgufLow, "GGUF PQ2_0 (ternary)")
+        .speed(6.85, 64)
+        .note(BONSAI25),
+    Model::new("prism-ml/Ternary-Bonsai-2.5-27B-GGUF:PTQ1_0-mtp", Kind::Chat, 27.3, 6.9, &[Text, ImageInput, Thinking, Tools])
+        .fixed(Format::GgufLow, "GGUF PTQ1_0 (ternary)")
+        .speed(5.65, 64)
+        .note(BONSAI25),
     Model::new("Qwen/Qwen3.8-27B", Kind::Chat, 27.8, 55.6, QWEN_VL).speed(51.0, 64),
     Model::new("ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF:IQ2_XS-mtp", Kind::Chat, 27.8, 8.8, AGENT)
         .fixed(Format::GgufLow, "GGUF GSQ-RCO IQ2_XS")
@@ -1547,7 +1559,8 @@ enum EnginePath {
     /// TTS too), Qwen3 / 3.5 / 3.6 / 3.8 dense and MoE, Granite 4, Gemma 3 / 4. The GPU runs the
     /// prompt and every decoded token.
     Graph,
-    /// Qwen4-Exp (Qwen3.8-Flash-Next): a decode graph Metal runs and CUDA declines.
+    /// Qwen4-Exp (Qwen3.8-Flash-Next), Hadamard-folded ternary weights (Ternary-Bonsai): a
+    /// decode graph Metal runs and CUDA declines.
     GraphMetal,
     /// The shared linear layers only (`model::linear_multi`): the GPU takes the prompt's large
     /// matmuls, decoding runs on the CPU (the families without a graph, and Qwen2.5 / LFM3 /
@@ -1558,7 +1571,7 @@ enum EnginePath {
     /// One stage whose products (convolutions, attention, matmuls) run on the GPU: images,
     /// embeddings.
     Pipeline,
-    /// The CPU alone (Hadamard-folded ternary weights, the pipelines whose docs say so).
+    /// The CPU alone (the pipelines whose docs say so).
     Cpu,
     /// A Core ML package (ANEMLL): the Neural Engine.
     CoreMl,
@@ -1574,8 +1587,7 @@ fn path_of(m: &Model) -> EnginePath {
         return EnginePath::CoreMl;
     }
     match m.kind {
-        Kind::Chat if has(&["ternary-bonsai"]) => EnginePath::Cpu,
-        Kind::Chat if has(&["flash-next"]) => EnginePath::GraphMetal,
+        Kind::Chat if has(&["ternary-bonsai", "flash-next"]) => EnginePath::GraphMetal,
         Kind::Chat
             if has(&[
                 "qwen3.5",
@@ -1607,12 +1619,13 @@ fn path_of(m: &Model) -> EnginePath {
 }
 
 /// Whether the backend has kernels for the bulk of the weights: Metal takes every format but
-/// NVFP4 and MXFP8 (FP8 with 128 x 128 block scales only); CUDA and Vulkan take bf16 and
-/// oxinfer's / MLX's Q8 and Q4 blocks, no GGUF or FP8 (`cuda.rs` / `vulkan.rs` `upload_weight`).
+/// NVFP4 and MXFP8 (FP8 with 128 x 128 block scales only; the ternary GGUF types too); CUDA and
+/// Vulkan take bf16 and oxinfer's / MLX's Q8 and Q4 blocks, no GGUF or FP8 (`cuda.rs` /
+/// `vulkan.rs` `upload_weight`).
 /// A GGUF file is also recognized by its repo id (entries such as the Orpheus GGUFs are listed
 /// without a fixed format).
 fn gpu_takes(kind: GpuKind, format: Format, label: &str, repo: &str) -> bool {
-    if label.contains("NVFP4") || label.contains("MXFP8") || label.contains("ternary") {
+    if label.contains("NVFP4") || label.contains("MXFP8") {
         return false;
     }
     let gguf = repo.to_ascii_lowercase().contains("gguf");
@@ -2330,8 +2343,11 @@ mod tests {
         assert_eq!(label(&rows, "LiquidAI/LFM3-1.7B", 0), "GPU (Metal) prefill, CPU decode");
         // FP8 has Metal GEMMs, no decode matvec; NVFP4 neither.
         assert_eq!(label(&rows, "MiniMaxAI/MiniMax-H3-Image-PE", 0), "CPU");
-        // Folded ternary weights: the CPU alone.
-        assert_eq!(label(&rows, "prism-ml/Ternary-Bonsai-2-2B-gguf:PTQ1_0", 0), "CPU");
+        // Folded ternary weights: the Metal decode graph.
+        assert_eq!(
+            label(&rows, "prism-ml/Ternary-Bonsai-2.5-27B-GGUF:PQ2_0-mtp", 0),
+            "GPU (Metal) prefill + decode"
+        );
         // A streamed mixture of experts on unified memory: both are timed.
         let small = survey(&unified(64.0, 50.0));
         let v = &row(&small, "Qwen/Qwen3.6-35B-A3B").variants[0];

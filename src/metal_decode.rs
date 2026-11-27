@@ -328,6 +328,7 @@ impl MvFmt {
                 GgmlType::Q5_K => format!("MV_RAW({n}, MQ5_K, XKQ, 32, {nr}, {ks})"),
                 GgmlType::Q6_K => format!("MV_RAW({n}, MQ6_K, X6, 32, {nr}, {ks})"),
                 GgmlType::IQ4_XS => format!("MV_IQ4({n}, {nr}, {ks})"),
+                GgmlType::Q2_0 | GgmlType::PQ2_0 | GgmlType::PTQ1_0 => format!("MV_RAW({n}, M{}, X32, 32, {nr}, {ks})", k.name()),
                 GgmlType::F32 => format!("MV_GEN({n}, F32W2, {nr}, {ks})"),
                 k => format!("MV_GEN({n}, {}W, {nr}, {ks})", k.name()),
             },
@@ -394,6 +395,9 @@ impl MvFmt {
                 GgmlType::F32 => gen_("F32W2".into()),
                 GgmlType::IQ1_S => raw("MIQ1_S", "X32", 32),
                 GgmlType::IQ1_M => raw("MIQ1_M", "X32", 32),
+                GgmlType::Q2_0 => raw("MQ2_0", "X32", 32),
+                GgmlType::PQ2_0 => raw("MPQ2_0", "X32", 32),
+                GgmlType::PTQ1_0 => raw("MPTQ1_0", "X32", 32),
                 k => gen_(format!("{}W", k.name())),
             },
         }
@@ -405,7 +409,8 @@ impl MvFmt {
     pub(crate) fn tiled_kernel_types(self) -> Option<(String, &'static str, usize, String)> {
         use GgmlType::*;
         let MvFmt::Gguf(k) = self else { return None };
-        if !super::GGUF_MMA_TYPES.contains(&k) || k == F8E4M3 {
+        // (The ternary dots read plain rows only.)
+        if !super::GGUF_MMA_TYPES.contains(&k) || matches!(k, F8E4M3 | Q2_0 | PQ2_0 | PTQ1_0) {
             return None;
         }
         let (t, x, ch, mk) = self.kernel_types();
@@ -428,7 +433,7 @@ impl MvFmt {
         matches!(self, MvFmt::Gguf(GgmlType::Q8_0 | GgmlType::Q4_K))
     }
     fn specialized(self) -> bool {
-        !matches!(self, MvFmt::Gguf(k) if !matches!(k, GgmlType::F16 | GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::IQ4_XS))
+        !matches!(self, MvFmt::Gguf(k) if !matches!(k, GgmlType::F16 | GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::IQ4_XS | GgmlType::Q2_0 | GgmlType::PQ2_0 | GgmlType::PTQ1_0))
     }
 }
 
@@ -1634,6 +1639,7 @@ fn op_kind(op: &MOp) -> String {
         MOp::Norm { .. } => "norm".into(),
         MOp::Ew { .. } => "ew".into(),
         MOp::Glu { .. } => "glu".into(),
+        MOp::Fold { .. } => "fold".into(),
         MOp::AddRows { .. } => "addrows".into(),
         MOp::PfTopk { .. } => "topk".into(),
         MOp::PfExperts(_, ph) => match *ph {
@@ -2163,7 +2169,7 @@ fn dec_only_kind(op: &MOp) -> &'static str {
         MOp::QkRope { .. } => "qk",
         MOp::GdnConv { .. } => "gdnc",
         MOp::GdnRule { .. } => "gdnr",
-        MOp::Glu { .. } | MOp::Ew { .. } | MOp::PleGate { .. } => "glu",
+        MOp::Glu { .. } | MOp::Ew { .. } | MOp::PleGate { .. } | MOp::Fold { .. } => "glu",
         MOp::LoraDown { .. } | MOp::LoraUp { .. } => "lora",
         MOp::Steer { .. } | MOp::NeuronEdit { .. } => "iv",
         MOp::AddNorm { .. } => "norm",
@@ -2560,6 +2566,15 @@ enum MOp {
         /// Multi-token plans: the pipeline and the g, u, out strides.
         t: Option<(Id, [u32; 4])>,
     },
+    /// `Op::Fold`: a Hadamard-folded weight's input transform (`dec_fold`, a threadgroup per
+    /// rotation block and token); `signs` in the constants.
+    Fold {
+        pipe: Id,
+        x: usize,
+        out: usize,
+        signs: usize,
+        p: FoldParams,
+    },
     /// `Op::LoraDown`: partial sums of `u = A x` (`lora_down`, a threadgroup per chunk, component
     /// and token); `a` in the constants.
     LoraDown {
@@ -2875,6 +2890,24 @@ enum MOp {
         /// `PFA` without the start position.
         a: [u32; 8],
     },
+}
+
+/// `dec_fold` parameters (see the shader's `FoldP`): the row width, the rotation block, the
+/// value-head permutation (head width, key heads, repeat; a head width of 0: none), the token
+/// strides of x and out, whether there are signs, and `1 / sqrt(block)`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FoldParams {
+    n: u32,
+    block: u32,
+    hd: u32,
+    nk: u32,
+    rep: u32,
+    xs: u32,
+    os: u32,
+    has_signs: u32,
+    scale: f32,
+    _p: [u32; 3],
 }
 
 /// `lora_down` / `lora_up` parameters (see the shader's `LoraP`).
@@ -4734,6 +4767,40 @@ impl MetalBackend {
                     rd.extend(gate.map(|v| rng(v, 1)));
                     (rd, vec![rng(y, n_out)])
                 }
+                Op::Fold { x, out, n, fold } => {
+                    let bl = fold.block;
+                    if fold.regular
+                        || !(2..=1024).contains(&bl)
+                        || !n.is_multiple_of(bl)
+                        || !(fold.signs.is_empty() || fold.signs.len() == n)
+                    {
+                        return None;
+                    }
+                    let (hd, nk, rp) = fold.perm.unwrap_or((0, 0, 0));
+                    if fold.perm.is_some() && hd * nk * rp != n {
+                        return None;
+                    }
+                    emit.push(MOp::Fold {
+                        pipe: self.named_pipeline("dec_fold")?,
+                        x: byte(x),
+                        out: byte(out),
+                        signs: if fold.signs.is_empty() { 0 } else { cst(&fold.signs) },
+                        p: FoldParams {
+                            n: n as u32,
+                            block: bl as u32,
+                            hd: hd as u32,
+                            nk: nk as u32,
+                            rep: rp as u32,
+                            xs: if mt { ts(x) as u32 } else { 0 },
+                            os: if mt { ts(out) as u32 } else { 0 },
+                            has_signs: !fold.signs.is_empty() as u32,
+                            // (The CPU's `fwht` scale, rounded the same way.)
+                            scale: 1.0 / (bl as f32).sqrt(),
+                            _p: [0; 3],
+                        },
+                    });
+                    (vec![rng(x, n)], vec![rng(out, n)])
+                }
                 Op::Glu { g: gv, u, out, n, gelu } => {
                     emit.push(MOp::Glu {
                         pipe: self.named_pipeline("dec_glu")?,
@@ -6561,6 +6628,14 @@ impl MetalPlan<'_> {
                 e.dispatch(((*n as usize).div_ceil(256), t), 256);
             }
             MOp::LoraDown { .. } | MOp::LoraUp { .. } => self.encode_lora(e, op, arena, consts, t),
+            MOp::Fold { pipe, x, out, signs, p } => {
+                e.pipe(*pipe);
+                e.buf(arena, *x, 0);
+                e.buf(arena, *out, 1);
+                e.buf(consts, *signs, 2);
+                e.bytes(p, 3);
+                e.dispatch(((p.n / p.block) as usize, t), p.block.min(1024) as usize);
+            }
             MOp::Glu {
                 g, u, out, n, gelu, t: tk, ..
             } => {
@@ -8427,6 +8502,14 @@ impl MetalPlan<'_> {
                 e.dispatch(((*n as usize).div_ceil(64), 1), 64);
             }
             MOp::LoraDown { .. } | MOp::LoraUp { .. } => self.encode_lora(e, op, arena, consts, 1),
+            MOp::Fold { pipe, x, out, signs, p } => {
+                e.pipe(*pipe);
+                e.buf(arena, *x, 0);
+                e.buf(arena, *out, 1);
+                e.buf(consts, *signs, 2);
+                e.bytes(p, 3);
+                e.dispatch(((p.n / p.block) as usize, 1), p.block.min(1024) as usize);
+            }
             MOp::Glu {
                 pipe, g, u, out, n, gelu, ..
             } => {

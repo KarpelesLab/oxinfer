@@ -454,13 +454,6 @@ fn expert_formats() -> Vec<(String, String, &'static str, usize, String)> {
             32,
             "MGen<MXFP4W>{ MXFP4W{ { (device const uchar*)(e).q, (e).rb } } }".into(),
         ),
-        (
-            "Q2_0".into(),
-            "MGen<Q2_0W>".into(),
-            "X32",
-            32,
-            "MGen<Q2_0W>{ Q2_0W{ { (device const uchar*)(e).q, (e).rb } } }".into(),
-        ),
     ];
     for &k in GGUF_GPU_TYPES.iter() {
         let n = k.name();
@@ -1292,7 +1285,6 @@ fn kind_name(k: GgmlType) -> Option<String> {
         GgmlType::NVFP4 => "nvfp4".into(),
         GgmlType::BF16 => "bf".into(),
         GgmlType::MXFP4 => "MXFP4".into(),
-        GgmlType::Q2_0 => "Q2_0".into(),
         k if GGUF_GPU_TYPES.contains(&k) => k.name().into(),
         _ => return None,
     })

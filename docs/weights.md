@@ -65,8 +65,9 @@ format: F32, F16, BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K-Q6_K, IQ1_S/IQ1_M, IQ2_XX
 IQ3_XXS/S, IQ4_NL/XS, MXFP4 and the 1-bit and ternary types Q1_0, Q2_0, TQ1_0, TQ2_0 and
 PrismML's PQ2_0 / PTQ1_0 (`ggml.rs`, dequantization bit-exact with gguf-py or, for the 1-bit and
 ternary types, ggml's C code; see [below](#mixed-low-bit-and-ternary-ggufs)), with NEON decode
-kernels for every type but those six (which take the portable decoder on ARM), Metal prefill
-kernels, and CUDA decode and prefill kernels for every type but those six
+kernels for every type but Q1_0, TQ1_0 and TQ2_0 (which take the portable decoder on ARM), Metal
+prefill kernels (and Metal decode kernels for every type but those three), and CUDA decode and
+prefill kernels for every type but the six 1-bit / ternary ones
 ([CUDA](platforms.md#cuda)). On x86-64 with AVX2 every type's int8 dot
 products run on `maddubs` / `madd`, and the block-of-32 formats, the K-quants and IQ4_XS are
 unpacked in registers (`kernels_ggml_x86.rs`; the grid-table i-quants IQ1-IQ3 still unpack through
@@ -92,6 +93,7 @@ log-probability difference over the top 10 of those steps):
 | `DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF:MTP-IQ3_M` (5.7 GB) | Qwen3.5-9B fine-tune with the MTP layer (`blk.32.nextn.*`), IQ3_S / Q4_K | 26 tokens as llama.cpp (within 0.65), then a near tie (0.334 against 0.316); `--mtp`: 2.33 tokens per forward. The repository's `MTP-IQ2_M` file is damaged on the Hub (its first 10.97 MB, the whole header, are zeros) |
 | `HauhauCS/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive` `Q4_K_M`, `ccore/Qwen3.5-4B-3D-Coder` `Q4_K_M` (2.7 GB each) | Qwen3.5-4B fine-tunes in the usual layout (the second with the newer `nextn_predict_layers = 0` and `attention.recurrent_layers` keys) | 16 tokens as llama.cpp (within 0.28) then a near tie (0.202 against 0.199); 32/32 (within 0.25) |
 | `prism-ml/Ternary-Bonsai-2-2B-gguf` `Q2_0` / `PQ2_0` / `PTQ1_0` (0.4-0.5 GB) | ternary weights, Hadamard-folded, tied output head (below) | `Q2_0`: 48/48 tokens as llama.cpp, within 0.22; the other two packings give the same 48 tokens |
+| `prism-ml/Ternary-Bonsai-2.5-27B-GGUF` `Q2_0` / `PQ2_0` / `PTQ1_0`, each plain and `-mtp` (5.6-7.9 GB), `mmproj-Q8_0` (0.63 GB) | Bonsai 2.5: the same format and model shape as the 27B below (version 1 folding, block 1024), retrained for agents; the `-mtp` files add the Q4_0 MTP layer (`blk.64`, not folded) | `Q2_0` on mainline llama.cpp (`de30697`, Metal and CPU) and oxinfer (Metal and CPU): 49/49 greedy steps identical, top-10 log-probabilities within 0.031 (Metal against Metal) / 0.103 (CPU against CPU); `PQ2_0` and `PTQ1_0` (which mainline cannot read) give the same 49 tokens, within 0.031 of llama.cpp's `Q2_0`; images through the `mmproj` file (Metal and CPU) |
 | `prism-ml/Ternary-Bonsai-2-27B-gguf` `Q2_0` (7.6 GB) / `PTQ1_0` (5.9 GB) | the same for Qwen3.8-27B, with its own output head and the Gated DeltaNet permutation | `Q2_0`: 20 tokens as llama.cpp (within 0.07), then a near tie (0.328 against 0.323); `PTQ1_0`: the 32 tokens of `Q2_0`, within 0.06 |
 
 `maritaca-ai/S5-nano` (`qwen3_5` safetensors of Qwen3.5-4B's shape, 9.3 GB) ran as stored and
@@ -118,12 +120,46 @@ projection its value heads in the checkpoint's order (`gdn_v_grouped`). A runtim
 metadata loads the file and prints noise (llama.cpp before b11556 did; oxinfer before this
 support refused the files for their tensor type). Version 1 (27B: a separate output head) and
 version 2 (2B: the folded token embedding is also the output head) are read; anything else in
-that metadata is an error rather than a guess. Folded matmuls run on the CPU kernels (the GPU
-decode and prefill plans do not take them), so on a machine with a GPU these models decode at the
-CPU's speed. The six 1-bit / ternary types are unpacked in registers on x86-64 (AVX2, rows
+that metadata is an error rather than a guess. On Metal the whole-token decode plans and the
+prefill plans take the folded matmuls: a graph op (`Op::Fold`, kernel `dec_fold`, one
+threadgroup per rotation block and token) applies `H (D P x)` to the input with the CPU's
+butterflies in the CPU's order (the same values), once per input shared by the matmuls that read
+it, and `Q2_0` / `PQ2_0` / `PTQ1_0` have matvec dots of their own (`MQ2_0`, `MPQ2_0`,
+`MPTQ1_0`; the trits of a `PTQ1_0` chunk picked by selects, not branches, so the lanes of a
+SIMD-group, which read different chunks of a block, stay on the same instructions: 9.5 -> 16.6
+tok/s) and GEMM loaders (`load` in `GGUF_SHADER_SRC`, the matrix-unit GEMMs too). CUDA keeps
+these models on the CPU (`Op::Fold` is declined). The folded token embedding is still read on
+the host (the greedy chain is off for these models). On ARM `Q2_0`, `PQ2_0` and `PTQ1_0` have
+NEON dots (`q2_0`, `pq2_0`, `ptq1_0` in `kernels_ggml.rs`, the trits unpacked with byte
+multiplies, `TRITS`' formula) and int8 GEMM rows: Bonsai 2.5 `PTQ1_0` on the CPU 1.2 -> 11.0
+tok/s decoding, 12.6 -> 24.2 prefilling a 23-token prompt.
+
+Ternary-Bonsai 2.5 27B on the M5 Max (`with-lock`, two alternated rounds while other agents'
+jobs loaded the machine, so ranges; tok/s; the prompts as `tools/bench`'s: pp512 / pp2048 of
+the corpus raw, 128 tokens of the prose and code prompts; llama.cpp mainline `de30697`
+`llama-bench -fa 1`, `Q2_0` only, as it cannot read the other two):
+
+| file | Metal pp512 | pp2048 | decode | CPU pp512 | decode |
+|---|---|---|---|---|---|
+| `PQ2_0` / `PQ2_0-mtp` | 508-728 | 442-637 | 29-37 | 51-61 | 9-12 |
+| `Q2_0` / `Q2_0-mtp` | 616-710 | 544-605 | 32-35 | 49-62 | 11 (4 in one round under load) |
+| `PTQ1_0` / `PTQ1_0-mtp` | 279-334 | 275-303 | 24-26 | 55-61 | 9-11 |
+| llama.cpp `Q2_0` | 417 | 523 | 36.8 | 23 (12 threads) | 8.4 |
+
+The `PTQ1_0` decode is ALU-bound (five trits a byte unpacked with multiplies) where the 2-bit
+files are bandwidth-bound; its GEMM loader decodes trit by trit, hence the slower prompts. With
+`--mtp` (the files' Q4_0 MTP layer; PrismML's Metal preset drafts one token at p >= 0.6) the
+drafts were accepted 42-57% of the time on Metal, and `--mtp-cost` then drafts in few rounds: 30-33 tok/s,
+no faster than plain decoding (a verification pass costs about a plain step plus the drafts'
+share here), so MTP stays opt-in for these files. Images: the `mmproj-Q8_0` tower (Q8_0
+weights of the padded MLP layers read through a bf16 copy) described a 512x384 photo (mountains
+at sunset above an inset of a Japanese room) correctly on Metal and the CPU, 192 image tokens,
+prefill of the 213-token prompt 404 tok/s on Metal. Before this, the repository's
+`Ternary-Bonsai-2.5-27B-mmproj-Q8_0.gguf` was not found beside the model (only `mmproj*` names
+were: `gguf::is_mmproj_name` also takes a name with an `-mmproj` part) and its Q8_0 weights were
+refused by the bf16 loaders of the tower. The six 1-bit / ternary types are unpacked in registers on x86-64 (AVX2, rows
 bit-identical to the portable decoder's: 19-42 ns per 256 weights and token on one thread, as
-Q2_K's 21 and Q4_K's 32, against 140-185 through the portable decoder) and take the portable
-decoder on ARM. On the test machine, shared and under load, so indicative only: the 2B on 8
+Q2_K's 21 and Q4_K's 32, against 140-185 through the portable decoder). On the test machine, shared and under load, so indicative only: the 2B on 8
 threads at 41 tok/s (`Q2_0`), 33 (`PQ2_0`) and 23 (`PTQ1_0`) where llama.cpp's CPU build gave 46
 on `Q2_0`; the 27B `PTQ1_0` at 6.9 tok/s on a chat prompt (2.1 before the AVX2 unpackers; a
 GSQ-RCO IQ2_XS file of the same model, whose i-quants unpack through the portable decoder: 2.3).

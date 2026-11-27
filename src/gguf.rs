@@ -1418,9 +1418,17 @@ fn unnamed_part(dir: &Path, no: usize, count: usize) -> Option<std::path::PathBu
         .flat_map(|rd| rd.flatten().map(|e| e.path()))
         .filter(|p| {
             let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            n.ends_with(".gguf") && split_name(n).is_none() && !n.starts_with("mmproj") && !n.starts_with("dspark")
+            n.ends_with(".gguf") && split_name(n).is_none() && !is_mmproj_name(n) && !n.starts_with("dspark")
         })
         .find(|p| header(p).is_ok_and(|h| split(&h, "split.no") == Some(no) && split(&h, "split.count") == Some(count)))
+}
+
+/// Whether GGUF file name `name` (a file name or a repository path) is a llama.cpp vision
+/// projector rather than a model: `mmproj*.gguf`, or a name with an `mmproj` part such as
+/// PrismML's `Ternary-Bonsai-2.5-27B-mmproj-Q8_0.gguf` (case-insensitive).
+pub fn is_mmproj_name(name: &str) -> bool {
+    let n = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
+    n.ends_with(".gguf") && (n.starts_with("mmproj") || ["-mmproj", "_mmproj", ".mmproj"].iter().any(|p| n.contains(p)))
 }
 
 /// The first file of the GGUF model in folder `dir` (a single `.gguf`, or part 1 of a split one;
@@ -1436,7 +1444,7 @@ pub fn model_in_dir(dir: &Path) -> Option<std::path::PathBuf> {
         .map(|e| e.path())
         .filter(|p| {
             let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            n.ends_with(".gguf") && !n.starts_with("mmproj") && !n.starts_with("dspark") && split_name(n).is_none_or(|s| s.1 == 1)
+            n.ends_with(".gguf") && !is_mmproj_name(n) && !n.starts_with("dspark") && split_name(n).is_none_or(|s| s.1 == 1)
         })
         .collect();
     ggufs.sort();
@@ -1468,6 +1476,26 @@ pub fn scalar_metadata(h: &Header) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mmproj_names() {
+        for n in [
+            "mmproj-F16.gguf",
+            "sub/mmproj-model-f16.gguf",
+            "Ternary-Bonsai-2.5-27B-mmproj-Q8_0.gguf",
+            "X_mmproj_BF16.GGUF",
+        ] {
+            assert!(is_mmproj_name(n), "{n}");
+        }
+        for n in [
+            "Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf",
+            "Qwen3-8B-Q8_0.gguf",
+            "mmproj-F16.bin",
+            "mmprojector/model.gguf",
+        ] {
+            assert!(!is_mmproj_name(n), "{n}");
+        }
+    }
 
     /// A `.gguf` file without the magic is reported as such; other paths are left to the caller.
     #[test]

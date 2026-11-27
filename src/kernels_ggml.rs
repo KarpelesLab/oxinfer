@@ -82,6 +82,8 @@ pub(super) unsafe fn rows<const TC: usize>(m: &GgufMatrix, x: &Act, y: *mut f32,
         GgmlType::Q5_1 => q32::<TC, Q5_1>,
         GgmlType::NVFP4 => nvfp4::<TC>,
         GgmlType::Q2_0 => q2_0::<TC>,
+        GgmlType::PQ2_0 => pq2_0::<TC>,
+        GgmlType::PTQ1_0 => ptq1_0::<TC>,
         _ => return false,
     };
     let rb = m.row_bytes();
@@ -1154,6 +1156,103 @@ unsafe fn q2_0<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; T
         }
     }
     finish(acc)
+}
+
+/// The 128 weights of a PQ2_0 block (PrismML: Q2_0's codes, 32 bytes of them after one f16
+/// scale) as eight vectors of 16 in element order: two Q2_0 halves under one scale.
+#[inline(always)]
+unsafe fn pq2_0_unpack(b: *const u8) -> [int8x16_t; 8] {
+    let (lo, hi) = (q2_0_unpack(b), q2_0_unpack(b.add(16)));
+    [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]]
+}
+
+/// Base-3 digit `n` (`3^n` in `p`) of each byte of `v` minus one, as ggml reads TQ1_0 /
+/// PTQ1_0 bytes: `((v * 3^n mod 256) * 3) >> 8` (see `ggml::TRITS`).
+#[inline(always)]
+unsafe fn trit16(v: uint8x16_t, p: u8) -> int8x16_t {
+    let q = vmulq_u8(v, vdupq_n_u8(p));
+    let three = vdup_n_u8(3);
+    let d = vcombine_u8(
+        vshrn_n_u16::<8>(vmull_u8(vget_low_u8(q), three)),
+        vshrn_n_u16::<8>(vmull_high_u8(q, vdupq_n_u8(3))),
+    );
+    vsubq_s8(vreinterpretq_s8_u8(d), vdupq_n_s8(1))
+}
+
+/// [`trit16`] of eight bytes.
+#[inline(always)]
+unsafe fn trit8(v: uint8x8_t, p: uint8x8_t) -> int8x8_t {
+    let d = vshrn_n_u16::<8>(vmull_u8(vmul_u8(v, p), vdup_n_u8(3)));
+    vsub_s8(vreinterpret_s8_u8(d), vdup_n_s8(1))
+}
+
+/// The 128 trits of a PTQ1_0 block (PrismML: 24 bytes of five trits each in runs of 16 and 8,
+/// digit-major, then 2 bytes of four trits, then an f16 scale; see `ggml::low_bit_i8`) as eight
+/// vectors of 16 in element order.
+#[inline(always)]
+unsafe fn ptq1_0_unpack(b: *const u8) -> [int8x16_t; 8] {
+    // Elements 0..80: digit n of byte m of the first run is element 16 n + m.
+    let v = vld1q_u8(b);
+    let r: [int8x16_t; 5] = [trit16(v, 1), trit16(v, 3), trit16(v, 9), trit16(v, 27), trit16(v, 81)];
+    // Elements 80..120: digit n of byte m of the second run is element 80 + 8 n + m.
+    let w = vld1_u8(b.add(16));
+    let d = |p: u8| trit8(w, vdup_n_u8(p));
+    // Elements 120..128: digit n of qh byte h is element 120 + 2 n + h.
+    let (h0, h1) = (*b.add(24), *b.add(25));
+    let hv = vld1_u8([h0, h1, h0, h1, h0, h1, h0, h1].as_ptr());
+    let hp = vld1_u8([1u8, 1, 3, 3, 9, 9, 27, 27].as_ptr());
+    [
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        r[4],
+        vcombine_s8(d(1), d(3)),
+        vcombine_s8(d(9), d(27)),
+        vcombine_s8(d(81), trit8(hv, hp)),
+    ]
+}
+
+/// The eight vectors of a 128-value ternary block (see [`pq2_0_unpack`], [`ptq1_0_unpack`]).
+type Unpack128 = unsafe fn(*const u8) -> [int8x16_t; 8];
+
+/// A row of 128-blocks of ternary int8 values (`unpack` gives a block's eight vectors, its f16
+/// scale at byte `scale_at`) against TC int8 activation rows (one scale per 32).
+#[inline(always)]
+unsafe fn t128<const TC: usize>(row: *const u8, n_in: usize, x: &Act, bs: usize, scale_at: usize, unpack: Unpack128) -> [f32; TC] {
+    let zero = vdupq_n_s32(0);
+    let bpr = n_in / 32;
+    let mut acc = [vdupq_n_f32(0.0); TC];
+    for blk in 0..n_in / 128 {
+        let b = row.add(bs * blk);
+        let w = unpack(b);
+        let dv = vdupq_n_f32(f16p(b.add(scale_at)));
+        for c in 0..TC {
+            let xq = x.q.add(c * n_in + 128 * blk);
+            let xs = vld1q_f32(x.s.add(c * bpr + 4 * blk));
+            for h in 0..2 {
+                let a0 = sdot(zero, w[4 * h], vld1q_s8(xq.add(64 * h)));
+                let a1 = sdot(zero, w[4 * h + 1], vld1q_s8(xq.add(64 * h + 16)));
+                let a2 = sdot(zero, w[4 * h + 2], vld1q_s8(xq.add(64 * h + 32)));
+                let a3 = sdot(zero, w[4 * h + 3], vld1q_s8(xq.add(64 * h + 48)));
+                let s = vpaddq_s32(vpaddq_s32(a0, a1), vpaddq_s32(a2, a3));
+                // Lanes: elements 0..16, 16..32 of block 2h, then of block 2h + 1.
+                let xsv = if h == 0 { vzip1q_f32(xs, xs) } else { vzip2q_f32(xs, xs) };
+                acc[c] = vfmaq_f32(acc[c], vcvtq_f32_s32(s), vmulq_f32(dv, xsv));
+            }
+        }
+    }
+    finish(acc)
+}
+
+/// PQ2_0 (PrismML's type 142): Q2_0's codes in blocks of 128 with one f16 scale.
+unsafe fn pq2_0<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; TC] {
+    t128::<TC>(row, n_in, x, 34, 0, pq2_0_unpack)
+}
+
+/// PTQ1_0 (PrismML's type 143): five trits a byte in blocks of 128 with one f16 scale.
+unsafe fn ptq1_0<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; TC] {
+    t128::<TC>(row, n_in, x, 28, 26, ptq1_0_unpack)
 }
 
 unsafe fn q8_0<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; TC] {
@@ -2545,6 +2644,8 @@ fn cols_kind(kind: GgmlType) -> bool {
             | GgmlType::Q5_1
             | GgmlType::NVFP4
             | GgmlType::Q2_0
+            | GgmlType::PQ2_0
+            | GgmlType::PTQ1_0
     )
 }
 
@@ -2587,6 +2688,8 @@ unsafe fn cols_multi(m: &GgufMatrix, x: &Act, t: usize, y: *mut f32, ys: usize, 
                 GgmlType::Q5_0 => q32::<$TC, Q5_0>,
                 GgmlType::NVFP4 => nvfp4::<$TC>,
                 GgmlType::Q2_0 => q2_0::<$TC>,
+                GgmlType::PQ2_0 => pq2_0::<$TC>,
+                GgmlType::PTQ1_0 => ptq1_0::<$TC>,
                 _ => q32::<$TC, Q5_1>,
             }
         };
@@ -2684,7 +2787,7 @@ pub(super) unsafe fn rows_multi(
 pub(super) fn i8_layout(kind: GgmlType) -> Option<(bool, bool)> {
     use GgmlType::*;
     Some(match kind {
-        Q8_0 | Q4_0 | IQ4_NL | MXFP4 | Q5_0 | IQ4_XS | Q2_0 => (false, false),
+        Q8_0 | Q4_0 | IQ4_NL | MXFP4 | Q5_0 | IQ4_XS | Q2_0 | PQ2_0 | PTQ1_0 => (false, false),
         Q4_1 | Q5_1 | Q4_K | Q5_K => (false, true),
         Q6_K | Q3_K | IQ2_XXS | IQ2_XS | IQ2_S | IQ3_XXS | IQ3_S | IQ1_S | IQ1_M => (true, false),
         _ => return None,
@@ -2719,6 +2822,23 @@ pub(super) unsafe fn unpack_row_i8(kind: GgmlType, row: *const u8, n_in: usize, 
                 let d = f16p(p);
                 *ds.add(2 * b) = d;
                 *ds.add(2 * b + 1) = d;
+            }
+        }
+        GgmlType::PQ2_0 | GgmlType::PTQ1_0 => {
+            let (bs, sa, un): (usize, usize, Unpack128) = if kind == GgmlType::PQ2_0 {
+                (34, 0, pq2_0_unpack)
+            } else {
+                (28, 26, ptq1_0_unpack)
+            };
+            for b in 0..n_in / 128 {
+                let p = row.add(bs * b);
+                for (k, w) in un(p).iter().enumerate() {
+                    vst1q_s8(q.add(128 * b + 16 * k), *w);
+                }
+                let d = f16p(p.add(sa));
+                for j in 0..4 {
+                    *ds.add(4 * b + j) = d;
+                }
             }
         }
         GgmlType::Q4_K => sb_i8::<MQ4K<false>>(row, n_in, q, ds, mn, sc),

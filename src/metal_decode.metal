@@ -148,6 +148,64 @@ inline float q8_0_dot(device const ushort* b, thread const X32& xr) {
 inline float mdot(MQ8_0 f, uint row, uint c, thread const X32& xr) { return q8_0_dot((device const ushort*)(f.w + (ulong)row * f.rb + c * 34), xr); }
 struct MQ8_0T { device const uchar* w; ulong rb; };
 inline float mdot(MQ8_0T f, uint row, uint c, thread const X32& xr) { return q8_0_dot((device const ushort*)tblk(f.w, f.rb, row, c, 34), xr); }
+// ---- Ternary blocks with one f16 scale, chunk of 32: Q2_0 (18-byte blocks of 64), PrismML's
+// PQ2_0 (34 bytes of 128: Q2_0's codes) and PTQ1_0 (28 bytes of 128: five trits a byte). The
+// codes c of a chunk are summed against x and the scale applied once: d (sum c x - sum x).
+inline float4 t2x4(uint v) { return float4(uint4(v, v >> 2, v >> 4, v >> 6) & 3u); }
+// The 8 code bytes of a Q2_0 / PQ2_0 chunk (4 ushorts) against x.
+inline float t2_dot(device const ushort* q, thread const X32& xr) {
+    float4 a = float4(0.f);
+    for (uint i = 0; i < 4; i++) {
+        uint u = q[i];
+        a = fma(t2x4(u & 255u), xr.v[2 * i], a);
+        a = fma(t2x4(u >> 8), xr.v[2 * i + 1], a);
+    }
+    return hsum(a) - xsum32(xr);
+}
+struct MQ2_0 { device const uchar* w; ulong rb; };
+inline float mdot(MQ2_0 f, uint row, uint c, thread const X32& xr) {
+    device const ushort* b = (device const ushort*)(f.w + (ulong)row * f.rb + (c / 2) * 18);
+    return float(as_type<half>(b[0])) * t2_dot(b + 1 + 4 * (c % 2), xr);
+}
+struct MPQ2_0 { device const uchar* w; ulong rb; };
+inline float mdot(MPQ2_0 f, uint row, uint c, thread const X32& xr) {
+    device const ushort* b = (device const ushort*)(f.w + (ulong)row * f.rb + (c / 4) * 34);
+    return float(as_type<half>(b[0])) * t2_dot(b + 1 + 4 * (c % 4), xr);
+}
+// Base-3 digits (3^n in p) of the four bytes of w, as ggml reads TQ1_0 / PTQ1_0 bytes (not minus one).
+inline float4 trit4(uint w, uint4 p) { return float4(((((uint4(as_type<uchar4>(w)) * p) & 255u) * 3u) >> 8)); }
+inline float4 trit4(uint w, uint p) { return trit4(w, uint4(p)); }
+// PTQ1_0 chunk j (values 32 j .. 32 j + 31, four at a time as x.v[k]) reads the block's word
+// wi (6: the two qh bytes, repeated) and from each byte the base-3 digit e: chunks 0 and 1 digits
+// 2 j and 2 j + 1 of the first run's 16 bytes (words 0..3); chunk 2 digit 4 of the first run, then
+// digits 0 and 1 of the second run's 8 bytes (words 4, 5); chunk 3 digits 2, 3, 4 of the second
+// run, then digit n of qh byte h as value 120 + 2 n + h. Computed with selects rather than branches
+// or tables: the lanes of a SIMD-group read different chunks.
+inline uint pow3(uint e) { return e == 0 ? 1u : e == 1 ? 3u : e == 2 ? 9u : e == 3 ? 27u : 81u; }
+struct MPTQ1_0 { device const uchar* w; ulong rb; };
+inline float mdot(MPTQ1_0 f, uint row, uint c, thread const X32& xr) {
+    device const uint* b = (device const uint*)(f.w + (ulong)row * f.rb + (c / 4) * 28);
+    uint j = c % 4;
+    bool lo = j < 2, j2 = j == 2;
+    float4 a = float4(0.f);
+    for (uint k = 0; k < 4; k++) {
+        uint w = b[j == 3 ? 4 + (k & 1) : k];
+        a = fma(trit4(w, pow3(lo ? 2 * j : j2 ? 4u : 2 + k / 2)), xr.v[k], a);
+    }
+    for (uint k = 4; k < 6; k++) {
+        uint w = b[lo ? k - 4 : 4 + (k & 1)];
+        a = fma(trit4(w, pow3(lo ? 2 * j + 1 : j2 ? 0u : 4u)), xr.v[k], a);
+    }
+    for (uint k = 6; k < 8; k++) {
+        uint w = b[lo ? k - 4 : j2 ? 4 + (k & 1) : 6u];
+        uint h = (w & 0xFFFFu) * 0x10001u;
+        uint4 ph = k == 6 ? uint4(1u, 1u, 3u, 3u) : uint4(9u, 9u, 27u, 27u);
+        uint4 p = j == 3 ? ph : uint4(pow3(lo ? 2 * j + 1 : 1u));
+        a = fma(trit4(j == 3 ? h : w, p), xr.v[k], a);
+    }
+    float d = float(as_type<half>(ushort(b[6] >> 16)));
+    return d * (hsum(a) - xsum32(xr));
+}
 // ---- IQ1_S (50-byte blocks of 256, 2-byte aligned), chunk of 32 = one sub-block: four grid
 // entries of 8 ternary values (signed bytes) plus a shared delta, one scale. The delta is applied
 // to the sum of the x values rather than to each weight. The chunk is decoded (`iq1s_dec`) and its
@@ -3282,4 +3340,39 @@ kernel void dec_embed(device float* a [[buffer(0)]], constant EmP& p [[buffer(1)
 kernel void dec_copy(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]], constant uint& n [[buffer(2)]],
                      uint i [[thread_position_in_grid]]) {
     if (i < n) dst[i] = src[i];
+}
+
+// ---- The input transform of a Hadamard-folded weight (`Op::Fold`, `hadamard::Fold::apply`):
+// out = H (D P x) over blocks of `block` values (one threadgroup per block and token): P the
+// value-head permutation (value head k + nk r of x read as head r + rep k), D the signs, H the
+// normalized Sylvester Walsh-Hadamard matrix, butterflies in the CPU's order (the same values).
+struct FoldP { uint n; uint block; uint hd; uint nk; uint rep; uint xs; uint os; uint has_signs; float scale; uint _p0; uint _p1; uint _p2; };
+kernel void dec_fold(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], device const float* signs [[buffer(2)]],
+                     constant FoldP& p [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]],
+                     uint tid [[thread_index_in_threadgroup]], uint2 ntg [[threads_per_threadgroup]]) {
+    uint nt = ntg.x;
+    threadgroup float v[1024];
+    uint b0 = tg.x * p.block;
+    device const float* xr = x + (ulong)tg.y * p.xs;
+    for (uint i = tid; i < p.block; i += nt) {
+        uint d = b0 + i, s = d;
+        if (p.hd != 0) {
+            uint h = d / p.hd, j = d % p.hd;
+            s = p.hd * (h / p.rep + p.nk * (h % p.rep)) + j;
+        }
+        float a = xr[s];
+        v[i] = p.has_signs != 0 ? a * signs[d] : a;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint h = 1; h < p.block; h *= 2) {
+        for (uint i = tid; i < p.block / 2; i += nt) {
+            uint a = (i / h) * 2 * h + i % h;
+            float u = v[a], w = v[a + h];
+            v[a] = u + w;
+            v[a + h] = u - w;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    device float* o = out + (ulong)tg.y * p.os + b0;
+    for (uint i = tid; i < p.block; i += nt) o[i] = v[i] * p.scale;
 }

@@ -1695,18 +1695,7 @@ kernel void NAME##_sum(device float* a [[buffer(0)]], device const IXT* tab [[bu
         device float* y = a + p.y + (ulong)ti * p.h + r; \
         if (p.add != 0) { y[0] += v0; if (r + 1 < p.h) y[1] += v1; } else { y[0] = v0; if (r + 1 < p.h) y[1] = v1; } \
     } }
-// Q2_0 (ggml type 42): an f16 scale, then 16 bytes of 2-bit codes `c - 1` (element j: bits
-// 2 (j % 4) of byte j / 4) per block of 64; chunk b of 32 is half of block b / 2.
-struct Q2_0W { GgW g; };
-inline void load(Q2_0W w, uint row, uint b, thread float4* out) {
-    device const uchar* B = w.g.q + (ulong)row * w.g.rb + (b / 2) * 18;
-    float d = h2f(B);
-    device const uchar* q = B + 2 + 8 * (b % 2);
-    for (uint i = 0; i < 8; i++) {
-        uint c = q[i];
-        out[i] = (float4(float(c & 3), float((c >> 2) & 3), float((c >> 4) & 3), float(c >> 6)) - 1.f) * d;
-    }
-}
+// (Q2_0's weight loader, `Q2_0W`, is in the GGUF loaders of metal.rs.)
 
 // ---- Runtime LoRA updates (`crate::lora`): `y += s B (A x)` beside a matvec or GEMM. The down
 // half (grid: rank, token; one SIMD-group each): `u[t][r] = A[r] . x[t]`; the up half (grid: blocks

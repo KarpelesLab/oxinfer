@@ -1,5 +1,5 @@
 // Inkling-2 prefill kernels (metal_inkling.rs), after the matrix-unit GEMMs' source (MMA_SHADER_SRC: tg_max,
-// row_scale, the grouped GEMMs) and metal_inkling.metal (the weight loaders of NVFP4, MXFP8 and Q2_0).
+// row_scale, the grouped GEMMs) and metal_inkling.metal (the weight loaders of NVFP4 and MXFP8).
 #pragma clang fp reassociate(on)
 
 // ---- Prefill passes (more tokens than the rings hold) ---------------------------------------------
@@ -78,7 +78,7 @@ kernel void ink_combine(device float* a [[buffer(0)]], constant ICbP& p [[buffer
 
 // Grouped expert GEMMs of the formats the matrix-unit library leaves out.
 #define MK_MXF8 MXF8W{ (device const uchar*)qb, (device const float*)sb, p.n_in }
-MMAG(mmag_nvfp4, NVFP4W, MK_GG(NVFP4W)) MMAG(mmag_Q2_0, Q2_0W, MK_GG(Q2_0W)) MMAG(mmag_mxf8, MXF8W, MK_MXF8)
+MMAG(mmag_nvfp4, NVFP4W, MK_GG(NVFP4W)) MMAG(mmag_mxf8, MXF8W, MK_MXF8)
 #define MK_MXF8B MXF8B{ (device const uchar*)qb, (device const uchar*)sb, p.n_in }
 MMAG(mmag_mxf8b, MXF8B, MK_MXF8B)
 

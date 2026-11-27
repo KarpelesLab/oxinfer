@@ -882,6 +882,42 @@ inline void load(Q5_1W w, uint row, uint b, thread float4* out) {
         out[i + 4] = (hi - 0.f) * d + m;
     }
 }
+// Ternary blocks (Q2_0: 64 values, PrismML's PQ2_0 / PTQ1_0: 128) with one f16 scale. Q2_0 /
+// PQ2_0: 2-bit codes c - 1, value j in bits 2 (j % 4) of byte j / 4.
+inline void load_t2(device const uchar* q, float d, thread float4* out) {
+    for (uint i = 0; i < 8; i++) {
+        uint v = q[i];
+        out[i] = (float4(float(v & 3u), float((v >> 2) & 3u), float((v >> 4) & 3u), float(v >> 6)) - 1.f) * d;
+    }
+}
+struct Q2_0W { GgW g; };
+inline void load(Q2_0W w, uint row, uint b, thread float4* out) {
+    device const uchar* B = gblk(w.g, row, b / 2, 18);
+    load_t2(B + 2 + 8 * (b % 2), h2f(B), out);
+}
+struct PQ2_0W { GgW g; };
+inline void load(PQ2_0W w, uint row, uint b, thread float4* out) {
+    device const uchar* B = gblk(w.g, row, b / 4, 34);
+    load_t2(B + 2 + 8 * (b % 4), h2f(B), out);
+}
+// Base-3 digit n (3^n in p) of byte q minus one, as ggml reads TQ1_0 / PTQ1_0 bytes.
+inline float trit(uint q, uint p) { return float((((q * p) & 255u) * 3u) >> 8) - 1.f; }
+// PTQ1_0: 24 bytes of five trits in runs of 16 and 8 (digit n of byte m of a run of c bytes is
+// value n c + m of the run's 5 c), 2 bytes of four trits (value 120 + 2 n + h), then the scale.
+inline float ptq1_at(device const uchar* B, uint e) {
+    const uint p3[5] = {1u, 3u, 9u, 27u, 81u};
+    if (e < 80) return trit(B[e % 16], p3[e / 16]);
+    if (e < 120) return trit(B[16 + (e - 80) % 8], p3[(e - 80) / 8]);
+    return trit(B[24 + (e - 120) % 2], p3[(e - 120) / 2]);
+}
+struct PTQ1_0W { GgW g; };
+inline void load(PTQ1_0W w, uint row, uint b, thread float4* out) {
+    device const uchar* B = gblk(w.g, row, b / 4, 28);
+    float d = h2f(B + 26);
+    uint e = 32 * (b % 4);
+    for (uint i = 0; i < 8; i++)
+        out[i] = float4(ptq1_at(B, e + 4 * i), ptq1_at(B, e + 4 * i + 1), ptq1_at(B, e + 4 * i + 2), ptq1_at(B, e + 4 * i + 3)) * d;
+}
 struct F16W { GgW g; };
 inline void load(F16W w, uint row, uint b, thread float4* out) {
     device const packed_half4* p = (device const packed_half4*)(gblk(w.g, row, b, 64));
@@ -909,6 +945,7 @@ GEMM(gemm_F8_E4M3, F8W, MK_F8)
 GEMM(gemm_F32, F32W2, MK_GG(F32W2)) GG(F16) GG(Q4_1) GG(Q5_0) GG(Q5_1)
 GG(Q4_0) GG(IQ4_NL) GG(Q8_0) GG(Q4_K) GG(Q5_K) GG(Q6_K) GG(Q3_K) GG(Q2_K) GG(IQ4_XS)
 GG(IQ2_XXS) GG(IQ2_XS) GG(IQ2_S) GG(IQ3_XXS) GG(IQ3_S) GG(IQ1_S) GG(IQ1_M) GG(MXFP4)
+GG(Q2_0) GG(PQ2_0) GG(PTQ1_0)
 "#;
 
 /// GEMMs on the matrix units of M5 / A19 GPU cores (Metal 4 tensor operations, `matmul2d` from
@@ -1188,6 +1225,7 @@ MMAG_BF(mmag_bf, GTM) MMAG_BF(mmag_bf_l, 128) MMAG_BF(mmag_bf_s, 16)
 GGM(F16) GGM(Q4_1) GGM(Q5_0) GGM(Q5_1)
 GGM(Q4_0) GGM(IQ4_NL) GGM(Q8_0) GGM(Q4_K) GGM(Q5_K) GGM(Q6_K) GGM(Q3_K) GGM(Q2_K) GGM(IQ4_XS)
 GGM(IQ2_XXS) GGM(IQ2_XS) GGM(IQ2_S) GGM(IQ3_XXS) GGM(IQ3_S) GGM(IQ1_S) GGM(IQ1_M) GGM(MXFP4)
+GGM(Q2_0) GGM(PQ2_0) GGM(PTQ1_0)
 #if MMA_UNITS
 // Prefill plans: a gate / up pair and its SwiGLU in one GEMM (`mmap_*`). A threadgroup's 64
 // weight rows are 32 gate rows and the 32 matching up rows, so the products run as one dense GEMM
@@ -1739,7 +1777,7 @@ kernel void tile_blocks(device const TSrc* src [[buffer(0)]], device uchar* dst 
 
 /// GGUF types with a Metal GEMM (`gemm_<TYPE>` in `GGUF_SHADER_SRC`) and a decode matvec
 /// (`metal_decode.rs`). FP8 E4M3 (128 x 128 block scales, [`fp8_ok`]) has the GEMMs only.
-const GGUF_GPU_TYPES: [GgmlType; 21] = [
+const GGUF_GPU_TYPES: [GgmlType; 24] = [
     GgmlType::F32,
     GgmlType::F16,
     GgmlType::Q4_1,
@@ -1761,12 +1799,15 @@ const GGUF_GPU_TYPES: [GgmlType; 21] = [
     GgmlType::IQ3_S,
     GgmlType::IQ1_S,
     GgmlType::IQ1_M,
+    GgmlType::Q2_0,
+    GgmlType::PQ2_0,
+    GgmlType::PTQ1_0,
 ];
 
 /// GGUF types with a matrix-unit GEMM (`mma_<TYPE>` / `mmag_<TYPE>` in `MMA_SHADER_SRC`): all but
 /// F32, whose values would lose precision as half, and MXFP4 (which has the GEMMs but no decode
 /// matvec, so it is not in [`GGUF_GPU_TYPES`]).
-const GGUF_MMA_TYPES: [GgmlType; 22] = [
+const GGUF_MMA_TYPES: [GgmlType; 25] = [
     GgmlType::MXFP4,
     GgmlType::F8E4M3,
     GgmlType::F16,
@@ -1789,6 +1830,9 @@ const GGUF_MMA_TYPES: [GgmlType; 22] = [
     GgmlType::IQ3_S,
     GgmlType::IQ1_S,
     GgmlType::IQ1_M,
+    GgmlType::Q2_0,
+    GgmlType::PQ2_0,
+    GgmlType::PTQ1_0,
 ];
 
 /// The grouped GEMM tiles of a MoE layer with `count[e]` rows for expert e: the gathered input

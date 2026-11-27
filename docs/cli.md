@@ -159,11 +159,11 @@ untested Gemma 4 12B / 31B, ...).
 "decode_measured", "streamed"}` naming the unit of each stage: `cpu`, `metal`, `cuda`, `vulkan`
 or `neural-engine`) says which accelerator the engine uses with the defaults: `GPU (Metal) prefill
 + decode` for the families with a whole-token decode graph (Llama 3 and Orpheus, Qwen3 / 3.5 / 3.6
-/ 3.8 dense and MoE, Granite 4, Gemma 3 / 4; Qwen3.8-Flash-Next on Metal only), `GPU (CUDA)
+/ 3.8 dense and MoE, Granite 4, Gemma 3 / 4; Qwen3.8-Flash-Next and the folded ternary GGUFs
+of Ternary-Bonsai on Metal only), `GPU (CUDA)
 prefill, CPU decode` where the GPU takes only the prompt's matmuls (every other family, Qwen2.5,
 LFM3 and MiniMax included, and a graph model whose weights do not fit a discrete GPU), `CPU` where
-no backend takes the weight format (GGUF and FP8 on CUDA and Vulkan, NVFP4 and MXFP8 everywhere,
-the folded ternary GGUFs) or the pipeline is CPU-only (video, ZONOS, Fish, Audio8, Haru), `GPU
+no backend takes the weight format (GGUF and FP8 on CUDA and Vulkan, NVFP4 and MXFP8 everywhere) or the pipeline is CPU-only (video, ZONOS, Fish, Audio8, Haru), `GPU
 (Metal) encoder, CPU decode` for Whisper, plain `GPU (Metal)` for image and embedding pipelines,
 `Neural Engine (Core ML)` for ANEMLL packages, and `, streamed from disk` when the weights are
 over 60% of the RAM (on unified memory a streamed mixture of experts times GPU and CPU decoding

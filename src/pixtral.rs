@@ -217,7 +217,7 @@ pub fn mmproj_for(model: &Path) -> Option<PathBuf> {
             .map(|e| e.path())
             .filter(|p| {
                 let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                n.starts_with("mmproj") && n.ends_with(".gguf")
+                crate::gguf::is_mmproj_name(n)
             })
             .collect();
         v.sort();

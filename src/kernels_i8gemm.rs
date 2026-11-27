@@ -1077,7 +1077,7 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 20, "formats");
+        assert_eq!(n, 22, "formats");
     }
 
     /// Interleaved matrices (`ggml::repack`) through every GEMM path, tiles filled from the

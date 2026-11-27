@@ -304,6 +304,15 @@ pub enum Op<'a> {
         ratio: usize,
         top: usize,
     },
+    /// The input transform of a Hadamard-folded weight ([`crate::hadamard::Fold::apply`]) of a
+    /// row of `n` values: `out = H (D P x)` (P the value-head permutation, D the signs, H the
+    /// blocked Walsh-Hadamard rotation), for the [`Op::Linear`]s that read `out`.
+    Fold {
+        x: View,
+        out: View,
+        n: usize,
+        fold: &'a crate::hadamard::Fold,
+    },
 }
 
 /// The largest rank (all chained adapters of a layer together) of [`Op::LoraUp`].

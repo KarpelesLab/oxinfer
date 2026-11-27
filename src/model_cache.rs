@@ -128,7 +128,7 @@ fn walk(dir: &Path, rel: &str, depth: usize, acc: &mut (u64, usize, Option<u64>,
             acc.2 = acc.2.max(secs(md.modified()));
             let lower = name.to_ascii_lowercase();
             let later_part = matches!(crate::gguf::split_name(&name), Some((_, i, _, _)) if i > 1);
-            if lower.ends_with(".gguf") && !lower.starts_with("mmproj") && !later_part {
+            if lower.ends_with(".gguf") && !crate::gguf::is_mmproj_name(&lower) && !later_part {
                 acc.3.push(path);
             }
         }

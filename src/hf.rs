@@ -196,7 +196,7 @@ pub fn resolve_file(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
 fn gguf_models(list: &Listing) -> Vec<&String> {
     let mut v: Vec<&String> = list
         .keys()
-        .filter(|k| k.ends_with(".gguf") && !k.rsplit('/').next().unwrap_or(k).starts_with("mmproj"))
+        .filter(|k| k.ends_with(".gguf") && !crate::gguf::is_mmproj_name(k))
         .collect();
     v.sort();
     v
@@ -264,7 +264,7 @@ fn mmprojs_present(dir: &Path, name: &str) -> Vec<String> {
         let Ok(rd) = std::fs::read_dir(dir.join(&f)) else { continue };
         for e in rd.flatten() {
             let n = e.file_name().to_string_lossy().into_owned();
-            if n.starts_with("mmproj") && n.ends_with(".gguf") {
+            if crate::gguf::is_mmproj_name(&n) {
                 out.push(format!("{f}{n}"));
             }
         }
@@ -285,10 +285,7 @@ fn gguf_mmproj(list: &Listing, name: &str, present: &[String], mmproj: &crate::p
     if *mmproj != crate::pixtral::Mmproj::Auto || name.matches('/').count() > 1 {
         return None;
     }
-    let mut cands: Vec<&String> = list
-        .keys()
-        .filter(|k| !k.contains('/') && k.starts_with("mmproj") && k.ends_with(".gguf"))
-        .collect();
+    let mut cands: Vec<&String> = list.keys().filter(|k| !k.contains('/') && crate::gguf::is_mmproj_name(k)).collect();
     if !present.is_empty() {
         return present.iter().find(|p| cands.contains(p)).cloned();
     }

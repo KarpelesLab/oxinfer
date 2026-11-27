@@ -1195,6 +1195,24 @@ impl ModelFiles {
         }
         let sh = &self.shards[i];
         let host = matches!(sh.mmap, Storage::Host(_));
+        if info.dtype == "GGML" {
+            // A GGUF block format (a Q8_0 llama.cpp mmproj file's tower read by a bf16 loader):
+            // dequantized once into a bf16 copy.
+            let mut cache = self.dequantized.lock().unwrap();
+            if !cache.contains_key(name) {
+                drop(cache);
+                let f = self.f32(name)?;
+                let mut v = PageVec::<u16>::zeroed(f.len());
+                for (o, &x) in v.iter_mut().zip(&f) {
+                    *o = half::bf16::from_f32(x).to_bits();
+                }
+                cache = self.dequantized.lock().unwrap();
+                cache.entry(name.to_string()).or_insert(v);
+            }
+            let v = &cache[name];
+            // SAFETY: as in `mlx_bf16`.
+            return Ok(unsafe { std::slice::from_raw_parts(v.as_ptr(), v.len()) });
+        }
         if info.dtype == "F32" || info.dtype == "F16" {
             // fp32 / fp16 checkpoints (PyTorch files, sentence-transformers heads): a bf16 copy.
             let mut cache = self.dequantized.lock().unwrap();

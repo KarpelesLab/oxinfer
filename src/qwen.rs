@@ -1434,12 +1434,13 @@ impl<'a> QwenModel<'a> {
         let gated = cfg.attn_output_gate;
         let qw = if gated { 2 * nh * hd } else { nh * hd };
         // Streamed weights (layers outside the resident set) are wrapped by the plan per step.
+        // Hadamard-folded weights take their input through an `Op::Fold` first (`fold_in`).
         let dev = |l: &'s Lin, n_out: usize, n_in: usize| -> Option<&crate::gpu::DeviceWeight> {
-            if l.fold.is_some() {
-                return None;
-            }
             if l.is_transient() {
-                return self.stream.is_some().then(crate::gpu::decode::streamed_weight);
+                return (self.stream.is_some() && l.fold.is_none()).then(crate::gpu::decode::streamed_weight);
+            }
+            if l.fold.is_some() {
+                return l.device_weight_unfolded(n_out, n_in);
             }
             l.device_weight(n_out, n_in)
         };
@@ -1526,7 +1527,53 @@ impl<'a> QwenModel<'a> {
             crate::gpu::decode::View,
             LinMode,
         );
+        // The jobs with each folded weight's input replaced by its transform (`Op::Fold`, one per
+        // input and transform; the k-th transform of a width in a call goes to scratch buffer k of
+        // that width). Folded weights take no LoRA updates on the device.
+        let fold_bufs: std::cell::RefCell<Vec<(usize, usize, crate::gpu::decode::View)>> = Default::default();
+        let fold_in = |g: &mut Graph<'s>, jobs: &[Job<'s>]| -> Option<Vec<Job<'s>>> {
+            let mut done: Vec<(crate::gpu::decode::View, *const crate::hadamard::Fold, crate::gpu::decode::View)> = Vec::new();
+            let mut out = Vec::with_capacity(jobs.len());
+            for &(l, n_out, n_in, x, y, mode) in jobs {
+                let Some(f) = l.fold.as_deref() else {
+                    out.push((l, n_out, n_in, x, y, mode));
+                    continue;
+                };
+                if l.has_lora() {
+                    return None;
+                }
+                let fp = f as *const crate::hadamard::Fold;
+                let v = match done.iter().find(|d| d.0 == x && d.1 == fp) {
+                    Some(d) => d.2,
+                    None => {
+                        let k = done.iter().filter(|d| d.2.off == 0 && g.bufs[d.2.buf] == n_in).count();
+                        let v = {
+                            let mut fb = fold_bufs.borrow_mut();
+                            match fb.iter().find(|e| e.0 == n_in && e.1 == k) {
+                                Some(e) => e.2,
+                                None => {
+                                    let v = g.buf(n_in);
+                                    fb.push((n_in, k, v));
+                                    v
+                                }
+                            }
+                        };
+                        g.ops.push(Op::Fold {
+                            x,
+                            out: v,
+                            n: n_in,
+                            fold: f,
+                        });
+                        done.push((x, fp, v));
+                        v
+                    }
+                };
+                out.push((l, n_out, n_in, v, y, mode));
+            }
+            Some(out)
+        };
         let put_all = |g: &mut Graph<'s>, jobs: &[Job<'s>]| -> Option<()> {
+            let jobs = &fold_in(g, jobs)?[..];
             for &(l, n_out, n_in, x, y, mode) in jobs {
                 g.ops.push(lin(l, n_out, n_in, x, y, mode)?);
             }
@@ -1552,14 +1599,20 @@ impl<'a> QwenModel<'a> {
                 return None;
             }
             let (gw, uw) = (m.gate.as_ref(), m.up.as_ref());
-            if crate::gpu::decode::pairable(&gw, &uw) && !m.gate.has_lora() && !m.up.has_lora() {
+            let same_fold = match (&m.gate.fold, &m.up.fold) {
+                (None, None) => true,
+                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                _ => false,
+            };
+            if crate::gpu::decode::pairable(&gw, &uw) && !m.gate.has_lora() && !m.up.has_lora() && same_fold {
+                let xin = fold_in(g, &[(&m.gate, m.inter, h, hn, act, LinMode::Store)])?[0].3;
                 g.ops.push(Op::Linear {
                     w: gw,
                     dev: dev(&m.gate, m.inter, h)?,
                     w2: Some((uw, dev(&m.up, m.inter, h)?)),
                     n_out: m.inter,
                     n_in: h,
-                    x: hn,
+                    x: xin,
                     y: act,
                     mode: LinMode::SiluPair,
                 });
