@@ -2056,18 +2056,23 @@ impl<'a> Inkling2Model<'a> {
         Ok(m)
     }
 
+    /// Forgets the GPU engine, which is built for the weights' adapters (Metal runs them as side
+    /// paths, CUDA leaves adapted models to the CPU): decided again at the next pass, after the
+    /// set of attached adapters changed. The engine it replaces stays to bring the sessions that
+    /// ran on it back to the host caches.
+    pub(crate) fn reset_device(&mut self) {
+        if let Some(Some(e)) = std::mem::take(&mut self.device).into_inner() {
+            self.retired.push(e);
+        }
+    }
+
     /// Attaches the modules of a runtime LoRA adapter (see `crate::lora`) by the release's module
     /// names (`layers.N.attn.wo_ud`, `layers.N.mlp.experts`, `layers.N.controllers.attn.down_weight`,
     /// `lm_head` for the unembedding), and its token-embedding update. A GGUF adapter's names
     /// map to these (`blk.N.attn_output.weight` is `layers.N.attn.wo_ud`, `ffn_down_exps` the
     /// experts' `down_proj`). Returns the number patched.
     pub fn attach_lora(&mut self, ad: &mut crate::lora::LoraAdapter) -> Result<usize> {
-        // The GPU engine is built for the weights' adapters (Metal runs them as side paths, CUDA
-        // leaves adapted models to the CPU): decided again at the next pass. The engine it
-        // replaces stays to bring the sessions that ran on it back to the host caches.
-        if let Some(Some(e)) = std::mem::take(&mut self.device).into_inner() {
-            self.retired.push(e);
-        }
+        self.reset_device();
         let c = &self.cfg;
         let (h, v, dr) = (c.hidden_size, c.vocab_size, c.d_rel);
         let rank = c.loop_cfg.map_or(0, |l| l.gate_rank);

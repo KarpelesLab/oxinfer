@@ -821,6 +821,67 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The same on Inkling-2 (the tiny looped checkpoint): an adapter attached after the load is
+    /// off for the requests without it and on for those that select it, with the replies of a
+    /// model loaded with `lora=` and of the base model; replaced and detached without a reload.
+    #[test]
+    fn inkling_adapters_attach_to_a_loaded_model_and_switch_per_request() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-pool-ink-adapters-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (model, ad1, ad2) = (dir.join("model"), dir.join("a1"), dir.join("a2"));
+        crate::inkling::tiny::write_tiny(&model, 3).unwrap();
+        crate::inkling::tiny::write_adapter(&ad1, 11, 0.4).unwrap();
+        crate::inkling::tiny::write_adapter(&ad2, 12, 0.4).unwrap();
+        let mut o = EngineOptions::default();
+        o.set("device", "cpu").unwrap();
+        let load = |o: &EngineOptions| {
+            let mut e = Engine::load(model.to_str().unwrap(), o).unwrap();
+            e.config_mut().max_tokens = 12;
+            e
+        };
+        // (With a system message: the default one carries the time of day, and this random
+        // model's reply follows every byte of its prompt.)
+        let m = vec![Message::system("Be brief."), Message::user("Hello there, how are you?")];
+        let alone = |lora: Option<&std::path::Path>| {
+            let mut o = o.clone();
+            if let Some(l) = lora {
+                o.set("lora", l.to_str().unwrap()).unwrap();
+            }
+            load(&o).chat(&m, &mut quiet).unwrap().tokens
+        };
+        let (base, with1, with2) = (alone(None), alone(Some(&ad1)), alone(Some(&ad2)));
+        assert_ne!(base, with1, "the adapter changes nothing");
+        assert_ne!(with1, with2);
+        let pool = EnginePool::new(load(&o), 2, BatchOptions::default());
+        let turn = |adapter: Option<&str>| -> (Vec<u32>, Option<String>) {
+            let mut g = pool
+                .acquire_with(&m, adapter, std::time::Duration::from_millis(50), &mut || true)
+                .unwrap();
+            let r = g.chat(&m, &mut quiet).unwrap();
+            g.remember(&m);
+            (r.tokens, g.adapter().map(|a| a.version.clone()))
+        };
+        assert_eq!(turn(None).0, base);
+        let a = pool.attach_adapter("p", &ad1, 1.0, "v1").unwrap();
+        assert_eq!((a.info.rank, a.info.modules, a.info.merged), (4, 12, 0));
+        assert_eq!(turn(None).0, base);
+        assert_eq!(turn(Some("p")), (with1.clone(), Some("v1".into())));
+        assert_eq!(turn(None).0, base);
+        // A second adapter beside it, each on for its own requests only.
+        pool.attach_adapter("q", &ad2, 1.0, "v1").unwrap();
+        assert_eq!(turn(Some("q")).0, with2);
+        assert_eq!(turn(Some("p")).0, with1);
+        assert_eq!(turn(None).0, base);
+        // Replaced, then detached.
+        pool.attach_adapter("p", &ad2, 1.0, "v2").unwrap();
+        assert_eq!(turn(Some("p")), (with2.clone(), Some("v2".into())));
+        assert!(pool.detach_adapter("q"));
+        assert_eq!(turn(Some("q")), (base.clone(), None));
+        assert_eq!(turn(Some("p")).0, with2);
+        assert_eq!(turn(None).0, base);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Requests with different adapters do not overlap: one waits for the other to end.
     #[test]
     fn requests_with_different_adapters_take_turns() {

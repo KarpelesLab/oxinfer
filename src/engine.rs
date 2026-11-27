@@ -3265,8 +3265,10 @@ impl Engine {
     /// Changes the adapters of the loaded model itself, for every session of it: forgets its
     /// GPU plans (they hold the adapters' side paths), attaches the adapter at `path` when one
     /// is given ([`crate::lora::attach_switched`]: runtime updates, switched off) and starts this
-    /// session again ([`Engine::rebind`]). For Qwen-path and Gemma models decoded without MTP or
-    /// a DSpark draft, not streamed from disk, without interventions or decision assets.
+    /// session again ([`Engine::rebind`]). For Qwen-path, Gemma and Inkling-2 models decoded
+    /// without MTP or a DSpark draft, not streamed from disk, without interventions or decision
+    /// assets. (Inkling-2 has no plans: its GPU engine is built again for the new set of
+    /// adapters, [`Inkling2Model::reset_device`].)
     ///
     /// # Safety
     /// The model is shared with this engine's forks ([`Engine::fork`]): none of them may be
@@ -3309,10 +3311,23 @@ impl Engine {
                 *model = unsafe { &*p };
                 r
             }
+            Lm::Inkling2 { model, sess } => {
+                let p = arena.raw_of(*model).ok_or_else(missing)?;
+                // (A session on the GPU engine comes back to the host while that engine is the
+                // model's; `rebind` then starts it again.)
+                model.to_host(sess);
+                // SAFETY: as above.
+                let r = change(unsafe { &mut *p }, Inkling2Model::reset_device, attach, &base);
+                *model = unsafe { &*p };
+                r
+            }
             _ => bail!(
-                "adapters are attached to a loaded model for Qwen-path and Gemma models decoded without MTP or a DSpark draft, not {}{}",
+                "adapters are attached to a loaded model for Qwen-path, Gemma and Inkling-2 models decoded without MTP or a DSpark draft, not {}{}",
                 self.info.model_type,
-                if matches!(self.info.family, Family::Qwen | Family::Llama | Family::Gemma4 | Family::Gemma3) {
+                if matches!(
+                    self.info.family,
+                    Family::Qwen | Family::Llama | Family::Gemma4 | Family::Gemma3 | Family::Inkling2
+                ) {
                     " with speculative decoding"
                 } else {
                     ""
@@ -3337,6 +3352,13 @@ impl Engine {
                 *sess = model.new_session();
             }
             Lm::Gemma { model, sess, .. } => {
+                if let Some(p) = arena.raw_of(*model) {
+                    // SAFETY: as above.
+                    *model = unsafe { &*p };
+                }
+                *sess = model.new_session();
+            }
+            Lm::Inkling2 { model, sess } => {
                 if let Some(p) = arena.raw_of(*model) {
                     // SAFETY: as above.
                     *model = unsafe { &*p };

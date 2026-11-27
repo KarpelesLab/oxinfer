@@ -160,6 +160,28 @@ pub fn write_tiny(dir: &Path, seed: u64) -> Result<()> {
     write_tiny_with(dir, seed, false, &TINY)
 }
 
+/// Writes a random PEFT LoRA adapter for [`write_tiny`]'s model into the folder `dir`
+/// (`adapter_config.json`, `adapter_model.safetensors`): rank 4, alpha 8, on the attention output
+/// projection (`wo_ud`) of every layer, `A` and `B` noise of width `scale` from `seed`.
+pub fn write_adapter(dir: &Path, seed: u64, scale: f32) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
+    let r = 4usize;
+    let mut t = Tensors {
+        list: Vec::new(),
+        rng: Rng(seed),
+    };
+    for l in 0..LAYERS {
+        let (heads, _, d) = if (l + 1).is_multiple_of(BLOCK) { FULL } else { SWA };
+        let p = format!("base_model.model.model.llm.layers.{l}.attn.wo_ud");
+        t.raw(&format!("{p}.lora_A.weight"), &[r, heads * d], scale, 0.0);
+        t.raw(&format!("{p}.lora_B.weight"), &[H, r], scale, 0.0);
+    }
+    t.write(&dir.join("adapter_model.safetensors"))?;
+    let config = json!({"peft_type": "LORA", "r": r, "lora_alpha": 2 * r, "target_modules": ["wo_ud"]});
+    let path = dir.join("adapter_config.json");
+    std::fs::write(&path, config.to_string()).with_context(|| path.display().to_string())
+}
+
 /// [`write_tiny`] in the shapes the Metal engine takes (heads of 128 channels, 256 wide, a
 /// relative bias of 16), for tests of the GPU passes.
 pub fn write_tiny_metal(dir: &Path, seed: u64) -> Result<()> {
