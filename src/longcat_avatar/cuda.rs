@@ -13,6 +13,11 @@
 //! two halves `hi + lo 2^-11` (two products per GEMM, three per attention product: float32
 //! results to about 1e-6, at about twice the time).
 //!
+//! The default path's attention is laid out for a GPU whose kernels wait on memory rather than
+//! on the tensor cores (a GB10, which shares the machine's memory): blocks of 128 queries (each
+//! read of a step's keys and values serves twice the queries of a block of 64), and no planes
+//! for the operands' second halves.
+//!
 //! Weights: `base_model_int8/` goes to the device byte for byte (0.33 GB a block); the bf16
 //! `base_model/` as float16 (exact but for values under 2^-14; 0.66 GB a block). The LoRAs are
 //! side paths (`u = A x`, `y += s B u` per output section) with their factors as float16 after a
@@ -110,10 +115,11 @@ fn mats<'b>(b: &'b Block<'static>) -> [&'b Mat<'static>; N_MATS] {
     ]
 }
 
-/// The shared memory of an `attn_flash` block (as `flash_smem` of `minimax_h3/cuda.rs`).
-fn flash_smem(hd: usize) -> u32 {
-    let (q, p) = (64 * (hd / 2 + 4), 64 * 36);
-    ((2 * q + 2 * q.max(hd * 36) + 2 * p + 8 * 64) * 4) as u32
+/// The shared memory of an `attn_flash` block of `fq` queries (as `flash_smem` of
+/// `minimax_h3/cuda.rs`); `planes`: 2 with the operands' second halves, else 1.
+fn flash_smem(hd: usize, fq: usize, planes: usize) -> u32 {
+    let (q, b, p) = (fq * (hd / 2 + 4), (64 * (hd / 2 + 4)).max(hd * 36), fq * 36);
+    ((planes * (q + b + p) + 8 * fq) * 4) as u32
 }
 
 /// `GemmP` of `minimax_h3/cuda.cu`.
@@ -305,16 +311,18 @@ struct Bufs {
 }
 
 impl Arena {
-    fn bufs(&self) -> Bufs {
+    /// `exact`: with the planes of the operands' second halves (else null: not allocated).
+    fn bufs(&self, exact: bool) -> Bufs {
         let p = &self.all;
+        let lo = |i: usize| if exact { p[i] } else { 0 };
         Bufs {
             x: p[0],
             hn: p[1],
-            qp: [p[2], p[3]],
-            kp: [p[4], p[5]],
-            vp: [p[6], p[7]],
-            xs: [p[8], p[9]],
-            us: [p[10], p[11]],
+            qp: [p[2], lo(3)],
+            kp: [p[4], lo(5)],
+            vp: [p[6], lo(7)],
+            xs: [p[8], lo(9)],
+            us: [p[10], lo(11)],
             u: p[12],
             rs: p[13],
             urs: p[14],
@@ -358,6 +366,9 @@ struct Funcs {
     ln_affine: F,
     resid: F,
     qk_prep: F,
+    /// The queries and the shared memory of an attention block.
+    fq: usize,
+    smem: u32,
 }
 
 pub(super) struct Engine {
@@ -369,6 +380,8 @@ pub(super) struct Engine {
     state: Mutex<State>,
     failed: AtomicBool,
     prof: bool,
+    /// Split operands (`OXINFER_AVATAR_GPU_EXACT`).
+    exact: bool,
 }
 
 // SAFETY: the raw pointers are driver handles; every use binds the context and goes through
@@ -445,6 +458,9 @@ impl Engine {
         };
         let ctx = be.context().ok_or_else(|| anyhow!("no context"))?;
         let src = concat!(include_str!("../minimax_h3/cuda.cu"), "\n", include_str!("cuda.cu"));
+        // The default path: 128 queries per attention block.
+        let fq = if exact { 64 } else { 128 };
+        let smem = flash_smem(hd, fq, if exact { 2 } else { 1 });
         let module = be.cached_module(src, "longcat-avatar-{sm}", "longcat_avatar.cu")?;
         let get = |name: &str| -> Result<F> {
             let cn = CString::new(name)?;
@@ -463,17 +479,19 @@ impl Engine {
             v_planes: get("v_planes")?,
             attn: get(match (hd, exact) {
                 (128, true) => "lc_attn_flash_128",
-                (128, false) => "lc_attn_flash_128_fast",
+                (128, false) => "lc_attn_flash_128_wide",
                 (_, true) => "lc_attn_flash_64",
-                (_, false) => "lc_attn_flash_64_fast",
+                (_, false) => "lc_attn_flash_64_wide",
             })?,
             ln_mod: get("lc_ln_mod")?,
             ln_affine: get("lc_ln_affine")?,
             resid: get("lc_resid")?,
             qk_prep: get("lc_qk_prep")?,
+            fq,
+            smem,
         };
-        if unsafe { x.cuFuncSetAttribute(f.attn, MAX_DYNAMIC_SHARED, flash_smem(hd) as c_int) } != 0 {
-            bail!("the device does not give a block {} bytes of shared memory", flash_smem(hd));
+        if unsafe { x.cuFuncSetAttribute(f.attn, MAX_DYNAMIC_SHARED, smem as c_int) } != 0 {
+            bail!("the device does not give a block {smem} bytes of shared memory");
         }
         let mut stream = std::ptr::null_mut();
         if unsafe { x.cuStreamCreate(&mut stream, 1) } != 0 {
@@ -505,6 +523,7 @@ impl Engine {
                 events,
             }),
             failed: AtomicBool::new(false),
+            exact,
             prof: std::env::var("OXINFER_AVATAR_GPU_PROF").is_ok_and(|v| v != "0"),
         })
     }
@@ -650,19 +669,21 @@ impl Engine {
         let arows = ctx.n_t * ctx.na;
         let xs = (n * h).max(rc * ffn).max(l * h).max(arows * c.output_dim.next_multiple_of(32)) * 2;
         let tab = dit.blocks.len() * ctx.n_t * 9 * h * 4;
+        // The operands' second halves: with split operands only.
+        let lo = |bytes: usize| if self.exact { bytes } else { 0 };
         let sizes = [
             n * h * 4,
             n * h * 4,
             plane,
+            lo(plane),
             plane,
+            lo(plane),
             plane,
-            plane,
-            plane,
-            plane,
+            lo(plane),
             xs,
-            xs,
+            lo(xs),
             n * u_stride * 2,
-            n * u_stride * 2,
+            lo(n * u_stride * 2),
             n * u_stride * 4,
             n.max(l).max(arows) * 4,
             n.max(l).max(arows) * 4,
@@ -733,7 +754,7 @@ impl Engine {
         debug(&format!("{:.2} GB of activations", total as f64 / 1e9));
         st.arena = Arena { caps, all: ptrs };
         // The side paths' `u` rows are read past their last section (see `lin`): zeros there.
-        let b = st.arena.bufs();
+        let b = st.arena.bufs(self.exact);
         let z = vec![0u8; st.arena.caps[12]];
         self.htod(b.u, &z)
     }
@@ -951,7 +972,14 @@ impl Engine {
             klo: k.start as u32,
             khi: k.end as u32,
         };
-        self.go(self.f.attn, (ceil(q.len(), 64), heads as u32), 256, flash_smem(hd), &mut args![p]);
+        let fq = self.f.fq;
+        self.go(
+            self.f.attn,
+            (ceil(q.len(), fq), heads as u32),
+            4 * fq as u32,
+            self.f.smem,
+            &mut args![p],
+        );
     }
 
     /// The values of `rows` keys (at `off0` of rows `xs` floats apart in `src`) as planes.
@@ -1007,7 +1035,7 @@ impl Engine {
             self.release_blocks(st);
             return false;
         }
-        let bf = st.arena.bufs();
+        let bf = st.arena.bufs(self.exact);
         let mut tm = crate::clock::Instant::now();
         // The AdaLN sets of every block: [n_t, 6 H] then [n_t, 3 H].
         let tab_floats = n_t * 9 * h;

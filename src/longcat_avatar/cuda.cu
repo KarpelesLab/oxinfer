@@ -17,9 +17,11 @@ struct LcAttP {
 extern "C" __global__ void __launch_bounds__(256) lc_attn_flash_64(LcAttP a) { flash_body<64>(a.p, a.qlo, a.qhi, a.klo, a.khi); }
 extern "C" __global__ void __launch_bounds__(256) lc_attn_flash_128(LcAttP a) { flash_body<128>(a.p, a.qlo, a.qhi, a.klo, a.khi); }
 // The same with the first halves of the operands only (float16 queries, keys, probabilities and
-// values: a third of the products).
+// values: a third of the products), in blocks of 64 queries and, what the engine runs, of 128.
 extern "C" __global__ void __launch_bounds__(256) lc_attn_flash_64_fast(LcAttP a) { flash_body<64, 1>(a.p, a.qlo, a.qhi, a.klo, a.khi); }
 extern "C" __global__ void __launch_bounds__(256) lc_attn_flash_128_fast(LcAttP a) { flash_body<128, 1>(a.p, a.qlo, a.qhi, a.klo, a.khi); }
+extern "C" __global__ void __launch_bounds__(512) lc_attn_flash_64_wide(LcAttP a) { flash_body<64, 1, 128>(a.p, a.qlo, a.qhi, a.klo, a.khi); }
+extern "C" __global__ void __launch_bounds__(512) lc_attn_flash_128_wide(LcAttP a) { flash_body<128, 1, 128>(a.p, a.qlo, a.qhi, a.klo, a.khi); }
 
 // ---- out[r] = layernorm(x[r]) (no weights), then (1 + scale) and + shift of the row's frame:
 // `tab` holds `stride` floats per frame, the shift at `shift_at` and the scale at `scale_at`;
@@ -74,7 +76,8 @@ extern "C" __global__ void __launch_bounds__(256) lc_resid(float* x, const float
 // ---- queries or keys as half planes: one warp per (row, head). The head's hd values (at
 // `off0 + head * hd` of the row of `src`, rows `xs` floats apart) are RMS normed with weights `w`
 // and their adjacent pairs rotated by the row's cos / sin (`hd / 2` each; null: no rotation);
-// written at [head][row][hd / 2] of planes whose heads are `n` rows apart.
+// written at [head][row][hd / 2] of planes whose heads are `n` rows apart (`lo` null: the first
+// halves only).
 extern "C" __global__ void __launch_bounds__(32) lc_qk_prep(const float* src, u64 xs, u32 off0, const float* w, const float* cs, const float* sn, u32 hd, u32 n, u32* hi, u32* lo) {
     u32 row = blockIdx.x, head = blockIdx.y, lane = threadIdx.x;
     const float* v = src + (u64)row * xs + off0 + (u64)head * hd;
@@ -91,6 +94,9 @@ extern "C" __global__ void __launch_bounds__(32) lc_qk_prep(const float* src, u6
             b = b * co + a * si;
             a = ra;
         }
-        split_h2(a, b, hi[base + c / 2], lo[base + c / 2]);
+        if (lo)
+            split_h2(a, b, hi[base + c / 2], lo[base + c / 2]);
+        else
+            hi[base + c / 2] = pack_h2(a, b);
     }
 }

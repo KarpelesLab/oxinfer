@@ -306,6 +306,7 @@ extern "C" __global__ void __launch_bounds__(128) gemm_h_3(GemmP p) { gemm_body<
 
 // ---- the rows of a GEMM's input as half planes: row r of x (k values, rows `xs` floats apart)
 // times the power of two that brings its largest value into [2^13, 2^14); rs[r] is its inverse.
+// `lo` null: the first halves only.
 extern "C" __global__ void __launch_bounds__(256) split_rows(const float* x, u64 xs, u32 k, u32* hi, u32* lo, float* rs) {
     __shared__ float red[256];
     u32 r = blockIdx.x, tid = threadIdx.x;
@@ -318,7 +319,10 @@ extern "C" __global__ void __launch_bounds__(256) split_rows(const float* x, u64
     u32 per = k / 2;
     for (u32 i = tid; i < per; i += 256) {
         float2 v = *(const float2*)(row + 2 * i);
-        split_h2(v.x * f, v.y * f, hi[(u64)r * per + i], lo[(u64)r * per + i]);
+        if (lo)
+            split_h2(v.x * f, v.y * f, hi[(u64)r * per + i], lo[(u64)r * per + i]);
+        else
+            hi[(u64)r * per + i] = pack_h2(v.x * f, v.y * f);
     }
     if (tid == 0) rs[r] = inv;
 }
@@ -414,7 +418,7 @@ extern "C" __global__ void __launch_bounds__(256) v_scale(const float* qkv, u64 
 }
 
 // ---- the values transposed as half planes [head][c][nk / 2] (keys past n are zero), scaled by
-// 1 / vs[head].
+// 1 / vs[head]. `lo` null: the first halves only.
 extern "C" __global__ void __launch_bounds__(256) v_planes(const float* qkv, u64 xs, u32 off0, u32 hstep, u32 hd, u32 n, u32 nk, const float* vs, u32* hi, u32* lo) {
     u32 hc = blockIdx.y, head = hc / hd, c = hc % hd;
     u32 i = blockIdx.x * 256 + threadIdx.x;
@@ -424,7 +428,10 @@ extern "C" __global__ void __launch_bounds__(256) v_planes(const float* qkv, u64
     u32 j = 2 * i;
     float a = j < n ? col[(u64)j * xs] * f : 0.f;
     float b = j + 1 < n ? col[(u64)(j + 1) * xs] * f : 0.f;
-    split_h2(a, b, hi[(u64)hc * (nk / 2) + i], lo[(u64)hc * (nk / 2) + i]);
+    if (lo)
+        split_h2(a, b, hi[(u64)hc * (nk / 2) + i], lo[(u64)hc * (nk / 2) + i]);
+    else
+        hi[(u64)hc * (nk / 2) + i] = pack_h2(a, b);
 }
 
 // ---- the softmax of each row of scores (`cols` of `ld` per row, times `scale`) as half planes of
@@ -462,7 +469,6 @@ extern "C" __global__ void __launch_bounds__(256) softmax_split(float* s, u32 co
 // products). out[q][c] = O / l vs[head] 2^-14. Shared memory: dynamic, see `flash_smem` in
 // cuda.rs. q, k: planes [head][n][HD / 2 words]; v: planes [head][HD][nk / 2 words].
 
-#define FQ 64
 #define FK 64
 #define PLD 36 // words per shared row of 64 halves
 
@@ -491,11 +497,64 @@ __device__ __forceinline__ void zero8(u32* d) {
 }
 __device__ __forceinline__ void store4(u32* d, uint4 v) { d[0] = v.x, d[1] = v.y, d[2] = v.z, d[3] = v.w; }
 
+__device__ __forceinline__ u32 smem_addr(const void* p) {
+    u32 a;
+    asm("{ .reg .u64 s; cvta.to.shared.u64 s, %1; cvt.u32.u64 %0, s; }" : "=r"(a) : "l"(p));
+    return a;
+}
+// Four 8 x 8 tiles of halves from shared memory: lane l gives the address of row l % 8 of tile
+// l / 8, and receives of each tile the pair (row lane / 4, columns 2 (lane % 4) and the next).
+__device__ __forceinline__ void ldmatrix4(u32* r, const u32* at) {
+    asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_addr(at)));
+}
+
 // One 32-wide K step (from word k0) of a warp's 32 x 8 NT products: A rows from `a0` on in `ah` /
 // `al` (rows of `ald` words), B rows from `b0` on in `bh` / `bl`, three products; their sum
-// `hi + lo / 2048` is added to `acc`. NP 1: the product of the first halves only.
-template <int NT, int NP = 3>
+// `hi + lo / 2048` is added to `acc`. NP 1: the product of the first halves only, its operands
+// read by `ldmatrix` (NT even). FRESH: the step's products are summed in accumulators of their
+// own and added to `acc` in float32; else the tensor cores accumulate in `acc`, whose additions
+// truncate: for sums of a few steps only (the scores), not for one that runs over every key.
+template <int NT, int NP = 3, bool FRESH = true>
 __device__ __forceinline__ void flash_step(float acc[2][NT][4], const u32* ah, const u32* al, u32 ald, const u32* bh, const u32* bl, u32 bld, u32 a0, u32 b0, u32 g, u32 c4, u32 k0) {
+    if constexpr (NP == 1) {
+        float st1[2][NT][4];
+        if constexpr (FRESH) {
+#pragma unroll
+            for (int a = 0; a < 2; a++)
+#pragma unroll
+                for (int b = 0; b < NT; b++)
+#pragma unroll
+                    for (int c = 0; c < 4; c++) st1[a][b][c] = 0.f;
+        }
+        u32 lane = 4 * g + c4;
+        const u32* la = ah + (a0 + (lane & 15)) * ald + k0 + 4 * (lane >> 4);
+        const u32* lb = bh + (b0 + (lane & 7) + 8 * (lane >> 4)) * bld + k0 + 4 * ((lane >> 3) & 1);
+#pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            u32 af[2][4], bf[NT][2];
+#pragma unroll
+            for (int mt = 0; mt < 2; mt++) ldmatrix4(af[mt], la + 16 * mt * ald + 8 * kk);
+#pragma unroll
+            for (int np = 0; np < NT / 2; np++) {
+                u32 r[4];
+                ldmatrix4(r, lb + 16 * np * bld + 8 * kk);
+                bf[2 * np][0] = r[0], bf[2 * np][1] = r[1], bf[2 * np + 1][0] = r[2], bf[2 * np + 1][1] = r[3];
+            }
+#pragma unroll
+            for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+                for (int nt = 0; nt < NT; nt++) mma16816(FRESH ? st1[mt][nt] : acc[mt][nt], af[mt], bf[nt]);
+        }
+        if constexpr (FRESH) {
+#pragma unroll
+            for (int a = 0; a < 2; a++)
+#pragma unroll
+                for (int b = 0; b < NT; b++)
+#pragma unroll
+                    for (int c = 0; c < 4; c++) acc[a][b][c] += st1[a][b][c];
+        }
+        return;
+    }
     float st[2][NT][4], stl[2][NT][4];
 #pragma unroll
     for (int a = 0; a < 2; a++)
@@ -541,19 +600,35 @@ __device__ __forceinline__ void flash_step(float acc[2][NT][4], const u32* ah, c
             for (int c = 0; c < 4; c++) acc[a][b][c] += st[a][b][c] + stl[a][b][c] * (1.f / 2048.f);
 }
 
+// e^x: `expf`, or with NP 1 the device's approximate 2^x (one instruction; about 2^-21 relative,
+// next to the 2^-11 of the half the probability is rounded to). e^-inf is 0 in both.
+template <int NP>
+__device__ __forceinline__ float flash_exp(float x) {
+    if constexpr (NP == 1) {
+        float r;
+        asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x * 1.4426950408889634f));
+        return r;
+    } else {
+        return expf(x);
+    }
+}
+
 // Queries `qlo..qhi` against keys `klo..khi` (rows of the same planes: `p.n` is their stride).
-template <int HD, int NP = 3>
+// FQ: the queries of a block of 4 FQ threads (64, or 128: half the reads of keys and values per
+// product). NP 1 has no second planes in shared memory.
+template <int HD, int NP = 3, int FQ = 64>
 __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 klo, u32 khi) {
     const u32 HW = HD / 2, QLD = HW + 4;
     const u32 BW = FK * QLD > HD * PLD ? FK * QLD : HD * PLD;
     const int NO = HD / 32; // 8-wide output tiles per warp (a quarter of the head's channels)
-    extern __shared__ u32 sm[];
+    extern __shared__ __align__(16) u32 sm[];
     u32* Qh = sm;
-    u32* Ql = Qh + FQ * QLD;
+    const u32 L2 = NP == 1 ? 0 : 1;
+    u32* Ql = Qh + L2 * FQ * QLD;
     u32* Bh = Ql + FQ * QLD; // the step's keys (rows of QLD), then its values (HD rows of PLD)
-    u32* Bl = Bh + BW;
+    u32* Bl = Bh + L2 * BW;
     u32* Ph = Bl + BW;
-    u32* Pl = Ph + FQ * PLD;
+    u32* Pl = Ph + L2 * FQ * PLD;
     float* rmax = (float*)(Pl + FQ * PLD); // [4][FQ]: per key quarter of the step
     float* rsum = rmax + 4 * FQ;
     u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -570,11 +645,14 @@ __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 
             if constexpr (NP == 3) put8(Ql + tr * QLD + to + i, p.ql + at);
         } else {
             zero8(Qh + tr * QLD + to + i);
-            zero8(Ql + tr * QLD + to + i);
+            if constexpr (NP == 3) zero8(Ql + tr * QLD + to + i);
         }
     }
-    // Its part of the HD rows of 64 values: 256 / HD threads per row.
-    const u32 TPR = 256 / HD;
+    // Its part of a step's 64 keys: 4 FQ / 64 threads per key.
+    const u32 TPK = 4 * FQ / FK;
+    u32 tk = tid / TPK, tko = (HW / TPK) * (tid % TPK);
+    // Its part of the HD rows of 64 values: 4 FQ / HD threads per row.
+    const u32 TPR = 4 * FQ / HD;
     u32 vr = tid / TPR, vo = (32 / TPR) * (tid % TPR);
     // This warp's 32 queries, its 16 keys of a step, its HD / 4 output channels.
     u32 wm = (warp >> 2) * 32, kw = warp & 3, wn = kw * 16, cn = kw * (HD / 4);
@@ -594,13 +672,13 @@ __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 
     u32 half_nk = p.nk / 2;
     // A step's keys and values are read from the device's memory into registers one phase ahead
     // (while the products before them run), then stored to shared memory.
-    const int KN = HW / 16, VN = 8 / TPR;
+    const int KN = HW / (4 * TPK), VN = 8 / TPR;
     uint4 kr[2][KN], vq[2][VN];
     auto read_keys = [&](u32 k0) {
 #pragma unroll
         for (int i = 0; i < KN; i++) {
-            if (k0 + tr < p.n) {
-                u64 at = ((u64)head * p.n + k0 + tr) * HW + to + 4 * i;
+            if (k0 + tk < p.n) {
+                u64 at = ((u64)head * p.n + k0 + tk) * HW + tko + 4 * i;
                 kr[0][i] = *(const uint4*)(p.kh + at);
                 if constexpr (NP == 3) kr[1][i] = *(const uint4*)(p.kl + at);
             } else {
@@ -612,8 +690,8 @@ __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 
     for (u32 k0 = klo / FK * FK; k0 < khi; k0 += FK) {
 #pragma unroll
         for (int i = 0; i < KN; i++) {
-            store4(Bh + tr * QLD + to + 4 * i, kr[0][i]);
-            if constexpr (NP == 3) store4(Bl + tr * QLD + to + 4 * i, kr[1][i]);
+            store4(Bh + tk * QLD + tko + 4 * i, kr[0][i]);
+            if constexpr (NP == 3) store4(Bl + tk * QLD + tko + 4 * i, kr[1][i]);
         }
         __syncthreads();
 #pragma unroll
@@ -635,7 +713,7 @@ __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 
 #pragma unroll
                 for (int c = 0; c < 4; c++) s[a][b][c] = 0.f;
 #pragma unroll
-        for (u32 k = 0; k < HW; k += 16) flash_step<2, NP>(s, Qh, Ql, QLD, Bh, Bl, QLD, wm, wn, g, c4, k);
+        for (u32 k = 0; k < HW; k += 16) flash_step<2, NP, NP != 1>(s, Qh, Ql, QLD, Bh, Bl, QLD, wm, wn, g, c4, k);
         // The scaled scores (keys past n: -inf) and each row's maximum over this warp's keys.
 #pragma unroll
         for (int mt = 0; mt < 2; mt++) {
@@ -671,7 +749,7 @@ __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 
             for (int hq = 0; hq < 2; hq++) {
                 u32 rr = wm + 16 * mt + g + 8 * hq;
                 float mn = fmaxf(fmaxf(m[mt][hq], rmax[rr]), fmaxf(rmax[FQ + rr], fmaxf(rmax[2 * FQ + rr], rmax[3 * FQ + rr])));
-                alpha[mt][hq] = expf(m[mt][hq] - mn);
+                alpha[mt][hq] = flash_exp<NP>(m[mt][hq] - mn);
                 m[mt][hq] = mn;
             }
             float sum[2] = {0.f, 0.f};
@@ -679,11 +757,14 @@ __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 
             for (int nt = 0; nt < 2; nt++)
 #pragma unroll
                 for (int hq = 0; hq < 2; hq++) {
-                    float e0 = expf(s[mt][nt][2 * hq] - m[mt][hq]);
-                    float e1 = expf(s[mt][nt][2 * hq + 1] - m[mt][hq]);
+                    float e0 = flash_exp<NP>(s[mt][nt][2 * hq] - m[mt][hq]);
+                    float e1 = flash_exp<NP>(s[mt][nt][2 * hq + 1] - m[mt][hq]);
                     sum[hq] += e0 + e1;
                     u32 at = (wm + 16 * mt + g + 8 * hq) * PLD + (wn >> 1) + 4 * nt + c4;
-                    split_h2(e0 * 16384.f, e1 * 16384.f, Ph[at], Pl[at]);
+                    if constexpr (NP == 1)
+                        Ph[at] = pack_h2(e0 * 16384.f, e1 * 16384.f);
+                    else
+                        split_h2(e0 * 16384.f, e1 * 16384.f, Ph[at], Pl[at]);
                 }
 #pragma unroll
             for (int hq = 0; hq < 2; hq++) {
@@ -702,10 +783,13 @@ __device__ __forceinline__ void flash_body(const AttP& p, u32 qlo, u32 qhi, u32 
                 u32 rr = wm + 16 * mt + g + 8 * hq;
                 l[mt][hq] = l[mt][hq] * alpha[mt][hq] + ((rsum[rr] + rsum[FQ + rr]) + (rsum[2 * FQ + rr] + rsum[3 * FQ + rr]));
             }
+            // (Mostly 1 once the maxima have settled.)
+            if (alpha[mt][0] != 1.f || alpha[mt][1] != 1.f) {
 #pragma unroll
-            for (int nt = 0; nt < NO; nt++)
+                for (int nt = 0; nt < NO; nt++)
 #pragma unroll
-                for (int q = 0; q < 4; q++) o[mt][nt][q] *= alpha[mt][q >> 1];
+                    for (int q = 0; q < 4; q++) o[mt][nt][q] *= alpha[mt][q >> 1];
+            }
         }
         flash_step<NO, NP>(o, Ph, Pl, PLD, Bh, Bl, PLD, wm, cn, g, c4, 0);
         flash_step<NO, NP>(o, Ph, Pl, PLD, Bh, Bl, PLD, wm, cn, g, c4, 16);
