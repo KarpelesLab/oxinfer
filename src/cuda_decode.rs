@@ -649,8 +649,11 @@ struct PfFuncs {
     xh_n: u32,
     norm_h: F,
     glu_h: F,
-    /// The stream-K GEMM's scratch ([`super::gemmh_fix_floats`]).
+    /// The stream-K GEMMs' scratch ([`super::gemmh_fix_floats`], [`super::gemmq_fix_floats`]).
     fix: u64,
+    /// The int8 GEMM (`gemmq_K`, [`super::gemm_i8`]) over the rows of [`CudaPlan::q8x`]: its
+    /// blocks' words (after the flag in the arena), or 0 when the plan does not take it.
+    qst: u64,
     glu: F,
     ew: F,
     qk: F,
@@ -867,6 +870,9 @@ thread_local! {
     /// decode plans f32 activations in their matvecs) or fast (false: the f16 GEMM, int8
     /// matvecs) whatever `gpu::exact` says ([`with_pf_exact`]; tests).
     static PF_EXACT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Fast prefill plans built on this thread take the int8 GEMM (true) or the f16 one (false)
+    /// whatever [`super::gemm_i8`] says ([`with_pf_i8`]; tests).
+    static PF_I8: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Runs `f` with the plans it builds on this thread exact (`gemmi`, f32 matvecs) or fast
@@ -876,6 +882,16 @@ pub(super) fn with_pf_exact<R>(exact: bool, f: impl FnOnce() -> R) -> R {
     let prev = PF_EXACT.with(|c| c.replace(Some(exact)));
     let r = f();
     PF_EXACT.with(|c| c.set(prev));
+    r
+}
+
+/// Runs `f` with the fast prefill plans it builds on this thread on the int8 GEMM (`gemmq`) or
+/// the f16 one (`gemmh`).
+#[cfg(test)]
+pub(super) fn with_pf_i8<R>(i8: bool, f: impl FnOnce() -> R) -> R {
+    let prev = PF_I8.with(|c| c.replace(Some(i8)));
+    let r = f();
+    PF_I8.with(|c| c.set(prev));
     r
 }
 
@@ -948,6 +964,10 @@ impl CudaBackend {
         // exact (`gpu::exact`; the attention also with `gpu::exact_attention`).
         let fast_gemm = pf && !PF_EXACT.with(|c| c.get()).unwrap_or_else(crate::gpu::exact);
         let fast_attn = fast_gemm && !crate::gpu::exact_attention();
+        // The int8 matvecs, and with them the fast prefill plans' int8 GEMM.
+        let q8 =
+            !PF_EXACT.with(|c| c.get()).unwrap_or_else(crate::gpu::exact) && std::env::var("OXINFER_CUDA_MVQ").map_or(true, |v| v != "0");
+        let gemm_i8 = fast_gemm && q8 && PF_I8.with(|c| c.get()).unwrap_or_else(super::gemm_i8);
         // The arena: every buffer 256-byte aligned; in a multi-token plan, `tokens` rows of `tsz`
         // floats (256-byte aligned too).
         let tsz: Vec<usize> = g.bufs.iter().map(|&n| if mt { n.next_multiple_of(64) } else { n }).collect();
@@ -1740,13 +1760,16 @@ impl CudaBackend {
         if head_from == usize::MAX {
             head_from = ops.len();
         }
-        let flag_off = region(4);
+        // The flag, then a word per block of an int8 GEMM's launch (a block per SM at most).
+        let flag_off = region(4 * (1 + super::sms() as usize));
         // The fast prefill GEMM's f16 input rows.
 
         let xh_off = region(if fast_gemm { gemm_in_max * tokens * 2 } else { 4 });
-        let fix_off = region(if fast_gemm { super::gemmh_fix_floats() * 4 } else { 4 });
-        let q8 =
-            !PF_EXACT.with(|c| c.get()).unwrap_or_else(crate::gpu::exact) && std::env::var("OXINFER_CUDA_MVQ").map_or(true, |v| v != "0");
+        let fix_off = region(if fast_gemm {
+            super::gemmh_fix_floats().max(if gemm_i8 { super::gemmq_fix_floats() } else { 0 }) * 4
+        } else {
+            4
+        });
         let q8x_off = region(if q8 { gemm_in_max * tokens } else { 4 });
         let q8d_off = region(if q8 { gemm_in_max / 32 * 8 * tokens } else { 4 });
         let part_off = region(part_floats.max(1) * 4);
@@ -1935,6 +1958,7 @@ impl CudaBackend {
                     norm_h: if fast_gemm { self.func("dnorm_h")? } else { std::ptr::null_mut() },
                     glu_h: if fast_gemm { self.func("dglu_th")? } else { std::ptr::null_mut() },
                     fix: arena + fix_off as u64,
+                    qst: if gemm_i8 { arena + flag_off as u64 + 4 } else { 0 },
                     glu: self.func("dglu_t")?,
                     ew: self.func("dew_t")?,
                     qk: self.func("dqk_rope_t")?,
@@ -2368,6 +2392,54 @@ impl CudaPlan<'_> {
         !pf.norm_h.is_null() && t >= PF_GEMM_MIN && n <= pf.xh_n && self.xh_next.get() == (out, n)
     }
 
+    /// The int8 GEMM of a prefill plan over the step's `tt` rows of `x` (`gemmq_K`; with `w2` the
+    /// gate / up pair and its activation, `gemmqp_K`, `mode` then 0 SiLU, 1 GELU): the rows
+    /// rounded to int8 per block of 32 once (as the decode plans' int8 matvecs round them, kept
+    /// for the GEMMs that follow over the same x), then stream-K in one launch. None for a
+    /// format without the kernels.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gemmq(
+        &self,
+        pf: &PfFuncs,
+        k: &super::GgKernels,
+        w: Wg,
+        w2: Option<Wg>,
+        x: P,
+        y: P,
+        n_out: u32,
+        n_in: u32,
+        mode: u32,
+        tt: u32,
+    ) -> Option<bool> {
+        let be = self.be;
+        let (f, g, threads, shm) = super::gemmq_launch(k, w2.is_some(), n_out, tt, n_in)?;
+        let (xa, xs, flag, fix) = (x.a, (x.ts / 4) as u32, pf.flag, pf.fix);
+        let (xq, xd) = self.q8x;
+        let key = (xa, xs, n_in, tt);
+        let fresh = self.q8_last.get() == key;
+        self.q8_last.set(key);
+        let p = super::GemmQ {
+            xq,
+            xd,
+            y: y.a,
+            st: pf.qst,
+            flag,
+            n_in,
+            n_out,
+            rows: tt,
+            ys: (y.ts / 4) as u32,
+            mode,
+            seq: super::gemmq_seq(),
+        };
+        Some(
+            (fresh || be.launch(k.dq8_t, ((n_in / 32).div_ceil(8), tt), 256, &mut args![xa, n_in, xs, xq, xd, flag]))
+                && match w2 {
+                    Some(w2) => be.launch_shm(f, (g, 1, 1), threads, shm, &mut args![w, w2, p, fix]),
+                    None => be.launch_shm(f, (g, 1, 1), threads, shm, &mut args![w, p, fix]),
+                },
+        )
+    }
+
     /// A prefill plan's launch of `op` over the step's `t` tokens at once; None for the ops
     /// without such a kernel (they run token by token).
     fn launch_pf(&self, pf: &PfFuncs, op: &COp, slot: &CudaSlot, t: usize) -> Option<bool> {
@@ -2386,6 +2458,12 @@ impl CudaPlan<'_> {
                 mode,
             } if t >= PF_GEMM_MIN => {
                 let (xa, xs, flag) = (x.a, st(x), pf.flag);
+                if pf.qst != 0
+                    && k.i8()
+                    && let Some(ok) = self.launch_gemmq(pf, &k, w, None, x, y, n_out, n_in, mode, tt)
+                {
+                    return Some(ok);
+                }
                 if !pf.half.is_null() {
                     // The fast GEMM: the rows as f16 once, then 128 x 128 tiles.
                     let xh = pf.xh;
@@ -2861,8 +2939,9 @@ impl CudaPlan<'_> {
             self.q8_last.set(Default::default());
             self.xh_last.set(Default::default());
         }
+        let i8 = self.pf.as_ref().is_some_and(|pf| pf.qst != 0);
         self.xh_next.set(match self.ops[..end].get(i + 1) {
-            Some(&COp::Gmv { x, n_in, w2: None, .. }) => (x.a, n_in),
+            Some(&COp::Gmv { k, x, n_in, w2: None, .. }) if !(i8 && k.i8()) => (x.a, n_in),
             _ => Default::default(),
         });
     }

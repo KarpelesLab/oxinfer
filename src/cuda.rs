@@ -111,6 +111,122 @@ pub(crate) fn gemmh_fix_floats() -> usize {
     2 * SMS.load(Ordering::Relaxed) as usize * 128 * 128
 }
 
+/// Dynamic shared memory of `gemmq*_K` over tiles of `bm` rows x `bn` outputs. `ks` 0: two
+/// stages of a 32-wide step, 48 bytes (32 int8 and padding) and a pair of floats per row and per
+/// output; else one stage of a group of `ks` steps, 32 `ks` + 16 bytes and `ks` pairs.
+pub(crate) const fn gemmq_shmem(bm: u32, bn: u32, ks: u32) -> u32 {
+    if ks == 0 { 2 * 56 * (bm + bn) } else { (bm + bn) * (40 * ks + 16) }
+}
+
+/// Whether the fast prefill plans take the int8 GEMM (`gemmq_K`, `cuda_gemmq.cu`) for the formats
+/// that have one ([`GgKernels::i8`]): the step's rows rounded to int8 per block of 32, as the
+/// decode plans' int8 matvecs and the CPU's default prompt GEMM round them, instead of f16 rows
+/// against f16 weight values. With the CPU's opt-out of that rounding (`prefill_gemm=exact`,
+/// `f32` or `sme`: [`crate::kernels::PrefillGemm`]) the plans keep the f16 GEMM;
+/// `OXINFER_CUDA_GEMM_I8=0` / `1`: never / always, for every format with the kernels.
+pub(crate) fn gemm_i8() -> bool {
+    use crate::kernels::PrefillGemm::*;
+    gemm_i8_env().unwrap_or_else(|| !matches!(crate::kernels::prefill_gemm(), Exact | F32 | Sme))
+}
+fn gemm_i8_env() -> Option<bool> {
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OXINFER_CUDA_GEMM_I8").ok().map(|v| v != "0"))
+}
+
+/// The int8 GEMM's tiles (`GEMMQ` in `cuda_gemmq.cu`): kernel suffix, rows, outputs, threads,
+/// 32-wide steps per group (0: a step at a time, two stages), blocks per SM.
+pub(crate) const GEMMQ_TILES: [(&str, u32, u32, u32, u32, u32); 3] =
+    [("", 256, 128, 256, 0, 1), ("s", 128, 128, 256, 0, 1), ("g", 64, 128, 256, 8, 1)];
+
+/// The launch of the int8 GEMM for `n_out` outputs over `rows` rows of `n_in` (`pair`: a gate /
+/// up pair with its activation, `gemmqp*_K`): (kernel, blocks, threads, dynamic shared memory),
+/// or None for a format without one. Always by stream-K, as many blocks as are resident at once
+/// at most (the blocks of a launch wait for each other).
+/// `OXINFER_CUDA_GEMMQ_TILE=RxN` or `=RxNg` (the kernels over groups of steps) takes one tile of
+/// [`GEMMQ_TILES`] always; `OXINFER_CUDA_GEMMQ_STEPS=N` sets the least steps or groups a block.
+fn gemmq_launch(k: &GgKernels, pair: bool, n_out: u32, rows: u32, n_in: u32) -> Option<(*mut c_void, u32, u32, u32)> {
+    static TILE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let forced = *TILE.get_or_init(|| {
+        let v = std::env::var("OXINFER_CUDA_GEMMQ_TILE").ok()?;
+        GEMMQ_TILES
+            .iter()
+            .position(|t| format!("{}x{}{}", t.1, t.2, if t.4 == 0 { "" } else { "g" }) == v)
+    });
+    // The weight rows a launch covers: both matrices' of a pair.
+    let wrows = if pair { 2 * n_out } else { n_out };
+    let i = forced.unwrap_or_else(|| gemmq_tile(wrows, rows, n_in, SMS.load(Ordering::Relaxed)));
+    gemmq_launch_on(k, pair, i, n_out, rows, n_in)
+}
+
+/// [`gemmq_launch`] on tile `i` of [`GEMMQ_TILES`].
+fn gemmq_launch_on(k: &GgKernels, pair: bool, i: usize, n_out: u32, rows: u32, n_in: u32) -> Option<(*mut c_void, u32, u32, u32)> {
+    static MIN: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let min = *MIN.get_or_init(|| std::env::var("OXINFER_CUDA_GEMMQ_STEPS").ok().and_then(|v| v.parse().ok()));
+    let sms = SMS.load(Ordering::Relaxed);
+    let nb = (n_in / 32) as u64;
+    let wrows = if pair { 2 * n_out } else { n_out };
+    let (_, bm, bn, threads, ks, per_sm) = GEMMQ_TILES[i];
+    let f = if pair { k.gemmqp[i] } else { k.gemmq[i] };
+    if f.is_null() || k.dq8_t.is_null() {
+        return None;
+    }
+    let tiles = (wrows.div_ceil(bn) * rows.div_ceil(bm)) as u64;
+    let cap = (sms * per_sm) as u64;
+    let g = if ks == 0 {
+        cap.min(tiles * nb / min.unwrap_or(8).max(1))
+    } else {
+        // A whole tile to each block (no parts through the scratch, which cost a block about
+        // what 8 groups do) unless shares of the tiles' groups over every SM are shorter by
+        // more than that.
+        let ng = nb.div_ceil(ks as u64);
+        if tiles < cap && ng * (cap - tiles) > min.unwrap_or(8) * cap {
+            cap.min(tiles * ng / 2)
+        } else {
+            cap.min(tiles)
+        }
+    };
+    Some((f, g.max(1) as u32, threads, gemmq_shmem(bm, bn, ks)))
+}
+
+/// The tile of [`GEMMQ_TILES`] for `wrows` weight rows over `rows` rows of `n_in`, on `sms` SMs.
+/// Measured on an RTX 5080 and a GB10 (docs/platforms.md, "The int8 prefill GEMM"): up to 64
+/// rows the 64 x 128 tile over groups of 8 steps (a step of so few MMAs waits for its loads);
+/// past that a step at a time, 256 x 128 where a block's share is long (64 steps of those
+/// tiles and more) and 128 x 128 where it is shorter (most blocks then leave a part of a tile
+/// in the scratch, and the smaller tile is less to write and read back).
+fn gemmq_tile(wrows: u32, rows: u32, n_in: u32, sms: u32) -> usize {
+    let steps = (wrows.div_ceil(128) * rows.div_ceil(256)) as u64 * (n_in / 32) as u64;
+    if rows <= 64 {
+        2
+    } else if rows > 128 && steps >= 64 * sms as u64 {
+        0
+    } else {
+        1
+    }
+}
+
+/// Floats of the int8 GEMM's scratch: a tile per block of its largest grid.
+pub(crate) fn gemmq_fix_floats() -> usize {
+    SMS.load(Ordering::Relaxed) as usize * GEMMQ_TILES.iter().map(|t| (t.1 * t.2 * t.5) as usize).max().unwrap_or(0)
+}
+
+/// The launch counter of the int8 GEMMs (`GemmQ::seq`: the value a block writes to its word when
+/// its part of a tile is in the scratch; never 0, what the words start as).
+pub(crate) fn gemmq_seq() -> u32 {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    loop {
+        let v = SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if v != 0 {
+            return v;
+        }
+    }
+}
+
+/// Streaming multiprocessors of the device in use.
+pub(crate) fn sms() -> u32 {
+    SMS.load(Ordering::Relaxed)
+}
+
 /// Whether the device in use shares the system's memory ([`INTEGRATED`]).
 pub(crate) fn integrated() -> bool {
     INTEGRATED.load(Ordering::Relaxed)
@@ -515,6 +631,14 @@ struct GgKernels {
     /// `gemmhk5_K`: stream-K over 512 x 64 tiles (the same warps; [`GEMMHK5_SHMEM`]): a step of
     /// up to 512 rows unpacks each weight once ([`gemm_512`]).
     pub(crate) gemmhk5: *mut c_void,
+    /// `gemmq*_K`: the int8 prefill GEMM by stream-K, a kernel per tile of [`GEMMQ_TILES`] (Q4_K,
+    /// Q5_K, Q6_K, Q8_0; null for the other formats), over x rounded by `dq8_x`
+    /// ([`gemmq_launch`]).
+    pub(crate) gemmq: [*mut c_void; GEMMQ_TILES.len()],
+    /// `gemmqp*_K`: the same over a gate / up pair of one format, writing act(gate) * up.
+    pub(crate) gemmqp: [*mut c_void; GEMMQ_TILES.len()],
+    /// The format scales per 16 values (Q6_K).
+    pub(crate) k16: bool,
     /// `mvq_K` / `mvqp_K`: the int8 matvec and gate / up pair (Q4_K, Q6_K, Q8_0; null for the
     /// other formats) over x rounded by `dq8_x`.
     pub(crate) mvq: *mut c_void,
@@ -527,6 +651,25 @@ struct GgKernels {
     pub(crate) mvqpt: *mut c_void,
     pub(crate) mvq3t: *mut c_void,
     pub(crate) dq8_x: *mut c_void,
+    /// `dq8_t`: `dq8_x` that also sets a flag when a value is not finite (the int8 GEMM's
+    /// input; null with `gemmq`).
+    pub(crate) dq8_t: *mut c_void,
+}
+
+impl GgKernels {
+    /// Whether the format has the int8 GEMM's kernels.
+    pub(crate) fn has_gemmq(&self) -> bool {
+        !self.gemmq[0].is_null() && !self.gemmqp[0].is_null() && !self.dq8_t.is_null()
+    }
+
+    /// Whether a plan with the int8 GEMM ([`gemm_i8`]) takes it for this format: every format
+    /// with the kernels on a discrete card; on a unified-memory device not the formats with a
+    /// scale per 16 values (Q6_K: two 16-wide MMAs and twice the scaling a step), which
+    /// the f16 GEMM runs faster there (measured on a GB10, docs/platforms.md, "The int8 prefill
+    /// GEMM"; `OXINFER_CUDA_GEMM_I8=1` takes them too).
+    pub(crate) fn i8(&self) -> bool {
+        self.has_gemmq() && (!self.k16 || !integrated() || gemm_i8_env() == Some(true))
+    }
 }
 
 /// Rows per warp of the ggml matvec kernel of `kind` (`MV_ROWS` in `inkling_cuda.cu`), 0 for the
@@ -644,6 +787,26 @@ pub(crate) struct GemmH {
     pub xs: u32,
     pub ys: u32,
     pub mode: u32,
+}
+
+/// The int8 prefill GEMM's parameters (`GemmQ` in `cuda_gemmq.cu`): `rows` rows of `n_in` int8 at
+/// `xq` with their blocks' (d, d sum q) at `xd` (rows of `n_in / 32` pairs), into rows of `y`
+/// (`ys` floats apart; `mode` 1 adds); `st`: a word per block of the launch, `flag`: set when a
+/// block gave up waiting for another's, `seq`: this launch ([`gemmq_seq`]).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GemmQ {
+    pub(crate) xq: u64,
+    pub(crate) xd: u64,
+    pub(crate) y: u64,
+    pub(crate) st: u64,
+    pub(crate) flag: u64,
+    pub(crate) n_in: u32,
+    pub(crate) n_out: u32,
+    pub(crate) rows: u32,
+    pub(crate) ys: u32,
+    pub(crate) mode: u32,
+    pub(crate) seq: u32,
 }
 
 /// Whether every value is finite and below 32768 in magnitude: what the ggml GEMMs' split into
@@ -1281,7 +1444,16 @@ impl CudaBackend {
             0 => (String::new(), String::new()),
             n => (format!("#define MV_ROWS {n}\n"), format!("-r{n}")),
         };
-        let src = format!("#define GGML_ONLY 1\n#define HAS_{id} 1\n{defs}{def}{}{body}", ggml_tables_src());
+        let gemmq = include_str!("cuda_gemmq.cu");
+        #[cfg(test)]
+        let gemmq = &std::env::var("OXINFER_GEMMQ_CU")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_else(|| gemmq.to_string());
+        let src = format!(
+            "#define GGML_ONLY 1\n#define HAS_{id} 1\n{defs}{def}{}{body}\n{gemmq}",
+            ggml_tables_src()
+        );
         match self.cached_module(&src, &format!("ggml-{{sm}}-{id}{tag}"), "ggml.cu") {
             Ok(module) => {
                 let get = |name: String| -> Option<*mut c_void> {
@@ -1309,6 +1481,17 @@ impl CudaBackend {
                         // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
                         unsafe { self.cu.cuFuncSetAttribute(f, 8, GEMMHK5_SHMEM as c_int) == 0 }
                     })?,
+                    gemmq: GEMMQ_TILES.map(|(sfx, bm, bn, _, ks, _)| {
+                        get(format!("gemmq{sfx}_{id}"))
+                            .filter(|&f| unsafe { self.cu.cuFuncSetAttribute(f, 8, gemmq_shmem(bm, bn, ks) as c_int) == 0 })
+                            .unwrap_or(std::ptr::null_mut())
+                    }),
+                    k16: id == 14,
+                    gemmqp: GEMMQ_TILES.map(|(sfx, bm, bn, _, ks, _)| {
+                        get(format!("gemmqp{sfx}_{id}"))
+                            .filter(|&f| unsafe { self.cu.cuFuncSetAttribute(f, 8, gemmq_shmem(bm, bn, ks) as c_int) == 0 })
+                            .unwrap_or(std::ptr::null_mut())
+                    }),
                     mvq: q8.then(|| get(format!("mvq_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
                     mvqp: q8.then(|| get(format!("mvqp_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
                     mvq3: q8.then(|| get(format!("mvq3_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
@@ -1316,6 +1499,7 @@ impl CudaBackend {
                     mvqpt: q8.then(|| get(format!("mvqpt_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
                     mvq3t: q8.then(|| get(format!("mvq3t_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
                     dq8_x: get("dq8_x".to_string())?,
+                    dq8_t: get("dq8_t".to_string()).unwrap_or(std::ptr::null_mut()),
                 })
             }
             Err(e) => {
@@ -3911,6 +4095,200 @@ mod tests {
         }
     }
 
+    /// The int8 prefill GEMM (`cuda_gemmq.cu`) of every format that has one, on each of its
+    /// tiles over row counts and shapes that leave parts of tiles to the scratch: against the
+    /// exact GEMM over the rows it rounds x to (so only the order of the f32 sums differs), and
+    /// its gate / up pair against the two GEMMs and the activation on the host.
+    #[test]
+    fn ggml_int8_gemm_matches_exact_over_rounded_rows() {
+        use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
+        let Some(be) = backend() else { return };
+        assert!(be.bind());
+        let sync = || assert_eq!(unsafe { be.cu.cuCtxSynchronize() }, 0);
+        let sms = SMS.load(Ordering::Relaxed) as usize;
+        let mut seed = 11;
+        // The tiles the plans take: by the rows, then by the length of a block's share.
+        assert_eq!(gemmq_tile(2000, 290, 8192, 84), 0);
+        assert_eq!(gemmq_tile(520, 300, 1024, 84), 1);
+        assert_eq!(gemmq_tile(330, 100, 768, 84), 1);
+        assert_eq!(gemmq_tile(16384, 64, 2048, 84), 2);
+        let mut fix = 0u64;
+        assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut fix, gemmq_fix_floats() * 4) }, 0);
+        let words = vec![0u32; 1 + 2 * sms];
+        let stw = be.upload_bytes(words.as_ptr() as *const u8, words.len() * 4).unwrap();
+        for kind in [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K, GgmlType::Q8_0] {
+            // (rows, outputs, inputs).
+            for (t, n_out, n_in) in [(9usize, 200usize, 256usize), (64, 1100, 512), (100, 330, 768), (300, 520, 1024)] {
+                let bytes = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
+                let bytes2 = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
+                let (m, m2) = (
+                    GgufMatrix::from_bytes(kind, &bytes, n_out, n_in).unwrap(),
+                    GgufMatrix::from_bytes(kind, &bytes2, n_out, n_in).unwrap(),
+                );
+                let (cw, cw2) = (
+                    be.upload_weight(&WeightRef::Gguf(&m)).unwrap(),
+                    be.upload_weight(&WeightRef::Gguf(&m2)).unwrap(),
+                );
+                let ((k, w), (_, w2)) = (Wg::of(&cw).unwrap(), Wg::of(&cw2).unwrap());
+                assert!(k.has_gemmq(), "{kind}");
+                let nb = n_in / 32;
+                // Rows with a few large values, as a model's activations have.
+                let x: Vec<f32> = (0..t * n_in)
+                    .map(|i| rnd(&mut seed) * if i % 97 == 0 { 40.0 } else { 2.0 })
+                    .collect();
+                let dx = be.upload_bytes(x.as_ptr() as *const u8, x.len() * 4).unwrap();
+                let (mut dy, mut xq, mut xd) = (0u64, 0u64, 0u64);
+                assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut dy, t * n_out * 4) }, 0);
+                assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut xq, t * n_in) }, 0);
+                assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut xd, t * nb * 8) }, 0);
+                let (ni, no, tt) = (n_in as u32, n_out as u32, t as u32);
+                let mut a = [
+                    &dx as *const _ as *mut c_void,
+                    &ni as *const _ as *mut c_void,
+                    &ni as *const _ as *mut c_void,
+                    &xq as *const _ as *mut c_void,
+                    &xd as *const _ as *mut c_void,
+                    &stw as *const _ as *mut c_void,
+                ];
+                assert!(be.launch(k.dq8_t, ((ni / 32).div_ceil(8), tt), 256, &mut a));
+                let run = |tile: usize, wa: Wg, pair: Option<Wg>, mode: u32| -> Vec<f32> {
+                    let (f, g, threads, shm) = gemmq_launch_on(&k, pair.is_some(), tile, no, tt, ni).unwrap();
+                    let pq = GemmQ {
+                        xq,
+                        xd,
+                        y: dy,
+                        st: stw + 4,
+                        flag: stw,
+                        n_in: ni,
+                        n_out: no,
+                        rows: tt,
+                        ys: no,
+                        mode,
+                        seq: gemmq_seq(),
+                    };
+                    let wb = pair.unwrap_or(wa);
+                    let mut a = [
+                        &wa as *const _ as *mut c_void,
+                        &wb as *const _ as *mut c_void,
+                        &pq as *const _ as *mut c_void,
+                        &fix as *const _ as *mut c_void,
+                    ];
+                    let a: &mut [*mut c_void] = if pair.is_some() { &mut a } else { &mut a[1..] };
+                    assert!(be.launch_shm(f, (g, 1, 1), threads, shm, a));
+                    sync();
+                    let mut y = vec![0f32; t * n_out];
+                    assert!(be.dtoh(&mut y, dy));
+                    y
+                };
+                // x as rounded (d q per block), through the exact GEMM.
+                let mut qb = vec![0f32; t * n_in / 4];
+                let mut db = vec![0f32; t * nb * 2];
+                sync();
+                assert!(be.dtoh(&mut qb, xq) && be.dtoh(&mut db, xd));
+                let qb: &[i8] = unsafe { std::slice::from_raw_parts(qb.as_ptr() as *const i8, t * n_in) };
+                let xr: Vec<f32> = (0..t * n_in)
+                    .map(|i| db[2 * ((i / n_in) * nb + (i % n_in) / 32)] * qb[i] as f32)
+                    .collect();
+                // The rounding is the decode kernels': within half a step of each value.
+                for (i, (&a, &b)) in x.iter().zip(&xr).enumerate() {
+                    let d = db[2 * ((i / n_in) * nb + (i % n_in) / 32)];
+                    assert!((a - b).abs() <= 0.5001 * d, "{kind} t {t}: x[{i}] {a} rounded to {b} (step {d})");
+                }
+                let dxr = be.upload_bytes(xr.as_ptr() as *const u8, xr.len() * 4).unwrap();
+                let exact = |wa: Wg| -> Vec<f32> {
+                    let p = GemmP {
+                        x: dxr,
+                        y: dy,
+                        n_in: ni,
+                        n_out: no,
+                        rows: tt,
+                        xs: ni,
+                        ys: no,
+                        ..GemmP::default()
+                    };
+                    assert!(be.gemm_gg_p(k, wa, p));
+                    sync();
+                    let mut y = vec![0f32; t * n_out];
+                    assert!(be.dtoh(&mut y, dy));
+                    y
+                };
+                let (eg, eu) = (exact(w), exact(w2));
+                let scale = eg.iter().chain(&eu).fold(0f32, |m, v| m.max(v.abs()));
+                for tile in 0..GEMMQ_TILES.len() {
+                    let (_, bm, bn, ..) = GEMMQ_TILES[tile];
+                    let what = format!("{kind} {n_out} x {n_in} over {t} rows on {bm} x {bn} tiles");
+                    let (yg, yu) = (run(tile, w, None, 0), run(tile, w2, None, 0));
+                    for (which, e, y) in [("gate", &eg, &yg), ("up", &eu, &yu)] {
+                        let worst = e.iter().zip(y).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                        assert!(worst <= 2e-5 * scale, "{what} ({which}): {worst:e} of {scale:e}");
+                    }
+                    // mode 1 adds.
+                    let ya = run(tile, w, None, 1);
+                    let worst = ya
+                        .iter()
+                        .zip(yg.iter().zip(&yu))
+                        .fold(0f32, |m, (a, (g, u))| m.max((a - (g + u)).abs()));
+                    assert!(worst <= 2e-5 * scale, "{what} (add): {worst:e} of {scale:e}");
+                    for gelu in 0..2u32 {
+                        let yp = run(tile, w, Some(w2), gelu);
+                        let (mut worst, mut ps) = (0f32, 0f32);
+                        for ((&g, &u), &o) in yg.iter().zip(&yu).zip(&yp) {
+                            let act = if gelu == 1 {
+                                0.5 * g * (1.0 + (0.797_884_6 * (g + 0.044715 * g * g * g)).tanh())
+                            } else {
+                                g / (1.0 + (-g).exp())
+                            };
+                            worst = worst.max((act * u - o).abs());
+                            ps = ps.max(o.abs());
+                        }
+                        assert!(worst <= 2e-5 * ps, "{what} (pair, gelu {gelu}): {worst:e} of {ps:e}");
+                    }
+                }
+                let mut flag = [0f32; 1];
+                assert!(be.dtoh(&mut flag, stw));
+                assert_eq!(
+                    flag[0].to_bits(),
+                    0,
+                    "{kind} {n_out} x {n_in} over {t} rows: a block gave up waiting"
+                );
+                be.free_weight(&cw);
+                be.free_weight(&cw2);
+                unsafe {
+                    for b in [dx, dy, xq, xd, dxr] {
+                        be.cu.cuMemFree_v2(b);
+                    }
+                }
+            }
+        }
+        unsafe {
+            be.cu.cuMemFree_v2(fix);
+            be.cu.cuMemFree_v2(stw);
+        }
+        // A value that is not finite sets the flag.
+        let x = [1.0f32, f32::INFINITY].repeat(16);
+        let dx = be.upload_bytes(x.as_ptr() as *const u8, 128).unwrap();
+        let out = be.upload_bytes([0u8; 64].as_ptr(), 64).unwrap();
+        let (n, k) = (32u32, be.gg_kernels(GgmlType::Q4_K).unwrap());
+        let (xq, xd, flag) = (out, out + 32, out + 48);
+        let mut a = [
+            &dx as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+            &xq as *const _ as *mut c_void,
+            &xd as *const _ as *mut c_void,
+            &flag as *const _ as *mut c_void,
+        ];
+        assert!(be.launch(k.dq8_t, (1, 1), 256, &mut a));
+        sync();
+        let mut f = [0f32; 1];
+        assert!(be.dtoh(&mut f, flag));
+        assert_eq!(f[0].to_bits(), 1);
+        unsafe {
+            be.cu.cuMemFree_v2(dx);
+            be.cu.cuMemFree_v2(out);
+        }
+    }
+
     /// The ggml kernels (`inkling_cuda.cu` compiled per format): the matvec and the GEMM of every
     /// format with device kernels against the dequantized rows' products in f64.
     #[test]
@@ -4612,7 +4990,8 @@ mod tests {
         let one_q = decode::with_pf_exact(false, || be.build_plan(&g, 1)).expect("int8 single-token plan");
         let multi_q = decode::with_pf_exact(false, || be.build_plan(&g, 8)).expect("int8 multi-token plan");
         let pf = decode::with_pf_exact(true, || be.build_plan_pf(&g, 2048)).expect("prefill plan");
-        let pf_fast = decode::with_pf_exact(false, || be.build_plan_pf(&g, 2048)).expect("fast prefill plan");
+        let pf_fast = decode::with_pf_i8(false, || decode::with_pf_exact(false, || be.build_plan_pf(&g, 2048))).expect("fast prefill plan");
+        let pf_i8 = decode::with_pf_i8(true, || decode::with_pf_exact(false, || be.build_plan_pf(&g, 2048))).expect("int8 prefill plan");
         let r1 = run(&one, &vec![1; n]);
         assert!(r1.0.iter().all(|v| v.is_finite()) && r1.0.iter().any(|&v| v.abs() > 0.1));
         // Multi-token steps: a grid row per token of the same kernels.
@@ -4678,6 +5057,33 @@ mod tests {
                 worst <= 1e-2 * scale,
                 "fast prefill plan: {what} differ by {worst:.2e} (largest value {scale:.2e})"
             );
+        }
+        // The int8 GEMM: to x's rounding to int8
+        // of the f32 steps, as the int8 matvecs' steps are, and of those (the same rounding of
+        // the same x until the sums' order moves a value across a step). The recurrent states
+        // are the furthest: 2.2% of their largest value from the int8 matvecs' on an RTX 5080,
+        // 3.1% from the f32 steps' on a GB10 (where the formats with a scale per 16 keep the f16
+        // GEMM).
+        for steps in [&[40usize, 67][..], &[107], &[9, 64, 34]] {
+            let ri = run(&pf_i8, steps);
+            for (what, a, q, b) in [
+                ("hidden", &r1.0, &q1.0, &ri.0),
+                ("keys", &r1.1, &q1.1, &ri.1),
+                ("values", &r1.2, &q1.2, &ri.2),
+                ("states", &r1.3, &q1.3, &ri.3),
+            ] {
+                let scale = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let worst = a.iter().zip(b).fold(0f32, |m, (p, q)| m.max((p - q).abs()));
+                assert!(
+                    worst <= 5e-2 * scale,
+                    "int8 prefill plan in steps of {steps:?}: {what} differ by {worst:.2e} (largest value {scale:.2e})"
+                );
+                let worst = q.iter().zip(b).fold(0f32, |m, (p, q)| m.max((p - q).abs()));
+                assert!(
+                    worst <= 5e-2 * scale,
+                    "int8 prefill plan in steps of {steps:?}: {what} differ by {worst:.2e} from the int8 matvecs' (largest value {scale:.2e})"
+                );
+            }
         }
         // Batched rows (`step_rows`, the server's concurrent requests): eight sequences at
         // different positions, a token of each per step, give each sequence's one-token steps'
@@ -5149,7 +5555,8 @@ mod tests {
 
     /// `cargo test --profile ci --lib ggml_bench -- --ignored --nocapture`: the ggml matvec (GB/s
     /// of weights read) and GEMM (TFLOP/s at 512 tokens) on matrices of Qwen3.8-27B's shapes.
-    /// `OXINFER_GGML_CU=file` compiles the kernels from a file, `BENCH_KINDS=23,21` picks formats.
+    /// `OXINFER_GGML_CU=file` compiles the kernels from a file, `BENCH_KINDS=23,21` picks formats,
+    /// `BENCH_T=64` the rows.
     #[test]
     #[ignore]
     fn ggml_bench() {
@@ -5159,7 +5566,7 @@ mod tests {
         let kinds: Vec<u32> = std::env::var("BENCH_KINDS")
             .map(|v| v.split(',').map(|k| k.parse().unwrap()).collect())
             .unwrap_or_else(|_| vec![23, 21, 12]);
-        let t = 512usize;
+        let t: usize = std::env::var("BENCH_T").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
         let mut seed = 5;
         for id in kinds {
             let kind = GgmlType::from_id(id).unwrap();
@@ -5226,7 +5633,10 @@ mod tests {
                     };
                     let g = 2 * SMS.load(Ordering::Relaxed);
                     let mut fix = 0u64;
-                    assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut fix, g as usize * 128 * 128 * 4) }, 0);
+                    assert_eq!(
+                        unsafe { be.cu.cuMemAlloc_v2(&mut fix, (g as usize * 128 * 128).max(gemmq_fix_floats()) * 4) },
+                        0
+                    );
                     let sk_with = |f: *mut c_void, g: u32, threads: u32, bm: u32, bn: u32, shm: u32| {
                         let mut a = [
                             &w as *const _ as *mut c_void,
@@ -5297,6 +5707,143 @@ mod tests {
                         worst2,
                         worst5
                     );
+                    // The int8 GEMM: against the exact GEMM over the rows it rounds x to, and
+                    // its time.
+                    if !k.gemmq[0].is_null() {
+                        let nb = n_in / 32;
+                        let (mut xq, mut xd) = (0u64, 0u64);
+                        assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut xq, t * n_in) }, 0);
+                        assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut xd, t * nb * 8) }, 0);
+                        let stw = be.upload_bytes(vec![0u8; 4 * g as usize + 4].as_ptr(), 4 * g as usize + 4).unwrap();
+                        let mut a = [
+                            &dx as *const _ as *mut c_void,
+                            &ni as *const _ as *mut c_void,
+                            &ni as *const _ as *mut c_void,
+                            &xq as *const _ as *mut c_void,
+                            &xd as *const _ as *mut c_void,
+                        ];
+                        assert!(be.launch(k.dq8_x, ((ni / 32).div_ceil(8), t as u32), 256, &mut a));
+                        let q = || {
+                            let (f, gq, threads, shm) = gemmq_launch(&k, false, no, t as u32, ni).unwrap();
+                            let pq = GemmQ {
+                                xq,
+                                xd,
+                                y: dy,
+                                st: stw,
+                                flag: stw + 4 * g as u64,
+                                n_in: ni,
+                                n_out: no,
+                                rows: t as u32,
+                                ys: no,
+                                mode: 0,
+                                seq: gemmq_seq(),
+                            };
+                            let mut a = [
+                                &w as *const _ as *mut c_void,
+                                &pq as *const _ as *mut c_void,
+                                &fix as *const _ as *mut c_void,
+                            ];
+                            assert!(be.launch_shm(f, (gq, 1, 1), threads, shm, &mut a));
+                        };
+                        q();
+                        sync();
+                        assert!(be.dtoh(&mut yb, dy));
+                        let vs_f16 = ya.iter().zip(&yb).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                        // x as rounded: d q per block.
+                        let mut qb = vec![0f32; t * n_in / 4];
+                        let mut db = vec![0f32; t * nb * 2];
+                        assert!(be.dtoh(&mut qb, xq) && be.dtoh(&mut db, xd));
+                        let qb: &[i8] = unsafe { std::slice::from_raw_parts(qb.as_ptr() as *const i8, t * n_in) };
+                        let xr: Vec<f32> = (0..t * n_in)
+                            .map(|i| db[2 * ((i / n_in) * nb + (i % n_in) / 32)] * qb[i] as f32)
+                            .collect();
+                        let dxr = be.upload_bytes(xr.as_ptr() as *const u8, xr.len() * 4).unwrap();
+                        assert!(be.gemm_gg_p(k, w, GemmP { x: dxr, ..p }));
+                        sync();
+                        let mut yr = vec![0f32; t * n_out];
+                        assert!(be.dtoh(&mut yr, dy));
+                        let vs_exact = yr.iter().zip(&yb).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                        let mut fl32 = [0f32; 1];
+                        assert!(be.dtoh(&mut fl32, stw + 4 * g as u64));
+                        let tq = timed(&q);
+                        eprintln!(
+                            "{kind} {n_out} x {n_in}: int8 gemm {:.0} us ({:.1} TFLOP/s); differs by {vs_exact:.1e} from the exact GEMM over its rounded rows and by {vs_f16:.1e} from the f16 GEMM, of {scale:.1e}; flag {}",
+                            tq * 1e6,
+                            fl / tq / 1e12,
+                            fl32[0].to_bits()
+                        );
+                        // A gate / up pair (a second matrix as the up) against the two GEMMs
+                        // and the activation on the host.
+                        if !k.gemmqp[0].is_null() {
+                            let bytes2 = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
+                            let m2 = GgufMatrix::from_bytes(kind, &bytes2, n_out, n_in).unwrap();
+                            let cw2 = be.upload_weight(&WeightRef::Gguf(&m2)).unwrap();
+                            let (_, w2) = Wg::of(&cw2).unwrap();
+                            let run = |wa: Wg, pair: Option<Wg>, gelu: u32| {
+                                let (f, gq, threads, shm) = gemmq_launch(&k, pair.is_some(), no, t as u32, ni).unwrap();
+                                let pq = GemmQ {
+                                    xq,
+                                    xd,
+                                    y: dy,
+                                    st: stw,
+                                    flag: stw + 4 * g as u64,
+                                    n_in: ni,
+                                    n_out: no,
+                                    rows: t as u32,
+                                    ys: no,
+                                    mode: gelu,
+                                    seq: gemmq_seq(),
+                                };
+                                let wb = pair.unwrap_or(wa);
+                                let mut a = [
+                                    &wa as *const _ as *mut c_void,
+                                    &wb as *const _ as *mut c_void,
+                                    &pq as *const _ as *mut c_void,
+                                    &fix as *const _ as *mut c_void,
+                                ];
+                                let a: &mut [*mut c_void] = if pair.is_some() { &mut a } else { &mut a[1..] };
+                                assert!(be.launch_shm(f, (gq, 1, 1), threads, shm, a));
+                            };
+                            let mut yg = vec![0f32; t * n_out];
+                            let mut yu = vec![0f32; t * n_out];
+                            run(w, None, 0);
+                            sync();
+                            assert!(be.dtoh(&mut yg, dy));
+                            run(w2, None, 0);
+                            sync();
+                            assert!(be.dtoh(&mut yu, dy));
+                            let mut worst = [0f32; 2];
+                            for gelu in 0..2u32 {
+                                run(w, Some(w2), gelu);
+                                sync();
+                                assert!(be.dtoh(&mut yb, dy));
+                                for ((&g, &u), &o) in yg.iter().zip(&yu).zip(&yb) {
+                                    let act = if gelu == 1 {
+                                        0.5 * g * (1.0 + (0.797_884_6 * (g + 0.044715 * g * g * g)).tanh())
+                                    } else {
+                                        g / (1.0 + (-g).exp())
+                                    };
+                                    worst[gelu as usize] = worst[gelu as usize].max((act * u - o).abs());
+                                }
+                            }
+                            let pscale = yb.iter().fold(0f32, |m, v| m.max(v.abs()));
+                            let tp = timed(&|| run(w, Some(w2), 0));
+                            eprintln!(
+                                "{kind} {n_out} x {n_in}: int8 gate / up pair {:.0} us ({:.1} TFLOP/s); differs by {:.1e} (SiLU) and {:.1e} (GELU) from the two GEMMs and the activation, of {pscale:.1e}",
+                                tp * 1e6,
+                                2.0 * fl / tp / 1e12,
+                                worst[0],
+                                worst[1]
+                            );
+                            be.free_weight(&cw2);
+                        }
+                        unsafe {
+                            be.cu.cuMemFree_v2(xq);
+                            be.cu.cuMemFree_v2(xd);
+                            be.cu.cuMemFree_v2(stw);
+                            be.cu.cuMemFree_v2(dxr);
+                        }
+                    }
                     unsafe {
                         be.cu.cuMemFree_v2(dxh);
                         be.cu.cuMemFree_v2(fix);

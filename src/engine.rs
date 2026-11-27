@@ -230,7 +230,9 @@ pub struct EngineOptions {
     /// `fast` (SME and `int8` at once: fastest, KL ~1e-4..1e-3),
     /// `int8x2` (int8 SDOT GEMM with a residual activation plane), `int8` (one plane: KL ~1e-3
     /// against f32), `f32` (dequantized weights times f32 activations on the NEON / AVX2 FMA
-    /// GEMM). Process-wide, applied on load; None leaves the current setting
+    /// GEMM). On CUDA a GGUF model's prompt takes an int8 GEMM with the same activation rounding
+    /// unless this is `exact`, `sme` or `f32`, which keep f16 operands there. Process-wide,
+    /// applied on load; None leaves the current setting
     /// ([`crate::kernels::set_prefill_gemm`]; also `OXINFER_PREFILL_GEMM`). Decoding is
     /// unaffected. Key `prefill_gemm`.
     pub prefill_gemm: Option<crate::kernels::PrefillGemm>,
