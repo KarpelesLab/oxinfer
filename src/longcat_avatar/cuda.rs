@@ -13,10 +13,15 @@
 //! two halves `hi + lo 2^-11` (two products per GEMM, three per attention product: float32
 //! results to about 1e-6, at about twice the time).
 //!
-//! The default path's attention is laid out for a GPU whose kernels wait on memory rather than
-//! on the tensor cores (a GB10, which shares the machine's memory): blocks of 128 queries (each
-//! read of a step's keys and values serves twice the queries of a block of 64), and no planes
-//! for the operands' second halves.
+//! The default path is laid out for a GPU whose kernels wait on memory rather than on the
+//! tensor cores (measured on a GB10, which shares the machine's memory: with the products
+//! removed a GEMM took 90% of its time, with its reads removed 60%): GEMMs in tiles of 128 x 128
+//! (half the reads per product of `gemm_body`'s 64 x 64), attention in blocks of 128 queries
+//! (each read of a step's keys and values serves twice the queries), the weights of a GEMM in
+//! groups of outputs that stay in the cache (12 MB on a GPU sharing the machine's memory), no
+//! planes for the operands' second halves, and what follows a matrix as part of its GEMM's
+//! output instead of a pass of its own over the activations: the LoRAs' side paths, the gated
+//! residual, SwiGLU's product.
 //!
 //! Weights: `base_model_int8/` goes to the device byte for byte (0.33 GB a block); the bf16
 //! `base_model/` as float16 (exact but for values under 2^-14; 0.66 GB a block). The LoRAs are
@@ -148,6 +153,47 @@ struct GemmP {
 struct LcGemmP {
     p: GemmP,
     cs: u64,
+}
+
+/// `LcFastP` of `cuda.cu`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LcFastP {
+    p: GemmP,
+    cs: u64,
+    uh: [u64; 2],
+    bw: [u64; 2],
+    urs: [u64; 2],
+    tab: u64,
+    uf: [f32; 2],
+    ur: u32,
+    us: u32,
+    mode: u32,
+    s: u32,
+    frame0: u32,
+    stride: u32,
+    gate_at: u32,
+    row0: u32,
+}
+
+/// What a matrix's output becomes on the default path (`mode` of `LcFastP`).
+#[derive(Clone, Copy)]
+enum Out {
+    /// `y = v`.
+    Store,
+    /// `y += gate v`, `y` the residual stream: the gate at `gate_at` of the row's frame in `tab`
+    /// (`stride` floats per frame; row r is row `row0 + r` of frame `frame0 + (row0 + r) / s`),
+    /// or 1 with `tab` 0.
+    Resid {
+        tab: u64,
+        s: u32,
+        frame0: u32,
+        stride: u32,
+        gate_at: u32,
+        row0: u32,
+    },
+    /// `y = v silu(y)`: `y` holds the gate rows of the SwiGLU.
+    Swiglu,
 }
 
 /// `LcAttP` of `cuda.cu` (`AttP`, then the ranges).
@@ -308,6 +354,11 @@ struct Bufs {
     tkv: u64,
     audio: u64,
     akv: u64,
+    /// Floats per row of a side path's `u`, the halves per row of its planes (per section), and
+    /// the rows a GEMM may have.
+    u_stride: usize,
+    u_rp: usize,
+    rmax: usize,
 }
 
 impl Arena {
@@ -335,6 +386,9 @@ impl Arena {
             tkv: p[21],
             audio: p[22],
             akv: p[23],
+            u_stride: 0,
+            u_rp: 0,
+            rmax: 0,
         }
     }
 }
@@ -344,8 +398,12 @@ struct State {
     nets: Vec<usize>,
     blocks: Vec<BlockImg>,
     block_cap: usize,
-    /// Width of a row of the side paths' `u`.
+    /// Width of a row of the side paths' `u`, and of a section's planes (halves).
     u_stride: usize,
+    u_rp: usize,
+    /// Whether the LoRAs of each matrix have the same sections and rank (what the default path's
+    /// GEMM takes as side paths).
+    sides_ok: bool,
     arena: Arena,
     resident: Vec<Option<u64>>,
     filled: Vec<bool>,
@@ -357,6 +415,15 @@ struct State {
 struct Funcs {
     gemm_i8: F,
     gemm_h: F,
+    /// The default path's GEMMs with side paths (int8 rows, float16 planes).
+    gemm_sides: [F; 2],
+    /// Rows and outputs per block of the two GEMMs, and its threads.
+    tile: usize,
+    threads: u32,
+    /// The weights of a group of a GEMM's outputs, at most, and how many groups' worth of
+    /// outputs still make one group.
+    hot: usize,
+    merge: u32,
     split_rows: F,
     swiglu: F,
     v_scale: F,
@@ -382,6 +449,8 @@ pub(super) struct Engine {
     prof: bool,
     /// Split operands (`OXINFER_AVATAR_GPU_EXACT`).
     exact: bool,
+    /// What follows a matrix (side paths, residual, SwiGLU) as part of its GEMM's output.
+    fuse: bool,
 }
 
 // SAFETY: the raw pointers are driver handles; every use binds the context and goes through
@@ -418,8 +487,23 @@ fn ceil(a: usize, b: usize) -> u32 {
 }
 
 /// Stage times of the last forwards (`OXINFER_AVATAR_GPU_PROF=1`).
-static PROF: Mutex<[f64; 8]> = Mutex::new([0.0; 8]);
-const STAGES: [&str; 8] = ["copy", "norm", "qkv+prep", "attn", "proj", "text", "audio", "ffn"];
+static PROF: Mutex<[f64; 14]> = Mutex::new([0.0; 14]);
+const STAGES: [&str; 14] = [
+    "copy",
+    "norm",
+    "qkv",
+    "prep",
+    "attn",
+    "proj",
+    "text q",
+    "text attn",
+    "text proj",
+    "audio q",
+    "audio attn",
+    "audio proj",
+    "ffn in",
+    "ffn out",
+];
 
 impl Engine {
     /// The engine for `dit` on the active backend, when that is CUDA and the model is one it
@@ -458,7 +542,7 @@ impl Engine {
         };
         let ctx = be.context().ok_or_else(|| anyhow!("no context"))?;
         let src = concat!(include_str!("../minimax_h3/cuda.cu"), "\n", include_str!("cuda.cu"));
-        // The default path: 128 queries per attention block.
+        // The default path: 128 queries per attention block, GEMMs in tiles of 128.
         let fq = if exact { 64 } else { 128 };
         let smem = flash_smem(hd, fq, if exact { 2 } else { 1 });
         let module = be.cached_module(src, "longcat-avatar-{sm}", "longcat_avatar.cu")?;
@@ -471,8 +555,17 @@ impl Engine {
             Ok(f)
         };
         let f = Funcs {
-            gemm_i8: get(if exact { "lc_gemm_i8_2" } else { "lc_gemm_i8_1" })?,
-            gemm_h: get(if exact { "gemm_h_2" } else { "gemm_h_1" })?,
+            gemm_i8: get(if exact { "lc_gemm_i8_2" } else { "lc_gemm_fast_i8" })?,
+            gemm_h: get(if exact { "gemm_h_2" } else { "lc_gemm_fast_h" })?,
+            gemm_sides: [get("lc_gemm_sides_i8")?, get("lc_gemm_sides_h")?],
+            tile: if exact { 64 } else { 128 },
+            threads: if exact { 128 } else { 256 },
+            // A GPU that shares the machine's memory (GB10) keeps less of a GEMM's weights in
+            // its cache: 12 MB per group measured best there (8 and 6 within 2%, one group of
+            // 32 MB 10% slower over a step), 16 MB and matrices up to 48 MB whole on the
+            // RTX 5080.
+            hot: if crate::cuda::integrated() { 12 << 20 } else { HOT_BYTES },
+            merge: if crate::cuda::integrated() { 1 } else { 3 },
             split_rows: get("split_rows")?,
             swiglu: get("swiglu")?,
             v_scale: get("v_scale")?,
@@ -515,6 +608,8 @@ impl Engine {
                 blocks: Vec::new(),
                 block_cap: 0,
                 u_stride: 32,
+                u_rp: 32,
+                sides_ok: true,
                 arena: Arena::default(),
                 resident: vec![None; n],
                 filled: vec![false; n],
@@ -524,15 +619,19 @@ impl Engine {
             }),
             failed: AtomicBool::new(false),
             exact,
+            // On a GPU sharing the machine's memory, where a pass over the activations costs
+            // what it reads and writes (GB10: 48.0 s a forward against 56.9 s); a discrete
+            // card runs the passes as fast (RTX 5080: 27.1 s fused, 26.9 s not).
+            fuse: !exact && crate::cuda::integrated(),
             prof: std::env::var("OXINFER_AVATAR_GPU_PROF").is_ok_and(|v| v != "0"),
         })
     }
 
     /// The blocks' layouts and blobs for `nets`.
-    fn layouts(dit: &Dit, nets: &[&LoraNet]) -> (Vec<BlockImg>, usize, usize) {
+    fn layouts(dit: &Dit, nets: &[&LoraNet]) -> (Vec<BlockImg>, usize, [usize; 2], bool) {
         let t0 = crate::clock::Instant::now();
         let mut out = Vec::with_capacity(dit.blocks.len());
-        let (mut cap, mut u_stride) = (0usize, 32usize);
+        let (mut cap, mut u_stride, mut u_rp, mut sides_ok) = (0usize, 32usize, 32usize, true);
         for (bi, b) in dit.blocks.iter().enumerate() {
             let ms = mats(b);
             let mut img = BlockImg::default();
@@ -594,6 +693,8 @@ impl Engine {
                         bs.push((put(bytes_of(&p)), f));
                     }
                     u_stride = u_stride.max((sep * l.r + 32).next_multiple_of(32));
+                    u_rp = u_rp.max(l.r.next_multiple_of(32));
+                    sides_ok &= sep <= 3 && lin.lora.iter().all(|d| d.bs.len() == sep && d.r == l.r) && lin.lora.len() < 2;
                     lin.lora.push(DLora {
                         net: ni,
                         a: a_at,
@@ -616,7 +717,7 @@ impl Engine {
             nets.len(),
             t0.elapsed().as_secs_f64()
         ));
-        (out, cap, u_stride)
+        (out, cap, [u_stride, u_rp], sides_ok)
     }
 
     fn alloc(&self, bytes: usize) -> Option<u64> {
@@ -655,7 +756,7 @@ impl Engine {
 
     /// The sizes of the activation buffers (in the order of [`Arena::bufs`]), the key count
     /// padded, and the rows per feed-forward chunk.
-    fn sizes(&self, dit: &Dit, ctx: &Ctx, u_stride: usize) -> ([usize; 24], usize, usize) {
+    fn sizes(&self, dit: &Dit, ctx: &Ctx, u_stride: usize, u_rp: usize) -> ([usize; 24], usize, usize) {
         let c = &dit.cfg;
         let (h, hd, heads) = (c.hidden_size, dit.head_dim(), c.num_heads);
         let ffn = dit.blocks[0].w1.n_out;
@@ -669,6 +770,14 @@ impl Engine {
         let arows = ctx.n_t * ctx.na;
         let xs = (n * h).max(rc * ffn).max(l * h).max(arows * c.output_dim.next_multiple_of(32)) * 2;
         let tab = dit.blocks.len() * ctx.n_t * 9 * h * 4;
+        let rmax = n.max(l).max(arows);
+        // The side paths: one `u`, its planes and its row scales with split operands; on the
+        // default path those of two LoRAs, the planes and scales per section (three at most).
+        let (us, u, urs) = if self.exact {
+            (n * u_stride * 2, n * u_stride * 4, rmax * 4)
+        } else {
+            (6 * rmax * u_rp * 2, 2 * rmax * u_stride * 4, 6 * rmax * 4)
+        };
         // The operands' second halves: with split operands only.
         let lo = |bytes: usize| if self.exact { bytes } else { 0 };
         let sizes = [
@@ -682,11 +791,11 @@ impl Engine {
             lo(plane),
             xs,
             lo(xs),
-            n * u_stride * 2,
-            lo(n * u_stride * 2),
-            n * u_stride * 4,
-            n.max(l).max(arows) * 4,
-            n.max(l).max(arows) * 4,
+            us,
+            lo(us),
+            u,
+            rmax * 4,
+            urs,
             heads * 4,
             n * hd / 2 * 4,
             n * hd / 2 * 4,
@@ -822,15 +931,43 @@ impl Engine {
     }
 
     /// The grid of a GEMM whose weights take `w_row` bytes per output (as `Engine::gemm` of
-    /// `minimax_h3/cuda.rs`: the outputs in groups whose weights stay in the cache).
-    fn grid(p: &mut GemmP, w_row: usize) -> (u32, u32) {
-        let (ct, rt) = (ceil(p.n_out as usize, 64), ceil(p.rows as usize, 64));
-        let mut cg = ((HOT_BYTES / (64 * w_row.max(1))) as u32).clamp(1, ct);
-        if rt * ct.div_ceil(cg) > 65535 || ct <= 3 * cg {
+    /// `minimax_h3/cuda.rs`: the outputs in groups whose weights stay in the cache), in blocks of
+    /// `tile` rows and outputs.
+    fn grid(&self, p: &mut GemmP, w_row: usize) -> (u32, u32) {
+        let tile = self.f.tile;
+        let (ct, rt) = (ceil(p.n_out as usize, tile), ceil(p.rows as usize, tile));
+        let mut cg = ((self.f.hot / (tile * w_row.max(1))) as u32).clamp(1, ct);
+        if rt * ct.div_ceil(cg) > 65535 || ct <= self.f.merge * cg {
             cg = ct;
         }
         p.cg = cg;
         (cg, rt * ct.div_ceil(cg))
+    }
+
+    /// A GEMM of the default path: `p` (its grid is set here), the int8 rows' scales `cs` (0:
+    /// float16 planes), the side paths and the output of `a`.
+    fn gemm_fast(&self, mut a: LcFastP, int8: bool, out: Out) {
+        match out {
+            Out::Store => a.mode = 0,
+            Out::Resid {
+                tab,
+                s,
+                frame0,
+                stride,
+                gate_at,
+                row0,
+            } => (a.mode, a.tab, a.s, a.frame0, a.stride, a.gate_at, a.row0) = (1, tab, s.max(1), frame0, stride, gate_at, row0),
+            Out::Swiglu => a.mode = 2,
+        }
+        a.s = a.s.max(1);
+        let w_row = if int8 { a.p.n_in as usize } else { a.p.n_in as usize * 2 };
+        let g = self.grid(&mut a.p, w_row);
+        let f = match (a.uh[0] != 0, int8) {
+            (true, _) => self.f.gemm_sides[!int8 as usize],
+            (false, true) => self.f.gemm_i8,
+            (false, false) => self.f.gemm_h,
+        };
+        self.go(f, g, self.f.threads, 0, &mut args![a]);
     }
 
     /// `y (= or +=) f rs W x` with float16 planes `w`.
@@ -865,15 +1002,120 @@ impl Engine {
             f,
             cg: 0,
         };
-        let g = Self::grid(&mut p, n_in * 2);
-        self.go(self.f.gemm_h, g, 128, 0, &mut args![p]);
+        if !self.exact {
+            let out = match add {
+                true => Out::Resid {
+                    tab: 0,
+                    s: 1,
+                    frame0: 0,
+                    stride: 0,
+                    gate_at: 0,
+                    row0: 0,
+                },
+                false => Out::Store,
+            };
+            return self.gemm_fast(LcFastP { p, ..Default::default() }, false, out);
+        }
+        let g = self.grid(&mut p, n_in * 2);
+        self.go(self.f.gemm_h, g, self.f.threads, 0, &mut args![p]);
     }
 
-    /// `y = W x + bias` of matrix `l` (at `base`) and its side paths, over `rows` rows whose
-    /// planes are in `bf.xs` (row scales in `bf.rs`).
+    /// `W x + bias` of matrix `l` (at `base`) and its side paths, over `rows` rows whose planes
+    /// are in `bf.xs` (row scales in `bf.rs`), into `y` as `out` says (with split operands:
+    /// stored).
     #[allow(clippy::too_many_arguments)]
-    fn lin(&self, bf: &Bufs, base: u64, l: &DLin, mult: &[f32], u_stride: usize, y: u64, ys: usize, rows: usize) {
+    fn lin(&self, bf: &Bufs, base: u64, l: &DLin, mult: &[f32], y: u64, ys: usize, rows: usize, out: Out) {
         let bias = if l.bias == u64::MAX { 0 } else { base + l.bias };
+        let u_stride = bf.u_stride;
+        if !self.exact {
+            // The side paths first: u = A x of each LoRA in use, as planes per output section.
+            let sides: Vec<(&DLora, f32)> = l
+                .lora
+                .iter()
+                .map(|d| (d, mult.get(d.net).copied().unwrap_or(0.0)))
+                .filter(|(_, m)| *m != 0.0)
+                .take(2)
+                .collect();
+            let sep = sides.first().map_or(1, |(d, _)| d.bs.len());
+            let rp = sides.first().map_or(32, |(d, _)| d.r.next_multiple_of(32));
+            let (plane, scales) = ((bf.rmax * bf.u_rp * 2) as u64, (bf.rmax * 4) as u64);
+            for (i, (d, _)) in sides.iter().enumerate() {
+                let u = bf.u + (i * bf.rmax * u_stride * 4) as u64;
+                self.gemm_h(bf.xs, bf.rs, base + d.a, 0, u, u_stride, l.n_in, sep * d.r, rows, false, d.a_f);
+                for j in 0..sep {
+                    let k = (3 * i + j) as u64;
+                    self.split(
+                        u + (j * d.r * 4) as u64,
+                        u_stride,
+                        rp,
+                        rows,
+                        [bf.us[0] + k * plane, 0],
+                        bf.urs + k * scales,
+                    );
+                }
+            }
+            let per = l.n_out / sep;
+            let w_row = if l.int8 { l.n_in } else { l.n_in * 2 };
+            for j in 0..sep {
+                let at = |bytes: usize| (j * per * bytes) as u64;
+                let mut a = LcFastP {
+                    p: GemmP {
+                        xh: bf.xs[0],
+                        xl: 0,
+                        w: base + l.w + at(w_row),
+                        wl: 0,
+                        rs: bf.rs,
+                        bias: if bias == 0 { 0 } else { bias + at(4) },
+                        y: y + at(4),
+                        ys: ys as u64,
+                        n_in: l.n_in as u32,
+                        n_out: per as u32,
+                        rows: rows as u32,
+                        add: 0,
+                        f: 1.0,
+                        cg: 0,
+                    },
+                    cs: if l.int8 { base + l.cs + at(4) } else { 0 },
+                    ur: rp as u32,
+                    us: (rp / 2) as u32,
+                    ..Default::default()
+                };
+                for (i, (d, m)) in sides.iter().enumerate() {
+                    if !self.fuse {
+                        break;
+                    }
+                    let k = (3 * i + j) as u64;
+                    a.uh[i] = bf.us[0] + k * plane;
+                    a.bw[i] = base + d.bs[j].0;
+                    a.urs[i] = bf.urs + k * scales;
+                    a.uf[i] = d.bs[j].1 * m * d.alpha;
+                }
+                self.gemm_fast(a, l.int8, out);
+                // Not fused: each side path's section as a GEMM of its own, added.
+                for (i, (d, m)) in sides.iter().enumerate() {
+                    if self.fuse {
+                        break;
+                    }
+                    let k = (3 * i + j) as u64;
+                    let planes = [bf.us[0] + k * plane, 0];
+                    let f = d.bs[j].1 * m * d.alpha;
+                    self.gemm_h(
+                        planes,
+                        bf.urs + k * scales,
+                        base + d.bs[j].0,
+                        0,
+                        y + at(4),
+                        ys,
+                        rp,
+                        per,
+                        rows,
+                        true,
+                        f,
+                    );
+                }
+            }
+            return;
+        }
         if l.int8 {
             let mut p = LcGemmP {
                 p: GemmP {
@@ -894,8 +1136,8 @@ impl Engine {
                 },
                 cs: base + l.cs,
             };
-            let g = Self::grid(&mut p.p, l.n_in);
-            self.go(self.f.gemm_i8, g, 128, 0, &mut args![p]);
+            let g = self.grid(&mut p.p, l.n_in);
+            self.go(self.f.gemm_i8, g, self.f.threads, 0, &mut args![p]);
         } else {
             self.gemm_h(bf.xs, bf.rs, base + l.w, bias, y, ys, l.n_in, l.n_out, rows, false, 1.0);
         }
@@ -1020,8 +1262,8 @@ impl Engine {
         let ids: Vec<usize> = nets.iter().map(|n| *n as *const LoraNet as usize).collect();
         if st.nets != ids {
             self.release_blocks(st);
-            let (blocks, cap, u_stride) = Self::layouts(dit, &nets);
-            (st.blocks, st.block_cap, st.u_stride, st.nets) = (blocks, cap, u_stride, ids);
+            let (blocks, cap, [u_stride, u_rp], sides_ok) = Self::layouts(dit, &nets);
+            (st.blocks, st.block_cap, st.u_stride, st.u_rp, st.sides_ok, st.nets) = (blocks, cap, u_stride, u_rp, sides_ok, ids);
             // `u` may be wider now.
             for p in st.arena.all.drain(..) {
                 unsafe { self.x.cuMemFree_v2(p) };
@@ -1029,13 +1271,17 @@ impl Engine {
             st.arena = Arena::default();
         }
         let mult: Vec<f32> = ctx.lora.nets.iter().map(|(_, m)| *m).collect();
-        let u_stride = st.u_stride;
-        let (need, nk, rc) = self.sizes(dit, ctx, u_stride);
+        if !self.exact && !st.sides_ok {
+            debug("LoRAs of different ranks or sections on one matrix");
+            return false;
+        }
+        let (need, nk, rc) = self.sizes(dit, ctx, st.u_stride, st.u_rp);
         if !self.make_arena(st, &need) || !self.place_blocks(st) {
             self.release_blocks(st);
             return false;
         }
-        let bf = st.arena.bufs(self.exact);
+        let mut bf = st.arena.bufs(self.exact);
+        (bf.u_stride, bf.u_rp, bf.rmax) = (st.u_stride, st.u_rp, n.max(ctx.text_len).max(n_t * ctx.na));
         let mut tm = crate::clock::Instant::now();
         // The AdaLN sets of every block: [n_t, 6 H] then [n_t, 3 H].
         let tab_floats = n_t * 9 * h;
@@ -1087,7 +1333,17 @@ impl Engine {
                 }
             };
             let img = &st.blocks[bi];
-            let lin = |i: usize, y: u64, ys: usize, rows: usize| self.lin(&bf, base, &img.lins[i], &mult, u_stride, y, ys, rows);
+            let lin_out = |i: usize, y: u64, ys: usize, rows: usize, out: Out| self.lin(&bf, base, &img.lins[i], &mult, y, ys, rows, out);
+            let lin = |i: usize, y: u64, ys: usize, rows: usize| lin_out(i, y, ys, rows, Out::Store);
+            // The gated residual of the row's frame (`tab` 0: no gate), for rows from `row0` on.
+            let resid = |tab: u64, gate_at: u32, row0: usize| Out::Resid {
+                tab,
+                s: su,
+                frame0: 0,
+                stride: 6 * hu,
+                gate_at,
+                row0: row0 as u32,
+            };
             let nrm = |i: usize| base + img.norms[i];
             let tab = bf.tabs + (bi * tab_floats * 4) as u64;
             let atab = tab + (n_t * 6 * h * 4) as u64;
@@ -1106,6 +1362,7 @@ impl Engine {
             self.mark(&mut tm, 1);
             self.split(bf.hn, h, h, n, bf.xs, bf.rs);
             lin(0, bf.big, 3 * h, n);
+            self.mark(&mut tm, 2);
             for (part, planes) in [bf.qp, bf.kp].into_iter().enumerate() {
                 self.go(
                     self.f.qk_prep,
@@ -1127,21 +1384,25 @@ impl Engine {
                 );
             }
             self.values(&bf, bf.big, 3 * h, 2 * h, hd, heads, n, nk);
-            self.mark(&mut tm, 2);
+            self.mark(&mut tm, 3);
             for (q, k) in &segs {
                 self.attend(&bf, bf.big, h, hd, heads, n, nk, q.clone(), k.clone());
             }
-            self.mark(&mut tm, 3);
-            self.split(bf.big, h, h, n, bf.xs, bf.rs);
-            lin(1, bf.hn, h, n);
-            self.go(
-                self.f.resid,
-                (ceil(h, 256), n as u32),
-                256,
-                0,
-                &mut args![bf.x, bf.hn, tab, hu, su, 0u32, m6, 2 * hu],
-            );
             self.mark(&mut tm, 4);
+            self.split(bf.big, h, h, n, bf.xs, bf.rs);
+            if !self.fuse {
+                lin(1, bf.hn, h, n);
+                self.go(
+                    self.f.resid,
+                    (ceil(h, 256), n as u32),
+                    256,
+                    0,
+                    &mut args![bf.x, bf.hn, tab, hu, su, 0u32, m6, 2 * hu],
+                );
+            } else {
+                lin_out(1, bf.x, h, n, resid(tab, 2 * hu, 0));
+            }
+            self.mark(&mut tm, 5);
 
             if nn > 0 {
                 let xn = bf.x + (nc * s * h * 4) as u64;
@@ -1157,6 +1418,7 @@ impl Engine {
                     0,
                     &mut args![bf.big, h as u64, 0u32, nrm(2), null, null, hdu, n as u32, bf.qp[0], bf.qp[1]],
                 );
+                self.mark(&mut tm, 6);
                 self.split(bf.text, h, h, l, bf.xs, bf.rs);
                 lin(3, bf.tkv, 2 * h, l);
                 self.go(
@@ -1168,16 +1430,21 @@ impl Engine {
                 );
                 self.values(&bf, bf.tkv, 2 * h, h, hd, heads, l, nk_text);
                 self.attend(&bf, att, h, hd, heads, n, nk_text, 0..nn, 0..l);
+                self.mark(&mut tm, 7);
                 self.split(att, h, h, nn, bf.xs, bf.rs);
-                lin(4, bf.hn, h, nn);
-                self.go(
-                    self.f.resid,
-                    (ceil(h, 256), nn as u32),
-                    256,
-                    0,
-                    &mut args![xn, bf.hn, null, hu, su, 0u32, m6, 0u32],
-                );
-                self.mark(&mut tm, 5);
+                if !self.fuse {
+                    lin(4, bf.hn, h, nn);
+                    self.go(
+                        self.f.resid,
+                        (ceil(h, 256), nn as u32),
+                        256,
+                        0,
+                        &mut args![xn, bf.hn, null, hu, su, 0u32, m6, 0u32],
+                    );
+                } else {
+                    lin_out(4, xn, h, nn, resid(0, 0, 0));
+                }
+                self.mark(&mut tm, 8);
 
                 // Audio cross-attention, frame by frame.
                 self.go(self.f.ln_affine, (nn as u32, 1), 256, 0, &mut args![xn, nrm(8), nrm(9), bf.hn, hu]);
@@ -1190,6 +1457,7 @@ impl Engine {
                     0,
                     &mut args![bf.big, h as u64, 0u32, nrm(4), null, null, hdu, n as u32, bf.qp[0], bf.qp[1]],
                 );
+                self.mark(&mut tm, 9);
                 let arows = frames * na;
                 self.split(bf.audio + (nc * na * od * 4) as u64, od, od, arows, bf.xs, bf.rs);
                 lin(6, bf.akv, 2 * h, arows);
@@ -1204,6 +1472,7 @@ impl Engine {
                 for f in 0..frames {
                     self.attend(&bf, att, h, hd, heads, n, nk_audio, f * s..(f + 1) * s, f * na..(f + 1) * na);
                 }
+                self.mark(&mut tm, 10);
                 self.split(att, h, h, nn, bf.xs, bf.rs);
                 lin(7, bf.hn, h, nn);
                 self.go(
@@ -1220,7 +1489,7 @@ impl Engine {
                     0,
                     &mut args![xn, bf.big, atab, hu, su, nc as u32, m3, 2 * hu],
                 );
-                self.mark(&mut tm, 6);
+                self.mark(&mut tm, 11);
             }
 
             // Feed-forward, in row chunks.
@@ -1237,6 +1506,17 @@ impl Engine {
                 let rn = rc.min(n - r0);
                 let rows = bf.hn + (r0 * h * 4) as u64;
                 self.split(rows, h, h, rn, bf.xs, bf.rs);
+                if self.fuse {
+                    // The gate rows, the value rows times their SiLU over them, and the result
+                    // into the residual stream.
+                    lin(8, gu, ffn, rn);
+                    lin_out(9, gu, ffn, rn, Out::Swiglu);
+                    self.mark(&mut tm, 12);
+                    self.split(gu, ffn, ffn, rn, bf.xs, bf.rs);
+                    lin_out(10, bf.x + (r0 * h * 4) as u64, h, rn, resid(tab, 5 * hu, r0));
+                    self.mark(&mut tm, 13);
+                    continue;
+                }
                 lin(8, gu, 2 * ffn, rn);
                 lin(9, gu + (ffn * 4) as u64, 2 * ffn, rn);
                 self.go(
@@ -1246,17 +1526,20 @@ impl Engine {
                     0,
                     &mut args![gu, act, rn as u32, ffn as u32, 1u32],
                 );
+                self.mark(&mut tm, 12);
                 self.split(act, ffn, ffn, rn, bf.xs, bf.rs);
                 lin(10, rows, h, rn);
             }
-            self.go(
-                self.f.resid,
-                (ceil(h, 256), n as u32),
-                256,
-                0,
-                &mut args![bf.x, bf.hn, tab, hu, su, 0u32, m6, 5 * hu],
-            );
-            self.mark(&mut tm, 7);
+            if !self.fuse {
+                self.go(
+                    self.f.resid,
+                    (ceil(h, 256), n as u32),
+                    256,
+                    0,
+                    &mut args![bf.x, bf.hn, tab, hu, su, 0u32, m6, 5 * hu],
+                );
+            }
+            self.mark(&mut tm, 13);
             if st.resident[bi].is_none() {
                 unsafe { self.x.cuEventRecord(st.events[slot], self.stream) };
                 slot ^= 1;
@@ -1279,7 +1562,7 @@ impl Engine {
             let mut p = PROF.lock().unwrap();
             let line: Vec<String> = STAGES.iter().zip(p.iter()).map(|(n, t)| format!("{n} {t:.2}")).collect();
             eprintln!("[longcat-avatar cuda: {} s]", line.join(", "));
-            *p = [0.0; 8];
+            *p = [0.0; 14];
         }
         got
     }
@@ -1329,8 +1612,9 @@ mod tests {
         };
         for sub in ["base_model", "base_model_int8"] {
             let dit = Dit::load(&avatar.join(sub)).unwrap();
-            for exact in [true, false] {
-                let e = Engine::build(be, &dit, exact).unwrap();
+            for (exact, fuse) in [(true, false), (false, false), (false, true)] {
+                let mut e = Engine::build(be, &dit, exact).unwrap();
+                e.fuse = fuse;
                 let c = &dit.cfg;
                 let (lh, lw) = (8, 12);
                 for (n_t, num_cond, num_ref, mask) in [(4usize, 0usize, 0usize, 0usize), (4, 1, 0, 0), (6, 3, 1, 1)] {
@@ -1374,7 +1658,7 @@ mod tests {
                         };
                         assert!(
                             max < tol * scale.max(1.0),
-                            "{sub} exact {exact} cond {num_cond} ref {num_ref} mix {mix:?}: {max:.3e} (mean |v| {scale:.3e})"
+                            "{sub} exact {exact} fused {fuse} cond {num_cond} ref {num_ref} mix {mix:?}: {max:.3e} (mean |v| {scale:.3e})"
                         );
                     }
                 }
