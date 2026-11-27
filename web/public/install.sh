@@ -56,8 +56,8 @@ case "$os" in
     Linux)
         case "$arch" in
             x86_64|amd64)
-                # The glibc build has every feature (GPU libraries are loaded at run time); the
-                # static one runs anywhere, without glibc (musl distributions), on the CPU only.
+                # Both load the GPU libraries at run time where a driver is installed. The static
+                # one runs anywhere, without glibc (musl distributions): it needs only a kernel.
                 if [ "$STATIC" = 1 ] || ! (ldd --version 2>&1 | grep -qi -e glibc -e 'gnu libc'); then
                     target="linux-x86_64-static"
                 else
