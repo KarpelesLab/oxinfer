@@ -482,6 +482,7 @@ fn usage() -> ! {
          \x20 --modality-scale F, --audio-modality-scale F, --skip-step N, --audio-skip-step N,\n\
          \x20 --guidance-mode auto|on|off (--no-guidance: off), --refine-audio (denoise audio in stage 2)\n\
          \x20 --image-crf N        H.264 CRF images are re-compressed at first (default 18; 0: off)\n\
+         \x20 --vae conv|diff|FILE the video decoder: convolutional (default) or the diffusion one (DiffVAE)
          \x20 --text-encoder FILE, --vae FILE, --audio-vae FILE, --upsampler FILE, --duration-head FILE\n\
          \x20 --sigmas a,b,..,0, --stage2-sigmas a,..,0, --eta F (ancestral noise; 1 distilled, 0 guided), --noise torch\n\
          \x20 --exact-attention    the GPU's video attention on float32 operands (else half)\n\

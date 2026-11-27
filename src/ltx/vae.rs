@@ -294,9 +294,19 @@ impl VaeConfig {
         if v.get("norm_layer").and_then(|x| x.as_str()).is_some_and(|n| n != "pixel_norm") {
             bail!("LTX video VAE: only pixel_norm is supported");
         }
+        // The diffusion VAE's file (`CausalDiffusionVAE`) nests its encoder's blocks and has no
+        // convolutional decoder.
+        let enc_blocks = v.get("encoder").and_then(|e| e.get("blocks"));
         let blocks = |k: &str| -> Result<Vec<(String, usize, usize)>> {
-            v.get(k)
-                .and_then(|b| b.as_array())
+            let b = match k {
+                "encoder_blocks" => v.get(k).or(enc_blocks),
+                _ if enc_blocks.is_some() => v.get(k).or(Some(&serde_json::Value::Null)),
+                _ => v.get(k),
+            };
+            if b.is_some_and(|b| b.is_null()) {
+                return Ok(Vec::new());
+            }
+            b.and_then(|b| b.as_array())
                 .with_context(|| format!("LTX video VAE: no {k}"))?
                 .iter()
                 .map(|b| {

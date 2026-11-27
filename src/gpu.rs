@@ -244,6 +244,30 @@ pub trait Backend: Send + Sync {
     fn ltx_session(&'static self) -> Option<Box<dyn dit::LtxSession>> {
         None
     }
+    /// A session running LTX-2.5 DiffVAE blocks on the device; None when the backend has none.
+    fn na_session(&'static self) -> Option<Box<dyn dit::NaSession>> {
+        None
+    }
+    /// 3D neighborhood attention (`natten.na3d`, LTX-2.5's DiffVAE): queries over a `qd` grid
+    /// (`[t, h, w]`) attend to the `ker` window of keys / values over a `kd` grid centered at
+    /// the query's index plus `off` per axis, shifted inward at the borders; rows of
+    /// `heads * hd`, queries already scaled. False when the backend has no kernel for it.
+    #[allow(clippy::too_many_arguments)]
+    fn na3d(
+        &self,
+        _q: &[f32],
+        _k: &[f32],
+        _v: &[f32],
+        _qd: [usize; 3],
+        _kd: [usize; 3],
+        _off: [usize; 3],
+        _ker: [usize; 3],
+        _heads: usize,
+        _hd: usize,
+        _out: &mut [f32],
+    ) -> bool {
+        false
+    }
     /// A session running whole CLIP text-encoder passes on the device; None when the backend
     /// has none.
     fn clip_session(&'static self) -> Option<Box<dyn dit::ClipSession>> {

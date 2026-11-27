@@ -1145,7 +1145,8 @@ typedef struct OxiVideo OxiVideo;
  * `options`: key=value (text_encoder, transformer, vae, audio_vae, quant, lora, shift,
  * audio_shift, cache_dir). LTX-2.5 ("Lightricks/LTX-2.5": the parts a run reads are fetched from
  * the public mirror comfyicu/LTX-2.5; a release folder or a transformer file); options:
- * transformer (int8, bf16, nvfp4, dev, dev-bf16 or a file), text_encoder, vae, audio_vae,
+ * transformer (int8, bf16, nvfp4, dev, dev-bf16 or a file), text_encoder, vae (conv, diff: the
+ * diffusion decoder, or a file), audio_vae,
  * upsampler, temporal_upsampler, duration_head, text_bf16=1, temporal=1, distilled_lora=1,
  * lora=FILE[:SCALE], device=cpu, exact_attention=1, cache_dir. NULL on error. */
 OxiVideo *oxi_video_load(const char *model, const char *options, oxi_progress_fn progress, void *user);

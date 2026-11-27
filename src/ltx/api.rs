@@ -2,7 +2,7 @@
 //! generation parameters from a JSON object (the same fields everywhere).
 
 use super::dit::Blocks;
-use super::{FetchOptions, Guidance, GuidanceMode, ImageCond, Noise, Params, Paths, Pipeline, Variant};
+use super::{FetchOptions, Guidance, GuidanceMode, ImageCond, Noise, Params, Paths, Pipeline, Variant, VideoVae};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -22,7 +22,8 @@ pub fn is_ltx_source(src: &str) -> bool {
 
 /// Loads LTX-2.5 from `src` (`Lightricks/LTX-2.5` or its mirror: the parts a run reads are
 /// fetched; a release folder; a transformer file) with options: `transformer` (`int8`, `bf16`,
-/// `nvfp4`, `dev`, `dev-bf16` or a file), `text_encoder`, `vae`, `audio_vae`, `upsampler`,
+/// `nvfp4`, `dev`, `dev-bf16` or a file), `vae` (`conv`, `diff`: the diffusion decoder, or a
+/// file), `text_encoder`, `audio_vae`, `upsampler`,
 /// `temporal_upsampler`, `duration_head` (files), `text_bf16` (fetch the bf16 text encoder),
 /// `temporal` (fetch the temporal upsampler), `distilled_lora` (the release's, on the dev
 /// transformer), `lora` (`FILE[:SCALE]`, repeatable), `device` (`cpu`: the transformer on the
@@ -40,15 +41,20 @@ pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Pa
             "text_bf16" => fo.text_bf16 = flag(v),
             "temporal" => fo.temporal_upsampler = flag(v),
             "distilled_lora" => fo.distilled_lora = flag(v),
+            "vae" => {
+                if let Some(x) = VideoVae::parse(v) {
+                    fo.vae = x;
+                }
+            }
             _ => {}
         }
     }
     let mut paths = if super::is_repo(src) && !Path::new(src).exists() {
         let dir = super::fetch(src, &fo, cache_dir)?;
-        Paths::resolve_with(&dir, Some(fo.variant))?
+        Paths::resolve_vae(&dir, Some(fo.variant), fo.vae)?
     } else {
         let variant = opts.iter().find(|(k, _)| *k == "transformer").and_then(|(_, v)| Variant::parse(v));
-        Paths::resolve_with(Path::new(src), variant)?
+        Paths::resolve_vae(Path::new(src), variant, fo.vae)?
     };
     if let Some(t) = transformer_file {
         paths.transformer = t;
@@ -58,6 +64,7 @@ pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Pa
         match *k {
             "transformer" | "text_bf16" | "distilled_lora" | "temporal" => {}
             "text_encoder" => paths.text_encoder = Some(part(v, cache_dir)?),
+            "vae" if VideoVae::parse(v).is_some() => {}
             "vae" => paths.video_vae = Some(part(v, cache_dir)?),
             "audio_vae" => paths.audio_vae = Some(part(v, cache_dir)?),
             "upsampler" => paths.spatial_upsampler = Some(part(v, cache_dir)?),

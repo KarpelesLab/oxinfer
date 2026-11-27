@@ -9,6 +9,8 @@ use super::decode::{FastEnc, Fns, run_concurrent};
 use super::*;
 use crate::gpu::dit::{FluxInput, FluxModel, FluxSession, Lin, Model, Seq, Session};
 
+#[path = "metal_diffvae.rs"]
+mod diffvae;
 #[path = "metal_ltx.rs"]
 mod ltx;
 #[path = "metal_t5.rs"]

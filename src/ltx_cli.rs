@@ -14,7 +14,7 @@
 use crate::Args;
 use anyhow::{Context, Result, bail};
 use oxinfer::clock::Instant;
-use oxinfer::ltx::{self, FetchOptions, ImageCond, Noise, Params, Paths, Pipeline, Variant};
+use oxinfer::ltx::{self, FetchOptions, ImageCond, Noise, Params, Paths, Pipeline, Variant, VideoVae};
 use std::path::{Path, PathBuf};
 
 /// The LTX-2.5 flags.
@@ -140,17 +140,20 @@ pub fn run(args: &Args) -> Result<()> {
     let spec = args.model.to_string_lossy().to_string();
     // `--transformer int8|bf16|nvfp4|dev|dev-bf16` picks a release file; a path names one.
     let variant = args.transformer.as_ref().and_then(|t| Variant::parse(&t.to_string_lossy()));
+    // `--vae conv|diff` picks the release's decoder; a path names a file.
+    let vae_kind = args.flux.vae.as_deref().and_then(VideoVae::parse);
     let mut paths = if ltx::is_repo(&spec) && !args.model.exists() {
         let o = FetchOptions {
             variant: variant.unwrap_or_default(),
             text_bf16: a.text_bf16,
             temporal_upsampler: a.temporal_upscale,
             distilled_lora: a.distilled_lora,
+            vae: vae_kind.unwrap_or_default(),
         };
         let dir = ltx::fetch(&spec, &o, args.cache_dir.as_deref())?;
-        Paths::resolve_with(&dir, Some(o.variant))?
+        Paths::resolve_vae(&dir, Some(o.variant), o.vae)?
     } else {
-        Paths::resolve_with(&args.model, variant)?
+        Paths::resolve_vae(&args.model, variant, vae_kind.unwrap_or_default())?
     };
     if args.download_only {
         eprintln!("[LTX-2.5 parts: {}]", paths.transformer.display());
@@ -162,7 +165,7 @@ pub fn run(args: &Args) -> Result<()> {
     if let Some(t) = &args.flux.text_encoder {
         paths.text_encoder = Some(part(Path::new(t), args)?);
     }
-    if let Some(v) = &args.flux.vae {
+    if let Some(v) = args.flux.vae.as_ref().filter(|_| vae_kind.is_none()) {
         paths.video_vae = Some(part(Path::new(v), args)?);
     }
     if let Some(v) = &args.audio_vae {

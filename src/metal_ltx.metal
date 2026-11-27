@@ -138,3 +138,251 @@ kernel void ltx_gelu(device float* x [[buffer(0)]], device const float* b [[buff
     float4 u = 1.5957691216057308f * (v + 0.044715f * v * v * v);
     *xp = v / (1.0f + exp(-u));
 }
+
+// ---- LTX-2.5 DiffVAE: 3D neighborhood attention (natten.na3d), 64-wide heads ----
+// Queries over a [qt, qh, qw] grid attend to the [kt_, kh_, KW] window of keys / values over a
+// [kt, kh, kw] grid centered at the query's index plus (ot, oh, ow), shifted inward at the
+// borders (queries already scaled). Rows of `dim` floats, head h at h * 64. One SIMD-group per
+// threadgroup: 32 consecutive queries of one (t, h) row and one head; each key row segment they
+// need is staged in threadgroup memory.
+struct NA3 { uint qt; uint qh; uint qw; uint kt; uint kh; uint kw; uint ot; uint oh; uint ow; uint kt_; uint kh_; uint heads; uint dim; uint row0; uint wtiles; uint _p2; };
+static inline uint na_start(uint i, uint off, uint k, uint len) {
+    int s = int(i + off) - int(k / 2);
+    return uint(clamp(s, 0, int(len - k)));
+}
+template <uint KW>
+static inline void ltx_na3d_impl(device const float* q, device const float* k, device const float* v, device float* o,
+                                 constant NA3& p, uint3 tg, uint lane, threadgroup float4* ks, threadgroup float4* vs) {
+    uint row = tg.y + p.row0, head = tg.x / p.wtiles;
+    uint w0 = (tg.x % p.wtiles) * 32, t = row / p.qh, h = row % p.qh;
+    uint w = w0 + lane;
+    bool valid = w < p.qw;
+    uint wc = min(w, p.qw - 1), wl = min(w0 + 31, p.qw - 1);
+    uint st = na_start(t, p.ot, p.kt_, p.kt), sh = na_start(h, p.oh, p.kh_, p.kh);
+    uint sw = na_start(wc, p.ow, KW, p.kw);
+    uint u0 = na_start(w0, p.ow, KW, p.kw), u1 = na_start(wl, p.ow, KW, p.kw) + KW;
+    uint nu = u1 - u0;
+    ulong qi = ((ulong)t * p.qh + h) * p.qw + wc;
+    device const float4* qr = (device const float4*)(q + qi * p.dim + head * 64);
+    float4 qv[16];
+    float4 acc[16];
+    for (uint i = 0; i < 16; i++) { qv[i] = qr[i]; acc[i] = float4(0.f); }
+    float m = -INFINITY, l = 0.f;
+    for (uint a = 0; a < p.kt_; a++) {
+        for (uint b = 0; b < p.kh_; b++) {
+            ulong base = (((ulong)(st + a) * p.kh + sh + b) * p.kw + u0) * p.dim + head * 64;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = lane; i < nu * 16; i += 32) {
+                uint j = i / 16, c = i % 16;
+                ks[i] = *((device const float4*)(k + base + (ulong)j * p.dim) + c);
+                vs[i] = *((device const float4*)(v + base + (ulong)j * p.dim) + c);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float s[KW];
+            float mx = m;
+            uint j0 = sw - u0;
+            for (uint c = 0; c < KW; c++) {
+                threadgroup const float4* kr = ks + (j0 + c) * 16;
+                float4 d4 = qv[0] * kr[0];
+                for (uint i = 1; i < 16; i++) d4 = fma(qv[i], kr[i], d4);
+                s[c] = d4.x + d4.y + d4.z + d4.w;
+                mx = max(mx, s[c]);
+            }
+            float sc = exp(m - mx);
+            l *= sc;
+            for (uint i = 0; i < 16; i++) acc[i] *= sc;
+            for (uint c = 0; c < KW; c++) {
+                float pc = exp(s[c] - mx);
+                l += pc;
+                threadgroup const float4* vr = vs + (j0 + c) * 16;
+                for (uint i = 0; i < 16; i++) acc[i] = fma(float4(pc), vr[i], acc[i]);
+            }
+            m = mx;
+        }
+    }
+    if (!valid) return;
+    device float4* orow = (device float4*)(o + qi * p.dim + head * 64);
+    float inv = 1.f / l;
+    for (uint i = 0; i < 16; i++) orow[i] = acc[i] * inv;
+}
+#define LTX_NA3D(KW)                                                                                                     \
+    kernel void ltx_na3d_k##KW(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]],                \
+                               device const float* v [[buffer(2)]], device float* o [[buffer(3)]],                      \
+                               constant NA3& p [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]],                \
+                               uint lane [[thread_index_in_threadgroup]]) {                                             \
+        threadgroup float4 ks[(32 + KW - 1) * 16];                                                                       \
+        threadgroup float4 vs[(32 + KW - 1) * 16];                                                                       \
+        ltx_na3d_impl<KW>(q, k, v, o, p, tg, lane, ks, vs);                                                              \
+    }
+LTX_NA3D(3)
+LTX_NA3D(5)
+LTX_NA3D(7)
+LTX_NA3D(11)
+
+// ---- LTX-2.5 DiffVAE block session (metal_diffvae.rs) ----
+// Fused q / k / v rows (f32, `3 dim` wide, rows r0.. of the grid, biases not yet added) to the
+// attention's half operands: per 64-wide head the RMS-normed queries (weight qn, times `scale`)
+// and keys (weight kn), rotated by absolute RoPE (adjacent pairs: the first pt pairs by time, the
+// next ph by height, the rest by width; tables at tab + o* of cos then sin per position), and the
+// values. Keys and values go to a grid `kw` wide (the query's column plus `halo`); the edge columns
+// are also written to the halo columns past their edge, rotated at those positions. One SIMD-group
+// per head (lane = pair), 256 threads per row.
+struct DQH { uint dim; uint heads; uint qh; uint qw; uint kw; uint halo; uint r0; uint pt; uint ph;
+             uint ot; uint oh; uint ow; float scale; float eps; uint nt; uint nh; uint nw; uint _p0; uint _p1; uint _p2; };
+static inline float2 dv_rot(float2 x, device const float* tab, uint n, uint idx) {
+    float c = tab[idx], s = tab[n + idx];
+    return float2(x.x * c - x.y * s, x.x * s + x.y * c);
+}
+kernel void dv_qkv_heads(device const float* src [[buffer(0)]], device const float* bias [[buffer(1)]],
+                         device const float* qn [[buffer(2)]], device const float* kn [[buffer(3)]],
+                         device const float* tab [[buffer(4)]], device half* qo [[buffer(5)]],
+                         device half* ko [[buffer(6)]], device half* vo [[buffer(7)]], constant DQH& p [[buffer(8)]],
+                         uint ri [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    uint r = p.r0 + ri;
+    uint w = r % p.qw, h = (r / p.qw) % p.qh, t = r / (p.qw * p.qh);
+    device const float* row = src + (ulong)ri * 3 * p.dim;
+    uint pw = 32 - p.pt - p.ph;
+    // The pair's axis: its table (n cosines, then n sines) and position index.
+    device const float* tb;
+    uint n, base, pi;
+    bool wax = false;
+    if (lane < p.pt) { tb = tab + p.ot; n = p.nt * p.pt; base = t * p.pt; pi = lane; }
+    else if (lane < p.pt + p.ph) { tb = tab + p.oh; n = p.nh * p.ph; base = h * p.ph; pi = lane - p.pt; }
+    else { tb = tab + p.ow; n = p.nw * pw; base = (w + p.halo) * pw; pi = lane - p.pt - p.ph; wax = true; }
+    ulong kr0 = ((ulong)t * p.qh + h) * p.kw;
+    ulong kr = kr0 + w + p.halo;
+    for (uint hd = sg; hd < p.heads; hd += 8) {
+        uint c = hd * 64 + 2 * lane;
+        float2 q = float2(row[c] + bias[c], row[c + 1] + bias[c + 1]);
+        float2 k = float2(row[p.dim + c] + bias[p.dim + c], row[p.dim + c + 1] + bias[p.dim + c + 1]);
+        float2 v = float2(row[2 * p.dim + c] + bias[2 * p.dim + c], row[2 * p.dim + c + 1] + bias[2 * p.dim + c + 1]);
+        float sq = simd_sum(q.x * q.x + q.y * q.y), sk = simd_sum(k.x * k.x + k.y * k.y);
+        q *= rsqrt(sq / 64.f + p.eps) * p.scale * float2(qn[2 * lane], qn[2 * lane + 1]);
+        k *= rsqrt(sk / 64.f + p.eps) * float2(kn[2 * lane], kn[2 * lane + 1]);
+        q = dv_rot(q, tb, n, base + pi);
+        float2 kq = dv_rot(k, tb, n, base + pi);
+        ulong o = (ulong)r * p.dim + c;
+        qo[o] = half(q.x); qo[o + 1] = half(q.y);
+        ulong ok = kr * p.dim + c;
+        ko[ok] = half(kq.x); ko[ok + 1] = half(kq.y);
+        vo[ok] = half(v.x); vo[ok + 1] = half(v.y);
+        if (p.halo > 0 && (w == 0 || w == p.qw - 1)) {
+            for (uint j = 0; j < p.halo; j++) {
+                uint col = w == 0 ? j : w + p.halo + 1 + j;
+                float2 kk = wax ? dv_rot(k, tb, n, col * pw + pi) : kq;
+                ulong oc = (kr0 + col) * p.dim + c;
+                ko[oc] = half(kk.x); ko[oc + 1] = half(kk.y);
+                vo[oc] = half(v.x); vo[oc + 1] = half(v.y);
+            }
+        }
+    }
+}
+
+// SwiGLU's middle: rows of silu(g) * u (f32 rows of f) to scaled half rows. 256 threads per row.
+kernel void dv_silu_mul(device const float* g [[buffer(0)]], device const float* u [[buffer(1)]], device half* out [[buffer(2)]],
+                        device float* rs [[buffer(3)]], constant uint& f [[buffer(4)]],
+                        uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    device const float4* g4 = (device const float4*)(g + (ulong)r * f);
+    device const float4* u4 = (device const float4*)(u + (ulong)r * f);
+    uint n4 = f / 4;
+#define DV_SM(i) (g4[i] / (1.0f + exp(-g4[i])) * u4[i])
+    float m = 0.f;
+    for (uint i = tid; i < n4; i += 256) { float4 v = abs(DV_SM(i)); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
+    m = dit_tg_max(m, sg, lane, red);
+    float sinv, s = dit_row_scale(m, sinv);
+    device half4* o = (device half4*)(out + (ulong)r * f);
+    for (uint i = tid; i < n4; i += 256) o[i] = half4(DV_SM(i) * s);
+    if (tid == 0) rs[r] = sinv;
+#undef DV_SM
+}
+
+// h[r][c] += b[c] over rows of n.
+kernel void dv_add_bias(device float* h [[buffer(0)]], device const float* b [[buffer(1)]], constant uint& n [[buffer(2)]],
+                        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    uint c = tg.x * 256 + tid;
+    if (c >= n) return;
+    h[(ulong)tg.y * n + c] += b[c];
+}
+
+// 3D neighborhood attention over half operands (see ltx_na3d_k*; keys over the same frames and
+// rows, `ow` extra columns before the queries'), the output as half rows (the next GEMM's input,
+// unscaled). Threadgroups of 4 SIMD-groups: 32 consecutive queries of 4 consecutive rows (one
+// frame) and one head; each key row any of them needs is staged once.
+struct DNA { uint qt; uint qh; uint qw; uint kt; uint kh; uint kw; uint ow; uint kt_; uint kh_; uint heads; uint dim; uint hblocks;
+             uint row0; uint wtiles; uint _p0; uint _p1; };
+template <uint KW>
+static inline void dv_na3d_impl(device const half* q, device const half* k, device const half* v, device half* o, constant DNA& p,
+                                uint2 tg, uint sg, uint lane, uint tid, threadgroup half4* ks, threadgroup half4* vs) {
+    uint head = tg.x / p.wtiles, w0 = (tg.x % p.wtiles) * 32;
+    uint g = tg.y + p.row0, t = g / p.hblocks, h0 = (g % p.hblocks) * 4;
+    uint h = h0 + sg;
+    bool hv = h < p.qh;
+    uint hc = min(h, p.qh - 1), hl = min(h0 + 3, p.qh - 1);
+    uint w = w0 + lane;
+    bool valid = hv && w < p.qw;
+    uint wc = min(w, p.qw - 1), wl = min(w0 + 31, p.qw - 1);
+    uint st = na_start(t, 0, p.kt_, p.kt), sh = na_start(hc, 0, p.kh_, p.kh);
+    uint sh0 = na_start(h0, 0, p.kh_, p.kh), sh1 = na_start(hl, 0, p.kh_, p.kh) + p.kh_;
+    uint sw = na_start(wc, p.ow, KW, p.kw);
+    uint u0 = na_start(w0, p.ow, KW, p.kw), u1 = na_start(wl, p.ow, KW, p.kw) + KW;
+    uint nu = u1 - u0;
+    ulong qi = ((ulong)t * p.qh + hc) * p.qw + wc;
+    device const half4* qr = (device const half4*)(q + qi * p.dim + head * 64);
+    float4 qv[16];
+    float4 acc[16];
+    for (uint i = 0; i < 16; i++) { qv[i] = float4(qr[i]); acc[i] = float4(0.f); }
+    float m = -INFINITY, l = 0.f;
+    uint j0 = sw - u0;
+    for (uint a = 0; a < p.kt_; a++) {
+        for (uint b = sh0; b < sh1; b++) {
+            ulong base = (((ulong)(st + a) * p.kh + b) * p.kw + u0) * p.dim + head * 64;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = tid; i < nu * 16; i += 128) {
+                uint j = i / 16, c = i % 16;
+                ks[i] = *((device const half4*)(k + base + (ulong)j * p.dim) + c);
+                vs[i] = *((device const half4*)(v + base + (ulong)j * p.dim) + c);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (b < sh || b >= sh + p.kh_) continue;
+            float s[KW];
+            float mx = m;
+            for (uint c = 0; c < KW; c++) {
+                threadgroup const half4* kr = ks + (j0 + c) * 16;
+                float4 d4 = qv[0] * float4(kr[0]);
+                for (uint i = 1; i < 16; i++) d4 = fma(qv[i], float4(kr[i]), d4);
+                s[c] = d4.x + d4.y + d4.z + d4.w;
+                mx = max(mx, s[c]);
+            }
+            float sc = exp(m - mx);
+            l *= sc;
+            for (uint i = 0; i < 16; i++) acc[i] *= sc;
+            for (uint c = 0; c < KW; c++) {
+                float pc = exp(s[c] - mx);
+                l += pc;
+                threadgroup const half4* vr = vs + (j0 + c) * 16;
+                for (uint i = 0; i < 16; i++) acc[i] = fma(float4(pc), float4(vr[i]), acc[i]);
+            }
+            m = mx;
+        }
+    }
+    if (!valid) return;
+    device half4* orow = (device half4*)(o + qi * p.dim + head * 64);
+    float inv = 1.f / l;
+    for (uint i = 0; i < 16; i++) orow[i] = half4(acc[i] * inv);
+}
+#define DV_NA3D(KW)                                                                                                      \
+    kernel void dv_na3d_k##KW(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],                  \
+                              device const half* v [[buffer(2)]], device half* o [[buffer(3)]], constant DNA& p [[buffer(4)]], \
+                              uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],    \
+                              uint lane [[thread_index_in_simdgroup]], uint tid [[thread_index_in_threadgroup]]) {      \
+        threadgroup half4 ks[(32 + KW - 1) * 16];                                                                         \
+        threadgroup half4 vs[(32 + KW - 1) * 16];                                                                         \
+        dv_na3d_impl<KW>(q, k, v, o, p, tg, sg, lane, tid, ks, vs);                                                       \
+    }
+DV_NA3D(3)
+DV_NA3D(5)
+DV_NA3D(7)
+DV_NA3D(11)

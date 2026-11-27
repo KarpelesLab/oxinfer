@@ -3300,6 +3300,115 @@ impl MetalBackend {
         }
     }
 
+    /// [`crate::gpu::Backend::na3d`]: `ltx_na3d_k*` over buffers made for the call (released
+    /// after it, so the decoder's large volumes are not kept).
+    #[allow(clippy::too_many_arguments)]
+    fn na3d_impl(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        qd: [usize; 3],
+        kd: [usize; 3],
+        off: [usize; 3],
+        ker: [usize; 3],
+        heads: usize,
+        hd: usize,
+        out: &mut [f32],
+    ) -> bool {
+        let (nq, nk, d) = (qd.iter().product::<usize>(), kd.iter().product::<usize>(), heads * hd);
+        if hd != 64 || nq == 0 || q.len() < nq * d || k.len() < nk * d || v.len() < nk * d || out.len() < nq * d {
+            return false;
+        }
+        if (0..3).any(|a| ker[a] == 0 || ker[a] > kd[a]) {
+            return false;
+        }
+        let Some(pipe) = self.named_pipeline(&format!("ltx_na3d_k{}", ker[2])) else {
+            return false;
+        };
+        let new_len: MsgNewBufLen = self.o.msg_send();
+        let void: MsgVoid = self.o.msg_send();
+        let mk = |bytes: usize| unsafe { new_len(self.device, self.sels.new_buffer_len, bytes.div_ceil(PAGE) * PAGE, 0) };
+        let bufs = [mk(nq * d * 4), mk(nk * d * 4), mk(nk * d * 4), mk(nq * d * 4)];
+        let release = || {
+            for b in bufs {
+                if !b.is_null() {
+                    unsafe { void(b, self.sels.release) };
+                }
+            }
+        };
+        if bufs.iter().any(|b| b.is_null()) {
+            release();
+            return false;
+        }
+        let t0 = Instant::now();
+        // SAFETY: the buffers hold the sizes made above.
+        unsafe {
+            par_copy(self.contents(bufs[0]) as *mut f32, q.as_ptr(), nq * d);
+            par_copy(self.contents(bufs[1]) as *mut f32, k.as_ptr(), nk * d);
+            par_copy(self.contents(bufs[2]) as *mut f32, v.as_ptr(), nk * d);
+        }
+        #[repr(C)]
+        struct Na3 {
+            q: [u32; 3],
+            k: [u32; 3],
+            off: [u32; 3],
+            kt: u32,
+            kh: u32,
+            heads: u32,
+            dim: u32,
+            row0: u32,
+            wtiles: u32,
+            _p: u32,
+        }
+        let u = |a: [usize; 3]| a.map(|x| x as u32);
+        let p = Na3 {
+            q: u(qd),
+            k: u(kd),
+            off: u(off),
+            kt: ker[0] as u32,
+            kh: ker[1] as u32,
+            heads: heads as u32,
+            dim: d as u32,
+            row0: 0,
+            wtiles: qd[2].div_ceil(32) as u32,
+            _p: 0,
+        };
+        // A few frames of queries per command buffer (long submissions stall the display).
+        let per = (1usize << 22).div_ceil(qd[1] * qd[2] * heads).clamp(1, qd[0]);
+        let mut ok = true;
+        let mut t = 0;
+        while t < qd[0] && ok {
+            let t1 = (t + per).min(qd[0]);
+            let mut none = ();
+            let pc = Na3 {
+                row0: (t * qd[1]) as u32,
+                ..p
+            };
+            ok = self.submit(
+                t0,
+                &mut none,
+                |e, _| {
+                    e.pipe(pipe);
+                    e.buf(bufs[0], 0, 0);
+                    e.buf(bufs[1], 0, 1);
+                    e.buf(bufs[2], 0, 2);
+                    e.buf(bufs[3], 0, 3);
+                    e.bytes(&pc, 4);
+                    e.dispatch((qd[2].div_ceil(32) * heads, (t1 - t) * qd[1]), 32);
+                },
+                |_| {},
+            );
+            t = t1;
+        }
+        if ok {
+            // SAFETY: the output buffer holds nq rows of d floats.
+            unsafe { par_copy(out.as_mut_ptr(), self.contents(bufs[3]) as *const f32, nq * d) };
+        }
+        release();
+        ok
+    }
+
     fn contents(&self, b: Id) -> *mut u8 {
         let f: MsgPtr = self.o.msg_send();
         unsafe { f(b, self.sels.contents) as *mut u8 }
@@ -4285,6 +4394,26 @@ impl Backend for MetalBackend {
 
     fn ltx_session(&'static self) -> Option<Box<dyn crate::gpu::dit::LtxSession>> {
         self.ltx_session_impl()
+    }
+
+    fn na_session(&'static self) -> Option<Box<dyn crate::gpu::dit::NaSession>> {
+        self.na_session_impl()
+    }
+
+    fn na3d(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        qd: [usize; 3],
+        kd: [usize; 3],
+        off: [usize; 3],
+        ker: [usize; 3],
+        heads: usize,
+        hd: usize,
+        out: &mut [f32],
+    ) -> bool {
+        self.na3d_impl(q, k, v, qd, kd, off, ker, heads, hd, out)
     }
 
     fn t5_session(&'static self) -> Option<Box<dyn crate::gpu::dit::T5Session>> {

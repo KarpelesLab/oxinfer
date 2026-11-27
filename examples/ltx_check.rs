@@ -6,6 +6,8 @@
 //! ltx_check dit FILE REF_DIR        # ref_dit.py's dump (FILE: a transformer file)
 //! ltx_check connector FILE REF_DIR  # ref_connector.py
 //! ltx_check vae FILE REF_DIR        # ref_vae.py (FILE: the video VAE)
+//! ltx_check diffvae FILE REF_DIR    # tools/ltx_ref_diffvae.py (FILE: the DiffVAE)
+//! ltx_check diffvae_time FILE T H W # a timed decode of random latents (either VAE)
 //! ltx_check audio FILE REF_DIR      # ref_audio.py (FILE: the audio VAE)
 //! ltx_check upsample FILE VAE REF_DIR  # ref_upsample.py
 //! ltx_check text FILE REF_DIR       # ref_text.py (FILE: the text encoder)
@@ -204,6 +206,43 @@ fn main() -> Result<()> {
                 let z = enc.encode(&v);
                 compare("encoded image", &z.to_cthw(), &r("z")?);
             }
+        }
+        "diffvae" => {
+            // ref_diffvae.py's decode: the same latents and the reference's recorded noise.
+            let m = meta(dir)?;
+            let u = |k: &str| m[k].as_u64().unwrap_or(0) as usize;
+            let files = ModelFiles::open_file(file, false)?;
+            let dec = ltx::diffvae::DiffDecoder::load(&files)?;
+            let (t, h, w) = (u("t"), u("h"), u("w"));
+            let noise = r("noise")?;
+            println!("noise: {} values, decode draws {}", noise.len(), dec.noise_len(t, h, w));
+            let mut at = 0;
+            let mut draw = |n: usize| {
+                let v = noise[at..at + n].to_vec();
+                at += n;
+                v
+            };
+            let t0 = std::time::Instant::now();
+            let px = dec.decode(&r("lat")?, t, h, w, &mut draw, &mut |_, _| {});
+            println!("decode {:.2}s ({}x{}x{} frames)", t0.elapsed().as_secs_f64(), px.t, px.h, px.w);
+            compare("decoded frames", &px.to_cthw(), &r("px")?);
+        }
+        "diffvae_time" => {
+            // ltx_check diffvae_time FILE T H W: a decode of random latents, timed (either VAE).
+            let n = |i: usize| -> Result<usize> { a.get(i).context("T H W")?.parse::<usize>().context("T H W") };
+            let (t, h, w) = (n(3)?, n(4)?, n(5)?);
+            let files = ModelFiles::open_file(file, false)?;
+            let mut g = ltx::NoiseGen::new(ltx::Noise::Oxinfer, 1);
+            let lat = g.normals(128 * t * h * w);
+            let t0 = std::time::Instant::now();
+            // The convolutional VAE's decode for comparison when FILE is that one.
+            let px = if ltx::diffvae::is_diffusion_vae(&files) {
+                let dec = ltx::diffvae::DiffDecoder::load(&files)?;
+                dec.decode(&lat, t, h, w, &mut |n| g.normals(n), &mut |_, _| {})
+            } else {
+                ltx::vae::VideoDecoder::load(&files)?.decode(&lat, t, h, w, &mut |_, _| {})
+            };
+            println!("decode {:.2}s ({}x{}x{} frames)", t0.elapsed().as_secs_f64(), px.t, px.h, px.w);
         }
         "audio" => {
             let files = ModelFiles::open_file(file, false)?;

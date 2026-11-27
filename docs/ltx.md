@@ -32,6 +32,7 @@ download only what a run reads, 39.7 GB by default:
 | transformer (distilled, ComfyUI int8 ConvRot) | `diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors` | 21.5 GB |
 | text encoder (Gemma 4 12B and the projections, int8 ConvRot) | `text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors` | 15.4 GB |
 | video VAE (convolutional) | `vae/ltx-2.5-video-vae-conv-bf16.safetensors` | 1.45 GB |
+| or the diffusion video decoder (DiffVAE, `--vae diff`; its encoder is the convolutional VAE's) | `vae/ltx-2.5-video-vae-bf16.safetensors` | 1.47 GB |
 | audio VAE, vocoder, bandwidth extension | `vae/ltx-2.5-audio-vae-bf16.safetensors` | 0.36 GB |
 | spatial x2 latent upsampler | `latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors` | 1.0 GB |
 | duration head | `model_patches/ltx-2.5-duration-head-bf16.safetensors` | 3.8 MB |
@@ -56,6 +57,7 @@ files (the other parts from the folder above it).
 | `--lora FILE[:SCALE]` | an LTX-2.x LoRA (repeatable) |
 | `--exact-attention` | the video self-attention in float32 on Metal (slower; default half operands) |
 | `--text-bf16` | fetch the bf16 text encoder (26.3 GB) instead of the int8 one |
+| `--vae conv\|diff` | the video decoder: the convolutional VAE (default) or the diffusion decoder ([below](#the-diffusion-decoder-diffvae)) |
 | `--text-encoder FILE`, `--vae FILE`, `--audio-vae FILE`, `--upsampler FILE`, `--temporal-upsampler FILE`, `--duration-head FILE` | parts from elsewhere |
 | `--sigmas a,b,..,0`, `--stage2-sigmas a,..,0` | other schedules than the distilled ones (or the guided `--steps`) |
 | `--eta F` | the ancestral sampler's noise (1, the distilled pipeline's for LTX-2.5; 0: plain Euler, the guided pipeline's) |
@@ -91,7 +93,8 @@ files (the other parts from the folder above it).
    width, normalized again), then **stage 2** at the full size: video and audio latents noised to
    `sigma = 0.909375` and three forwards on `[0.909375, 0.725, 0.421875, 0]` (noise seed
    `seed + 20000`).
-4. **Decoders**: the convolutional video VAE ([`vae.rs`](../src/ltx/vae.rs)), the audio VAE
+4. **Decoders**: the convolutional video VAE ([`vae.rs`](../src/ltx/vae.rs)) or the diffusion
+   decoder ([`diffvae.rs`](../src/ltx/diffvae.rs), [below](#the-diffusion-decoder-diffvae)), the audio VAE
    decoder (a stereo 64-bin mel spectrogram), the BigVGAN v2 vocoder (16 kHz) and its bandwidth
    extension to 48 kHz ([`audio.rs`](../src/ltx/audio.rs)); the soundtrack cut to the video's
    length (it is a little shorter: `4 n - 3` mel frames for `n` latents, as in the reference).
@@ -150,6 +153,54 @@ layers.
 with `[0.975, 0.909375, 0.725, 0.421875, 0]` (audio kept as it was): a simplified form of the
 release's DFR temporal rounds (`dfr_pipeline.py`), which tile the clip and carry keyframes.
 
+## The diffusion decoder (DiffVAE)
+
+`--vae diff` (the server's and the C API's option `vae=diff`, `Paths::video_vae` naming the file
+in the library) decodes with the release's "diffusion video decoder"
+(`ltx_core.model.video_vae.DiffusionVideoDecoder`, `NADiffusionDecoder` in the file's config), a
+neighborhood-attention transformer instead of convolutions:
+
+- stages 1 to 4: the latents un-normalized, a linear `conv_in` to 2048 channels, blocks of RMS
+  norm, 3D neighborhood attention (64-wide heads, absolute RoPE over each row's frame, row and
+  column with 16 / 24 / 24 of the head's dimensions; windows 3x7x7, 3x7x7, 3x5x5, 3x5x5) and
+  SwiGLU (4, 6, 4 and 2 blocks at 2048, 1024, 512 and 512 channels), each stage followed by a
+  linear pixel-shuffle upsampler (x2 space, x2 time, x2 all, x2 all; the doubled first frame
+  dropped): a 256-channel context at a quarter of the pixel size. The last latent frame is
+  repeated twice first and those frames cropped before stage 5 (NATTEN's last-frame border);
+  latents smaller than 3x7x7 are edge-padded and the padding cropped from the pixels;
+- stage 5: Gaussian noise over the 4x4-patchified pixels at timestep 1, a linear projection,
+  then 8 blocks with 11x11x11 windows: the context projected and added, AdaLN-modulated
+  attention and SwiGLU (one shared timestep modulation plus a table per block); RMS norm, a
+  linear layer to the 48 patch channels. The checkpoint predicts the clean pixels in one step.
+
+Windows shift inward at the volume's borders as NATTEN's do. Stage 5 follows the pipelines'
+default decode mode (`DiffVAEMode.CHUNKED_EAGER`): along the width its blocks see the volume
+edge-replicated by half a window (the repeated columns at their own, out-of-range RoPE positions),
+so the outer columns' windows stay centered; the reference's `COMBINED_COMPILE` mode shifts them
+instead. The decode is untiled (the reference tiles only when its device's free memory requires
+it). The starting noise is drawn from the run's generator after the denoising stages, as the
+reference continues its generator into the decoder.
+
+On Metal every block runs on the device ([`metal_diffvae.rs`](../src/metal_diffvae.rs), one command
+buffer per block, the rows in device memory for a stage's blocks): the projections on the
+matrix-unit GEMMs, q / k / v normed and rotated into half buffers, the attention on `dv_na3d_k*`
+(half operands, float32 arithmetic; a SIMD-group per 32 queries of a row, 4 rows per threadgroup
+sharing the staged key rows), the projections and the MLP over chunks of 65536 rows. Without
+matrix units, the attention alone runs on the GPU (`ltx_na3d_k*`, float32) and the rest per op.
+`OXINFER_DIFFVAE_GPU=0` keeps the blocks on the CPU; `OXINFER_DIFFVAE_PROF=1` prints the stages'
+times.
+
+The default stays the convolutional VAE: the two decode in about the same time on an M5 Max
+(table below), the DiffVAE needs about three times the memory at 768x512x121 (untiled), and on
+the clips checked (a face, a chalkboard sign) its frames were not visibly sharper, only a little
+softer. The release's own pipelines default to the DiffVAE.
+
+| decode (M5 Max, Metal) | convolutional VAE | DiffVAE |
+|---|---|---|
+| 384x256, 25 frames (4 x 8 x 12 latents) | 2.1 s | 1.6 s (CPU: 30 s; the reference, torch CPU float32: 21 s) |
+| 768x512, 49 frames, in a two-stage run | 10.9 s | 11.1 s |
+| 768x512, 121 frames (16 x 16 x 24 latents) | 25.2 s, 13 GB peak | 32.4 s (stage 5: 30.2 s), 38 GB peak |
+
 ## On the GPU
 
 With Metal (M5's matrix units) every block of both streams runs as one submission per forward
@@ -186,7 +237,7 @@ wall time from start to the written `.mp4`, files mapped (resident set 17 to 22 
 `minimax_h3::video::Video`: frames and the soundtrack); `oxinfer::ltx::api::load_with_options`
 takes a repository id, folder or file with the server's options. The C API's `oxi_video_load` /
 `oxi_video_generate` load LTX-2.5 for any of its names (options `transformer`, `text_encoder`,
-`vae`, `audio_vae`, `upsampler`, `temporal_upsampler`, `duration_head`, `text_bf16`, `temporal`,
+`vae` (`conv`, `diff` or a file), `audio_vae`, `upsampler`, `temporal_upsampler`, `duration_head`, `text_bf16`, `temporal`,
 `distilled_lora`, `lora`, `device`; parameters `prompt`, `size`, `frames` / `seconds`, `fps`,
 `seed`, `one_stage`, `temporal_upscale`, `audio`, `eta`, `sigmas`, `stage2_sigmas`, `noise`,
 `first_frame` / `strength`, `last_frame`, `images`). The server's `/v1/videos` takes the same
@@ -211,6 +262,8 @@ are `ref_*.py` beside `examples/ltx_check.rs`'s checks):
 | the guidance passes, 2 blocks (dev int8; STG: video self-attention skipped in block 1, audio in block 0; modality: no AV cross-attention), CPU / Metal | 2.3e-6 / 1.6e-6, 2.2e-6 / 1.5e-6; 9.7e-5 / 1.1e-4, 8.9e-5 / 7.7e-5 | `LTXModel` with a `BatchedPerturbationConfig` (`ref_dit_ptb.py`) |
 | guidance arithmetic (video / audio params, masked rescale) | 0 (bit-identical) | `MultiModalGuider.calculate` (`ref_guider.py`, `ltx_check guider`) |
 | `LTX2Scheduler(30)` | 6e-8 (one float32 ulp) | the dev schedule |
+| DiffVAE decoder, 2 x 4 x 6 latents (edge-padded to 3 x 7 x 7) / 4 x 8 x 12 (CPU) | 8.1e-7 / 8.1e-7 | `DiffusionVideoDecoder`, `CHUNKED` blocks, eager neighborhood attention, the reference's noise injected (`ref_diffvae.py`, `ltx_check diffvae`) |
+| the same on the Metal blocks | 1.8e-4 / 2.8e-4 | half GEMM inputs and half q / k / v |
 
 Positions (video and audio) are bit-identical to the reference's.
 
@@ -247,7 +300,8 @@ quantization) and the NVFP4 file 2.7e-2 / 1.6e-2 (its rows correlate 0.9956 with
   reference leaves the skipped stream out of that pass); off by default.
 - `ti2vid_two_stages_hq` (the res2s sampler) and the guidance factories by sigma.
 - The temporal upscaler's DFR rounds (tiled, with keyframes): a single refinement pass instead.
-- NVFP4 on the GPU (CPU only), the DiffVAE decoder, the prompt enhancer, audio-to-video and
+- NVFP4 on the GPU (CPU only), the DiffVAE's tiled decode (the reference's memory-driven tiles
+  and its keyframe-anchored decode), the prompt enhancer, audio-to-video and
   video-to-video (IC-LoRA) pipelines.
 - The text encoder, connectors, VAEs and vocoder run on the CPU kernels with per-op GPU matmuls
   and convolutions, not as whole GPU passes.

@@ -2844,9 +2844,10 @@ pub struct OxiVideo {
 /// `shift`, `audio_shift`, `corrector` and `corrector_strength` / `_budget` / `_floor` / `_start` /
 /// `_end`: [`crate::minimax_h3::video::load_with_options`]) or LTX-2.5 (`Lightricks/LTX-2.5`, its
 /// parts fetched from the public mirror, a release folder or a transformer file; options
-/// `transformer` (`int8`, `bf16`, `nvfp4`, `dev`, `dev-bf16` or a file), `text_encoder`, `vae`,
-/// `audio_vae`, `upsampler`, `temporal_upsampler`, `duration_head`, `text_bf16`, `temporal`,
-/// `distilled_lora`, `lora`, `device`, `exact_attention`), plus `cache_dir`.
+/// `transformer` (`int8`, `bf16`, `nvfp4`, `dev`, `dev-bf16` or a file), `text_encoder`, `vae`
+/// (`conv`, `diff`: the diffusion decoder, or a file), `audio_vae`, `upsampler`,
+/// `temporal_upsampler`, `duration_head`, `text_bf16`, `temporal`, `distilled_lora`, `lora`,
+/// `device`, `exact_attention`), plus `cache_dir`.
 #[cfg(not(target_arch = "wasm32"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxi_video_load(

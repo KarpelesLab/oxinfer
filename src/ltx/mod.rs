@@ -12,7 +12,7 @@
 //! 3. the spatial x2 latent upsampler ([`upsample`]), then stage 2 at the full size: the
 //!    upsampled latents (and the stage's audio latents) noised to `sigma = 0.909375` and
 //!    [`STAGE_2_SIGMAS`] (3 forwards);
-//! 4. the video VAE decoder ([`vae`]) and the audio VAE, vocoder and bandwidth extension
+//! 4. the video VAE decoder ([`vae`], or the diffusion decoder [`diffvae`]) and the audio VAE, vocoder and bandwidth extension
 //!    ([`audio`], 48 kHz stereo).
 //!
 //! An image conditions the latent frame it falls in: its VAE latents replace that frame's rows,
@@ -28,6 +28,7 @@
 pub mod api;
 pub mod audio;
 pub(crate) mod device;
+pub mod diffvae;
 pub mod dit;
 pub mod duration;
 pub mod guidance;
@@ -44,6 +45,7 @@ use crate::minimax_h3::video::{Soundtrack, Video};
 use crate::safetensors::ModelFiles;
 pub use crate::sd::Image;
 use anyhow::{Context, Result, bail};
+pub use diffvae::DiffDecoder;
 use dit::{Dit, Perturb, StreamIn};
 pub use guidance::{DEFAULT_NEGATIVE_PROMPT, Guidance, GuidanceMode, GuiderParams};
 use std::path::{Path, PathBuf};
@@ -75,6 +77,8 @@ pub mod files {
     pub const TEXT_INT8: &str = "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors";
     pub const TEXT_BF16: &str = "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors";
     pub const VIDEO_VAE: &str = "vae/ltx-2.5-video-vae-conv-bf16.safetensors";
+    /// The diffusion video decoder ("DiffVAE"; its encoder is the convolutional VAE's).
+    pub const VIDEO_VAE_DIFF: &str = "vae/ltx-2.5-video-vae-bf16.safetensors";
     pub const AUDIO_VAE: &str = "vae/ltx-2.5-audio-vae-bf16.safetensors";
     pub const SPATIAL_UPSAMPLER: &str = "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors";
     pub const TEMPORAL_UPSAMPLER: &str = "latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors";
@@ -125,6 +129,34 @@ impl Variant {
     }
 }
 
+/// The video decoder of a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VideoVae {
+    /// The convolutional VAE (`vae/ltx-2.5-video-vae-conv-bf16.safetensors`, 1.45 GB).
+    #[default]
+    Conv,
+    /// The diffusion decoder (`vae/ltx-2.5-video-vae-bf16.safetensors`, 1.47 GB; [`diffvae`]).
+    Diff,
+}
+
+impl VideoVae {
+    /// `conv`, `diff` (`diffvae`, `diffusion`).
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "conv" | "convolutional" => Self::Conv,
+            "diff" | "diffvae" | "diffusion" => Self::Diff,
+            _ => return None,
+        })
+    }
+
+    pub fn file(self) -> &'static str {
+        match self {
+            Self::Conv => files::VIDEO_VAE,
+            Self::Diff => files::VIDEO_VAE_DIFF,
+        }
+    }
+}
+
 /// Whether `spec` names the release (`Lightricks/LTX-2.5`, gated, or its public mirror).
 pub fn is_repo(spec: &str) -> bool {
     spec == "Lightricks/LTX-2.5" || spec == files::MIRROR
@@ -140,6 +172,8 @@ pub struct FetchOptions {
     pub temporal_upsampler: bool,
     /// The distilled LoRA (for the dev transformer).
     pub distilled_lora: bool,
+    /// The video decoder.
+    pub vae: VideoVae,
 }
 
 /// The files of a run fetched from the release's public mirror ([`files::MIRROR`]; the release
@@ -149,7 +183,7 @@ pub fn fetch(spec: &str, o: &FetchOptions, cache_dir: Option<&Path>) -> Result<P
     let mut names = vec![
         o.variant.file(),
         if o.text_bf16 { files::TEXT_BF16 } else { files::TEXT_INT8 },
-        files::VIDEO_VAE,
+        o.vae.file(),
         files::AUDIO_VAE,
         files::SPATIAL_UPSAMPLER,
         files::DURATION_HEAD,
@@ -226,6 +260,21 @@ impl Paths {
         Self::resolve_with(path, None)
     }
 
+    /// [`Self::resolve_with`] with the video decoder `vae` (the other one when it is missing).
+    pub fn resolve_vae(path: &Path, variant: Option<Variant>, vae: VideoVae) -> Result<Self> {
+        let mut p = Self::resolve_with(path, variant)?;
+        let root = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().and_then(|p| p.parent()).map(Path::to_path_buf).unwrap_or_default()
+        };
+        let want = root.join(vae.file());
+        if want.exists() {
+            p.video_vae = Some(want);
+        }
+        Ok(p)
+    }
+
     /// [`Self::resolve`] with the transformer `variant` of a folder (none: the first present).
     pub fn resolve_with(path: &Path, variant: Option<Variant>) -> Result<Self> {
         let (root, transformer) = if path.is_dir() {
@@ -250,7 +299,7 @@ impl Paths {
         Ok(Self {
             transformer,
             text_encoder: first(&[files::TEXT_INT8, files::TEXT_BF16]),
-            video_vae: first(&[files::VIDEO_VAE]),
+            video_vae: first(&[files::VIDEO_VAE, files::VIDEO_VAE_DIFF]),
             audio_vae: first(&[files::AUDIO_VAE]),
             spatial_upsampler: first(&[files::SPATIAL_UPSAMPLER]),
             temporal_upsampler: first(&[files::TEMPORAL_UPSAMPLER]),
@@ -740,7 +789,7 @@ impl Pipeline {
 
     fn vae_files(&self) -> Result<&'static ModelFiles> {
         self.vae_files
-            .context("LTX-2.5 needs its video VAE (vae/ltx-2.5-video-vae-conv-bf16.safetensors)")
+            .context("LTX-2.5 needs its video VAE (vae/ltx-2.5-video-vae-conv-bf16.safetensors or vae/ltx-2.5-video-vae-bf16.safetensors)")
     }
 
     /// Image latents `[c, 1, h / 32, w / 32]` of `img` resized and center-cropped to `w` x `h`.
@@ -1143,11 +1192,17 @@ impl Pipeline {
         }
         // Decode.
         let t3 = Instant::now();
-        let dec = vae::VideoDecoder::load(vfiles)?;
         let lat = unpatchify(&video.x, c, lt, lh, lw);
         let mut on_vae = |d: usize, t: usize| progress("vae", d, t);
-        let px = dec.decode(&lat, lt, lh, lw, &mut on_vae);
-        drop(dec);
+        let px = if diffvae::is_diffusion_vae(vfiles) {
+            // The diffusion decoder's starting pixels continue the run's noise stream, as the
+            // reference's decoder continues its generator.
+            let mut dec = diffvae::DiffDecoder::load(vfiles)?;
+            dec.device = self.dit.device;
+            dec.decode(&lat, lt, lh, lw, &mut |n| rng.normals(n), &mut on_vae)
+        } else {
+            vae::VideoDecoder::load(vfiles)?.decode(&lat, lt, lh, lw, &mut on_vae)
+        };
         dump("pixels", &px.data);
         let n_frames = px.t.min(frames);
         let (w, h) = (px.w, px.h);

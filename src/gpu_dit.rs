@@ -321,3 +321,38 @@ pub trait LtxSession: Send {
     /// false when the device declined or failed (the caller runs the CPU path).
     fn forward(&mut self, m: &LtxModel, v: &LtxIn, a: &LtxIn, p: &LtxPerturb, vout: &mut Vec<f32>, aout: &mut Vec<f32>) -> bool;
 }
+
+/// One neighborhood-attention block of LTX-2.5's DiffVAE decoder (`crate::ltx::diffvae`):
+/// RMS norm (with weight), fused q / k / v projection (`[3 dim, dim]`, biases added), RMS norms
+/// of each 64-wide head's queries (times `1 / 8`) and keys, absolute 3D RoPE, 3D neighborhood
+/// attention, the output projection; then RMS norm and a SwiGLU without biases. Stage-5 blocks
+/// first add `ctx (ctx rows)` and modulate both norms `* (1 + scale) + shift`.
+pub struct NaBlock<'a> {
+    pub dim: usize,
+    pub kernel: [usize; 3],
+    /// Keys extend half a window past both width edges (the edge columns repeated at their own
+    /// positions), else NATTEN's inward-shifted windows on every axis.
+    pub replicate_w: bool,
+    pub norm1: &'a [f32],
+    pub norm2: &'a [f32],
+    pub qkv: Lin<'a>,
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
+    pub proj: Lin<'a>,
+    pub gate: Lin<'a>,
+    pub up: Lin<'a>,
+    pub down: Lin<'a>,
+    /// Stage 5: the context projection (with its bias).
+    pub ctx: Option<Lin<'a>>,
+    /// Stage 5: scale and shift of the attention's norm, of the MLP's.
+    pub mods: Option<[&'a [f32]; 4]>,
+}
+
+/// LTX-2.5 DiffVAE blocks on the device: the rows stay in device buffers through a run of
+/// blocks.
+pub trait NaSession: Send {
+    /// `x` (`[t h w, dim]` rows over the `d = [t, h, w]` grid) through `blocks` in place, with the
+    /// stage-5 context rows `ctx` (same grid). False when the device declined or failed (`x` is
+    /// then unchanged).
+    fn blocks(&mut self, blocks: &[NaBlock], x: &mut [f32], ctx: Option<&[f32]>, d: [usize; 3]) -> bool;
+}
