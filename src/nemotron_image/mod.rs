@@ -749,11 +749,9 @@ impl NemotronImage {
             ..Default::default()
         };
         let n = o.num_images.max(1);
-        // (With guidance each image's prompts take its steps together instead, see `advance`.)
         if n > 1
             && o.structure == Structure::Grid
-            && guide.is_empty()
-            && let Some(out) = self.generate_batch(&ids, o, n, &mut st, progress)?
+            && let Some(out) = self.generate_batch(&ids, &guide, o, n, &mut st, progress)?
         {
             return Ok((out, st));
         }
@@ -776,13 +774,15 @@ impl NemotronImage {
         Ok((out, st))
     }
 
-    /// The grid of `n` images in lockstep (`Structure::Grid`): the prompt runs once, then each
-    /// step runs one token of every image in one GPU pass that reads the weights once
+    /// The grid of `n` images in lockstep (`Structure::Grid`): the prompt (and its guidance
+    /// prompts) run once, then each step runs one token of every image's sequences (the prompt's
+    /// and its guidance prompts') in one GPU pass that reads the weights once
     /// (`NemotronModel::forward_rows_batch`); image `i` samples with seed `o.seed + i`, as
     /// generated one at a time. None (nothing run) when the batch cannot run on the GPU.
     fn generate_batch(
         &self,
         ids: &[u32],
+        guide: &[(f32, Vec<u32>)],
         o: &GenerateOptions,
         n: usize,
         st: &mut Stats,
@@ -791,47 +791,54 @@ impl NemotronImage {
         const MAX_BATCH: usize = 16;
         let v = self.vocab;
         let (gw, gh) = (o.width / PATCH, o.height / PATCH);
-        let mut pre = ids.to_vec();
         let mut head = self.encode_text("\n")?;
         head.push(v.img_start);
         head.extend(self.encode_text(&size_header(o.width, o.height))?);
         head.push(v.vis_row);
-        pre.extend(&head);
+        // Sequences per image (the prompt's and its guidance prompts'), images per batch.
+        let k = 1 + guide.len();
+        let per = MAX_BATCH / k;
         // Probe: a batch plan for this many rows at all (before the prompt runs).
-        if !self.lm.can_batch(n.min(MAX_BATCH)) {
+        if !self.lm.can_batch(n.min(per) * k) {
             return Ok(None);
         }
         let t = Instant::now();
-        let mut sess = self.lm.new_session();
-        let first = self.lm.forward_rows(&mut sess, &pre);
+        let (first, base) = self.start(ids, guide, &head, false);
         st.prefill += t.elapsed().as_secs_f64();
         let stopped = || anyhow!("generation stopped");
         let steps = gh * gw;
         let mut out = Vec::with_capacity(n);
         let t = Instant::now();
         let mut dec = 0.0;
-        for g0 in (0..n).step_by(MAX_BATCH) {
-            let b = MAX_BATCH.min(n - g0);
+        for g0 in (0..n).step_by(per) {
+            let b = per.min(n - g0);
             let mut samplers: Vec<Sampler> = (0..b)
                 .map(|j| Sampler::new(o.temperature, o.top_k, o.top_p, o.seed.wrapping_add((g0 + j) as u64)))
                 .collect();
-            let mut sessions: Vec<_> = (0..b).map(|_| sess.clone()).collect();
+            // Image `j`'s sequences are rows `j * k .. (j + 1) * k`.
+            let mut sessions: Vec<_> = (0..b).flat_map(|_| base.iter().cloned()).collect();
             let mut logits: Vec<Vec<f32>> = vec![first.clone(); b];
             let mut codes: Vec<Vec<u32>> = vec![Vec::with_capacity(steps); b];
-            // One batched step, or (a single image left, or no batch plan) one step per session.
+            // One batched step, or (a single sequence left, or no batch plan) one step per
+            // session. `toks`: one per image; returns each image's guided logits.
             let run = |sessions: &mut [crate::nemotron::NemotronSession], toks: &[u32], want: bool| -> Vec<Vec<f32>> {
+                let toks: Vec<u32> = toks.iter().flat_map(|&t| std::iter::repeat_n(t, k)).collect();
+                let images = |all: Vec<Vec<f32>>| -> Vec<Vec<f32>> {
+                    let mut it = all.into_iter();
+                    (0..toks.len() / k).map(|_| mix(it.by_ref().take(k).collect(), guide)).collect()
+                };
                 if sessions.len() > 1 {
                     if want {
-                        if let Some(l) = self.lm.forward_rows_batch(sessions, toks) {
-                            return l;
+                        if let Some(l) = self.lm.forward_rows_batch(sessions, &toks) {
+                            return images(l);
                         }
-                    } else if self.lm.gpu_step_batch(sessions, toks, false, false).is_some() {
+                    } else if self.lm.gpu_step_batch(sessions, &toks, false, false).is_some() {
                         return Vec::new();
                     }
                 }
-                sessions
+                let all = sessions
                     .iter_mut()
-                    .zip(toks)
+                    .zip(&toks)
                     .map(|(s, &tk)| {
                         if want {
                             self.lm.forward_rows(s, &[tk])
@@ -842,7 +849,8 @@ impl NemotronImage {
                             Vec::new()
                         }
                     })
-                    .collect()
+                    .collect();
+                if want { images(all) } else { Vec::new() }
             };
             for r in 0..gh {
                 for c in 0..gw {

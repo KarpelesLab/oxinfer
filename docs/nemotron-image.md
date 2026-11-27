@@ -190,6 +190,8 @@ CPU (`tools/bench/with-lock.sh` held for the GPU):
 | 4 x 1024x1024, Metal (`--num-images 4`) | 16,700 | 70-76 s (219-238 tok/s) | 74-80 s |
 | 1024x1024, CPU (`--device cpu`) | 4,175 | 102 s (41 tok/s) | 107 s |
 | edit of a 1184x880 image (4,230 prompt tokens), guidance 2, Metal | 4,139 | 41.1 s (101 tok/s) | 46 s, prefill 3.7 s |
+| 2 edits of it (`--num-images 2`, both images' 4 sequences in each GPU step) | 8,278 | 68.9 s (120 tok/s; one edit in the same session 44.9 s) | 74.5 s |
+| 4 edits of it (8 sequences a step) | 16,556 | 134.9 s (123 tok/s) | 143.8 s |
 | 1024x1024, the float32 release with `--quant q4`, CPU | 4,175 | 173 s (24 tok/s) | 3.1 min, after 3.9 min of loading |
 
 Before the batched steps, the prefill plan and the experts fix below (the first Metal plan):
@@ -239,7 +241,10 @@ each of up to 16 sessions; `--num-images N` (the server's `n`) runs the prompt o
 grids in lockstep on it, each image with its own seed: the same images as one at a time, byte
 for byte (the batch's rows are the one-token steps' bits, `OXINFER_GPU_DECODE_CHECK=1` compares
 each row with a one-token step of its session: 510 of 510 equal; image 0 of a 4-image batch is
-the PNG of a single run with that seed). The CUDA backend declines these ops and runs
+the PNG of a single run with that seed). With guidance (edits, `guidance` / `image_guidance`)
+the prompt and its guidance prompts run once, and every image's sequences (two or three each)
+take each token together, 16 rows a step at most (8 guided images, 5 with image guidance): a
+4-image edit gives the PNGs of 4 single edits with those seeds. The CUDA backend declines these ops and runs
 Nemotron-H on the CPU. Inside the image grid only the visual tokens'
 logits are computed: their 196,560 rows of the head (60% of the 0.94 GB Q8_0 head) are a
 matrix of their own (`NemotronModel::load_head_rows`, borrowed from the GGUF file; on the CPU,
