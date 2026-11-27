@@ -1,7 +1,13 @@
 //! `oxinfer --model MiniMaxAI/MiniMax-H3-Image --prompt "..." --size 1024x1024 -o out.png`: text
 //! to image through `oxinfer::minimax_h3`. The text encoder is MiniMax-H3's (`text_encoder/` of
-//! `MiniMaxAI/MiniMax-H3`): `OXINFER_H3_TEXT_ENCODER`, else found in the release folder or the
-//! oxinfer / Hugging Face download caches.
+//! `MiniMaxAI/MiniMax-H3`): `--text-encoder`, `OXINFER_H3_TEXT_ENCODER`, else found in the release
+//! folder or the oxinfer / Hugging Face download caches.
+//!
+//! `--model` may also be ComfyUI's single-file transformer (`Comfy-Org/MiniMax-H3-Image`'s
+//! `diffusion_models/minimax_h3_image_*.safetensors`) with `--vae` (its
+//! `vae/minimax_h3_image_vae_fp16.safetensors`) and `--text-encoder` (a Qwen3-VL-32B-Instruct
+//! GGUF, ComfyUI's text encoder file, or the release's folder). `--attention split|half|f32` sets
+//! the operands of the Metal transformer's attention.
 
 use crate::Args;
 use anyhow::{Context, Result};
@@ -15,9 +21,36 @@ pub(crate) fn text_encoder(model: &std::path::Path, cache_dir: Option<&std::path
 }
 
 pub fn run(args: &Args) -> Result<()> {
-    let te = text_encoder(&args.model, args.cache_dir.as_deref())?;
+    let part = |spec: &str| -> Result<PathBuf> {
+        let p = std::path::Path::new(spec);
+        if p.exists() {
+            Ok(p.to_path_buf())
+        } else if spec.ends_with(".safetensors") || spec.ends_with(".gguf") {
+            oxinfer::engine::resolve_file(spec, args.cache_dir.as_deref())
+        } else {
+            oxinfer::engine::resolve_model(spec, args.cache_dir.as_deref())
+        }
+    };
+    let te = match &args.flux.text_encoder {
+        Some(t) => part(t)?,
+        None => text_encoder(&args.model, args.cache_dir.as_deref())?,
+    };
     let t0 = Instant::now();
-    let pipe = Pipeline::load(&args.model, &te)?;
+    let mut pipe = if args.model.is_file() {
+        let vae = args.flux.vae.as_deref().with_context(|| {
+            format!(
+                "{} is a single-file transformer: name the image VAE with --vae (ComfyUI's minimax_h3_image_vae_fp16.safetensors)",
+                args.model.display()
+            )
+        })?;
+        Pipeline::load_files(&args.model, &part(vae)?, &te)?
+    } else {
+        Pipeline::load(&args.model, &te)?
+    };
+    if let Some(a) = &args.h3_attention {
+        pipe.dit.gpu_attention =
+            oxinfer::gpu::dit::AttnPrecision::parse(a).with_context(|| format!("--attention {a}: half, split or f32"))?;
+    }
     eprintln!(
         "[MiniMax-H3-Image: {} blocks, {} steps; text encoder {}; loaded in {:.1}s]",
         pipe.dit.cfg.layers,

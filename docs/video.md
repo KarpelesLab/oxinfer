@@ -949,15 +949,18 @@ with a power of two per row), and the host keeps the text encoder and its refine
 before and after the blocks, the AdaLN tables (one small product per block and step) and the
 schedule. It takes the formats of the runs on this page: bf16 as stored; int8 rows with a row
 scale (`int8_tensorwise`, and the W4A8 / W6A8 codes, decoded to int8 at load) through a Q8 twin
-that borrows the int8 bytes; ConvRot inputs rotated on the device (`dit_rot_half`); LoRA updates
+that borrows the int8 bytes; FP8 "scaled" weights (one `weight_scale` per matrix) through an FP8
+twin that borrows the bytes and repeats the scale over the 128 x 128 blocks of the FP8 GEMMs
+(`mma_F8_E4M3`); NVFP4 (`comfy_quant` `nvfp4`, repacked into ggml's blocks at load) as it is, on
+`mma_NVFP4`; ConvRot inputs rotated on the device (`dit_rot_half`); LoRA updates
 as side paths (`up (down x)` in float16, the rank padded to 64); mixed files (the Ref2VA hybrid's
 bf16 and int8 blocks); the float16 VAE (biases, scaled residuals, 64-wide heads); structure
 guidance's bypassed blocks. The corrector's float32 weights go to the GPU as two float16
 matrices each (`w = hi + lo`, 22 significant bits; 8 GB beside its 8 GB, made at its first
 step). Without matrix units, with `--device cpu` (load option `device=cpu` in the C API and the
 server; `Dit::gpu`, `VaeDecoder::gpu`, `Corrector::gpu` in the library) or with
-`OXINFER_H3_GPU=0` everything runs on the CPU as before. FP8 and NVFP4 files and MiniMax-H3-Image
-(the same blocks and image VAE, so they take the same path) were not run on it.
+`OXINFER_H3_GPU=0` everything runs on the CPU as before. MiniMax-H3-Image (the same blocks, and
+the image VAE's) takes the same path ([below](#minimax-h3-image-on-metal)).
 
 Attention: 128-wide heads on the fused matrix-unit kernels, by default with queries and keys as
 hi + lo half pairs (`--attention split`, load option `attention`, `Dit::gpu_attention`): as exact
@@ -1004,6 +1007,96 @@ against its CPU path on the latents of the W4A8 clip (`h3_forward_bench vae`): r
 samples (the same seed): frame for frame the same scene and motion, 45.9 dB (W4A8), 45.0 dB (bf16 +
 corrector), 39.7 dB (the dancing LoRA clip) and 43.1 dB (Ref2VA) from the CPU files (PSNR of the
 H.264 frames); contact sheets of every third frame read by the model that ran this.
+
+**FP8 and NVFP4.** The same caption embedding, seed and settings on Comfy-Org's
+`minimax_h3_fl2va_pruned_fp8_scaled` (the base H3, not Sulphur-3) and on
+`lilcheaty/MiniMax-H3-NVFP4`'s `minimax_h3_fl2va_pruned_nvfp4` (12.5 GB: the four matrices of
+the 50 blocks as `comfy_quant` `nvfp4` with no AWQ scales, the refiner bf16, the rest as in the
+pruned files). The NVFP4 runs overlapped a compile that also used the machine:
+
+| | CPU | Metal |
+|---|---|---|
+| one forward, FP8 (`h3_forward_bench`) | 30 to 31 s | 2.0 to 2.3 s (`split`; `half` and `f32` 1.9 to 2.0 s) |
+| one forward, NVFP4 (`h3_forward_bench`) | 37 s (in the clip) | 1.2 to 1.5 s |
+| one forward, Comfy-Org's pruned int8 ConvRot, for comparison | 30 s | 1.7 s |
+| FP8 clip (20 forwards, VAE 14.9 / 0.8 s) | 638 s | 36.7 s (a forward 1.6 s) |
+| NVFP4 clip (load 21 / 4.7 s: the codes repacked) | 773 s | 44.3 s (a forward 1.7 s) |
+
+Against the CPU path (relative L2 of the video / audio velocities, each file against its own
+CPU run; the base H3 moves more at its second forward than Sulphur-3's W4A8 file above):
+
+| forward | FP8 `split` | FP8 `half` | FP8 `f32` | NVFP4 | int8 ConvRot |
+|---|---|---|---|---|---|
+| 1 | 6.5e-4 / 2.5e-4 (max abs 7.7e-3, mean \|v\| 1.60) | 1.2e-3 / 5.7e-4 | 6.2e-4 / 2.5e-4 | 8.4e-4 / 4.4e-4 | 7.8e-4 / 2.8e-4 |
+| 2 | 3.0e-3 / 3.6e-4 (max abs 9.9e-2) | 2.8e-3 / 1.6e-3 | 3.2e-3 / 3.6e-4 | 1.9e-3 / 4.0e-4 | 1.7e-3 / 3.7e-4 |
+
+The FP8 twin's weights are exact in half (an E4M3 value times a scale near 0.01 stays above
+half's normal range but for E4M3's own subnormals), so what is left is the half inputs of the
+projections, as for the other formats. The clips are the CPU clips' samples: the same woman,
+kitchen and dance step for step (sheets of every seventh frame side by side), 36.0 dB from the
+CPU files for both (PSNR of the H.264 frames; the 20-step schedule carries the second forward's
+larger difference). The NVFP4 clip is another sample of the scene (other weights), with the same
+flaw on both devices: her left forearm missing in the first frames.
+
+**1344x768.** FP8 with the 4-step 768p LoRA (`--size 1344x768 --frames 22`: 7056 video + 74
+audio + 350 text rows, 4 forwards at shifts 6 / 3, the same caption embedding and seed):
+
+| | CPU | Metal |
+|---|---|---|
+| one forward | 299 to 339 s (365 s in a run of one forward; compiles ran beside some) | 25.9 s (26.6 to 29.1 s in `h3_forward_bench`) |
+| video VAE decode, 22 frames | 170 s | 12.7 s |
+| the clip | 1452 s (34.7 GB resident) | 158 s (8.7 GB resident) |
+
+Both clips show the kitchen and the woman, sharp (the kettle, the knife block, the sink),
+dancing with her arms raised; 26.1 dB apart, the Metal clip's framing a little lower and wider
+in every frame (side by side) while pose and motion are the same. The turbo LoRA makes the
+transformer far more sensitive to the half inputs: at 448x256 one forward with it is 6.6e-3 from
+the CPU's (`f32` attention 6.5e-3, `half` 8.0e-3), 6.5e-4 without; its first block alone is
+within 2.0e-4 either way (so the side paths themselves are as exact as the projections), and
+at 1344x768 the first forward is 1.7e-2 / 3.2e-4 from the CPU's (max abs 0.81). A 124-frame
+clip at 1344x768 was not run on Metal (it would hold the shared GPU for half an hour).
+
+### MiniMax-H3-Image on Metal
+
+MiniMax-H3-Image's transformer is the same block stack and its VAE decoder the same ViT with
+two rotary axes, so both take the Metal passes above. Besides the release folder, oxinfer now
+reads `Comfy-Org/MiniMax-H3-Image`'s single files (`Pipeline::load_files`; on the command line
+`--model FILE --vae FILE --text-encoder GGUF|FILE|DIR`, in the server the `vae` and
+`text_encoder` options, plus `device` and `attention`):
+
+- the transformer (`diffusion_models/minimax_h3_image_pruned_{bf16,int8_convrot,w4a8}`: the
+  pruned layout of the video files without the audio stream) keeps its six PDD heads stacked in
+  `final_layer.video_out` (`[6 x 96, 5376]`): block 0 is the first step's head and block `s` the
+  *offset* of step `s`'s head from it (`comfy/ldm/minimax/model.py`, `_pdd_head`). The sum is
+  the release's `pdd_fused_heads.safetensors` head to 1e-9 (every fifth row and every bias of
+  the release's 12 MB file against the W4A8 file's, read by range requests). The grid is the
+  header's `pdd_sigmas`, else the release's `pdd_config.json` (`minimax_h3::PDD_SIGMAS`);
+- the VAE (`vae/minimax_h3_image_vae_fp16`: the release's tensor names in float16, no
+  configuration in its header) with the release's `vae/config.json` built in. (Reading that
+  configuration also showed that the release's own class name, `MiniMaxH3ImageVAE`, was taken for
+  a video VAE's: an image VAE now is any class whose name contains `Image`);
+- the text encoder from a Qwen3-VL-32B-Instruct GGUF (its own tokenizer) or ComfyUI's
+  single file, through the same loader as the video model's.
+
+A tiny checkpoint written both ways (the release folder, and its transformer converted to
+ComfyUI's names with the heads stacked as offsets) gives the same velocities to 1e-5 of the
+largest value (`minimax_h3::tiny` tests).
+
+M5 Max, a `--profile ci` build, Comfy-Org's W4A8 transformer (12.5 GB), the fp16 VAE and the
+Q8_0 GGUF text encoder, "A red fox sitting in fresh snow at dawn, soft golden light, a pine forest
+behind it, photograph", seed 42:
+
+| 1024x1024 output | CPU | Metal |
+|---|---|---|
+| the 1024x1024 canvas (`OXINFER_H3_MIN_AREA=1048576`, 1024 image rows): 6 steps | 168 s (28 s a step) | 9.1 s (1.5 s a step) |
+| VAE decode | 4.6 s | 0.7 s |
+| the picture, text encoder (13.2 / 2.0 s) and load included | 189 s (63.7 GB resident) | 17.0 s (33.2 GB) |
+| the default 2048x2048 canvas (4096 image rows), resized to 1024x1024 | not run | 6 steps 46.7 s (7.2 to 8.7 s a step), VAE 2.6 s, the picture 57.5 s (33.6 GB) |
+
+The two 1024x1024 pictures are the same fox, pose, snow and trees, 37.4 dB apart (PSNR of the
+8-bit pictures); the picture is sharp and coherent (fur, whiskers, the low sun through the
+pines). The 2048x2048 canvas gives another composition of the prompt (the fox in profile, closer),
+sharper still.
 
 ### Still not supported
 

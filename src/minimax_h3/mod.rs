@@ -49,6 +49,38 @@ pub fn is_h3_image(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `path` is a single-file MiniMax-H3-Image transformer in ComfyUI's layout
+/// (`Comfy-Org/MiniMax-H3-Image`'s `diffusion_models/minimax_h3_image_*.safetensors`): the H3
+/// DiT's tensor names without the audio stream.
+pub fn is_h3_image_file(path: &Path) -> bool {
+    if !path.is_file() || path.extension().is_none_or(|e| e != "safetensors") {
+        return false;
+    }
+    crate::safetensors::SafeTensors::open(path, false).is_ok_and(|st| {
+        [
+            "video_patch_proj.weight",
+            "blocks.0.attn.qkv_proj.weight",
+            "final_layer.video_out.weight",
+        ]
+        .iter()
+        .all(|n| st.info(n).is_some())
+            && st.info("audio_patch_proj.weight").is_none()
+    })
+}
+
+/// MiniMax-H3-Image's sampling grid (`pdd_config.json`'s `sigmas`), for a single file whose
+/// header does not state it.
+pub const PDD_SIGMAS: [f32; 7] = [1.0, 0.967_523_7, 0.887_548_5, 0.75, 0.532_773_9, 0.232_008_87, 0.0];
+
+/// The release's `vae/config.json` (`MiniMaxH3ImageVAE`), for ComfyUI's single-file image VAE
+/// (`vae/minimax_h3_image_vae_fp16.safetensors`: the release's tensors in float16, no
+/// configuration in its header).
+const IMAGE_VAE_JSON: &str = r#"{"_class_name": "MiniMaxH3ImageVAE", "latent_channels": 24,
+"latents_mean": [0.858090341091156, -0.9606591463088989, 1.0661640167236328, -0.5090325474739075, -0.2727581858634949, -1.3675414323806763, -0.2553254961967468, -0.26907554268836975, -0.5376840829849243, -0.0464097298681736, 0.6657370328903198, 0.19690127670764923, -0.5460608005523682, -0.4035342037677765, -0.23683024942874908, 0.25928452610969543, -0.30133944749832153, 0.211341992020607, -1.1206848621368408, 0.3581933379173279, -0.04225143790245056, 0.2604829967021942, 0.22864092886447906, 0.7056031823158264],
+"latents_std": [1.2223774194717407, 1.2767263650894165, 1.6831774711608887, 1.7549455165863037, 1.5636216402053833, 2.194143533706665, 0.9653137922286987, 1.0569885969161987, 0.841948926448822, 0.7729952931404114, 1.8955937623977661, 0.946841835975647, 0.7996809482574463, 0.44988900423049927, 0.7197399735450745, 0.6936293244361877, 2.961095094680786, 2.7694199085235596, 3.0496184825897217, 2.1088054180145264, 3.276226282119751, 3.1627357006073, 2.2816812992095947, 2.6127843856811523],
+"vae_tile_overlap_min": 64, "vae_tile_size": 256,
+"vit_decoder_kwargs": {"dim_head": 64, "heads": 16, "num_layers": 24, "rope_dim_ratio": 0.5, "rope_theta": 100.0}}"#;
+
 /// Whether a checkpoint folder holds its weights (not only its configuration).
 fn has_weights(dir: &Path) -> bool {
     if dir.join("model.safetensors").exists() {
@@ -125,12 +157,14 @@ impl Params {
 
 pub struct Pipeline {
     pub dir: PathBuf,
+    /// The text encoder: the release's `text_encoder/` folder, or a file ([`Pipeline::load_files`]).
     pub text_encoder_dir: PathBuf,
     pub dit: Dit<'static>,
     pub vae: VaeDecoder<'static>,
     /// The sampling grid (`pdd_config.json`), ending at 0.
     pub sigmas: Vec<f32>,
-    tok: crate::tokenizer::Tokenizer,
+    /// The release's tokenizer (None: the text encoder file's, see [`Pipeline::load_files`]).
+    tok: Option<crate::tokenizer::Tokenizer>,
 }
 
 /// Rows of patches `[C, pt, ph, pw]` from latents `[C, h, w]` (one frame), row-major.
@@ -239,14 +273,70 @@ impl Pipeline {
             dit,
             vae,
             sigmas,
+            tok: Some(tok),
+        })
+    }
+
+    /// Loads ComfyUI's single files (`Comfy-Org/MiniMax-H3-Image`): the transformer
+    /// ([`is_h3_image_file`]: the PDD heads stacked in `final_layer.video_out`, the grid in its
+    /// header or [`PDD_SIGMAS`]; any weight format the video transformer takes), the image VAE (its
+    /// single file, or a folder with `config.json`) and the text encoder: a folder in the
+    /// release's layout (with `tokenizer/` beside the transformer), a GGUF of
+    /// Qwen3-VL-32B-Instruct, or ComfyUI's `qwen3vl_32b_minimax_h3_*.safetensors` (with the
+    /// release's `tokenizer.json` where [`video::load_text_encoder`] looks for it).
+    pub fn load_files(transformer: &Path, vae: &Path, text_encoder: &Path) -> Result<Self> {
+        if !is_h3_image_file(transformer) {
+            bail!("{}: not a single-file MiniMax-H3-Image transformer", transformer.display());
+        }
+        let dit_files: &'static ModelFiles = Box::leak(Box::new(ModelFiles::open_file(transformer, false)?));
+        let cfg = DitConfig::from_files(dit_files)?;
+        let dit = Dit::load(cfg, dit_files, None)?;
+        let sigmas = dit::comfy_pdd_sigmas(dit_files).unwrap_or_else(|| PDD_SIGMAS.to_vec());
+        if sigmas.len() != dit.n_heads() + 1 {
+            bail!("{} sigmas for {} output heads", sigmas.len(), dit.n_heads());
+        }
+        let (vae_files, vcfg) = if vae.is_file() {
+            let f = ModelFiles::open_file(vae, false)?;
+            (f, VaeConfig::from_json(&serde_json::from_str(IMAGE_VAE_JSON)?)?)
+        } else {
+            (ModelFiles::open(vae, false)?, VaeConfig::load(vae)?)
+        };
+        let vae_files: &'static ModelFiles = Box::leak(Box::new(vae_files));
+        let vae_dec = VaeDecoder::load(vcfg, vae_files).with_context(|| format!("image VAE {}", vae.display()))?;
+        if vae_dec.cfg.axes != 2 || vae_dec.cfg.latent_channels != dit.cfg.in_channels {
+            bail!("{}: not MiniMax-H3-Image's VAE", vae.display());
+        }
+        let dir = transformer.parent().map(Path::to_path_buf).unwrap_or_default();
+        let tok = if text_encoder.is_dir() {
+            let t = crate::tokenizer::Tokenizer::from_bytes(crate::fsx::read(&dir.join("tokenizer").join("tokenizer.json"))?)
+                .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+            Some(t)
+        } else {
+            None
+        };
+        Ok(Self {
+            dir,
+            text_encoder_dir: text_encoder.to_path_buf(),
+            dit,
+            vae: vae_dec,
+            sigmas,
             tok,
         })
     }
 
     /// The conditioning of `prompt`: `[n, 5120]` after the text encoder's 50th layer.
     pub fn encode_prompt(&self, prompt: &str) -> Result<Vec<f32>> {
-        let ids = self
-            .tok
+        let Some(tok) = &self.tok else {
+            // A text encoder file (GGUF, or ComfyUI's single file) through Qwen3-VL's loader.
+            let vl = video::load_text_encoder(&self.dir, &self.text_encoder_dir, Quant::Bf16, false)?;
+            let ids = vl.tokenize(prompt)?;
+            if ids.is_empty() {
+                bail!("empty prompt");
+            }
+            let mut hs = vl.hidden_states_tokens(ids, &[], None, &[video::TEXT_LAYER - 1])?;
+            return Ok(hs.layers.pop().context("layer 50 not captured")?.1);
+        };
+        let ids = tok
             .encode(prompt, false)
             .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?
             .ids

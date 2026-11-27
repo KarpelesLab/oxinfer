@@ -5623,7 +5623,15 @@ On Metal (the transformer, the video VAE decoder and the corrector as whole GPU 
 | `s3` with the corrector (0.3 s a step) | 2.0 s | 64.6 s | 11x |
 | Comfy-Org's int8 ConvRot + LoRA | 1.8 s | 48.8 s | 14x |
 | the Ref2VA hybrid, one reference (text encoder included) | 1.6 to 1.8 s | 41.9 s | 10x |
-| `s3_w4a8`, 448x256, 124 frames (4908 rows) | 10.4 s | 251 s | || `s3_w4a8`, 672x384, 124 frames (10,088 rows) | 46 s | 969 s | |
+| `s3_w4a8`, 448x256, 124 frames (4908 rows) | 10.4 s | 251 s | |
+| `s3_w4a8`, 672x384, 124 frames (10,088 rows) | 46 s | 969 s | |
+| Comfy-Org's pruned FP8 (scaled) | 1.6 s | 36.7 s | 17x (638 s; velocities within 6.5e-4 / 3.0e-3 at the first / second forward) |
+| `lilcheaty/MiniMax-H3-NVFP4`'s pruned NVFP4 | 1.2 to 1.7 s | 44.3 s | 17x (773 s) |
+| Comfy-Org's pruned FP8 + the 4-step 768p LoRA, 1344x768, 22 frames (7480 rows), 4 forwards | 25.9 s | 158 s | 9x (1452 s; a forward 299 to 339 s) |
+
+MiniMax-H3-Image (Comfy-Org's W4A8 single file, 6 steps, [video.md](video.md#minimax-h3-image-on-metal)):
+a 1024x1024 canvas in 1.5 s a step on Metal against 28 s on the CPU, the picture (text encoder
+included) in 17.0 s against 189 s.
 
 ## Speech to text against whisper.cpp
 

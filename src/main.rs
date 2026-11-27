@@ -2046,7 +2046,7 @@ fn run(mut args: Args) -> Result<()> {
     if oxinfer::qwen_image::is_qwen_image(&args.model) {
         return qwen_image_cli::run(&args);
     }
-    if oxinfer::minimax_h3::is_h3_image(&args.model) {
+    if oxinfer::minimax_h3::is_h3_image(&args.model) || oxinfer::minimax_h3::is_h3_image_file(&args.model) {
         return minimax_h3_cli::run(&args);
     }
     if oxinfer::minimax_h3::video::is_h3_video(&args.model) {

@@ -48,6 +48,8 @@ impl Rng {
 /// Tensors of one safetensors file, written by hand.
 struct Tensors {
     list: Vec<(String, &'static str, Vec<usize>, Vec<u8>)>,
+    /// The header's `__metadata__` entries.
+    meta: serde_json::Map<String, Value>,
     rng: Rng,
 }
 
@@ -55,6 +57,7 @@ impl Tensors {
     fn new(seed: u64) -> Self {
         Self {
             list: Vec::new(),
+            meta: serde_json::Map::new(),
             rng: Rng(seed),
         }
     }
@@ -124,6 +127,9 @@ impl Tensors {
         // Float32 tensors first: every one then starts 4-byte aligned.
         self.list.sort_by_key(|t| t.1 != "F32");
         let mut head = serde_json::Map::new();
+        if !self.meta.is_empty() {
+            head.insert("__metadata__".into(), Value::Object(std::mem::take(&mut self.meta)));
+        }
         let mut data = Vec::new();
         for (name, dtype, shape, bytes) in self.list {
             let entry = json!({"dtype": dtype, "shape": shape, "data_offsets": [data.len(), data.len() + bytes.len()]});
@@ -832,6 +838,165 @@ mod tests {
         };
         let img = pipe.generate(&p, &mut |_, _| {}).unwrap();
         assert_eq!((img.width, img.height, img.rgb.len()), (96, 64, 96 * 64 * 3));
+    }
+
+    /// The tiny release's transformer in ComfyUI's single-file layout: the release's original
+    /// names, `qkv_proj` as `[q; k; v]`, `fc1` as `[gate; value]`, and the PDD heads stacked in
+    /// `final_layer.video_out` (block 0 the first head, block s the offset of head s from it).
+    fn write_comfy_image_dit(dir: &Path, out: &Path) {
+        let f = crate::safetensors::ModelFiles::open(&dir.join("transformer"), false).unwrap();
+        let heads = crate::safetensors::ModelFiles::open_file(&dir.join("pdd_fused_heads.safetensors"), false).unwrap();
+        let mut t = Tensors::new(0);
+        let put = |t: &mut Tensors, name: String, v: Vec<f32>, shape: Vec<usize>| t.put(&name, &shape, &v);
+        let shape = |n: &str| f.info(n).unwrap().shape.clone();
+        let blk = |t: &mut Tensors, from: &str, to: &str, adaln: bool| {
+            let g = |n: &str| f.f32(&format!("{from}{n}")).unwrap();
+            for (a, b) in [
+                ("norm1", "norm1"),
+                ("norm2", "norm2"),
+                ("attn.norm_q", "attn.q_norm"),
+                ("attn.norm_k", "attn.k_norm"),
+            ] {
+                put(
+                    t,
+                    format!("{to}{b}.weight"),
+                    g(&format!("{a}.weight")),
+                    shape(&format!("{from}{a}.weight")),
+                );
+            }
+            let mut qkv = g("attn.to_q.weight");
+            qkv.extend(g("attn.to_k.weight"));
+            qkv.extend(g("attn.to_v.weight"));
+            let [o, i] = shape(&format!("{from}attn.to_q.weight"))[..] else {
+                unreachable!()
+            };
+            put(t, format!("{to}attn.qkv_proj.weight"), qkv, vec![3 * o, i]);
+            put(
+                t,
+                format!("{to}attn.out_proj.weight"),
+                g("attn.to_out.0.weight"),
+                shape(&format!("{from}attn.to_out.0.weight")),
+            );
+            let fc1 = g("ff.net.0.proj.weight");
+            let s1 = shape(&format!("{from}ff.net.0.proj.weight"));
+            let half = fc1.len() / 2;
+            put(t, format!("{to}mlp.fc1.weight"), [&fc1[half..], &fc1[..half]].concat(), s1);
+            put(
+                t,
+                format!("{to}mlp.fc2.weight"),
+                g("ff.net.2.weight"),
+                shape(&format!("{from}ff.net.2.weight")),
+            );
+            if adaln {
+                for k in ["weight", "bias"] {
+                    put(
+                        t,
+                        format!("{to}adaln_proj.linear.{k}"),
+                        g(&format!("adaln_proj.linear.{k}")),
+                        shape(&format!("{from}adaln_proj.linear.{k}")),
+                    );
+                }
+            }
+        };
+        blk(&mut t, "token_refiner.refiner_blocks.0.", "token_refiner.blocks.0.", false);
+        for l in 0..DIT_LAYERS {
+            blk(&mut t, &format!("transformer_blocks.{l}."), &format!("blocks.{l}."), true);
+        }
+        for (a, b) in [
+            ("token_refiner.final_norm", "token_refiner.final_norm"),
+            ("proj_in", "video_patch_proj"),
+            ("context_embedder", "condition_proj"),
+            ("time_embedder.linear_1", "time_embedder.proj_in"),
+            ("time_embedder.linear_2", "time_embedder.proj_out"),
+            ("norm_out.norm", "final_layer.norm"),
+            ("norm_out.linear", "final_layer.adaln_proj.linear"),
+        ] {
+            for k in ["weight", "bias"] {
+                let n = format!("{a}.{k}");
+                if f.has(&n) {
+                    put(&mut t, format!("{b}.{k}"), f.f32(&n).unwrap(), shape(&n));
+                }
+            }
+        }
+        let (w, b) = (heads.f32("video_out.weight").unwrap(), heads.f32("video_out.bias").unwrap());
+        let s = heads.info("video_out.weight").unwrap().shape.clone();
+        let (steps, pd, h) = (s[0], s[1], s[2]);
+        let (mut ws, mut bs) = (w.clone(), b.clone());
+        for st in 1..steps {
+            ws[st * pd * h..(st + 1) * pd * h]
+                .iter_mut()
+                .zip(&w[..pd * h])
+                .for_each(|(v, a)| *v -= a);
+            bs[st * pd..(st + 1) * pd].iter_mut().zip(&b[..pd]).for_each(|(v, a)| *v -= a);
+        }
+        put(&mut t, "final_layer.video_out.weight".into(), ws, vec![steps * pd, h]);
+        put(&mut t, "final_layer.video_out.bias".into(), bs, vec![steps * pd]);
+        put(&mut t, "rope.inv_freq".into(), vec![1.0, 0.01], vec![2]);
+        // ComfyUI's header states the grid (the release's `pdd_config.json`).
+        let cfg = json!({"transformer": {"pdd_steps": steps, "pdd_sigmas": [1.0, 0.75, 0.4, 0.0]}});
+        t.meta.insert("config".into(), Value::String(cfg.to_string()));
+        t.write(out).unwrap();
+    }
+
+    #[test]
+    fn tiny_image_comfy_file() {
+        let tmp = TempDir::new("image-comfy");
+        let dir = &tmp.0;
+        write_tiny_image_release(dir).unwrap();
+        let file = dir.join("h3_image_comfy.safetensors");
+        write_comfy_image_dit(dir, &file);
+        assert!(super::super::is_h3_image_file(&file));
+        assert!(!is_h3_video(&file));
+        let te = dir.join("text_encoder");
+        let release = Pipeline::load(dir, &te).unwrap();
+        let comfy = Pipeline::load_files(&file, &dir.join("vae"), &te).unwrap();
+        assert_eq!(comfy.dit.n_heads(), 3);
+        assert_eq!(comfy.sigmas, release.sigmas);
+        let p = Params {
+            width: 64,
+            height: 64,
+            min_area: 64 * 64,
+            ..Params::new("A red fox in the snow.")
+        };
+        let text = release.encode_prompt(&p.prompt).unwrap();
+        assert_eq!(text, comfy.encode_prompt(&p.prompt).unwrap());
+        let noise = crate::sd::ops::Rng::new(3).normals(LATENT * 4 * 4);
+        let rows = super::super::patchify(&noise, LATENT, 4, 4, 2);
+        let a = release.dit.forward(
+            &super::super::dit::Packed {
+                text: &text,
+                image: &rows,
+                positions: &super::super::positions(text.len() / TEXT_HIDDEN, 4, 4, 2),
+                timesteps: &[0.25],
+                timestep_index: &vec![0; text.len() / TEXT_HIDDEN + 4],
+                tags: &[
+                    vec![super::super::dit::TAG_TEXT; text.len() / TEXT_HIDDEN],
+                    vec![super::super::dit::TAG_IMAGE; 4],
+                ]
+                .concat(),
+            },
+            &release.dit.embed_text(&text),
+            2,
+        );
+        let b = comfy.dit.forward(
+            &super::super::dit::Packed {
+                text: &text,
+                image: &rows,
+                positions: &super::super::positions(text.len() / TEXT_HIDDEN, 4, 4, 2),
+                timesteps: &[0.25],
+                timestep_index: &vec![0; text.len() / TEXT_HIDDEN + 4],
+                tags: &[
+                    vec![super::super::dit::TAG_TEXT; text.len() / TEXT_HIDDEN],
+                    vec![super::super::dit::TAG_IMAGE; 4],
+                ]
+                .concat(),
+            },
+            &comfy.dit.embed_text(&text),
+            2,
+        );
+        let scale = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let diff = a.iter().zip(&b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        assert!(diff <= 1e-5 * scale, "the third head's velocity: {diff} of {scale}");
     }
 
     /// An image reference at the release's default 2048-pixel short edge (as a server request

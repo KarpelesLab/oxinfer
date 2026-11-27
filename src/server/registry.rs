@@ -1425,19 +1425,50 @@ fn load_image(ik: ImageKind, src: &str, opts: &[(&str, &str)], cache_dir: Option
             &options!(crate::sd3::LoadOptions::default(), true),
         )?),
         ImageKind::H3Image => {
-            let dir = crate::engine::resolve_model(src, cache_dir)?;
-            let mut te = None;
+            let path = std::path::Path::new(src);
+            let dir = if path.is_file() {
+                path.to_path_buf()
+            } else {
+                crate::engine::resolve_model(src, cache_dir)?
+            };
+            let part = |v: &str| {
+                if std::path::Path::new(v).exists() {
+                    Ok(std::path::PathBuf::from(v))
+                } else if v.ends_with(".safetensors") || v.ends_with(".gguf") {
+                    crate::engine::resolve_file(v, cache_dir)
+                } else {
+                    crate::engine::resolve_model(v, cache_dir)
+                }
+            };
+            let (mut te, mut vae, mut gpu, mut attention) = (None, None, true, None);
             for (k, v) in opts {
                 match *k {
-                    "text_encoder" => te = Some(crate::engine::resolve_model(v, cache_dir)?),
-                    k => bail!("unknown MiniMax-H3-Image option {k:?} (text_encoder)"),
+                    "text_encoder" => te = Some(part(v)?),
+                    "vae" => vae = Some(part(v)?),
+                    "device" => gpu = !v.eq_ignore_ascii_case("cpu"),
+                    "attention" | "gpu_attention" => {
+                        attention =
+                            Some(crate::gpu::dit::AttnPrecision::parse(v).with_context(|| format!("{k}: {v:?} (half, split, f32)"))?)
+                    }
+                    k => bail!("unknown MiniMax-H3-Image option {k:?} (text_encoder, vae, device, attention)"),
                 }
             }
             let te = match te {
                 Some(t) => t,
                 None => crate::minimax_h3::find_text_encoder(&dir, cache_dir)?,
             };
-            ImageModel::H3Image(crate::minimax_h3::Pipeline::load(&dir, &te)?)
+            let mut p = if dir.is_file() {
+                let vae = vae.context("a single-file MiniMax-H3-Image transformer needs the vae option (its image VAE file)")?;
+                crate::minimax_h3::Pipeline::load_files(&dir, &vae, &te)?
+            } else {
+                crate::minimax_h3::Pipeline::load(&dir, &te)?
+            };
+            p.dit.gpu = gpu;
+            p.vae.gpu = gpu;
+            if let Some(a) = attention {
+                p.dit.gpu_attention = a;
+            }
+            ImageModel::H3Image(p)
         }
     })
 }
@@ -1563,7 +1594,7 @@ pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>
         img(ImageKind::Bagel)
     } else if crate::step1x::is_step1x(path) {
         img(ImageKind::Step1x)
-    } else if crate::minimax_h3::is_h3_image(path) {
+    } else if crate::minimax_h3::is_h3_image(path) || crate::minimax_h3::is_h3_image_file(path) {
         img(ImageKind::H3Image)
     } else if crate::sd3::is_sd3_dir(path) {
         img(ImageKind::Sd3)

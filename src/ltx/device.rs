@@ -8,7 +8,9 @@
 //! LoRA updates become side paths (`up (down x)`, float16, the rank padded to 64; `down` in the
 //! rotated basis of a ConvRot layer). NVFP4 layers (ggml's blocks, repacked at load) go as they
 //! are: the GEMMs dequantize their E2M1 codes, E4M3 scales and tensor-wide factor
-//! (`mma_NVFP4`). Anything else keeps the CPU path.
+//! (`mma_NVFP4`). FP8 E4M3 layers with one scale for the whole matrix (ComfyUI's "scaled" FP8)
+//! get a twin with that scale repeated over the 128 x 128 blocks the FP8 GEMMs read (the same
+//! bytes, borrowed). Anything else keeps the CPU path.
 
 use super::dit::Dit;
 use super::nn::Rope;
@@ -16,12 +18,12 @@ use crate::gpu::dit::{Lin as DevLin, LtxAttn, LtxBlock, LtxFf, LtxIn, LtxModel, 
 use crate::minimax_h3::dit::DLin;
 use std::collections::HashMap;
 
-/// Device twins of the int8 layers and float32 copies of the gates, made on the first device
-/// pass.
+/// Device twins of the int8 and scaled FP8 layers and float32 copies of the gates, made on the
+/// first device pass.
 #[derive(Default)]
 pub(crate) struct Twins<'a> {
     /// By the address of the layer's `DLin`.
-    q8: HashMap<usize, crate::model::Lin<'a>>,
+    twin: HashMap<usize, crate::model::Lin<'a>>,
     /// By the address of the gate's `DLin`: `[heads, q_dim]` weights and the bias.
     gates: HashMap<usize, (Vec<f32>, Vec<f32>)>,
     /// By the address of the layer's `DLin`: its LoRA updates as one side path (down, up).
@@ -106,6 +108,23 @@ fn q8_twin<'a>(d: &DLin<'a>) -> Option<crate::model::Lin<'a>> {
     }))
 }
 
+/// The FP8 twin of an FP8 layer with one scale for the whole matrix: the scale repeated over
+/// the 128 x 128 blocks of the device's FP8 GEMMs.
+fn fp8_twin<'a>(d: &DLin<'a>) -> Option<crate::model::Lin<'a>> {
+    let crate::model::Weight::Gguf(m) = &d.w.w else { return None };
+    let b = m.block_scales.as_ref()?;
+    if m.kind != crate::ggml::GgmlType::F8E4M3 || b.e8m0.is_some() || b.s.len() != 1 || m.data.len() != d.n_out * d.n_in {
+        return None;
+    }
+    const B: usize = 128;
+    let mut sc = crate::quant::PageVec::<f32>::zeroed(d.n_out.div_ceil(B) * d.n_in.div_ceil(B));
+    sc.fill(b.s[0]);
+    // SAFETY: as in `q8_twin`.
+    let q: &'a [u8] = unsafe { std::slice::from_raw_parts(m.data.as_ptr(), d.n_out * d.n_in) };
+    let g = crate::ggml::GgufMatrix::fp8(unsafe { crate::quant::QBuf::borrowed(q) }, sc.into(), d.n_out, d.n_in, (B, B)).ok()?;
+    Some(crate::model::Lin::gguf(g))
+}
+
 impl<'a> Twins<'a> {
     pub(crate) fn build(dit: &Dit<'a>) -> Self {
         let mut t = Self::default();
@@ -114,7 +133,7 @@ impl<'a> Twins<'a> {
     }
 
     /// Makes the device state of layer `d` (a gate: its float32 copy; otherwise an int8
-    /// layer's Q8 twin and its LoRA side path).
+    /// layer's Q8 twin or a scaled FP8 layer's twin, and its LoRA side path).
     pub(crate) fn add(&mut self, d: &DLin<'a>, gate: bool) {
         if gate {
             let mut w = vec![0f32; d.n_out * d.n_in];
@@ -123,8 +142,8 @@ impl<'a> Twins<'a> {
                 self.gates.insert(key(d), (w, d.b.clone().unwrap_or_else(|| vec![0.0; d.n_out])));
             }
         } else {
-            if let Some(q) = q8_twin(d) {
-                self.q8.insert(key(d), q);
+            if let Some(q) = q8_twin(d).or_else(|| fp8_twin(d)) {
+                self.twin.insert(key(d), q);
             }
             let rot = d.w.fold.as_ref().map(|f| f.block);
             if let Some(s) = side_of(d, rot) {
@@ -144,7 +163,7 @@ impl<'a> Twins<'a> {
             Some(f) if f.regular && f.signs.is_empty() && f.perm.is_none() => Some(f.block),
             Some(_) => return None,
         };
-        let w = self.q8.get(&key(d)).unwrap_or(&d.w);
+        let w = self.twin.get(&key(d)).unwrap_or(&d.w);
         if rot.is_some() && std::ptr::eq(w, &d.w) {
             // A rotated weight in a format without a twin (NVFP4 ConvRot is not one).
             return None;

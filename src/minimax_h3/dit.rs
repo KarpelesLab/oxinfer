@@ -194,14 +194,7 @@ impl DitConfig {
                 .with_context(|| format!("tensor {n} has no dimension {i}"))
         };
         let count = |prefix: &str| (0..).take_while(|i| files.has(&format!("{prefix}{i}.norm1.weight"))).count();
-        let meta: serde_json::Value = files
-            .metadata("config")
-            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-            .and_then(|v| v.get("transformer").cloned())
-            .unwrap_or(serde_json::Value::Null);
-        if meta.get("pdd_steps").and_then(|v| v.as_u64()).unwrap_or(1) > 1 {
-            bail!("a checkpoint with stacked PDD output heads (MiniMax-H3-Image) is not read from a single file");
-        }
+        let meta = comfy_meta(files);
         let eps = |k: &str| meta.get(k).and_then(|v| v.as_f64()).unwrap_or(1e-5) as f32;
         let head_dim = dim("blocks.0.attn.q_norm.weight", 0)?;
         // The curve form has no time embedder: the AdaLN projections read `k` coordinates.
@@ -222,7 +215,9 @@ impl DitConfig {
             heads: dim("blocks.0.attn.qkv_proj.weight", 0)? / (3 * head_dim),
             head_dim,
             ffn: dim("blocks.0.mlp.fc1.weight", 0)? / 2,
-            in_channels: dim("final_layer.video_out.weight", 0)? / patch.iter().product::<usize>(),
+            // MiniMax-H3-Image's file stacks its PDD heads in `video_out`: the patch width is
+            // `video_patch_proj`'s input.
+            in_channels: dim("video_patch_proj.weight", 1)? / patch.iter().product::<usize>(),
             audio_channels: if files.has("audio_patch_proj.weight") {
                 dim("final_layer.audio_out.weight", 0)?
             } else {
@@ -247,6 +242,27 @@ impl DitConfig {
     pub fn patch_dim(&self) -> usize {
         self.in_channels * self.patch.iter().product::<usize>()
     }
+}
+
+/// The `transformer` object of a ComfyUI single file's `config` header entry (Null without one).
+fn comfy_meta(files: &ModelFiles) -> serde_json::Value {
+    files
+        .metadata("config")
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .and_then(|v| v.get("transformer").cloned())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// The sampling grid of a ComfyUI single-file MiniMax-H3-Image transformer: its header's
+/// `pdd_sigmas` (`config.transformer`), None without them.
+pub fn comfy_pdd_sigmas(files: &ModelFiles) -> Option<Vec<f32>> {
+    let s = comfy_meta(files)
+        .get("pdd_sigmas")?
+        .as_array()?
+        .iter()
+        .map(|v| v.as_f64().map(|f| f as f32))
+        .collect::<Option<Vec<_>>>()?;
+    (s.len() >= 2).then_some(s)
 }
 
 /// A linear layer with an optional bias, float32 weights kept in float32 (the release keeps its
@@ -551,6 +567,31 @@ impl<'a> Dit<'a> {
                 }
                 (0..steps)
                     .map(|s| DLin::from_f32(&w[s * pd * h..(s + 1) * pd * h], Some(b[s * pd..(s + 1) * pd].to_vec()), pd, h))
+                    .collect::<Result<Vec<_>>>()?
+            }
+            // ComfyUI's single file stacks the PDD heads in `video_out` (`[steps * out, H]`): block 0
+            // is the first step's head, block s > 0 the offset of step s's head from it
+            // (`comfy/ldm/minimax/model.py`, `_pdd_head`).
+            None if original
+                && files
+                    .info("final_layer.video_out.weight")
+                    .is_some_and(|i| i.shape.len() == 2 && i.shape[0] > pd && i.shape[0].is_multiple_of(pd)) =>
+            {
+                let w = files.f32("final_layer.video_out.weight")?;
+                let b = files.f32("final_layer.video_out.bias")?;
+                let steps = b.len() / pd;
+                if w.len() != steps * pd * h || b.len() != steps * pd {
+                    bail!("final_layer.video_out: unexpected sizes for {steps} stacked heads");
+                }
+                (0..steps)
+                    .map(|s| {
+                        let (mut ws, mut bs) = (w[..pd * h].to_vec(), b[..pd].to_vec());
+                        if s > 0 {
+                            ws.iter_mut().zip(&w[s * pd * h..(s + 1) * pd * h]).for_each(|(a, d)| *a += d);
+                            bs.iter_mut().zip(&b[s * pd..(s + 1) * pd]).for_each(|(a, d)| *a += d);
+                        }
+                        DLin::from_f32(&ws, Some(bs), pd, h)
+                    })
                     .collect::<Result<Vec<_>>>()?
             }
             None if files.has("pdd_proj_out.0.weight") => (0..)

@@ -111,9 +111,10 @@ impl VaeConfig {
         };
         // The video VAE (`AutoencoderKLMiniMaxH3`) states its temporal geometry.
         // The image VAE's config lists `temporal_downsample_factors` too (its decoder writes
-        // one frame per latent whatever they say): the class name tells them apart when given.
+        // one frame per latent whatever they say): the class name tells them apart when given
+        // (diffusers' `AutoencoderKLMiniMaxH3Image`, the release's own `MiniMaxH3ImageVAE`).
         let video = match c.get("_class_name").and_then(|v| v.as_str()) {
-            Some(name) => !name.ends_with("Image"),
+            Some(name) => !name.contains("Image"),
             None => c.get("clip_length").is_some() || c.get("temporal_downsample_factors").is_some(),
         };
         let patch_t = c

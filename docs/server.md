@@ -119,7 +119,10 @@ MiniMax-H3-Image are image models of the server: SD 3 generates and edits (image
 `transformer`, `text_encoder`, `base`, `t5`, `device`, `vae_encoder`); MiniMax-H3-Image generates
 from text only, with its own six steps (`steps` and `guidance` are refused) and the text encoder
 found as the command line finds it (`OXINFER_H3_TEXT_ENCODER`, the release folder, the caches) or
-named with the `text_encoder` option.
+named with the `text_encoder` option (a folder, a Qwen3-VL-32B GGUF or ComfyUI's single file). Its
+model may also be ComfyUI's single-file transformer with the `vae` option (its image VAE file);
+`device` (`cpu`: the transformer and VAE decoder stay on the CPU with a GPU there) and
+`attention` (`split`, `half`, `f32`) are as for the video model ([video.md](video.md#minimax-h3-image-on-metal)).
 
 ### Video generation
 
