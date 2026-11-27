@@ -2297,8 +2297,9 @@ impl Backend for CudaBackend {
         true
     }
 
-    /// GGUF weights only (the LM head of a prompt's last token, a draft's few rows): the decode
-    /// plans' matvec (`mv_K`, a grid row per input row; `mvp_K` for a gate / up pair, SiLU).
+    /// GGUF weights, and bf16 matrices as the ggml BF16 format (the LM head of a prompt's last
+    /// token, a draft's few rows): the decode plans' matvec (`mv_K`, a grid row per input row;
+    /// `mvp_K` for a gate / up pair, SiLU).
     fn matvec_rows(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [crate::gpu::RowsJob]) -> bool {
         if jobs.is_empty() || !(1..=4).contains(&t) || !n_in.is_multiple_of(32) || x.len() < t * n_in || !self.bind() {
             return false;
@@ -2308,6 +2309,24 @@ impl Backend for CudaBackend {
         for j in jobs.iter() {
             let gg = |w: &WeightRef, d: &DeviceWeight| match w {
                 WeightRef::Gguf(_) => d.downcast_ref::<CudaWeightBox>().and_then(|b| Wg::of(&b.0)),
+                // (With the prefill plans off, `OXINFER_PREFILL_GPU=0`, the CPU's head too: the
+                // op-by-op prompt path then gives the CPU's logits bit for bit.)
+                WeightRef::Bf16(v) if v.len() == j.n_out * n_in && crate::qwen::prefill_gpu(usize::MAX, "plan") => {
+                    let k = self.gg_kernels(crate::ggml::GgmlType::BF16)?;
+                    let b = d.downcast_ref::<CudaWeightBox>()?;
+                    Some((
+                        k,
+                        Wg {
+                            q: b.0.data,
+                            rb: 2 * n_in as u64,
+                            f: 1.0,
+                            sr: 1,
+                            sc: 1,
+                            ncb: 1,
+                            ..Wg::default()
+                        },
+                    ))
+                }
                 _ => None,
             };
             let Some((k, w)) = gg(&j.w, j.dev) else { return false };
