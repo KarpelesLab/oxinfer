@@ -56,6 +56,20 @@ pub struct LtxArgs {
     pub image_crf: Option<u32>,
     /// `--enhance-prompt` (the reference's enhancer) / `--prompt-enhancer MODEL`.
     pub enhance_prompt: Option<String>,
+    /// `--audio-start S`, `--audio-max-duration S`: the window of `--audio` (audio to video).
+    pub audio_start: f64,
+    pub audio_max_duration: Option<f64>,
+    /// `--retake START:END` (seconds) of `--video`; `--keep-audio` / `--keep-video`: that stream
+    /// kept whole.
+    pub retake: Option<(f32, f32)>,
+    pub keep_audio: bool,
+    pub keep_video: bool,
+    /// `--audio-only`: text to audio.
+    pub audio_only: bool,
+    /// `--hq`: `ti2vid_two_stages_hq` (the res2s sampler and its settings).
+    pub hq: bool,
+    /// `--distilled-lora-strengths A,B`: the distilled LoRA's strength per stage.
+    pub lora_strengths: Option<(f32, f32)>,
 }
 
 fn floats(v: &str) -> Result<Vec<f32>> {
@@ -94,6 +108,24 @@ impl LtxArgs {
             "--image-crf" => self.image_crf = Some(val()?.parse()?),
             "--enhance-prompt" => self.enhance_prompt = Some(ltx::enhance::DEFAULT_ENHANCER.to_string()),
             "--prompt-enhancer" => self.enhance_prompt = Some(val()?),
+            "--audio-start" => self.audio_start = val()?.parse()?,
+            "--audio-max-duration" => self.audio_max_duration = Some(val()?.parse()?),
+            "--retake" => {
+                let v = val()?;
+                let (a, b) = v.split_once(':').with_context(|| format!("--retake {v:?}: START:END in seconds"))?;
+                self.retake = Some((a.trim().parse()?, b.trim().parse()?));
+            }
+            "--keep-audio" => self.keep_audio = true,
+            "--keep-video" => self.keep_video = true,
+            "--audio-only" => self.audio_only = true,
+            "--hq" => self.hq = true,
+            "--distilled-lora-strengths" => {
+                let f = floats(&val()?)?;
+                let [a, b] = f[..] else {
+                    bail!("--distilled-lora-strengths: two values, A,B")
+                };
+                self.lora_strengths = Some((a, b));
+            }
             "--audio-cfg"
             | "--stg"
             | "--audio-stg"
@@ -208,6 +240,9 @@ pub fn run(args: &Args) -> Result<()> {
     }
     let prompt = args.prompt.clone().context("--prompt is required")?;
     let mut p = Params::new(&prompt);
+    if a.hq {
+        p = p.hq();
+    }
     if let Some((w, h)) = args.size {
         p.width = w;
         p.height = h;
@@ -233,7 +268,28 @@ pub fn run(args: &Args) -> Result<()> {
     if !args.negative.is_empty() {
         gopts.push(("negative_prompt", args.negative.clone()));
     }
-    (p.guidance_mode, p.guidance) = ltx::api::guidance_from(a.guidance.as_deref(), &gopts)?;
+    let base = p.guidance.clone();
+    (p.guidance_mode, p.guidance) = ltx::api::guidance_from_base(base, a.guidance.as_deref(), &gopts)?;
+    if let Some(s) = &args.sampler {
+        p.sampler = ltx::Sampler::parse(s).with_context(|| format!("--sampler {s:?}: euler or res2s"))?;
+    }
+    if a.lora_strengths.is_some() {
+        p.distilled_lora_strengths = a.lora_strengths;
+    }
+    p.audio_only = a.audio_only;
+    if let Some(f) = args.audios.first() {
+        p.audio_input = Some(ltx::AudioInput::load(f)?.window(a.audio_start, a.audio_max_duration));
+    }
+    if let Some((start, end)) = a.retake {
+        let f = args.videos.first().context("--retake needs the source --video FILE")?;
+        p.retake = Some(ltx::Retake {
+            source: ltx::VideoInput::load(f)?,
+            start,
+            end,
+            video: !a.keep_video,
+            audio: !a.keep_audio,
+        });
+    }
     p.refine_audio = a.refine_audio;
     p.image_crf = a.image_crf;
     p.enhance_prompt = a.enhance_prompt.clone();
@@ -282,6 +338,24 @@ pub fn run(args: &Args) -> Result<()> {
     let mut progress = |stage: &str, i: usize, n: usize| eprint!("\r[{stage}: {i}/{n}, {:.1}s]   ", tp.elapsed().as_secs_f64());
     let video = pipe.generate(&p, &mut progress)?;
     eprintln!();
+    if p.audio_only {
+        // Text to audio: a WAV file (whatever the name's extension).
+        let out = args.output.clone().unwrap_or_else(|| PathBuf::from("audio.wav"));
+        let a = video
+            .audio
+            .as_ref()
+            .context("no soundtrack was decoded (the audio VAE is missing)")?;
+        std::fs::write(&out, a.to_wav()).with_context(|| format!("write {}", out.display()))?;
+        eprintln!(
+            "[{:.2} s of audio ({} Hz, {} channels) | {:.1}s | wrote {}]",
+            a.channels.first().map_or(0, |c| c.len()) as f64 / a.sample_rate as f64,
+            a.sample_rate,
+            a.channels.len(),
+            t0.elapsed().as_secs_f64(),
+            out.display()
+        );
+        return Ok(());
+    }
     let default = if cfg!(feature = "media") { "video.mp4" } else { "video.png" };
     let out = args.output.clone().unwrap_or_else(|| PathBuf::from(default));
     let what = crate::minimax_h3_video_cli::write_video(&video, &out)?;

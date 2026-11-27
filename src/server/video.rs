@@ -211,6 +211,10 @@ struct Request {
     first: Option<std::path::PathBuf>,
     last: Option<std::path::PathBuf>,
     refs: Vec<std::path::PathBuf>,
+    /// LTX-2.5: the soundtrack of audio to video (`audio_input`) and the source of a retake
+    /// (`video_input`).
+    audio_input: Option<std::path::PathBuf>,
+    video_input: Option<std::path::PathBuf>,
     /// Every field of the request (LTX-2.5 reads its own: `fps`, `one_stage`,
     /// `temporal_upscale`, `audio`, `eta`, `sigmas`, `stage2_sigmas`, `noise`, `strength`).
     fields: Value,
@@ -233,6 +237,7 @@ impl Request {
         let mut temp = TempFiles::default();
         let multipart_body = req.content_type.as_deref().is_some_and(|c| c.starts_with("multipart/"));
         // Fields as JSON values, media as local files.
+        let (mut audio_input, mut video_input) = (None, None);
         let (fields, first, last, refs) = if multipart_body {
             let parts = multipart(req.content_type.as_deref(), &req.body)?;
             let mut fields = serde_json::Map::new();
@@ -243,6 +248,8 @@ impl Request {
                     "input_reference" | "first_frame" | "image" => first = Some(media_part(api, p, &ext(), &mut temp)?),
                     "last_frame" => last = Some(media_part(api, p, &ext(), &mut temp)?),
                     "references" | "references[]" | "reference" | "reference[]" => refs.push(media_part(api, p, &ext(), &mut temp)?),
+                    "audio_input" => audio_input = Some(media_part(api, p, &ext(), &mut temp)?),
+                    "video_input" => video_input = Some(media_part(api, p, &ext(), &mut temp)?),
                     name => {
                         fields.insert(name.to_string(), Value::String(p.text()));
                     }
@@ -272,6 +279,12 @@ impl Request {
                 Some(u) => Some(to_file(api, &u, &mut temp)?),
                 None => None,
             };
+            if let Some(u) = url("audio_input")? {
+                audio_input = Some(to_file(api, &u, &mut temp)?);
+            }
+            if let Some(u) = url("video_input")? {
+                video_input = Some(to_file(api, &u, &mut temp)?);
+            }
             let mut refs = Vec::new();
             match v.get("references") {
                 None | Some(Value::Null) => {}
@@ -354,6 +367,8 @@ impl Request {
             first,
             last,
             refs,
+            audio_input,
+            video_input,
             fields,
             temp,
         })
@@ -618,6 +633,11 @@ fn run_ltx(j: &Job, r: &Request, pipe: &crate::ltx::Pipeline) -> ApiResult<crate
         anyhow::bail!("built without the `media` feature: images cannot be decoded")
     };
     crate::ltx::api::add_images(&mut p, imgs, &load).map_err(bad)?;
+    // Media only from the request's own files (never a path the client names).
+    let path = |f: &Option<std::path::PathBuf>| f.as_ref().map_or(Value::Null, |f| Value::String(f.to_string_lossy().into_owned()));
+    o["audio_input"] = path(&r.audio_input);
+    o["video_input"] = path(&r.video_input);
+    crate::ltx::api::add_media(&mut p, &o).map_err(bad)?;
     j.set(|s| {
         s.status = "in_progress";
         s.stage = "generating";
@@ -670,8 +690,9 @@ fn finish(j: &Job, video: crate::minimax_h3::video::Video, format: crate::minima
         thumbnail: video.frames.first().map(|f| crate::png::encode_rgb(video.width, video.height, f)),
         video: None,
     };
+    // Audio alone (LTX-2.5's text to audio): the WAV only.
     #[cfg(feature = "media")]
-    {
+    if !video.frames.is_empty() {
         let f = format;
         let bytes = crate::minimax_h3::encode::encode_video(&video, f).map_err(ApiError::internal)?;
         files.video = Some((bytes, f.mime()));

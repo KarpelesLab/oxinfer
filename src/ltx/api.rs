@@ -174,11 +174,15 @@ pub fn guidance_option(g: &mut Guidance, key: &str, v: &str) -> Result<bool> {
 /// `opts` ([`guidance_option`]) on top; a scale or block setting (not `steps` or
 /// `negative_prompt`) turns `auto` into `on`.
 pub fn guidance_from(mode: Option<&str>, opts: &[(&str, String)]) -> Result<(GuidanceMode, Guidance)> {
+    guidance_from_base(Guidance::default(), mode, opts)
+}
+
+/// [`guidance_from`] on top of `g` (the HQ pipeline's settings: [`Params::hq`]).
+pub fn guidance_from_base(mut g: Guidance, mode: Option<&str>, opts: &[(&str, String)]) -> Result<(GuidanceMode, Guidance)> {
     let mut m = match mode {
         None => GuidanceMode::Auto,
         Some(x) => GuidanceMode::parse(x).with_context(|| format!("guidance {x:?}: auto, on or off"))?,
     };
-    let mut g = Guidance::default();
     for (k, v) in opts {
         if !guidance_option(&mut g, k, v)? {
             bail!("unknown guidance setting {k:?}");
@@ -203,6 +207,10 @@ pub fn guidance_from(mode: Option<&str>, opts: &[(&str, String)]) -> Result<(Gui
 pub fn params_from_json(o: &serde_json::Value) -> Result<Params> {
     let prompt = o["prompt"].as_str().context("no prompt")?;
     let mut p = Params::new(prompt);
+    let bo = |k: &str| o[k].as_bool().or_else(|| o[k].as_str().map(|s| matches!(s, "1" | "true" | "yes")));
+    if bo("hq") == Some(true) {
+        p = p.hq();
+    }
     if let Some(s) = o["size"].as_str().filter(|s| !s.is_empty() && *s != "auto") {
         (p.width, p.height) = parse_size(s)?;
     }
@@ -269,7 +277,19 @@ pub fn params_from_json(o: &serde_json::Value) -> Result<Params> {
         serde_json::Value::String(s) => Some(s.clone()),
         _ => None,
     };
-    (p.guidance_mode, p.guidance) = guidance_from(gmode.as_deref(), &gopts)?;
+    (p.guidance_mode, p.guidance) = guidance_from_base(p.guidance.clone(), gmode.as_deref(), &gopts)?;
+    if let Some(s) = o["sampler"].as_str() {
+        p.sampler = super::Sampler::parse(s).with_context(|| format!("sampler {s:?}: euler or res2s"))?;
+    }
+    if let Some(s) = floats(&o["distilled_lora_strengths"]) {
+        let [a, b] = s[..] else {
+            bail!("distilled_lora_strengths: two values")
+        };
+        p.distilled_lora_strengths = Some((a, b));
+    }
+    if let Some(x) = b("audio_only") {
+        p.audio_only = x;
+    }
     if let Some(x) = b("refine_audio") {
         p.refine_audio = x;
     }
@@ -297,6 +317,31 @@ pub fn params_from_json(o: &serde_json::Value) -> Result<Params> {
         }
     }
     Ok(p)
+}
+
+/// The media of a JSON object, loaded into `p`: `audio_input` (a file: audio to video, with
+/// `audio_start` and `audio_max_duration` in seconds), `video_input` (a file: the source of a
+/// retake over `retake_start` to `retake_end` seconds, both streams regenerated unless
+/// `regenerate_video` / `regenerate_audio` is false).
+pub fn add_media(p: &mut Params, o: &serde_json::Value) -> Result<()> {
+    let num = |k: &str| o[k].as_f64().or_else(|| o[k].as_str().and_then(|s| s.trim().parse().ok()));
+    let b = |k: &str| o[k].as_bool().or_else(|| o[k].as_str().map(|s| matches!(s, "1" | "true" | "yes")));
+    if let Some(f) = o["audio_input"].as_str() {
+        let a = super::AudioInput::load(Path::new(f))?;
+        p.audio_input = Some(a.window(num("audio_start").unwrap_or(0.0), num("audio_max_duration")));
+    }
+    if let Some(f) = o["video_input"].as_str() {
+        let (start, end) = (num("retake_start").unwrap_or(0.0), num("retake_end"));
+        let end = end.context("video_input: a retake needs retake_end (seconds)")?;
+        p.retake = Some(super::Retake {
+            source: super::VideoInput::load(Path::new(f))?,
+            start: start as f32,
+            end: end as f32,
+            video: b("regenerate_video").unwrap_or(true),
+            audio: b("regenerate_audio").unwrap_or(true),
+        });
+    }
+    Ok(())
 }
 
 /// The image conditionings of a JSON object, as `(file, frame, strength)`: `first_frame` /

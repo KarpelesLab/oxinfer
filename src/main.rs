@@ -490,6 +490,13 @@ fn usage() -> ! {
          \x20 --guidance-mode auto|on|off (--no-guidance: off), --refine-audio (denoise audio in stage 2)\n\
          \x20 --image-crf N        H.264 CRF images are re-compressed at first (default 18; 0: off)\n\
          \x20 --enhance-prompt     rewrite the prompt with Gemma 4 E2B-it first (--prompt-enhancer MODEL)\n\
+         \x20 --audio FILE         audio to video: the soundtrack (kept) the video is made for (length from it\n\
+         \x20                      without --frames); --audio-start S, --audio-max-duration S\n\
+         \x20 --video FILE --retake START:END   regenerate seconds START to END of the video (--keep-audio,\n\
+         \x20                      --keep-video: that stream kept whole)\n\
+         \x20 --audio-only         text to audio (-o FILE.wav)\n\
+         \x20 --hq                 the HQ pipeline: res2s sampler, 15 guided steps, distilled LoRA 0.25 / 0.5;\n\
+         \x20                      --sampler euler|res2s, --distilled-lora-strengths A,B\n\
          \x20 --vae conv|diff|FILE the video decoder: convolutional (default) or the diffusion one (DiffVAE)
          \x20 --text-encoder FILE, --vae FILE, --audio-vae FILE, --upsampler FILE, --duration-head FILE\n\
          \x20 --sigmas a,b,..,0, --stage2-sigmas a,..,0, --eta F (ancestral noise; 1 distilled, 0 guided), --noise torch\n\

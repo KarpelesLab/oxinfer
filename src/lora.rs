@@ -152,6 +152,13 @@ impl LoraDelta {
         self
     }
 
+    /// This update's strength read from `gain` (`f32` bits, shared by the updates of one
+    /// adapter) at run time.
+    pub fn with_gain(mut self, gain: Arc<AtomicU32>) -> Self {
+        self.gain = gain;
+        self
+    }
+
     /// The strength this update alone is applied with now (0 when its adapter is off).
     #[inline]
     pub(crate) fn strength(&self) -> f32 {

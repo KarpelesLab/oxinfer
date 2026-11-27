@@ -661,3 +661,214 @@ impl VideoEncoder {
         out
     }
 }
+
+/// One interval of a tiled axis (latent units): `[start, end)` and its blend ramps.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Interval {
+    pub start: usize,
+    pub end: usize,
+    pub left: usize,
+    pub right: usize,
+}
+
+/// `split_by_size` (and `split_temporal_causal` with `causal`): tiles of `size` latent cells
+/// sharing `overlap`, the last one shorter; causally, each tile after the first starts a cell
+/// earlier with a ramp a cell longer.
+pub fn split_by_size(dim: usize, size: usize, overlap: usize, causal: bool) -> Vec<Interval> {
+    if dim <= size {
+        return vec![Interval {
+            start: 0,
+            end: dim,
+            left: 0,
+            right: 0,
+        }];
+    }
+    let step = size - overlap;
+    let amount = (dim + size - 2 * overlap - 1) / step;
+    let mut v = vec![Interval {
+        start: 0,
+        end: size,
+        left: 0,
+        right: overlap,
+    }];
+    for i in 1..amount - 1 {
+        v.push(Interval {
+            start: i * step,
+            end: i * step + size,
+            left: overlap,
+            right: overlap,
+        });
+    }
+    v.push(Interval {
+        start: (amount - 1) * step,
+        end: dim,
+        left: overlap,
+        right: 0,
+    });
+    if causal {
+        for iv in v.iter_mut().skip(1) {
+            iv.start -= 1;
+            iv.left += 1;
+        }
+    }
+    v
+}
+
+/// `torch.linspace(a, b, n)` in float32 (its two-sided formula).
+fn linspace(a: f32, b: f32, n: usize) -> Vec<f32> {
+    if n == 1 {
+        return vec![a];
+    }
+    let step = (b - a) / (n - 1) as f32;
+    let half = n / 2;
+    (0..n)
+        .map(|i| {
+            if i < half {
+                a + step * i as f32
+            } else {
+                b - step * (n - 1 - i) as f32
+            }
+        })
+        .collect()
+}
+
+/// `compute_trapezoidal_mask_1d`.
+pub fn trapezoid(len: usize, left: usize, right: usize, from_zero: bool) -> Vec<f32> {
+    let (l, r) = (left.min(len), right.min(len));
+    let mut m = vec![1f32; len];
+    if l > 0 {
+        let mut f = linspace(0.0, 1.0, if from_zero { l + 1 } else { l + 2 });
+        f.pop();
+        if !from_zero {
+            f.remove(0);
+        }
+        m[..l].iter_mut().zip(&f).for_each(|(a, b)| *a *= b);
+    }
+    if r > 0 {
+        let f = linspace(1.0, 0.0, r + 2);
+        m[len - r..].iter_mut().zip(&f[1..r + 1]).for_each(|(a, b)| *a *= b);
+    }
+    m.iter_mut().for_each(|v| *v = v.clamp(0.0, 1.0));
+    m
+}
+
+/// Whether the masks of an axis' tiles sum to one everywhere (`masks_are_complementary`).
+fn complementary(tiles: &[(Interval, Vec<f32>)], len: usize) -> bool {
+    let mut acc = vec![0f32; len];
+    for (iv, m) in tiles {
+        acc[iv.start..iv.end].iter_mut().zip(m).for_each(|(a, b)| *a += b);
+    }
+    acc.iter().all(|v| (v - 1.0).abs() <= 1e-5)
+}
+
+impl VideoEncoder {
+    /// `tiled_encode` with the release's `TileSizeConfig.default()` (the clip encoder of
+    /// `video_latent_from_file`): tiles of 80 frames sharing 24 (causal: each after the first
+    /// starts a latent frame earlier) and of 768 pixels sharing 64 in height and width, each
+    /// encoded alone and blended with trapezoidal ramps (in latent units); frames past `8 k + 1`
+    /// are cropped.
+    pub fn encode_tiled(&self, x: &Vid, progress: &mut dyn FnMut(usize, usize)) -> Vid {
+        let (tile_t, ov_t, tile_s, ov_s) = (80 / 8, 24 / 8, 768 / 32, 64 / 32);
+        let frames = (x.t - 1) / 8 * 8 + 1;
+        let (lt, lh, lw) = ((frames - 1) / 8 + 1, x.h / 32, x.w / 32);
+        let axis = |dim: usize, size: usize, ov: usize, causal: bool, from_zero: bool| -> Vec<(Interval, Vec<f32>)> {
+            split_by_size(dim, size.max(ov + 1).max(2), ov, causal)
+                .into_iter()
+                .map(|iv| (iv, trapezoid(iv.end - iv.start, iv.left, iv.right, from_zero)))
+                .collect()
+        };
+        let (ts, hs, ws) = (
+            axis(lt, tile_t, ov_t, true, true),
+            axis(lh, tile_s, ov_s, false, false),
+            axis(lw, tile_s, ov_s, false, false),
+        );
+        let c = self.cfg.latent_channels;
+        let mut buf = Vid::new(lt, lh, lw, c);
+        let mut wts = vec![0f32; lt * lh * lw];
+        let total = ts.len() * hs.len() * ws.len();
+        let mut done = 0;
+        for (ti, tm) in &ts {
+            let (f0, f1) = (ti.start * 8, 1 + (ti.end - 1) * 8);
+            for (hi, hm) in &hs {
+                let (y0, y1) = (hi.start * 32, hi.end * 32);
+                for (wi, wm) in &ws {
+                    let (x0, x1) = (wi.start * 32, wi.end * 32);
+                    let mut tile = Vid::new(f1 - f0, y1 - y0, x1 - x0, x.c);
+                    for f in f0..f1 {
+                        for yy in y0..y1 {
+                            let src = ((f * x.h + yy) * x.w + x0) * x.c;
+                            let dst = (((f - f0) * tile.h + yy - y0) * tile.w) * x.c;
+                            tile.data[dst..dst + (x1 - x0) * x.c].copy_from_slice(&x.data[src..src + (x1 - x0) * x.c]);
+                        }
+                    }
+                    let z = self.encode(&tile);
+                    for (a, f) in (ti.start..ti.end).enumerate() {
+                        for (b, yy) in (hi.start..hi.end).enumerate() {
+                            for (d, xx) in (wi.start..wi.end).enumerate() {
+                                let m = tm[a] * hm[b] * wm[d];
+                                let o = (f * lh + yy) * lw + xx;
+                                let s = ((a * z.h + b) * z.w + d) * c;
+                                buf.data[o * c..(o + 1) * c]
+                                    .iter_mut()
+                                    .zip(&z.data[s..s + c])
+                                    .for_each(|(p, q)| *p += q * m);
+                                wts[o] += m;
+                            }
+                        }
+                    }
+                    done += 1;
+                    progress(done, total);
+                }
+            }
+        }
+        if !(complementary(&ts, lt) && complementary(&hs, lh) && complementary(&ws, lw)) {
+            for (row, &w) in buf.data.chunks_mut(c).zip(&wts) {
+                let w = w.max(1e-8);
+                row.iter_mut().for_each(|v| *v /= w);
+            }
+        }
+        buf
+    }
+}
+
+#[cfg(test)]
+mod tiling_tests {
+    use super::*;
+
+    #[test]
+    fn splits_like_the_reference() {
+        // 121 frames: 16 latent frames, tiles of 10 sharing 3, causal.
+        let t = split_by_size(16, 10, 3, true);
+        assert_eq!(
+            t,
+            vec![
+                Interval {
+                    start: 0,
+                    end: 10,
+                    left: 0,
+                    right: 3
+                },
+                Interval {
+                    start: 6,
+                    end: 16,
+                    left: 4,
+                    right: 0
+                }
+            ]
+        );
+        assert_eq!(split_by_size(24, 24, 2, false).len(), 1);
+        let s = split_by_size(40, 24, 2, false);
+        assert_eq!(
+            s[1],
+            Interval {
+                start: 22,
+                end: 40,
+                left: 2,
+                right: 0
+            }
+        );
+        let close = |a: Vec<f32>, b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
+        assert!(close(trapezoid(5, 2, 1, false), &[1.0 / 3.0, 2.0 / 3.0, 1.0, 1.0, 0.5]));
+        assert!(close(trapezoid(4, 2, 0, true), &[0.0, 0.5, 1.0, 1.0]));
+    }
+}

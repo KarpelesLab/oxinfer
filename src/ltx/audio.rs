@@ -27,14 +27,14 @@ use crate::sd::ops::Conv;
 use anyhow::{Context, Result, bail};
 
 /// A causal (in time) 3 x 3 convolution over `[t, mel, c]` rows, or a 1 x 1 one.
-struct Conv2 {
-    conv: Conv,
+pub(super) struct Conv2 {
+    pub(super) conv: Conv,
     k: usize,
-    cout: usize,
+    pub(super) cout: usize,
 }
 
 impl Conv2 {
-    fn load(f: &ModelFiles, p: &str) -> Result<Self> {
+    pub(super) fn load(f: &ModelFiles, p: &str) -> Result<Self> {
         let wn = format!("{p}.weight");
         let i = f.info(&wn).with_context(|| format!("missing tensor {wn}"))?;
         let [cout, cin, kh, kw] = i.shape[..] else {
@@ -53,7 +53,7 @@ impl Conv2 {
     }
 
     /// `x` `[t, m, cin]` to `[t, m, cout]`.
-    fn forward(&self, x: &[f32], t: usize, m: usize) -> Vec<f32> {
+    pub(super) fn forward(&self, x: &[f32], t: usize, m: usize) -> Vec<f32> {
         if self.k == 1 {
             return self.conv.forward(x, t, m, 1).0;
         }
@@ -68,7 +68,7 @@ impl Conv2 {
     }
 }
 
-fn pixel_norm_silu(x: &[f32], c: usize) -> Vec<f32> {
+pub(super) fn pixel_norm_silu(x: &[f32], c: usize) -> Vec<f32> {
     let mut y = x.to_vec();
     let par = y.len() > c * 64;
     crate::kernels::for_chunks(&mut y, c * 64, par, |_, rows| {
@@ -84,14 +84,14 @@ fn pixel_norm_silu(x: &[f32], c: usize) -> Vec<f32> {
     y
 }
 
-struct Res {
+pub(super) struct Res {
     c1: Conv2,
     c2: Conv2,
     nin: Option<Conv2>,
 }
 
 impl Res {
-    fn load(f: &ModelFiles, p: &str) -> Result<Self> {
+    pub(super) fn load(f: &ModelFiles, p: &str) -> Result<Self> {
         let nin = format!("{p}.nin_shortcut.conv");
         Ok(Self {
             c1: Conv2::load(f, &format!("{p}.conv1.conv"))?,
@@ -104,7 +104,7 @@ impl Res {
         })
     }
 
-    fn forward(&self, x: &[f32], t: usize, m: usize) -> Vec<f32> {
+    pub(super) fn forward(&self, x: &[f32], t: usize, m: usize) -> Vec<f32> {
         let cin = x.len() / (t * m);
         let h = self.c1.forward(&pixel_norm_silu(x, cin), t, m);
         let mut h = self.c2.forward(&pixel_norm_silu(&h, self.c1.cout), t, m);

@@ -234,6 +234,10 @@ pub struct StreamIn<'a> {
     pub keyframe_rows: usize,
     /// More rows that get it: generated keyframe slots (`VideoGeneratedKeyframeSlots`).
     pub slot_rows: std::ops::Range<usize>,
+    /// The timesteps and the sigma in float64 when the sampler has them so (the res2s midpoints:
+    /// the reference's timestep sinusoids are then float64); none: `t` and `sigma`.
+    pub t64: Option<&'a [f64]>,
+    pub sigma64: Option<f64>,
 }
 
 /// Blocks a perturbation applies to (`Perturbation.blocks`: none means all of them).
@@ -320,10 +324,13 @@ pub struct Dit<'a> {
     pub device: bool,
     /// On the device, 128-wide heads' attention with float32 operands (else half-precision).
     pub exact_attention: bool,
-    /// The switch of the LoRA that changes between stages (the distilled LoRA of the two-stage
-    /// dev pipeline): the device twins are kept for each of its states.
+    /// The switch and the strength of the LoRA that changes between stages (the distilled LoRA
+    /// of the two-stage dev pipeline): the device twins are kept for each strength it runs at.
     pub lora_switch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    twins: [std::sync::OnceLock<super::device::Twins<'a>>; 2],
+    pub lora_gain: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    /// The device twins by the switched LoRA's strength (`f32` bits; 0 when off), never removed.
+    #[allow(clippy::vec_box)]
+    twins: std::sync::Mutex<Vec<(u32, Box<super::device::Twins<'a>>)>>,
     session: std::sync::Mutex<Option<Box<dyn crate::gpu::dit::LtxSession>>>,
 }
 
@@ -424,7 +431,8 @@ impl<'a> Dit<'a> {
             device: true,
             exact_attention: false,
             lora_switch: None,
-            twins: [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
+            lora_gain: None,
+            twins: std::sync::Mutex::new(Vec::new()),
             session: std::sync::Mutex::new(None),
         })
     }
@@ -478,11 +486,21 @@ impl<'a> Dit<'a> {
 
     /// The device twins of the layers for the switched LoRA's state now.
     fn device_twins(&self) -> &super::device::Twins<'a> {
-        let on = self
-            .lora_switch
-            .as_ref()
-            .is_none_or(|s| s.load(std::sync::atomic::Ordering::Relaxed));
-        self.twins[on as usize].get_or_init(|| super::device::Twins::build(self))
+        use std::sync::atomic::Ordering::Relaxed;
+        let on = self.lora_switch.as_ref().is_none_or(|s| s.load(Relaxed));
+        let gain = self.lora_gain.as_ref().map_or(1.0, |g| f32::from_bits(g.load(Relaxed)));
+        let key = if on { gain.to_bits() } else { 0 };
+        let mut t = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let p: *const super::device::Twins<'a> = match t.iter().find(|(k, _)| *k == key) {
+            Some((_, b)) => &**b,
+            None => {
+                t.push((key, Box::new(super::device::Twins::build(self))));
+                &*t.last().unwrap().1
+            }
+        };
+        // SAFETY: the boxes are never removed or replaced while `self` lives, so the twins stay
+        // where they are after the lock is released.
+        unsafe { &*p }
     }
 
     /// Whether the transformer has the learned keyframe embedding (generated keyframe slots).
@@ -601,32 +619,42 @@ impl<'a> Dit<'a> {
         self.blocks.truncate(n);
     }
 
-    fn mods(&self, s: &StreamIn, other_sigma: f32, video: bool) -> Mods {
+    fn mods(&self, s: &StreamIn, other: (f32, Option<f64>), video: bool) -> Mods {
         let m = self.cfg.timestep_mult;
         let (ada, av_ss, gate, prompt) = if video {
             (&self.adaln, &self.av_v_ss, &self.av_a2v_gate, &self.prompt_adaln)
         } else {
             (&self.a_adaln, &self.av_a_ss, &self.av_v2a_gate, &self.a_prompt_adaln)
         };
-        let mut uniq: Vec<f32> = Vec::new();
-        let idx: Vec<usize> =
-            s.t.iter()
-                .map(|&t| match uniq.iter().position(|&u| u.to_bits() == t.to_bits()) {
-                    Some(i) => i,
-                    None => {
-                        uniq.push(t);
-                        uniq.len() - 1
-                    }
-                })
-                .collect();
+        // The distinct timesteps (by their float64 values when there are those).
+        let keys: Vec<u64> = match s.t64 {
+            Some(t) => t.iter().map(|v| v.to_bits()).collect(),
+            None => s.t.iter().map(|v| v.to_bits() as u64).collect(),
+        };
+        let mut uniq: Vec<(u64, usize)> = Vec::new();
+        let idx: Vec<usize> = keys
+            .iter()
+            .enumerate()
+            .map(|(r, &k)| match uniq.iter().position(|u| u.0 == k) {
+                Some(i) => i,
+                None => {
+                    uniq.push((k, r));
+                    uniq.len() - 1
+                }
+            })
+            .collect();
         let mut block = Vec::new();
         let mut emb = Vec::new();
         let mut av = Vec::new();
-        for &t in &uniq {
-            let (b, e) = ada.forward(t * m);
+        let m64 = m as f64;
+        for &(_, r) in &uniq {
+            let ((b, e), a) = match s.t64 {
+                Some(t) => (ada.forward64(t[r] * m64), av_ss.forward64(t[r] * m64).0),
+                None => (ada.forward(s.t[r] * m), av_ss.forward(s.t[r] * m).0),
+            };
             block.push(b);
             emb.push(e);
-            av.push(av_ss.forward(t * m).0);
+            av.push(a);
         }
         let av_factor = self.cfg.av_ca_mult / m;
         Mods {
@@ -634,8 +662,14 @@ impl<'a> Dit<'a> {
             block,
             emb,
             av,
-            gate: gate.forward(other_sigma * m * av_factor).0,
-            prompt: prompt.forward(s.sigma * m).0,
+            gate: match other.1 {
+                Some(o) => gate.forward64(o * m64 * (self.cfg.av_ca_mult as f64 / m64)).0,
+                None => gate.forward(other.0 * m * av_factor).0,
+            },
+            prompt: match s.sigma64 {
+                Some(g) => prompt.forward64(g * m64).0,
+                None => prompt.forward(s.sigma * m).0,
+            },
         }
     }
 
@@ -651,8 +685,8 @@ impl<'a> Dit<'a> {
         let nv = v.x.len() / cfg.in_channels;
         let na = a.x.len() / cfg.audio_in_channels;
         let (n_ctx, na_ctx) = (v.ctx.len() / d, a.ctx.len() / ad);
-        let mv = self.mods(v, a.sigma, true);
-        let ma = self.mods(a, v.sigma, false);
+        let mv = self.mods(v, (a.sigma, a.sigma64), true);
+        let ma = self.mods(a, (v.sigma, v.sigma64), false);
 
         // Rotary tables: the streams' own positions, and time alone for the AV cross-attention.
         let vfrac: Vec<f32> = v

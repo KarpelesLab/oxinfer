@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 
 const PREFIXES: [&str; 4] = ["model.diffusion_model.", "diffusion_model.", "base_model.model.", "transformer."];
 const DOWN: [&str; 3] = [".lora_A.default.weight", ".lora_A.weight", ".lora_down.weight"];
@@ -26,12 +26,18 @@ type Parts = (Option<String>, Option<String>, Option<String>);
 
 /// Applies `(file, strength)` LoRAs to `dit`; returns the number of layers updated.
 pub fn apply(dit: &mut Dit, loras: &[(PathBuf, f32)]) -> Result<usize> {
-    apply_switched(dit, loras, None)
+    apply_switched(dit, loras, None, None)
 }
 
-/// [`apply`] with the updates switched on and off by `switch` (the distilled LoRA, on only in
-/// the second stage of the dev pipeline).
-pub fn apply_switched(dit: &mut Dit, loras: &[(PathBuf, f32)], switch: Option<&Arc<AtomicBool>>) -> Result<usize> {
+/// [`apply`] with the updates switched on and off by `switch` and scaled by `gain` (`f32` bits)
+/// at run time (the distilled LoRA: on only in the second stage of the dev pipeline, at 0.25
+/// then 0.5 in the HQ pipeline).
+pub fn apply_switched(
+    dit: &mut Dit,
+    loras: &[(PathBuf, f32)],
+    switch: Option<&Arc<AtomicBool>>,
+    gain: Option<&Arc<AtomicU32>>,
+) -> Result<usize> {
     let mut total = 0;
     for (path, strength) in loras {
         let st = SafeTensors::open(path, false).with_context(|| format!("open LoRA {}", path.display()))?;
@@ -85,6 +91,9 @@ pub fn apply_switched(dit: &mut Dit, loras: &[(PathBuf, f32)], switch: Option<&A
                 let mut d = LoraDelta::fixed(down, &up, r, lin.n_in, lin.n_out);
                 if let Some(sw) = switch {
                     d = d.with_switch(sw.clone());
+                }
+                if let Some(g) = gain {
+                    d = d.with_gain(g.clone());
                 }
                 lin.w.add_lora(Box::new(d));
                 Ok(())

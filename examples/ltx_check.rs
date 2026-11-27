@@ -89,6 +89,8 @@ fn main() -> Result<()> {
                     ctx: &vctx,
                     keyframe_rows: lh * lw,
                     slot_rows: 0..0,
+                    t64: None,
+                    sigma64: None,
                 },
                 &ltx::dit::StreamIn {
                     x: &ax,
@@ -98,6 +100,8 @@ fn main() -> Result<()> {
                     ctx: &actx,
                     keyframe_rows: 0,
                     slot_rows: 0..0,
+                    t64: None,
+                    sigma64: None,
                 },
             );
             println!("forward {:.2}s", t0.elapsed().as_secs_f64());
@@ -134,6 +138,8 @@ fn main() -> Result<()> {
                         ctx,
                         keyframe_rows,
                         slot_rows: 0..0,
+                        t64: None,
+                        sigma64: None,
                     }
                 }
                 use ltx::dit::{Blocks, Perturb};
@@ -325,6 +331,63 @@ fn main() -> Result<()> {
                 compare("mel", &mel, &want[..mel.len().min(want.len())]);
                 compare("mel and waveform", &flat, &want);
             }
+        }
+        "clipenc" => {
+            // ltx_check clipenc VAE VIDEO DIR: a video file's frames as oxinfer decodes them
+            // (DIR/frames_ox.u8) and the whole-clip encoding of them (DIR/rows_ox.f32), and of
+            // DIR/frames_ref.u8 (ref_clipenc.py's, `[t, h, w, 3]`) when present, compared with
+            // DIR/rows_ref.f32.
+            let v = ltx::VideoInput::load(Path::new(&a[3]))?;
+            let files = ModelFiles::open_file(file, false)?;
+            let enc = ltx::vae::VideoEncoder::load(&files)?;
+            let n = ltx::snap_frames(v.frames.len());
+            let raw: Vec<u8> = v.frames[..n].concat();
+            std::fs::write(dir.join("frames_ox.u8"), &raw)?;
+            let enc_frames = |raw: &[u8]| {
+                let mut x = ltx::vae::Vid::new(n, v.height, v.width, 3);
+                for (o, &b) in x.data.iter_mut().zip(raw) {
+                    *o = b as f32 / 127.5 - 1.0;
+                }
+                let t0 = std::time::Instant::now();
+                let z = enc.encode_tiled(&x, &mut |_, _| {});
+                println!("encoded {n} frames in {:.2}s", t0.elapsed().as_secs_f64());
+                z.data
+            };
+            let rows = enc_frames(&raw);
+            std::fs::write(
+                dir.join("rows_ox.f32"),
+                rows.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
+            )?;
+            if dir.join("frames_ref.u8").exists() {
+                let fr = std::fs::read(dir.join("frames_ref.u8"))?;
+                let d: f64 = fr.iter().zip(&raw).map(|(&x, &y)| (x as f64 - y as f64).abs()).sum::<f64>() / fr.len() as f64;
+                println!("frames: mean |ref - oxinfer| {d:.3} (of 255)");
+                let want = r("rows_ref")?;
+                compare("rows (oxinfer's frames)", &rows, &want);
+                compare("rows (the reference's frames)", &enc_frames(&fr), &want);
+            }
+        }
+        "audioenc" => {
+            // ltx_check audioenc FILE DIR: ref_audio_enc.py's waveform (DIR/wave_in.f32, two
+            // channels at meta.json's rate) through the resampler, the mel front end and the
+            // audio encoder.
+            let m = meta(dir)?;
+            let rate = m["rate"].as_u64().context("meta: rate")? as u32;
+            let w = r("wave_in")?;
+            let n = w.len() / 2;
+            let ch = vec![w[..n].to_vec(), w[n..].to_vec()];
+            let files = ModelFiles::open_file(file, false)?;
+            let enc = ltx::audio_enc::AudioEncoder::load(&files)?;
+            let t0 = std::time::Instant::now();
+            let rs = ltx::audio_enc::resample_sinc(&ch[0], rate, enc.sample_rate);
+            compare("resampled", &rs, &r("resampled")?);
+            let (mel, frames) = enc.mel(&ch, rate)?;
+            compare("mel", &mel, &r("mel")?);
+            let rows = enc.encode_mel(&r("mel")?, frames);
+            compare("latent rows (reference mel)", &rows, &r("rows")?);
+            let rows = enc.encode_mel(&mel, frames);
+            compare("latent rows", &rows, &r("rows")?);
+            println!("{:.2}s", t0.elapsed().as_secs_f64());
         }
         "audio" => {
             let files = ModelFiles::open_file(file, false)?;

@@ -2887,7 +2887,11 @@ pub unsafe extern "C" fn oxi_video_load(
 /// "frame", "strength"}` objects or `FILE@FRAME[:STRENGTH]`) and the guidance of the dev
 /// transformer (`crate::ltx::api::params_from_json`: `guidance`, `negative_prompt`, `cfg`,
 /// `stg`, `rescale`, `modality`, their `audio_` forms, `stg_blocks`, `skip_step`,
-/// `refine_audio`; `steps` its steps). `progress` gets each denoising step
+/// `refine_audio`; `steps` its steps), `audio_input` (a file: audio to video; `audio_start`,
+/// `audio_max_duration`), `video_input` with `retake_start` / `retake_end` (a retake;
+/// `regenerate_video`, `regenerate_audio`), `audio_only` (text to audio: only `out_wav` is
+/// written), `hq` (the res2s HQ pipeline), `sampler` (`euler`, `res2s`),
+/// `distilled_lora_strengths` (`[A, B]`). `progress` gets each denoising step
 /// (non-zero cancels). Writes the
 /// video (the `media` feature) to `out_video` in the format of its extension (`.mp4`: H.264 and
 /// AAC, also for other names; `.webm`: VP9 and Opus; `.avi`: Motion JPEG and PCM) and the
@@ -2918,6 +2922,7 @@ pub unsafe extern "C" fn oxi_video_generate(
             let load =
                 |_: &std::path::Path| -> Result<crate::sd::Image> { bail!("built without the `media` feature: images cannot be decoded") };
             crate::ltx::api::add_images(&mut p, crate::ltx::api::images_from_json(&o)?, &load)?;
+            crate::ltx::api::add_media(&mut p, &o)?;
             v.cancel.store(false, Ordering::Relaxed);
             p.cancel = Some(v.cancel.clone());
             let cancel = v.cancel.clone();
@@ -3016,7 +3021,7 @@ pub unsafe extern "C" fn oxi_video_generate(
 #[cfg(not(target_arch = "wasm32"))]
 fn write_video_files(video: &crate::minimax_h3::video::Video, out_video: Option<&str>, out_wav: Option<&str>) -> Result<()> {
     {
-        if let Some(path) = out_video {
+        if let Some(path) = out_video.filter(|_| !video.frames.is_empty()) {
             #[cfg(feature = "media")]
             {
                 // The format from the extension: .mp4 (the default for others), .webm, .avi.

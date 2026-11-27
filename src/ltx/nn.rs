@@ -269,6 +269,20 @@ pub(crate) fn timestep_sinusoid(t: f32) -> Vec<f32> {
     out
 }
 
+/// [`timestep_sinusoid`] in float64 (`get_timestep_embedding` of a float64 timestep), rounded
+/// to float32 at the end.
+pub(crate) fn timestep_sinusoid64(t: f64) -> Vec<f32> {
+    let half = 128usize;
+    let l = -10000f64.ln();
+    let mut out = vec![0f32; 2 * half];
+    for i in 0..half {
+        let a = t * (l * i as f64 / half as f64).exp();
+        out[i] = a.cos() as f32;
+        out[half + i] = a.sin() as f32;
+    }
+    out
+}
+
 /// `AdaLayerNormSingle`: the timestep embedder (`emb.timestep_embedder.linear_1` / `_2`) and the
 /// modulation projection (`linear`) of its SiLU.
 pub(crate) struct AdaSingle<'a> {
@@ -288,8 +302,17 @@ impl<'a> AdaSingle<'a> {
 
     /// `(modulation, embedded timestep)` of timestep `t` (already times the multiplier).
     pub fn forward(&self, t: f32) -> (Vec<f32>, Vec<f32>) {
-        let s = timestep_sinusoid(t);
-        let mut h = self.l1.forward(&s, 1);
+        self.forward_sinusoid(&timestep_sinusoid(t))
+    }
+
+    /// [`Self::forward`] of a float64 timestep (the reference's sinusoid is then float64: the
+    /// res2s midpoints' sigmas).
+    pub fn forward64(&self, t: f64) -> (Vec<f32>, Vec<f32>) {
+        self.forward_sinusoid(&timestep_sinusoid64(t))
+    }
+
+    fn forward_sinusoid(&self, s: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let mut h = self.l1.forward(s, 1);
         h.iter_mut().for_each(|v| *v = crate::sd::ops::silu(*v));
         let emb = self.l2.forward(&h, 1);
         let act: Vec<f32> = emb.iter().map(|&v| crate::sd::ops::silu(v)).collect();

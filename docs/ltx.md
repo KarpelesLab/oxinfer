@@ -1,9 +1,10 @@
 # Video with sound: LTX-2.5
 
 `Lightricks/LTX-2.5` is a 22B audio-video diffusion transformer: a prompt (and optionally images)
-becomes a video with a 48 kHz stereo soundtrack. oxinfer runs the release's distilled pipeline
-(`ltx_pipelines.distilled`, `DistilledPipeline` of github.com/Lightricks/LTX-2) from its split
-files: `src/ltx/`.
+becomes a video with a 48 kHz stereo soundtrack. oxinfer runs the release's pipelines
+(github.com/Lightricks/LTX-2's `ltx_pipelines`: `distilled`, `ti2vid_*` with the dev transformer,
+`ti2vid_two_stages_hq`, `a2vid_two_stage`, `retake`, `t2a_one_stage`, the DFR temporal rounds)
+from its split files: `src/ltx/`.
 
 ```sh
 # text to video: 768x512, 121 frames (5 s at 24 fps), the two-stage distilled pipeline
@@ -20,6 +21,14 @@ files: `src/ltx/`.
 # the dev transformer, guided (ti2vid_two_stages: 30 guided steps at half the size, then the
 # distilled LoRA's 3 steps at the full size; without --distilled-lora one guided stage)
 ./target/release/oxinfer --model Lightricks/LTX-2.5 --transformer dev --distilled-lora -p "..." -o dev.mp4
+# the HQ pipeline (res2s sampler, 15 guided steps, the distilled LoRA at 0.25 then 0.5)
+./target/release/oxinfer --model Lightricks/LTX-2.5 --transformer dev --distilled-lora --hq -p "..." -o hq.mp4
+# audio to video: the video made for a soundtrack, which is kept (its length unless --frames)
+./target/release/oxinfer --model Lightricks/LTX-2.5 --audio song.wav -p "A singer on a stage..." -o sing.mp4
+# retake: seconds 1.5 to 3 of a video regenerated, the rest kept
+./target/release/oxinfer --model Lightricks/LTX-2.5 --video clip.mp4 --retake 1.5:3 -p "..." -o retake.mp4
+# text to audio (the dev transformer)
+./target/release/oxinfer --model Lightricks/LTX-2.5 --transformer dev --audio-only --frames 121 -p "Rain on a tin roof" -o rain.wav
 ```
 
 The release repository is gated (accepting its terms shares the account's contact details), so
@@ -72,6 +81,10 @@ files (the other parts from the folder above it).
 | `--refine-audio` | the guided pipeline's second stage denoises the soundtrack again (default: the first stage's kept, as the reference) |
 | `--enhance-prompt`, `--prompt-enhancer MODEL` | rewrite the prompt first with a Gemma 4 instruct model (default the reference's, `google/gemma-4-E2B-it`; [below](#the-prompt-enhancer)) |
 | `--image-crf N` | the H.264 CRF conditioning images are re-compressed at first (default the model's: 18 for LTX-2.5; 0: as they are) |
+| `--audio FILE`, `--audio-start S`, `--audio-max-duration S` | audio to video ([below](#audio-to-video)) |
+| `--video FILE --retake START:END`, `--keep-audio`, `--keep-video` | a retake of seconds `START` to `END` ([below](#retake)) |
+| `--audio-only` | text to audio ([below](#text-to-audio)) |
+| `--hq`, `--sampler euler\|res2s`, `--distilled-lora-strengths A,B` | the HQ pipeline, its sampler, the distilled LoRA's strength per stage ([below](#the-hq-pipeline-res2s)) |
 | `--noise oxinfer\|torch\|files:DIR` | the noise source (`files:DIR`: the generator seeded `s` reads `DIR/noise_{s}.f32`, for comparisons with the reference) |
 | `--device cpu` | everything on the CPU |
 | `-o FILE` | `.mp4` (H.264 and AAC), `.webm` (VP9 and Opus), `.avi`, `.webp` or a PNG sequence with a WAV, as for [MiniMax-H3](video.md) |
@@ -164,6 +177,84 @@ full size (`ti2vid_one_stage`). The dev transformer with the distilled LoRA and 
 runs the distilled schedule instead (the LoRA makes it a distilled model). The distilled LoRA
 is switched per stage: on the GPU its side paths exist only in the second stage's view of the
 layers.
+
+### Audio to video
+
+`--audio FILE` (`audio_input` in the server and the C API, `Params::audio_input`) runs the
+release's `a2vid_two_stage` ([`audio_enc.rs`](../src/ltx/audio_enc.rs)): the video is made for a
+soundtrack that stays as it is.
+
+- The waveform (any file oxideav decodes; `--audio-start S`, `--audio-max-duration S` pick a
+  window, as `decode_audio_from_file`) is resampled to 16 kHz as
+  `torchaudio.functional.resample` does (a Hann-windowed sinc of 6 zero crossings, rolloff 0.99,
+  in float32), turned into the stereo log-mel spectrogram of `AudioProcessor` (torchaudio's
+  `MelSpectrogram`: 1024-point centered frames every 160 samples, reflect padding, magnitudes,
+  64 Slaney mel bins up to 8 kHz with Slaney's norm, `log(max(m, 1e-5))`) and encoded by the
+  audio VAE's encoder (`AudioEncoder`: causal 2-D convolutions as the decoder's, two residual
+  blocks per level, stride-2 convolutions between levels, the means of `conv_out` normalized by
+  the per-channel statistics). A mono file is used for both channels (the reference needs two).
+- Without `--frames`, the clip lasts as long as the audio (`num_frames_from_audio_duration`:
+  `int(seconds fps)`, at most 1024, snapped to `8 k + 1`); with it, the audio is cut to the clip.
+  The latents are cut (or zero-padded) to the clip's `audio_latents`.
+- Both stages keep those latents frozen (timestep and sigma 0, noised at scale 0 so the noise
+  stream is the reference's); with the dev transformer the first stage is guided on the video only
+  (the audio guider has the default parameters; the CFG pass sees the prompt's own audio context),
+  the second runs the distilled LoRA. The written soundtrack is the source waveform itself (at its
+  own rate), cut to the clip (`replace_chunks_audio`).
+
+### Retake
+
+`--video FILE --retake START:END` (`video_input`, `retake_start`, `retake_end`; `Params::retake`)
+runs the release's `RetakePipeline`: seconds `START` to `END` of a video are regenerated from the
+prompt and the rest kept.
+
+- The source's frames (cut to `8 k + 1`, and to multiples of 32 pixels; the reference refuses
+  other sizes) are encoded whole as `video_latent_from_file` does:
+  `VideoEncoder.tiled_encode` with `TileSizeConfig.default()` (tiles of 80 frames sharing 24,
+  causal: each after the first starts a latent frame earlier; 768 pixels sharing 64 in height and
+  width; trapezoidal blending in latent units; `vae::VideoEncoder::encode_tiled`). Its soundtrack
+  goes through the audio encoder (above); a source without one gets a new soundtrack.
+- `TemporalRegionMask`: a latent frame (its pixel span with the causal first frame) or an audio
+  latent whose time span meets the window is noised and denoised, the rest keeps its latents.
+- One stage at the source's size and rate: the distilled schedule with plain Euler steps (the
+  reference's retake has no ancestral sampler), guided on `--steps` with the dev transformer.
+- `--keep-audio` / `--keep-video` (`regenerate_audio` / `regenerate_video` false) keep that
+  stream whole: frozen, noised at scale 0 (the reference noises a frozen stream at scale 1 before
+  freezing it, so its kept stream would be noise).
+
+Decoding: oxideav's YUV to RGB conversion rounds where FFmpeg's swscale (the reference's PyAV)
+truncates: the frames differ by +0.34 of a level on average, which moves the encoded latents by
+2 % (rel L2); fed the same frames, the encoding matches to 4.5e-6.
+
+### Text to audio
+
+`--audio-only` (`audio_only`) runs `t2a_one_stage`: the audio stream alone (no video rows, so no
+audio-video cross-attention), with the dev transformer guided on the audio (CFG 7, STG on block
+28, rescale 0.7, no modality guidance) over `LTX2Scheduler`'s schedule; the length from `--frames`
+(`frames` / `seconds` in the server and C API) or the duration head on the audio context alone. The whole decoded soundtrack is
+written (`-o FILE.wav`; the server returns the WAV, the C API writes `out_wav`). The transformer
+runs on the CPU kernels (the Metal session needs both streams): about 1 s a pass for 5 s of audio.
+
+### The HQ pipeline: res2s
+
+`--hq` (`hq`, `Params::hq`) takes `ti2vid_two_stages_hq`'s settings: the res2s sampler (`--sampler
+res2s`, `sampler`) in both stages, 15 guided steps on `LTX2Scheduler`'s schedule shifted for the
+first stage's latent tokens, video CFG 3 / rescale 0.45 / modality 3, audio CFG 7 / rescale 1 /
+modality 3, no STG, and the distilled LoRA at 0.25 in the first stage and 0.5 in the second
+(`--distilled-lora-strengths A,B`); the second stage denoises the soundtrack
+again alongside the video, but the first stage's is the one decoded (as in the reference).
+
+`res2s_audio_video_denoising_loop` (`legacy_mode`, bong iterations, eta 0.5): per step the
+denoised rows at sigma, a midpoint at `sqrt(sigma next)` by the exponential integrator
+(`a21 = c2 phi_1(-h c2)`, `h = log(sigma / next)`), SDE noise there, the anchor refined by
+fixed-point iterations while `h < 0.5`, the denoised rows at the midpoint, the step
+(`b2 = phi_2(-h) / c2`, `b1 = phi_1(-h) - b2`) and SDE noise again; a last evaluation at 0.0011
+replaces the final step to 0. Two transformer evaluations a step. The noise comes from two
+generators seeded -1 and 9999 (in each stage), every draw normalized to zero mean and unit
+variance; the arithmetic is in float64 as the reference's on the CPU. The LoRA's strength is read
+at run time on the CPU; on Metal each strength gets its own side paths (2 x 8.9 GB for the HQ
+pipeline's two).
+
 
 ### Temporal upscaling: the DFR rounds
 
@@ -320,8 +411,14 @@ takes a repository id, folder or file with the server's options. The C API's `ox
 `vae` (`conv`, `diff` or a file), `audio_vae`, `upsampler`, `temporal_upsampler`, `duration_head`, `text_bf16`, `temporal`,
 `distilled_lora`, `lora`, `device`; parameters `prompt`, `size`, `frames` / `seconds`, `fps`,
 `seed`, `one_stage`, `temporal_upscale`, `audio`, `eta`, `sigmas`, `stage2_sigmas`, `noise`,
-`first_frame` / `strength`, `last_frame`, `images`). The server's `/v1/videos` takes the same
-request fields for an LTX-2.5 model (`oxinfer serve --model Lightricks/LTX-2.5`).
+`first_frame` / `strength`, `last_frame`, `images`, `audio_input` / `audio_start` /
+`audio_max_duration`, `video_input` / `retake_start` / `retake_end` / `regenerate_video` /
+`regenerate_audio`, `audio_only`, `hq`, `sampler`, `distilled_lora_strengths`; `Params` has
+`audio_input`, `retake`, `audio_only`, `sampler`, `distilled_lora_strengths`, and `Params::hq`).
+The server's `/v1/videos` takes the same request fields for an LTX-2.5 model (`oxinfer serve
+--model Lightricks/LTX-2.5`); its `audio_input` and `video_input` are media of the request (a
+`data:` or `http(s)://` URL in JSON, a file part in a multipart body), never server paths; an
+`audio_only` job has the WAV alone.
 
 ## Verification
 
@@ -342,6 +439,9 @@ are `ref_*.py` beside `examples/ltx_check.rs`'s checks):
 | spatial / temporal upsampler | 1.2e-5 / 2.2e-5 | `LatentUpsampler` with the VAE's statistics |
 | the guidance passes, 2 blocks (dev int8; STG: video self-attention skipped in block 1, audio in block 0; modality: no AV cross-attention), CPU / Metal | 2.3e-6 / 1.6e-6, 2.2e-6 / 1.5e-6; 9.7e-5 / 1.1e-4, 8.9e-5 / 7.7e-5 | `LTXModel` with a `BatchedPerturbationConfig` (`ref_dit_ptb.py`) |
 | guidance arithmetic (video / audio params, masked rescale) | 0 (bit-identical) | `MultiModalGuider.calculate` (`ref_guider.py`, `ltx_check guider`) |
+| audio encoder front end: resampling 48 / 44.1 kHz to 16 kHz, log-mel | 6.3e-8, 8.3e-8 / 7.0e-6, 7.6e-6 | `AudioProcessor` (`torchaudio` 2.11's `resample`, `MelSpectrogram`; `ref_audio_enc.py`, `ltx_check audioenc`) |
+| audio encoder (from the reference's mel / end to end) | 1.4e-6 / 1.1e-5 | `AudioEncoder`, `encode_audio` |
+| whole-clip video encoding, 384x256, 25 frames | 4.5e-6 | `VideoEncoder.tiled_encode(TileSizeConfig.default())` on the same frames (`ref_clipenc.py`, `ltx_check clipenc`) |
 | `LTX2Scheduler(30)` | 6e-8 (one float32 ulp) | the dev schedule |
 | DiffVAE decoder, 2 x 4 x 6 latents (edge-padded to 3 x 7 x 7) / 4 x 8 x 12 (CPU) | 8.1e-7 / 8.1e-7 | `DiffusionVideoDecoder`, `CHUNKED` blocks, eager neighborhood attention, the reference's noise injected (`ref_diffvae.py`, `ltx_check diffvae`) |
 | the same on the Metal blocks | 1.8e-4 / 2.8e-4 | half GEMM inputs and half q / k / v |
@@ -365,11 +465,24 @@ transformer passes, sampler, guidance, upsampler, decoders: all of it compared a
 | distilled, 384x256, 25 frames, two stages (8 + 3 steps, ancestral), CPU | 1.1e-6 / 1.4e-6 | 3.9e-4 / 2.7e-5 | 5.9e-4 | 2.7e-3 / 1.8e-4 | PSNR 57.8 dB | SNR 61.3 dB |
 | the same on Metal | 8.4e-5 / 1.4e-6 | 3.4e-2 / 1.6e-3 | 5.1e-2 | 0.16 / 1.8e-2 | 27.6 dB | 19.7 dB |
 | dev, guided, one stage, 256x160, 17 frames, 6 steps (4 passes each), CPU | 1.1e-6 / 4.8e-6 | 6.1e-4 / 1.6e-4 | | | 65.6 dB | 54.7 dB |
+| audio to video (`A2VidPipelineTwoStage`, the distilled transformer, Euler), 384x256, a 1.04 s WAV at 44.1 kHz (25 frames), CPU | 1.3e-6 / 1.0e-6 | 5.1e-5 / 4.7e-5 (the source's latents) | 8.0e-5 | 1.7e-4 / 4.7e-5 | 67.6 dB | the source's samples |
+| retake of 0.4 to 0.8 s (`RetakePipeline`, distilled) of a 384x256, 25-frame H.264 + PCM clip, CPU, the same decoded frames | 4.6e-6 / 1.1e-6 | 4.5e-5 / 2.3e-5 | | | 76.0 dB | 83.1 dB |
+| text to audio (`T2AOneStagePipeline`, dev, 4 guided steps of 3 passes), 49 frames (2 s), CPU | / 4.8e-6 | / 1.4e-5 | | | | 52.0 dB |
+| HQ (`TI2VidTwoStagesHQPipeline` on the distilled transformer, the LoRA at 0: the res2s loop and its guidance), 384x256, 17 frames, 2 steps, CPU | 1.6e-6 / 2.2e-6 | 3.7e-4 / 1.5e-4 | | | | |
+| the same with 4 steps (bong iterations) | | 0.25 / 9.9e-2 | 0.36 | 0.58 / | 17.6 dB | 8.1 dB |
 
 (rel L2 of the latents.) On the CPU the whole pipeline follows the reference's to float rounding,
 amplified by the ancestral sampler's steps. On Metal the half-precision GEMM inputs and attention
 (1e-4 a pass) grow over the steps into a different sample of the same video: the same scene,
 motion and sound, details apart (the dog's legs, `side_distilled.png` in the scratch notes).
+
+The HQ pipeline's guided res2s steps amplify float rounding far more than Euler steps do: in the
+reference itself a 1e-5 relative change of a midpoint's input moves that evaluation by 1.8e-4.
+Every evaluation of the 4-step run matches the reference's to that sensitivity (the first one
+3.3e-5; the first midpoint 7e-6 in, 8.4e-4 out), and over its 8 evaluations the two runs become
+different samples of the same clip (the same fox in the same snow, placed elsewhere); with 2 steps
+(no bong iterations, 4 evaluations) the first stage stays at 3.7e-4. The midpoints' sigmas are
+float64 in the reference, and so are their timestep sinusoids here (`StreamIn::t64`).
 
 The other transformer files, on one-block copies (block 0 and connector block 0 of the real files,
 fetched by HTTP ranges) against the reference on bf16 weights: the bf16 file 6.7e-7 / 8.7e-7 on
@@ -384,11 +497,14 @@ precision of the int8 and bf16 sessions; `ltx_check dit` with `LTX_SAVE` and `LT
   has constant QP only: the frame QP x264 picks is used).
 - The guided pipelines' `skip_step` with only one stream skipping a step runs both streams (the
   reference leaves the skipped stream out of that pass); off by default.
-- Audio-to-video (`a2vid_two_stage`: needs the audio VAE's encoder and mel front end), retake
-  (video-to-video regeneration of a time window: needs whole-clip VAE encoding of a decoded video),
-  the IC-LoRA pipelines (`ic_lora`, `hdr_ic_lora`, `dubit`: their LoRAs are not among the release's
-  files) and text-to-audio (`t2a_one_stage`).
-- `ti2vid_two_stages_hq` (the res2s sampler) and the guidance factories by sigma.
+- The IC-LoRA pipelines (`ic_lora`, `hdr_ic_lora`, `dubit`: their LoRAs are not among the
+  release's files) and the guidance factories by sigma.
+- The chunked long-clip forms of audio to video (`ChunkConfig`: one chunk here) and the release's
+  EXR / HDR inputs of retakes.
+- oxideav's YUV to RGB conversion rounds where swscale (the reference's PyAV) truncates, which
+  moves a retake's source latents by 2 % (above).
+- Text to audio on the GPU: the Metal session needs both streams, so the audio stream alone runs
+  on the CPU kernels.
 - DFR's detailing IC-LoRA second stage and its spatial epilogue (`spatial_upscalings = 2`): the
   LoRA is not part of the release's files.
 - The DiffVAE's tiled decode (the reference's memory-driven tiles and its keyframe-anchored
