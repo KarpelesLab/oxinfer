@@ -735,6 +735,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Attend { .. } => "attention",
         Op::GdnConv { .. } => "gdn-conv",
         Op::GdnRule(_) => "gdn-rule",
+        Op::Mamba2(_) => "mamba2",
         Op::Route { .. } => "route",
         Op::Experts(_) => "experts (VRAM?)",
         Op::Steer { .. } => "steer",
@@ -929,7 +930,7 @@ impl CudaBackend {
                         out_stride,
                         eps,
                         add,
-                    } => ops.push(COp::Norm {
+                    } if w.as_deref().is_none_or(|w| w.len() == n) => ops.push(COp::Norm {
                         f: self.func("dnorm")?,
                         x: byte(x),
                         out: byte(out),
@@ -1079,6 +1080,7 @@ impl CudaBackend {
                             LinMode::SiluPair => (2, P::default()),
                             LinMode::GeluPair => (3, P::default()),
                             LinMode::AddGated(v) => (4, byte(v)),
+                            LinMode::Relu2 => return None,
                         };
                         if cw2.is_some() != (mode == 2 || mode == 3) {
                             return None;
@@ -1312,7 +1314,15 @@ impl CudaBackend {
                             hd: hd as u32,
                         });
                     }
-                    Op::GdnConv { x, out, state, w, dim, kc } => {
+                    Op::GdnConv {
+                        x,
+                        out,
+                        state,
+                        w,
+                        dim,
+                        kc,
+                        bias: None,
+                    } => {
                         if kc < 2 || w.len() != dim * kc || g.states.get(state) != Some(&((kc - 1) * dim)) || (pf && kc > 9) {
                             return None;
                         }
@@ -1378,6 +1388,7 @@ impl CudaBackend {
                         logits,
                         sel,
                         expert_scale,
+                        sigmoid: None,
                     } => {
                         if router.len() != n_exp * h
                             || gate.is_some_and(|g| g.len() != h)
@@ -1418,7 +1429,8 @@ impl CudaBackend {
                         });
                     }
                     Op::Experts(ref ex) => {
-                        if ex.edits.is_some() || !ex.h.is_multiple_of(32) || !ex.inter.is_multiple_of(32) || ex.gate.is_empty() {
+                        if ex.relu2 || ex.edits.is_some() || !ex.h.is_multiple_of(32) || !ex.inter.is_multiple_of(32) || ex.gate.is_empty()
+                        {
                             return None;
                         }
                         let n = ex.gate.len();
@@ -1501,6 +1513,8 @@ impl CudaBackend {
                     }
                     Op::Steer { .. } | Op::NeuronEdit { .. } | Op::HcPre { .. } | Op::HcPost { .. } | Op::PleGate { .. } => return None,
                     Op::QsaKey { .. } | Op::QsaSelect { .. } | Op::AttendSel { .. } | Op::Fold { .. } => return None,
+                    // Nemotron-H's ops (Mamba-2, grouped norms, sigmoid routing): the CPU for now.
+                    Op::Mamba2(_) | Op::Norm { .. } | Op::GdnConv { .. } | Op::Route { .. } => return None,
                 }
             }
             Some(())

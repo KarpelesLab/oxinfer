@@ -365,6 +365,7 @@ impl<'a> Model<'a> {
                     logits: rlogits,
                     sel,
                     expert_scale: Some(&m.per_expert_scale),
+                    sigmoid: None,
                 };
                 if prefill || std::env::var("OXINFER_DEC_MOE_ORDER").is_ok_and(|v| v == "0") {
                     g.ops.push(one(ob, ob, Some(&m.ln_post_dense), false));
@@ -412,6 +413,7 @@ impl<'a> Model<'a> {
                     act: eact,
                     y: eo,
                     gelu: true,
+                    relu2: false,
                     add: false,
                     edits: expert_edit.map(|e| (hot.at(e.hot), e.n)),
                     lora,

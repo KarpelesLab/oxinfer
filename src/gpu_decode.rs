@@ -47,11 +47,14 @@ pub enum LinMode {
     GeluPair,
     /// `y += sigmoid(g) * W x`, with `g` the scalar at this view (a gated shared expert).
     AddGated(View),
+    /// `y = relu(W x)^2` (Nemotron-H's squared-ReLU MLPs).
+    Relu2,
 }
 
 pub enum Op<'a> {
     /// RMSNorm of `rows` rows of `n` values (row strides in floats) of `x * pre`: `out = x' /
-    /// rms(x') * w`, or `out += ...` with `add`.
+    /// rms(x') * w`, or `out += ...` with `add`. `w` holds `n` weights shared by the rows, or
+    /// `rows * n`, each row its own (Nemotron-H's grouped norm; one-token plans only).
     Norm {
         x: View,
         out: View,
@@ -141,7 +144,8 @@ pub enum Op<'a> {
     },
     /// Causal depthwise conv of kernel `kc` over `dim` channels with SiLU: `out = silu(sum of
     /// w[ch][j] * input j)`, inputs being the `kc - 1` earlier ones in recurrent state `state`
-    /// (`[kc - 1, dim]`, oldest first) and `x`; the state then shifts in `x`.
+    /// (`[kc - 1, dim]`, oldest first) and `x`; the state then shifts in `x`. With `bias`,
+    /// `out = silu(bias + sum ...)` (Mamba-2's convolution; one-token plans only).
     GdnConv {
         x: View,
         out: View,
@@ -149,7 +153,10 @@ pub enum Op<'a> {
         w: &'a [f32],
         dim: usize,
         kc: usize,
+        bias: Option<&'a [f32]>,
     },
+    /// Mamba-2's selective state update of one token (Nemotron-H, see `crate::nemotron`).
+    Mamba2(Mamba2<'a>),
     GdnRule(GdnRule<'a>),
     /// MoE routing of one token: router logits `router . x` (`[n_exp, h]` rows; with `gate`, one
     /// more logit `gate . x` after them, for a gated shared expert) into `logits`, then the top
@@ -166,6 +173,10 @@ pub enum Op<'a> {
         sel: View,
         /// Per-expert factors the chosen weights are multiplied by after the softmax (Gemma).
         expert_scale: Option<&'a [f32]>,
+        /// Sigmoid routing (Nemotron-H): the experts of the `k` largest `sigmoid(logit) + bias`
+        /// (ties to the lower index), weighted by their `sigmoid(logit)` renormalized over the
+        /// `k`, times the scale, instead of the softmax. `(bias, scale)`.
+        sigmoid: Option<(&'a [f32], f32)>,
     },
     /// The routed experts chosen in `sel` (see [`Op::Route`]): `act[s] = silu(gate_e x) *
     /// (up_e x)` for each slot, then `y += sum of weight_s * down_e act[s]`.
@@ -410,6 +421,9 @@ pub struct Experts<'a> {
     pub y: View,
     /// GELU-tanh experts (else SiLU).
     pub gelu: bool,
+    /// Ungated squared-ReLU experts (Nemotron-H): `act[s] = relu(up_e x)^2`, the up matrices
+    /// `[inter, h]` in `gate` and `up` None (instead of a fused gate / up).
+    pub relu2: bool,
     /// `y +=` the weighted sum (else `y =`).
     pub add: bool,
     /// Neuron edits of the routed experts' activations (entries with expert ids, see
@@ -432,6 +446,33 @@ pub fn pairable(a: &WeightRef, b: &WeightRef) -> bool {
 
 /// The gated delta rule of Gated DeltaNet (Qwen3.5 / 3.8 linear attention, see `crate::qwen`)
 /// for one token over all value heads, then the gated RMSNorm.
+/// Mamba-2's state update of one token ([`Op::Mamba2`]): per head `h` (group `g = h / (nh /
+/// ng)`), `dt = softplus(dt_raw[h] + dt_bias[h])` clamped to `[dt_min, dt_max]`, `S_h <-
+/// exp(dt a[h]) S_h + dt x_h B_g^T` (`S_h` `[hd, ns]`), then `out_h = (S_h C_g + d[h] x_h) *
+/// silu(z_h)`, the gated output before its grouped RMSNorm.
+pub struct Mamba2<'a> {
+    /// The convolution's output `[x (nh * hd) | B (ng * ns) | C (ng * ns)]`.
+    pub xbc: View,
+    /// The gate `z` (`nh * hd`).
+    pub z: View,
+    /// The raw time steps (`nh`).
+    pub dt: View,
+    /// `nh * hd`.
+    pub out: View,
+    /// Recurrent state `[nh, hd, ns]`.
+    pub state: usize,
+    pub nh: usize,
+    pub hd: usize,
+    pub ng: usize,
+    pub ns: usize,
+    /// `A = -exp(A_log)`, `D` and the time step bias (`nh` each).
+    pub a: &'a [f32],
+    pub d: &'a [f32],
+    pub dt_bias: &'a [f32],
+    pub dt_min: f32,
+    pub dt_max: f32,
+}
+
 pub struct GdnRule<'a> {
     /// Conv outputs `[q | k | v]` (`2 * nk * hdk + nv * hdv`), gate inputs `z` (`nv * hdv`),
     /// `b` and `a` (`nv` each).

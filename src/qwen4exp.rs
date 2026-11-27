@@ -1200,6 +1200,7 @@ impl<'a> QwenModel<'a> {
                     w: &p.conv_dense,
                     dim: w,
                     kc: hist + 1,
+                    bias: None,
                 });
                 for src in [gated, cv] {
                     g.ops.push(Op::Ew {
@@ -1236,6 +1237,7 @@ impl<'a> QwenModel<'a> {
                         w: &gd.conv_w,
                         dim: conv_dim,
                         kc: cfg.linear_conv_kernel_dim,
+                        bias: None,
                     });
                     g.ops.push(Op::GdnRule(crate::gpu::decode::GdnRule {
                         c: gconv,
@@ -1364,6 +1366,7 @@ impl<'a> QwenModel<'a> {
                 logits: rlogits,
                 sel,
                 expert_scale: None,
+                sigmoid: None,
             });
             let mut gw = Vec::with_capacity(ne);
             let mut uw = Vec::with_capacity(ne);
@@ -1392,6 +1395,7 @@ impl<'a> QwenModel<'a> {
                 act: eact,
                 y,
                 gelu: false,
+                relu2: false,
                 add: false,
                 edits: None,
                 lora: None,

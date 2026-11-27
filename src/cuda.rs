@@ -4050,6 +4050,7 @@ mod tests {
             w: &conv_w,
             dim: conv_dim,
             kc,
+            bias: None,
         });
         g.ops.push(Op::GdnRule(GdnRule {
             c: gconv,

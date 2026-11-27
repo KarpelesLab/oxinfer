@@ -393,11 +393,18 @@ fn load_lin_stored<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: us
     if let Some(k) = q.kind() {
         files.mark_quant(full, k);
     }
-    Ok(match q {
-        Quant::Bf16 => Lin::bf16(w),
+    let lin = match q {
+        Quant::Bf16 => return Ok(Lin::bf16(w)),
         Quant::Q8 => Lin::q8(quantize_bf16(w, n_out, n_in)),
         Quant::Q4 => Lin::q4(quantize_q4(w, n_out, n_in)),
-    })
+    };
+    if info.dtype == "F32" || info.dtype == "F16" {
+        // The bf16 copy of a float checkpoint's matrix is not needed once quantized (a 130 GB
+        // float32 release would otherwise keep 65 GB of them).
+        // SAFETY: `w` is not used past this point, and the quantized matrix owns its data.
+        unsafe { files.forget_converted(full) };
+    }
+    Ok(lin)
 }
 
 /// An FP8 E4M3 weight `full` (`[n_out, n_in]`) with its block scales: `full` minus `.weight`

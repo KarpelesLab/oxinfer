@@ -299,6 +299,11 @@ const PARAMS: &str = "bytes per token and layers from the parameter count";
 const BONSAI25: &str = "agentic Qwen3.8-27B in Hadamard-folded ternary weights with an MTP head (--mtp) and the mmproj \
      for images (also :Q2_0-mtp, and :PQ2_0 / :PTQ1_0 / :Q2_0 without the head); M5 Max Metal: PQ2_0 / Q2_0 32-37 tok/s \
      decoding, 600-700 tok/s prefill at 512 tokens, PTQ1_0 24-26 and ~300; CPU 9-12 tok/s";
+const NEMO_IMAGE_F32: &str = "autoregressive (4,176 tokens a 1024x1024 image), rendered by its ViT tokenizer; the float32 \
+     release is converted at load (--quant q4: 23 GB peak, 3.9 min); M5 Max CPU 24 tok/s, 3 min an image; the GGUFs load \
+     faster; source images experimental";
+const NEMO_IMAGE_GGUF: &str = "18.9 GB + the 2.6 GB tokenizer folder of nvidia/Nemotron-Labs-Image-30B-A3B; a 1024x1024 \
+     image (4,176 tokens) in 34 s on the M5 Max GPU (130-148 tok/s), 107 s on its CPU (41 tok/s); also Q8_0, Q4_K_M";
 const GLM_TINY: &str = "text only (no vision tower, no MTP); only its header was loaded, not its weights";
 
 /// The models oxinfer was run with (the README's model table), by kind and size. What each can
@@ -857,6 +862,23 @@ pub const CATALOG: &[Model] = &[
         .note("the release's base model, Kromoss' starting point; 50 steps, CFG 3"),
     Model::new("MiniMaxAI/MiniMax-H3-Image", Kind::Image, 63.0, 127.2, &[TextToImage])
         .note("with MiniMax-H3's Qwen3-VL text encoder; 2048x2048 and up"),
+    Model::new(
+        "nvidia/Nemotron-Labs-Image-30B-A3B",
+        Kind::Image,
+        32.6,
+        133.0,
+        &[TextToImage],
+    )
+    .note(NEMO_IMAGE_F32),
+    Model::new(
+        "wiz0floyd/Nemotron-Labs-Image-30B-A3B-GGUF:Q4_0",
+        Kind::Image,
+        32.6,
+        21.5,
+        &[TextToImage],
+    )
+    .fixed(Format::GgufQ4, "GGUF Q4_0 language model")
+    .note(NEMO_IMAGE_GGUF),
     Model::new("MiniMaxAI/MiniMax-H3", Kind::Video, 67.4, 140.1, &[TextToVideo, ImageToVideo])
         .note(
             "transformer/, text_encoder/, vae/ and audio_vae/ of the 498 GB repository; 24 fps, 5 to 15 s with a stereo \

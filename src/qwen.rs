@@ -1672,6 +1672,7 @@ impl<'a> QwenModel<'a> {
                 logits: rlogits,
                 sel,
                 expert_scale: None,
+                sigmoid: None,
             });
             mlp(g, shared, LinMode::AddGated(rlogits.at(ne)), de)?;
             let mut gate = Vec::with_capacity(ne);
@@ -1699,6 +1700,7 @@ impl<'a> QwenModel<'a> {
                 act: eact,
                 y: x,
                 gelu: false,
+                relu2: false,
                 add: true,
                 edits: ee.map(|e| (hot.at(e.hot), e.n)),
                 lora,
@@ -1771,6 +1773,7 @@ impl<'a> QwenModel<'a> {
                         w: &gd.conv_w,
                         dim: conv_dim,
                         kc: cfg.linear_conv_kernel_dim,
+                        bias: None,
                     });
                     g.ops.push(Op::GdnRule(crate::gpu::decode::GdnRule {
                         c: gconv,

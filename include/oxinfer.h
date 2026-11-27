@@ -603,6 +603,46 @@ char *oxi_janus_chat(OxiJanus *j, const char *question, const char *images_json,
                      void *user);
 void oxi_janus_chat_reset(OxiJanus *j);
 
+/* ---- Nemotron-Labs-Image: autoregressive text to image (nvidia/Nemotron-Labs-Image-30B-A3B) ------
+ *
+ * The Nemotron-H 30B-A3B language model writes the image as visual tokens (16x16 pixels each),
+ * which the bundled L24SQ ViT tokenizer renders (over oxinfer::nemotron_image). Same threading
+ * rules as engines: one call at a time, oxi_nemotron_image_cancel() from any thread. */
+
+typedef struct OxiNemotronImage OxiNemotronImage;
+
+/* Loads a checkpoint: a directory, a GGUF file, or a repo id (nvidia/Nemotron-Labs-Image-30B-A3B,
+ * or org/name:QUANT for a GGUF repository). `options`: `key=value` lines or `;`-separated pairs,
+ * NULL for the defaults:
+ *   quant=bf16|q8|q4       language model precision for the float32 release (GGUF files keep theirs)
+ *   mmap=0|1               map the weights instead of reading them into memory
+ *   device=auto|cpu|metal|cuda|vulkan
+ *   cache_dir=PATH         where repo ids are downloaded
+ *   tokenizer=PATH|REPO    the image tokenizer folder (default: the checkpoint's own
+ *                          Nemotron-Labs-Image-Tokenizer/, else NVIDIA's, fetched)
+ *   vit_precision=bf16|f32 the tokenizer's weights (default bf16)
+ *   encoder=0|1            load the tokenizer's encoder, for source images (default 1) */
+OxiNemotronImage *oxi_nemotron_image_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
+
+/* Frees a model (NULL is ignored); no other call on it may be running. */
+void oxi_nemotron_image_free(OxiNemotronImage *m);
+
+/* Stops the running generation (any thread); it then fails with "generation stopped". */
+void oxi_nemotron_image_cancel(const OxiNemotronImage *m);
+
+/* Text to image. `images_json`: a JSON array of source image paths the instruction refers to
+ * (editing; NULL or [] for none). `options_json` (NULL or {} for the model card's defaults, every
+ * key optional):
+ *   {"width": 1024, "height": 1024 (multiples of 16; recommended 1024x1024, 1184x880, 1248x832,
+ *    880x1184), "temperature": 0.9, "top_p": 1, "top_k": 0, "seed": 42,
+ *    "num_images": 1 (seeds seed, seed + 1, ...), "system_prompt": null (the card's),
+ *    "structure": "grid" (header and rows written for the size asked for) | "free" (every token
+ *    sampled, the size the model writes), "max_tokens": 0 ("free": the grid plus slack)}
+ * Each image is passed to `on_image`; `on_step` (may be NULL) is called after every visual token
+ * (step counts over all the images), non-zero cancels. Returns the number of images, or -1. */
+int oxi_nemotron_image_generate(OxiNemotronImage *m, const char *prompt, const char *images_json, const char *options_json,
+                                oxi_image_fn on_image, oxi_step_fn on_step, void *user);
+
 /* ---- Qwen-Image: instruction-based image editing and text to image --------------------------
  *
  * Qwen/Qwen-Image-Edit-2511, -Edit-2509, -Edit and Qwen/Qwen-Image diffusers folders (over

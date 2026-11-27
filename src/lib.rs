@@ -115,6 +115,7 @@ pub mod moss_image;
 pub mod mpnet;
 pub mod nemotron;
 pub mod nemotron_asr;
+pub mod nemotron_image;
 pub mod nomic_bert;
 pub mod omnigen2;
 pub mod opencode;

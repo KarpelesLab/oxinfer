@@ -63,7 +63,10 @@ NeMo Automodel's `nemotron_v3/mtp.py` and llama.cpp do, so there is a reference)
 and the MoE latent projection (no released checkpoint uses them), weight streaming (`--stream`),
 and speculative decoding of any kind: verifying a draft means going back to an earlier position
 when it is refuted, which the Mamba state cannot do without snapshots, so prompt-lookup rounds
-are off too. Decoding runs on the CPU kernels (an accelerator takes the prefill matmuls).
+are off too. One-token steps run as a whole on Metal (the decode plan of
+[Nemotron-Labs-Image](nemotron-image.md#speed): Mamba-2, sigmoid routing and squared-ReLU
+experts in one submission; `--gpu-decode off` keeps them on the CPU); prompts run on the CPU
+kernels, an accelerator taking their matmuls; CUDA decodes on the CPU.
 
 ### Checkpoints
 

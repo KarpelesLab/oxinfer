@@ -142,6 +142,7 @@ optional.
 | [FLUX.1](docs/flux.md) | Kontext editing, schnell / dev, Fill, Canny / Depth, Redux |
 | [Qwen-Image, Qwen-Image-Edit and Qwen-Image-2.1](docs/qwen-image.md) | editing, text to image, ControlNet, layers; Qwen-Image-2.1 / 2.1-Turbo |
 | [MOSS-Image and Kromoss](docs/moss-image.md) | text to image with Qwen3.5-9B conditioning; LoRA / LoKr, DMD turbo LoRAs, curated presets (`--preset kromoss-famegrid`) |
+| [Nemotron-Labs-Image](docs/nemotron-image.md) | autoregressive text to image on a 30B-A3B Nemotron-H (visual tokens rendered by its ViT tokenizer); the float32 release and its GGUFs, Metal decoding |
 | [MiniMax-H3 video](docs/video.md) | text to video, first / last frame to video, with the stereo soundtrack |
 | [LTX-2.5](docs/ltx.md) | text / image to video with a 48 kHz stereo soundtrack: the distilled two-stage pipeline, upsamplers, duration head, LoRAs; whole transformer passes on Metal |
 | [LongCat-Video-Avatar](docs/longcat-avatar.md) | a character speaking a recording: image + audio + text to video, long videos, two speakers; curated presets (`--preset longcat-avatar-int8`) |

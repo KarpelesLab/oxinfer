@@ -380,6 +380,8 @@ struct Mamba<'a> {
     in_proj: Lin<'a>,
     /// The depthwise kernels, `[kernel][conv_dim]` (the last multiplies the current token).
     conv_w: Vec<f32>,
+    /// The same as stored, `[conv_dim][kernel]` (the GPU decode plan's layout).
+    conv_rows: Vec<f32>,
     conv_b: Vec<f32>,
     dt_bias: Vec<f32>,
     /// `-exp(A_log)` per head.
@@ -431,8 +433,9 @@ enum LayerState {
     /// The last `kernel - 1` rows of `x | B | C` before the convolution, and each head's
     /// `[head_dim, state]` matrix.
     Mamba {
-        conv: Vec<f32>,
-        ssm: Vec<f32>,
+        // Page-aligned and never reallocated: GPU decoding updates them in place.
+        conv: PageVec<f32>,
+        ssm: PageVec<f32>,
     },
     Attn(LayerCache),
     None,
@@ -448,6 +451,10 @@ pub struct NemotronSession {
     pub dt_max: f32,
     /// Runtime interventions ([`crate::intervene`]).
     pub iv: crate::intervene::State,
+    /// The GPU decode plan's device state, and whether the recurrent states are as its last
+    /// step left them.
+    gpu: crate::gpu::decode::Slot,
+    gpu_kept: bool,
 }
 
 /// How a checkpoint names the language model's tensors.
@@ -495,15 +502,29 @@ pub struct NemotronModel<'a> {
     pub quant: Quant,
     embed: Table<'a>,
     lm_head: Lin<'a>,
+    /// The checkpoint's name of the LM head.
+    head_name: &'static str,
+    /// The rows of the LM head [`Self::forward_rows`] gives, as a matrix of their own when the
+    /// head can be cut ([`Self::load_head_rows`]).
+    head_rows: Option<(std::ops::Range<usize>, Option<Lin<'a>>)>,
     final_norm: Vec<f32>,
     layers: Vec<Layer<'a>>,
+    /// The GPU decode plan (`crate::gpu::decode`), compiled on first use.
+    gpu_plans: crate::gpu::decode::PlanCache,
 }
 
 struct Loader<'a, 'c> {
     files: &'a ModelFiles,
     cfg: &'c NemotronConfig,
     quant: Quant,
+    /// Float32 matrices used exactly as stored: the small reference checkpoints. A full-size
+    /// float32 release (nvidia/Nemotron-Labs-Image-30B-A3B, 130 GB) is converted to the
+    /// precision asked for instead.
+    exact_f32: bool,
 }
+
+/// Checkpoints up to this size keep their float32 matrices as float32.
+const EXACT_F32_BYTES: u64 = 4 << 30;
 
 impl<'a> Loader<'a, '_> {
     fn getf(&self, full: &str, n: usize) -> Result<Vec<f32>> {
@@ -514,9 +535,11 @@ impl<'a> Loader<'a, '_> {
         self.files.f32(full)
     }
 
-    /// A matrix: GGUF blocks as stored, float32 tensors exactly, others through `load_lin`.
+    /// A matrix: GGUF blocks as stored, float32 tensors of a small checkpoint exactly, others
+    /// through `load_lin`.
     fn lin(&self, full: &str, n_out: usize, n_in: usize) -> Result<Lin<'a>> {
         if let Some(info) = self.files.info(full)
+            && self.exact_f32
             && info.dtype == "F32"
             && self.files.ggml(full).is_none()
         {
@@ -538,6 +561,7 @@ impl<'a> Loader<'a, '_> {
         if self.files.has(&stacked) || self.files.has(&format!("{stacked}.q8")) || self.files.has(&format!("{stacked}.q4")) {
             // Stacked float32 experts (a tiny reference checkpoint): exact, one view per expert.
             if let Some(info) = self.files.info(&stacked)
+                && self.exact_f32
                 && info.dtype == "F32"
                 && self.files.ggml(&stacked).is_none()
             {
@@ -610,7 +634,8 @@ impl<'a> Loader<'a, '_> {
         let (h, nh, k) = (c.hidden_size, c.mamba_num_heads, c.conv_kernel);
         let (inner, cd) = (c.mamba_inner(), c.conv_dim());
         // `[channels, 1, kernel]` as `[kernel][channels]`.
-        let rows = self.getf(&format!("{mp}conv1d.weight"), cd * k)?;
+        let conv_rows = self.getf(&format!("{mp}conv1d.weight"), cd * k)?;
+        let rows = &conv_rows;
         let mut conv_w = vec![0f32; cd * k];
         for (ch, r) in rows.chunks(k).enumerate() {
             for (j, &x) in r.iter().enumerate() {
@@ -631,6 +656,7 @@ impl<'a> Loader<'a, '_> {
         Ok(Mamba {
             in_proj: self.lin(&format!("{mp}in_proj.weight"), inner + cd + nh, h)?,
             conv_w,
+            conv_rows,
             conv_b: self.getf(&format!("{mp}conv1d.bias"), cd)?,
             dt_bias: self.getf(&format!("{fp}dt_bias"), nh)?,
             a,
@@ -732,7 +758,12 @@ impl<'a> NemotronModel<'a> {
             .iter()
             .find(|n| files.has(n.embed))
             .context("cannot find the token embedding (backbone.embeddings.weight, model.embeddings.weight or llm.model.embed_tokens.weight) in the checkpoint")?;
-        let ld = Loader { files, cfg: &cfg, quant };
+        let ld = Loader {
+            files,
+            cfg: &cfg,
+            quant,
+            exact_f32: files.total_bytes() <= EXACT_F32_BYTES,
+        };
         let (h, v) = (cfg.hidden_size, cfg.vocab_size);
         let embed = Table::load(files, names.embed, v, h, table_quant(quant))?;
         let lm_head = ld.lin(names.head, v, h)?;
@@ -746,8 +777,11 @@ impl<'a> NemotronModel<'a> {
             quant,
             embed,
             lm_head,
+            head_name: names.head,
+            head_rows: None,
             final_norm,
             layers,
+            gpu_plans: Default::default(),
         })
     }
 
@@ -759,8 +793,8 @@ impl<'a> NemotronModel<'a> {
                 .iter()
                 .map(|l| match &l.mixer {
                     Mixer::Mamba(_) => LayerState::Mamba {
-                        conv: vec![0f32; (c.conv_kernel - 1) * c.conv_dim()],
-                        ssm: vec![0f32; c.mamba_inner() * c.ssm_state_size],
+                        conv: PageVec::zeroed((c.conv_kernel - 1) * c.conv_dim()),
+                        ssm: PageVec::zeroed(c.mamba_inner() * c.ssm_state_size),
                     },
                     Mixer::Attn(_) => LayerState::Attn(LayerCache::new(c.num_key_value_heads, c.head_dim)),
                     _ => LayerState::None,
@@ -770,6 +804,8 @@ impl<'a> NemotronModel<'a> {
             dt_min: c.time_step_limit.0 as f32,
             dt_max: c.time_step_limit.1 as f32,
             iv: Default::default(),
+            gpu: Default::default(),
+            gpu_kept: false,
         }
     }
 
@@ -797,6 +833,71 @@ impl<'a> NemotronModel<'a> {
         logits
     }
 
+    /// Loads rows `rows` of the LM head as a matrix of their own, for passes whose logits only
+    /// those rows matter in ([`Self::forward_rows`]: an image's visual tokens, 60% of the
+    /// vocabulary). GGUF blocks are borrowed from the file; a float checkpoint's rows are
+    /// converted at the model's precision (a copy of that part of the head). A GGUF head
+    /// interleaved for the CPU kernels at load is not cut: the passes then compute all of it.
+    pub fn load_head_rows(&mut self, files: &'a ModelFiles, rows: std::ops::Range<usize>) -> Result<()> {
+        let (h, v) = (self.cfg.hidden_size, self.cfg.vocab_size);
+        if rows.is_empty() || rows.end > v {
+            bail!("head rows {rows:?} out of the vocabulary ({v})");
+        }
+        let n = rows.len();
+        let name = self.head_name;
+        let lin = if let Some(g) = files.ggml(name) {
+            match g {
+                Ok((kind, bytes)) => {
+                    let rb = bytes.len() / v;
+                    Some(Lin::from_gguf(kind, &bytes[rows.start * rb..rows.end * rb], n, h)?)
+                }
+                // Interleaved four rows at a time at load (CPU decoding).
+                Err(_) => None,
+            }
+        } else {
+            let info = files.info(name).with_context(|| format!("missing tensor {name}"))?;
+            let float = info.dtype == "F32" || info.dtype == "F16";
+            let w = &files.bf16(name)?[rows.start * h..rows.end * h];
+            let l = match self.quant {
+                Quant::Bf16 => Lin::bf16(w),
+                Quant::Q8 => Lin::q8(quantize_bf16(w, n, h)),
+                Quant::Q4 => Lin::q4(quantize_q4(w, n, h)),
+            };
+            if float && self.quant != Quant::Bf16 {
+                // SAFETY: `w` is not used past this point; the quantized matrix owns its data.
+                unsafe { files.forget_converted(name) };
+            }
+            Some(l)
+        };
+        self.head_rows = Some((rows, lin));
+        // Plans compiled before have no such head.
+        self.gpu_plans = Default::default();
+        Ok(())
+    }
+
+    /// The logits of the rows of [`Self::load_head_rows`] after running `tokens` (all of them
+    /// when none were set).
+    pub fn forward_rows(&self, sess: &mut NemotronSession, tokens: &[u32]) -> Vec<f32> {
+        let Some((rows, head)) = &self.head_rows else {
+            return self.forward(sess, tokens);
+        };
+        if let [tok] = tokens
+            && let Some((_, Some(logits))) = self.gpu_step_with(sess, *tok, true, head.is_some())
+        {
+            return if head.is_some() { logits } else { logits[rows.clone()].to_vec() };
+        }
+        let h = self.cfg.hidden_size;
+        let hs = self.forward_hidden(sess, tokens);
+        let last = &hs[hs.len() - h..];
+        let Some(head) = head else {
+            return self.logits(last, 1)[rows.clone()].to_vec();
+        };
+        let _timer = prof::start(Cat::Head);
+        let mut logits = vec![0f32; rows.len()];
+        linear(head, rows.len(), h, last, 1, &mut logits);
+        logits
+    }
+
     /// The input embedding of `token` (`[hidden]`).
     pub fn embed_row(&self, token: u32, out: &mut [f32]) {
         self.embed.row(token as usize, out);
@@ -804,6 +905,11 @@ impl<'a> NemotronModel<'a> {
 
     /// Runs `tokens` and returns the logits after the last one.
     pub fn forward(&self, sess: &mut NemotronSession, tokens: &[u32]) -> Vec<f32> {
+        if let [tok] = tokens
+            && let Some((_, Some(logits))) = self.gpu_step(sess, *tok, true)
+        {
+            return logits;
+        }
         let h = self.cfg.hidden_size;
         let hs = self.forward_hidden(sess, tokens);
         self.logits(&hs[hs.len() - h..], 1)
@@ -867,6 +973,7 @@ impl<'a> NemotronModel<'a> {
             }
         };
         let dt_limit = (sess.dt_min, sess.dt_max);
+        sess.gpu_kept = false;
         let mut hn = vec![0f32; t * h];
         let mut o = vec![0f32; t * h];
         for (l, layer) in self.layers.iter().enumerate() {
@@ -1023,7 +1130,7 @@ impl<'a> NemotronModel<'a> {
     /// Mamba-2 over `xa` (`[t, H]`, the normed block input) into `out`, updating the convolution
     /// history `conv` and the heads' states `ssm`.
     #[allow(clippy::too_many_arguments)]
-    fn mamba_forward(&self, m: &Mamba, xa: &[f32], t: usize, dt_limit: (f32, f32), conv: &mut Vec<f32>, ssm: &mut [f32], out: &mut [f32]) {
+    fn mamba_forward(&self, m: &Mamba, xa: &[f32], t: usize, dt_limit: (f32, f32), conv: &mut [f32], ssm: &mut [f32], out: &mut [f32]) {
         let c = &self.cfg;
         let (h, nh, hd, ng, ns, kn) = (
             c.hidden_size,
@@ -1039,8 +1146,8 @@ impl<'a> NemotronModel<'a> {
         linear(&m.in_proj, pw, h, xa, t, &mut proj);
         let _timer = prof::start(Cat::Attention);
         // The causal depthwise convolution over `x | B | C` (history first), then SiLU.
-        let mut seq = std::mem::take(conv);
-        seq.reserve(t * cd);
+        let mut seq = Vec::with_capacity(conv.len() + t * cd);
+        seq.extend_from_slice(conv);
         for ti in 0..t {
             seq.extend_from_slice(&proj[ti * pw + inner..ti * pw + inner + cd]);
         }
@@ -1058,7 +1165,7 @@ impl<'a> NemotronModel<'a> {
                 *o = silu(*o);
             }
         });
-        *conv = seq[t * cd..].to_vec();
+        conv.copy_from_slice(&seq[t * cd..]);
         debug_assert_eq!(conv.len(), (kn - 1) * cd);
         // The recurrence, head by head over the tokens: `S <- exp(dt A) S + dt x B^T`, read
         // `S C + D x`.
@@ -1104,6 +1211,319 @@ impl<'a> NemotronModel<'a> {
         });
         drop(_timer);
         linear(&m.out_proj, h, inner, &z, t, out);
+    }
+}
+
+/// Decoding on an accelerator (`crate::gpu::decode`): one token's pass as one submission.
+impl NemotronModel<'_> {
+    /// One token's forward pass as a device graph: Mamba-2 (the convolution with its bias, the
+    /// state update, the grouped RMSNorm), attention without positions, the sigmoid-routed
+    /// squared-ReLU experts and their shared expert, dense MLPs, the head. None when a weight
+    /// cannot go to the device.
+    fn gpu_graph<'s>(&'s self, rows: bool) -> Option<crate::gpu::decode::Graph<'s>> {
+        use crate::gpu::decode::{Experts, Graph, LinMode, Mamba2, Op};
+        use std::borrow::Cow;
+        let c = &self.cfg;
+        let h = c.hidden_size;
+        let eps = c.layer_norm_epsilon as f32;
+        let (nh, nkv, hd) = (c.num_attention_heads, c.num_key_value_heads, c.head_dim);
+        let (mh, mhd, ng, ns, kn) = (c.mamba_num_heads, c.mamba_head_dim, c.n_groups, c.ssm_state_size, c.conv_kernel);
+        let (inner, cd) = (c.mamba_inner(), c.conv_dim());
+        let dev = |l: &'s Lin, n_out: usize, n_in: usize| -> Option<&'s crate::gpu::DeviceWeight> {
+            if l.fold.is_some() || l.is_transient() || l.has_lora() {
+                return None;
+            }
+            l.device_weight(n_out, n_in)
+        };
+        let mut g = Graph::new();
+        let x = g.buf(h);
+        let hn = g.buf(h);
+        let has_mamba = self.layers.iter().any(|l| matches!(l.mixer, Mixer::Mamba(_)));
+        let mproj = g.buf(if has_mamba { inner + cd + mh } else { 1 });
+        let xbc = g.buf(if has_mamba { cd } else { 1 });
+        let my = g.buf(if has_mamba { inner } else { 1 });
+        let myn = g.buf(if has_mamba { inner } else { 1 });
+        let qkv = g.buf((nh + 2 * nkv) * hd);
+        let qo = g.buf(nh * hd);
+        let att = g.buf(nh * hd);
+        let (mut ne, mut mi, mut si) = (1, 1, 1);
+        for l in &self.layers {
+            match &l.mixer {
+                Mixer::Moe(m) => {
+                    ne = ne.max(m.up.len());
+                    mi = mi.max(c.moe_intermediate_size);
+                    si = si.max(m.shared.inter);
+                }
+                Mixer::Mlp(m) => si = si.max(m.inter),
+                _ => {}
+            }
+        }
+        let k = c.num_experts_per_tok.max(1);
+        let rlogits = g.buf(ne);
+        let sel = g.buf(2 * k);
+        let eact = g.buf(k * mi);
+        let sact = g.buf(si);
+        let hidden = g.buf(h);
+        let (head, n_logits) = match (&self.head_rows, rows) {
+            (Some((r, Some(l))), true) => (l, r.len()),
+            (_, true) => return None,
+            _ => (&self.lm_head, c.vocab_size),
+        };
+        let logits = g.buf(n_logits);
+        g.input = x;
+        g.hidden = hidden;
+        g.n_hidden = h;
+        g.embed = Some((&self.embed, 1.0));
+        g.rope_halves = vec![0];
+        let lin = |l: &'s Lin, n_out: usize, n_in: usize, x, y, mode| -> Option<Op<'s>> {
+            Some(Op::Linear {
+                w: l.as_ref(),
+                dev: dev(l, n_out, n_in)?,
+                w2: None,
+                n_out,
+                n_in,
+                x,
+                y,
+                mode,
+            })
+        };
+        for layer in &self.layers {
+            g.ops.push(Op::norm(x, hn, &layer.norm, h, eps));
+            match &layer.mixer {
+                Mixer::Mamba(m) => {
+                    g.ops.push(lin(&m.in_proj, inner + cd + mh, h, hn, mproj, LinMode::Store)?);
+                    let st = g.states.len();
+                    g.states.push((kn - 1) * cd);
+                    g.states.push(inner * ns);
+                    g.ops.push(Op::GdnConv {
+                        x: mproj.at(inner),
+                        out: xbc,
+                        state: st,
+                        w: &m.conv_rows,
+                        dim: cd,
+                        kc: kn,
+                        bias: Some(&m.conv_b),
+                    });
+                    g.ops.push(Op::Mamba2(Mamba2 {
+                        xbc,
+                        z: mproj,
+                        dt: mproj.at(inner + cd),
+                        out: my,
+                        state: st + 1,
+                        nh: mh,
+                        hd: mhd,
+                        ng,
+                        ns,
+                        a: &m.a,
+                        d: &m.d,
+                        dt_bias: &m.dt_bias,
+                        dt_min: c.time_step_limit.0 as f32,
+                        dt_max: c.time_step_limit.1 as f32,
+                    }));
+                    let gs = inner / ng;
+                    g.ops.push(Op::Norm {
+                        x: my,
+                        out: myn,
+                        w: Some(Cow::Borrowed(&m.norm)),
+                        pre: 1.0,
+                        n: gs,
+                        rows: ng,
+                        x_stride: gs,
+                        out_stride: gs,
+                        eps,
+                        add: false,
+                    });
+                    g.ops.push(lin(&m.out_proj, h, inner, myn, x, LinMode::Add)?);
+                }
+                Mixer::Attn(a) => {
+                    let kv = g.kv.len();
+                    g.kv.push((nkv, hd));
+                    g.ops.push(lin(&a.q, nh * hd, h, hn, qkv, LinMode::Store)?);
+                    g.ops.push(lin(&a.k, nkv * hd, h, hn, qkv.at(nh * hd), LinMode::Store)?);
+                    g.ops.push(lin(&a.v, nkv * hd, h, hn, qkv.at((nh + nkv) * hd), LinMode::Store)?);
+                    g.ops.push(Op::QkRope {
+                        qkv,
+                        q_out: qo,
+                        kv,
+                        nh,
+                        nkv,
+                        hd,
+                        half_rot: 0,
+                        q_stride: hd,
+                        k_off: nh * hd,
+                        v_off: (nh + nkv) * hd,
+                        interleaved: false,
+                        q_norm: None,
+                        k_norm: None,
+                        eps,
+                        rope: 0,
+                        v_norm: false,
+                        v_from_k: false,
+                    });
+                    g.ops.push(Op::Attend {
+                        q: qo,
+                        out: att,
+                        kv,
+                        nh,
+                        nkv,
+                        hd,
+                        scale: (hd as f32).powf(-0.5),
+                        window: None,
+                        gate: None,
+                        block: None,
+                    });
+                    g.ops.push(lin(&a.o, h, nh * hd, att, x, LinMode::Add)?);
+                }
+                Mixer::Moe(m) => {
+                    let n = m.up.len();
+                    g.ops.push(Op::Route {
+                        x: hn,
+                        router: &m.router,
+                        gate: None,
+                        n_exp: n,
+                        h,
+                        k: c.num_experts_per_tok,
+                        logits: rlogits,
+                        sel,
+                        expert_scale: None,
+                        sigmoid: Some((&m.bias, c.routed_scaling_factor as f32)),
+                    });
+                    g.ops.push(lin(&m.shared.up, m.shared.inter, h, hn, sact, LinMode::Relu2)?);
+                    g.ops.push(lin(&m.shared.down, h, m.shared.inter, sact, x, LinMode::Add)?);
+                    if m.up.iter().chain(&m.down).any(|l| l.is_transient() || l.has_lora()) {
+                        return None;
+                    }
+                    g.ops.push(Op::Experts(Experts {
+                        gate: m.up.iter().map(|l| l.as_ref()).collect(),
+                        up: None,
+                        down: m.down.iter().map(|l| l.as_ref()).collect(),
+                        h,
+                        inter: c.moe_intermediate_size,
+                        k: c.num_experts_per_tok,
+                        x: hn,
+                        sel,
+                        act: eact,
+                        y: x,
+                        gelu: false,
+                        relu2: true,
+                        add: true,
+                        edits: None,
+                        lora: None,
+                    }));
+                }
+                Mixer::Mlp(m) => {
+                    g.ops.push(lin(&m.up, m.inter, h, hn, sact, LinMode::Relu2)?);
+                    g.ops.push(lin(&m.down, h, m.inter, sact, x, LinMode::Add)?);
+                }
+            }
+        }
+        g.ops.push(Op::norm(x, hidden, &self.final_norm, h, eps));
+        g.head_from = g.ops.len();
+        g.ops.push(lin(head, n_logits, h, hidden, logits, LinMode::Store)?);
+        g.logits = Some((logits, n_logits));
+        Some(g)
+    }
+
+    /// Whether this session's passes can run on the GPU decode plan.
+    fn gpu_ok(&self, sess: &NemotronSession) -> bool {
+        crate::gpu::decode_enabled()
+            && crate::gpu::active().is_some()
+            && !sess.iv.active()
+            && sess.dt_min == self.cfg.time_step_limit.0 as f32
+            && sess.dt_max == self.cfg.time_step_limit.1 as f32
+    }
+
+    /// The GPU decode plan, compiled on first use; None when unavailable.
+    fn gpu_plan(&self, rows: bool) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
+        self.gpu_plans.get(rows as u64, || {
+            let be = crate::gpu::active()?;
+            let g = self.gpu_graph(rows);
+            if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                eprintln!(
+                    "[nemotron gpu decode graph: {}]",
+                    g.as_ref().map_or("none".into(), |g| format!("{} ops", g.ops.len()))
+                );
+            }
+            let p = be.decode_plan(&g?);
+            if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                eprintln!("[nemotron gpu decode plan: {}]", if p.is_some() { "built" } else { "none" });
+            }
+            p
+        })
+    }
+
+    /// Runs token `tok` through the GPU decode plan: the final-normed hidden state and, if
+    /// wanted, the logits. None (nothing changed) when GPU decoding is off or unavailable.
+    /// `OXINFER_GPU_DECODE_CHECK=1` compares each step's logits with the CPU's.
+    pub fn gpu_step(&self, sess: &mut NemotronSession, tok: u32, want_logits: bool) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
+        self.gpu_step_with(sess, tok, want_logits, false)
+    }
+
+    /// [`Self::gpu_step`]; `rows`: the logits of the rows of [`Self::load_head_rows`] only.
+    fn gpu_step_with(&self, sess: &mut NemotronSession, tok: u32, want_logits: bool, rows: bool) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
+        if !self.gpu_ok(sess) {
+            return None;
+        }
+        // The full head's plan for a pass that wants no logits (either plan would do).
+        let rows = rows && want_logits;
+        let plan = self.gpu_plan(rows)?;
+        let n_logits = match (&self.head_rows, rows) {
+            (Some((r, Some(_))), true) => r.len(),
+            _ => self.cfg.vocab_size,
+        };
+        let check = crate::gpu::decode::check().then(|| sess.clone());
+        let c = &self.cfg;
+        let h = c.hidden_size;
+        let mut x = vec![0f32; h];
+        self.embed.row(tok as usize, &mut x);
+        let mut hidden = vec![0f32; h];
+        let mut logits = (want_logits || check.is_some()).then(|| vec![0f32; n_logits]);
+        let _timer = prof::start(Cat::Matmul);
+        let mut kv: Vec<&mut LayerCache> = Vec::new();
+        let mut states: Vec<&mut [f32]> = Vec::new();
+        for l in sess.layers.iter_mut() {
+            match l {
+                LayerState::Attn(cache) => kv.push(cache),
+                LayerState::Mamba { conv, ssm } => {
+                    states.push(&mut conv[..]);
+                    states.push(&mut ssm[..]);
+                }
+                LayerState::None => {}
+            }
+        }
+        let ok = plan.step(
+            &mut sess.gpu,
+            crate::gpu::decode::Step {
+                pos: sess.pos,
+                t: 1,
+                rope_cs: &[],
+                x: &x,
+                x2: &[],
+                kv: &mut kv,
+                states: &mut states,
+                hidden: &mut hidden,
+                logits: logits.as_deref_mut(),
+                params: None,
+                capture: None,
+                scratch: false,
+                states_kept: sess.gpu_kept,
+            },
+        );
+        drop(_timer);
+        sess.gpu_kept = ok;
+        if !ok {
+            return None;
+        }
+        if let (Some(mut cpu), Some(l)) = (check, &logits) {
+            let hs = self.forward_hidden(&mut cpu, &[tok]);
+            let mut want = self.logits(&hs, 1);
+            if let (Some((r, Some(_))), true) = (&self.head_rows, rows) {
+                want = want[r.clone()].to_vec();
+            }
+            crate::gpu::decode::report(sess.pos, &want, l);
+        }
+        sess.pos += 1;
+        Some((hidden, logits.filter(|_| want_logits)))
     }
 }
 

@@ -1149,6 +1149,109 @@ pub unsafe extern "C" fn oxi_janus_understand_rgb(
     })
 }
 
+// ---- Nemotron-Labs-Image (autoregressive text to image) ---------------------------------------
+
+/// A Nemotron-Labs-Image model handle.
+pub struct OxiNemotronImage {
+    cancel: crate::nemotron_image::CancelHandle,
+    model: Mutex<crate::nemotron_image::NemotronImage>,
+}
+
+/// Loads a Nemotron-Labs-Image checkpoint (directory, GGUF file or repo id; `key=value` options:
+/// quant, mmap, device, cache_dir, tokenizer, vit_precision, encoder).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_nemotron_image_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiNemotronImage {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let mut o = crate::nemotron_image::LoadOptions::default();
+        for item in unsafe { opt_str_arg(options, "options") }?.unwrap_or("").split(['\n', ';']) {
+            let item = item.trim();
+            if item.is_empty() || item.starts_with('#') {
+                continue;
+            }
+            let (k, v) = item.split_once('=').with_context(|| format!("option {item:?} is not key=value"))?;
+            o.set(k.trim(), v.trim())?;
+        }
+        let m = with_progress(progress, user, || crate::nemotron_image::NemotronImage::load(model, &o))?;
+        Ok(Box::into_raw(Box::new(OxiNemotronImage {
+            cancel: m.cancel_handle(),
+            model: Mutex::new(m),
+        })))
+    })
+}
+
+/// Frees a Nemotron-Labs-Image model (NULL is ignored). No other call on it may be running.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_nemotron_image_free(m: *mut OxiNemotronImage) {
+    if !m.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(m) });
+            Ok(())
+        })
+    }
+}
+
+/// Stops the running generation (any thread).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_nemotron_image_cancel(m: *const OxiNemotronImage) {
+    if let Some(m) = unsafe { m.as_ref() } {
+        m.cancel.cancel();
+    }
+}
+
+/// Text to image: `num_images` images for `prompt` (`images_json`: source image paths, NULL for
+/// none; `options_json`: see `oxinfer.h`), each passed to `on_image`. Returns the number of
+/// images, or -1 (error or cancelled).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_nemotron_image_generate(
+    m: *mut OxiNemotronImage,
+    prompt: *const c_char,
+    images_json: *const c_char,
+    options_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+) -> c_int {
+    guard(-1, || {
+        let m = unsafe { m.as_ref() }.context("model is NULL")?;
+        let prompt = unsafe { str_arg(prompt, "prompt") }?;
+        let opts: crate::nemotron_image::GenerateOptions = match unsafe { opt_str_arg(options_json, "options_json") }?.map(str::trim) {
+            Some(s) if !s.is_empty() => serde_json::from_str(s).context("options_json")?,
+            _ => Default::default(),
+        };
+        let sources = janus_image_paths(images_json)?;
+        let g = m.model.lock().unwrap_or_else(|p| p.into_inner());
+        let mut progress = |p: crate::nemotron_image::Progress| -> Flow {
+            match on_step {
+                Some(cb) if unsafe { cb(user, (p.image * p.steps + p.step) as c_int, (p.images * p.steps) as c_int) } != 0 => Flow::Stop,
+                _ => Flow::Continue,
+            }
+        };
+        let (imgs, _) = g.generate(prompt, &sources, &opts, &mut progress)?;
+        if let Some(cb) = on_image {
+            for (i, im) in imgs.iter().enumerate() {
+                let img = &im.image;
+                unsafe {
+                    cb(
+                        user,
+                        i as c_int,
+                        img.width as c_int,
+                        img.height as c_int,
+                        img.rgb.as_ptr(),
+                        img.rgb.len(),
+                    )
+                };
+            }
+        }
+        Ok(imgs.len() as c_int)
+    })
+}
+
 // ---- Qwen-Image (image editing, text to image) ------------------------------------------------
 
 /// A Qwen-Image pipeline handle.

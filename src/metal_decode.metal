@@ -677,6 +677,10 @@ inline void mv_store(float a, float b, device float* y, uint mode, uint o, uint 
     } else if (mode == 8) {
         float act = a / (1.0f + exp(-a));
         y[o] = act * gate[o];
+    } else if (mode == 9) {
+        // Squared ReLU (Nemotron-H's MLPs and experts; of the first matrix of a pair).
+        float r = max(a, 0.f);
+        y[o] = r * r;
     } else y[o] += a / (1.0f + exp(-gate[0]));
 }
 template <int NR, int KS>
@@ -1009,6 +1013,10 @@ inline void mvk_out(device float* y, uint o, uint mode, float a, float b, device
     } else if (mode == 8) {
         float act = a / (1.0f + exp(-a));
         y[o] = act * gate[o];
+    } else if (mode == 9) {
+        // Squared ReLU (Nemotron-H's MLPs and experts; of the first matrix of a pair).
+        float r = max(a, 0.f);
+        y[o] = r * r;
     } else y[o] += a / (1.0f + exp(-gate[0]));
 }
 // K-quants (Q4_K, Q5_K): the chunk's 32 quants as half (exact) and its super-block scale, min and the
@@ -1400,6 +1408,8 @@ MVK_SIG(NAME) { MVK_G(NR, KS, TT, H, G) \
 struct NP { uint n; float eps; uint has_w; uint add; uint x_stride; uint o_stride; float pre; uint _p; };
 inline void rms_norm_body(device const float* x, device float* out, device const float* w, constant NP& p, uint r, uint tid, uint nt,
                           uint sg, uint lane, threadgroup float* red) {
+    // `p._p`: the weights of row r start r * _p floats in (each row its own weights), else 0.
+    w += (ulong)r * p._p;
     device const float* xr = x + (ulong)r * p.x_stride;
     device float* o = out + (ulong)r * p.o_stride;
     // Up to 8 values per thread (and their weights) are loaded at once and kept in registers (one
@@ -2048,6 +2058,61 @@ kernel void dec_gdn_conv(device const float* x [[buffer(0)]], device float* out 
     if (ch >= p.dim) return;
     gdn_conv_body(x, out, si, st, w, p, ch);
 }
+// Mamba-2's convolution: the same with a bias, silu(bias + sum).
+kernel void dec_mamba_conv(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], device float* st [[buffer(2)]],
+                           device const float* w [[buffer(3)]], constant GC& p [[buffer(4)]], device const float* si [[buffer(5)]],
+                           device const float* bias [[buffer(6)]], uint ch [[thread_position_in_grid]]) {
+    if (ch >= p.dim) return;
+    uint kc = p.kc;
+    float xv = x[ch];
+    float s = bias[ch];
+    for (uint j = 0; j + 1 < kc; j++) s += w[ch * kc + j] * si[j * p.dim + ch];
+    s += w[ch * kc + kc - 1] * xv;
+    out[ch] = s / (1.0f + exp(-s));
+    for (uint j = 0; j + 2 < kc; j++) st[j * p.dim + ch] = si[(j + 1) * p.dim + ch];
+    st[(kc - 2) * p.dim + ch] = xv;
+}
+
+// Mamba-2's selective state update of one token, one threadgroup per head (256 threads): each
+// SIMD-group takes rows p of the head's [hd, ns] state, a lane every 32nd state column (ns a
+// multiple of 32, at most 256), so each row is read and written as whole cache lines. dt =
+// softplus(dt_raw + dt_bias) clamped, S <- exp(dt a) S + (dt x_p) B, y_p = S_p . C + d x_p, out =
+// y * silu(z). The state is read from `si` and written to `st` (see `gdn_conv_body`).
+struct M2P { uint nh; uint hd; uint ng; uint ns; float dt_min; float dt_max; uint _p0; uint _p1; };
+kernel void dec_mamba2(device const float* xbc [[buffer(0)]], device const float* z [[buffer(1)]], device const float* dtr [[buffer(2)]],
+                       device float* out [[buffer(3)]], device float* st [[buffer(4)]], device const float* cst [[buffer(5)]],
+                       constant M2P& p [[buffer(6)]], device const float* si [[buffer(7)]],
+                       uint h [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]], uint nt [[threads_per_threadgroup]]) {
+    uint g = h / (p.nh / p.ng), inner = p.nh * p.hd, nc = p.ns / 32, nsg = nt / 32;
+    device const float* B = xbc + inner + g * p.ns;
+    device const float* C = xbc + inner + (p.ng + g) * p.ns;
+    float b[8], c[8];
+    for (uint i = 0; i < 8; i++) {
+        b[i] = i < nc ? B[lane + 32 * i] : 0.f;
+        c[i] = i < nc ? C[lane + 32 * i] : 0.f;
+    }
+    float zz = dtr[h] + cst[2 * p.nh + h];
+    float dt = zz > 20.f ? zz : log(1.f + exp(zz));
+    dt = min(max(dt, p.dt_min), p.dt_max);
+    float da = exp(dt * cst[h]);
+    for (uint r = sg; r < p.hd; r += nsg) {
+        float xv = xbc[h * p.hd + r];
+        float dx = dt * xv;
+        ulong base = ((ulong)h * p.hd + r) * p.ns + lane;
+        float y = 0.f;
+        for (uint i = 0; i < nc; i++) {
+            float s = si[base + 32 * i] * da + dx * b[i];
+            st[base + 32 * i] = s;
+            y += s * c[i];
+        }
+        y = simd_sum(y);
+        if (lane == 0) {
+            float gz = z[h * p.hd + r];
+            out[h * p.hd + r] = (y + cst[p.nh + h] * xv) * (gz / (1.0f + exp(-gz)));
+        }
+    }
+}
 // ts: tokens, input and output strides.
 kernel void dec_gdn_conv_t(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], device float* st [[buffer(2)]],
                            device const float* w [[buffer(3)]], constant GC& p [[buffer(4)]], constant uint4& ts [[buffer(5)]],
@@ -2451,6 +2516,8 @@ kernel void dec_topk(device const float* logits [[buffer(0)]], device float* sel
     threadgroup float chosen[64];
     uint n = p.x, k = p.y;
     float v = tid < n ? logits[tid] : -INFINITY;
+    // Sigmoid routing (p.z == 2): chosen by sigmoid(logit) + bias (`scale[0 .. n]`).
+    if (p.z == 2 && tid < n) v = 1.0f / (1.0f + exp(-v)) + scale[tid];
     uint nsg = (nt + 31) / 32;
     if (p.w == 0 && k <= 32 && nsg * k <= 64) {
         // Each SIMD-group's own top k (no threadgroup barrier), then SIMD-group 0 picks the k
@@ -2491,7 +2558,12 @@ kernel void dec_topk(device const float* logits [[buffer(0)]], device float* sel
         if (tid == 0) { sel[j] = as_type<float>(bidx); chosen[j] = best; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (tid == 0) {
+    if (tid == 0 && p.z == 2) {
+        // The chosen experts' sigmoid scores, renormalized, times the scale (`scale[n]`).
+        float s = 0.f;
+        for (uint j = 0; j < k; j++) { float e = 1.0f / (1.0f + exp(-logits[as_type<uint>(sel[j])])); chosen[j] = e; s += e; }
+        for (uint j = 0; j < k; j++) sel[k + j] = chosen[j] / s * scale[n];
+    } else if (tid == 0) {
         float m = chosen[0], s = 0.f;
         for (uint j = 0; j < k; j++) { float e = exp(chosen[j] - m); chosen[j] = e; s += e; }
         for (uint j = 0; j < k; j++) sel[k + j] = chosen[j] / s * (p.z != 0 ? scale[as_type<uint>(sel[j])] : 1.f);

@@ -1251,6 +1251,15 @@ impl ModelFiles {
         sh.bf16(name)
     }
 
+    /// Frees the bf16 copy [`Self::bf16`] made of float32 / float16 tensor `name`, once the
+    /// caller has quantized it and holds no slice of it.
+    ///
+    /// # Safety
+    /// No slice returned by [`Self::bf16`] for `name` may be used afterwards.
+    pub unsafe fn forget_converted(&self, name: &str) {
+        self.dequantized.lock().unwrap().remove(name);
+    }
+
     /// A bf16 convolution weight in torch layout `shape` (`[out, in, spatial...]`). MLX stores
     /// convolutions channels-last (`[out, spatial..., in]`); those are permuted into a copy.
     pub fn bf16_conv(&self, name: &str, shape: &[usize]) -> Result<&[u16]> {

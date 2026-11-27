@@ -41,6 +41,7 @@ mod minimax_h3_cli;
 mod minimax_h3_video_cli;
 mod models_cli;
 mod moss_image_cli;
+mod nemotron_image_cli;
 mod omnigen2_cli;
 mod qwen_image_cli;
 mod sd3_cli;
@@ -248,6 +249,8 @@ struct Args {
     // FLUX.1 / Kontext.
     flux: flux_cli::FluxArgs,
     moss: moss_image_cli::MossArgs,
+    // Nemotron-Labs-Image.
+    nemo_image: nemotron_image_cli::NemoImageArgs,
     // LongCat-Video-Avatar.
     avatar: longcat_avatar_cli::AvatarArgs,
     // LTX-2.5.
@@ -556,7 +559,17 @@ fn usage() -> ! {
          \x20 --seed N             sampling seed (default 42)\n\
          \x20 --image FILE         with --prompt: answer a question about the image (repeatable)\n\
          \x20 --chat               a conversation: more questions from standard input, one per line\n\
-         \x20 --devices            list detected CPU features and GPUs, then exit\n\
+         \n\
+         Nemotron-Labs-Image (nvidia/Nemotron-Labs-Image-30B-A3B and its GGUFs): text to image\n\
+         \x20 --generate-image T   generate an image of T (or --prompt T with -o FILE)\n\
+         \x20 --size WxH           multiples of 16 (default 1024x1024; also 1184x880, 1248x832, 880x1184)\n\
+         \x20 --temp, --top-p, --top-k, --seed, --num-images N, --system TEXT   sampling (0.9, 1, 0, 42)\n\
+         \x20 --image FILE         a source image the instruction refers to (repeatable)\n\
+         \x20 --unconstrained      sample every token as the reference does (default: the header and row\n\
+         \x20                      markers of the size asked for are written)\n\
+         \x20 --image-tokenizer P  the ViT tokenizer folder or repo (default: NVIDIA's, fetched)\n\
+         \x20 --nemo-image K=V     any option by name (vit_precision=f32, structure=free, ...)\n\
+         \x20 --devices           list detected CPU features and GPUs, then exit\n\
          \x20 --version, -V        print the version, then exit
          \x20 --check-update       compare this binary with the latest GitHub release, then exit\n\
          \x20 --update             download the latest release's binary for this platform and replace this\n\
@@ -864,6 +877,7 @@ fn parse_args() -> Result<Args> {
         iv: Default::default(),
         flux: Default::default(),
         moss: Default::default(),
+        nemo_image: Default::default(),
         avatar: Default::default(),
         ltx: Default::default(),
         sd3: Default::default(),
@@ -1206,6 +1220,7 @@ fn parse_args() -> Result<Args> {
             "-h" | "--help" => usage(),
             _ if a.iv.parse(&k, &mut val)? => {}
             _ if a.moss.parse(&k, &mut val)? => {}
+            _ if a.nemo_image.parse(&k, &mut val)? => {}
             _ if a.avatar.parse(&k, &mut val)? => {}
             _ if a.ltx.parse(&k, &mut val)? => {}
             _ if a.flux.parse(&k, &mut val)? => {}
@@ -2041,6 +2056,9 @@ fn run(mut args: Args) -> Result<()> {
     #[cfg(feature = "media")]
     if oxinfer::haru::is_haru(&args.model) {
         return haru_cli::run(&args);
+    }
+    if oxinfer::nemotron_image::is_nemotron_image(&args.model) {
+        return nemotron_image_cli::run(&args);
     }
     let model_type = config::model_type(&args.model)?;
     if model_type == "whisper" || args.transcribe.is_some() {

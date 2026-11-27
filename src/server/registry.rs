@@ -63,6 +63,8 @@ pub(crate) enum ImageKind {
     Bagel,
     Janus,
     Moss,
+    /// Nemotron-Labs-Image (a folder or a GGUF file).
+    NemotronImage,
     /// Stable Diffusion 3 / 3.5 (a diffusers folder or an SD 3 GGUF transformer).
     Sd3,
     /// MiniMax-H3-Image.
@@ -87,6 +89,7 @@ pub(crate) enum ImageModel {
     Bagel(crate::bagel::Bagel),
     Janus(crate::janus::Janus),
     Moss(crate::moss_image::Pipeline),
+    NemotronImage(crate::nemotron_image::NemotronImage),
     Sd3(crate::sd3::Pipeline),
     H3Image(crate::minimax_h3::Pipeline),
 }
@@ -1350,6 +1353,10 @@ fn load_image(ik: ImageKind, src: &str, opts: &[(&str, &str)], cache_dir: Option
             src,
             &options!(crate::janus::JanusOptions::default(), true),
         )?),
+        ImageKind::NemotronImage => ImageModel::NemotronImage(crate::nemotron_image::NemotronImage::load(
+            src,
+            &options!(crate::nemotron_image::LoadOptions::default(), true),
+        )?),
         ImageKind::Sd3 => ImageModel::Sd3(crate::sd3::Pipeline::load(
             src,
             &options!(crate::sd3::LoadOptions::default(), true),
@@ -1450,6 +1457,9 @@ pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>
     let img = |k| (Kind::Image, Some(k));
     if crate::zonos::is_zonos(path) || crate::fish::is_drama(path) {
         return (Kind::Speech, None);
+    }
+    if crate::nemotron_image::is_nemotron_image(path) {
+        return img(ImageKind::NemotronImage);
     }
     if crate::gguf::is_gguf(path) {
         if crate::flux::is_flux_gguf(path) {

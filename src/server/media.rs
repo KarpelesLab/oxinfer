@@ -371,7 +371,17 @@ const EXTRA_KEYS: &[&str] = &[
     "sampler",
     "trigger",
     "noise",
+    // Nemotron-Labs-Image.
+    "temperature",
+    "top_p",
+    "top_k",
+    "structure",
+    "system_prompt",
+    "max_tokens",
 ];
+
+/// The keys of [`EXTRA_KEYS`] that Nemotron-Labs-Image reads (the others are MOSS-Image's).
+const NEMO_KEYS: &[&str] = &["temperature", "top_p", "top_k", "structure", "system_prompt", "max_tokens"];
 
 /// A JSON value as a `key=value` setting (arrays comma-joined).
 fn setting(v: &Value) -> String {
@@ -559,6 +569,28 @@ fn generate_images(
         bail!("masks are supported by Stable Diffusion and Qwen-Image models only");
     }
     let mut out = Vec::new();
+    if let ImageModel::NemotronImage(nm) = m {
+        // Source images (edits) go into the prompt; the size is the request's, else 1024x1024.
+        let mut o = crate::nemotron_image::GenerateOptions {
+            seed,
+            num_images: job.n,
+            ..Default::default()
+        };
+        if let (Some(w), Some(h)) = (w, h) {
+            (o.width, o.height) = (w, h);
+        }
+        for (k, v) in job.extra.iter().filter(|(k, _)| NEMO_KEYS.contains(&k.as_str())) {
+            o.set(k, &setting(v))?;
+        }
+        let (imgs, _) = nm.generate(&job.prompt, &job.images, &o, &mut |p| {
+            if on_step(p.image, p.step, p.steps) {
+                Flow::Continue
+            } else {
+                Flow::Stop
+            }
+        })?;
+        return Ok(imgs.into_iter().map(|g| (g.image.width, g.image.height, g.image.rgb)).collect());
+    }
     if let ImageModel::Janus(j) = m {
         if first.is_some() {
             bail!("Janus models generate images from text only (no edits)");
@@ -749,7 +781,7 @@ fn generate_images(
                     (p.width, p.height) = (w, h);
                 }
                 p.seed = seed;
-                for (k, v) in &job.extra {
+                for (k, v) in job.extra.iter().filter(|(k, _)| !NEMO_KEYS.contains(&k.as_str())) {
                     p.set(k, &setting(v))?;
                 }
                 let (img, _) = pipe.generate(&p, &mut |k, n| {
@@ -795,7 +827,7 @@ fn generate_images(
                 })?;
                 (img.width, img.height, img.rgb)
             }
-            ImageModel::Janus(_) => unreachable!(),
+            ImageModel::Janus(_) | ImageModel::NemotronImage(_) => unreachable!(),
         };
         out.push(img);
     }
