@@ -345,6 +345,7 @@ impl<'a> VaeDecoder<'a> {
                 fc1,
                 fc2,
                 scale: Some((&b.scale1, &b.scale2)),
+                out_scale: [None; 4],
             });
         }
         let model = H3Model {
@@ -359,6 +360,7 @@ impl<'a> VaeDecoder<'a> {
             gate_first: first.gate_first,
             blocks,
             attention: AttnPrecision::F32,
+            inputs: crate::gpu::dit::InputPrecision::Half,
         };
         let n = x.len() / c.dim;
         let inp = H3In {

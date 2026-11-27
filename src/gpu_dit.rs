@@ -539,6 +539,9 @@ pub struct H3Block<'a> {
     pub fc2: Lin<'a>,
     /// The residual scales of the attention and of the feed-forward (none: AdaLN).
     pub scale: Option<(&'a [f32], &'a [f32])>,
+    /// Scales of the outputs of qkv, out, fc1, fc2 (`[n_out]`), applied after their GEMMs and
+    /// before their side paths: the weights' own scales, when the device weights have unit ones.
+    pub out_scale: [Option<&'a [f32]>; 4],
 }
 
 /// How a device runs an attention: half-precision operands, float32 ones, or queries and keys
@@ -562,6 +565,26 @@ impl AttnPrecision {
     }
 }
 
+/// How a device feeds the projections' matrix-unit GEMMs: each input row as scaled halves
+/// (`Half`), or as a pair of them, hi + lo (`Split`: two GEMMs into the same output, about 22
+/// significant bits of each input), for models that amplify the half inputs' rounding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputPrecision {
+    Half,
+    Split,
+}
+
+impl InputPrecision {
+    /// `half` or `split`.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "half" | "f16" => Self::Half,
+            "split" | "hilo" => Self::Split,
+            _ => return None,
+        })
+    }
+}
+
 pub struct H3Model<'a> {
     pub hidden: usize,
     pub heads: usize,
@@ -574,6 +597,8 @@ pub struct H3Model<'a> {
     pub gate_first: bool,
     pub blocks: Vec<H3Block<'a>>,
     pub attention: AttnPrecision,
+    /// The projections' inputs.
+    pub inputs: InputPrecision,
 }
 
 /// One forward of the block stack.

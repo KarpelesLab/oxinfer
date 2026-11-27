@@ -1,7 +1,9 @@
 //! Whole MiniMax-H3 block stacks on Metal ([`H3Session`], `crate::minimax_h3::dit`): the packed
 //! sequence (text, video and audio rows) stays in f32 device buffers through every block; the
 //! projections run on the matrix-unit GEMMs of the diffusion-transformer plans (scaled half
-//! inputs; ConvRot inputs rotated by `dit_rot_half`; LoRA side paths), attention on
+//! inputs, or hi + lo pairs of them on the `*_x2` GEMMs with `InputPrecision::Split`; unit-scale
+//! weight twins whose scales `h3_col_scale` applies to the outputs; ConvRot inputs rotated by
+//! `dit_rot_half`; LoRA side paths), attention on
 //! `flash_attn128_mma` (half operands), `dit_flash128_hilo` (queries and keys as hi + lo halves)
 //! or `flash_attn128_mma_f32`, the AdaLN norms, the head norms with the 3-axis RoPE and the
 //! SwiGLU on the `h3_*` kernels of `metal_h3.metal`, the gated residuals on `ltx_gated_add`. One
@@ -10,7 +12,7 @@
 use super::super::decode::{Fns, run_concurrent};
 use super::super::*;
 use super::{DBuf, Enc, U4, Xh, grow, release_all, runnable};
-use crate::gpu::dit::{AttnPrecision, CorrIn, CorrModel, CorrSession, H3In, H3Model, H3Session, Lin, SplitLin};
+use crate::gpu::dit::{AttnPrecision, CorrIn, CorrModel, CorrSession, H3In, H3Model, H3Session, InputPrecision, Lin, SplitLin};
 
 /// Blocks per command buffer.
 const BLOCKS_PER_CB: usize = 4;
@@ -23,6 +25,8 @@ struct Pipes {
     rot: Id,
     flash64: Id,
     hilo: Option<Id>,
+    split: Id,
+    col: Id,
 }
 
 pub(crate) struct MetalH3 {
@@ -60,8 +64,10 @@ enum B {
     U,
     Uh,
     Urs,
+    Xl,
+    Ul,
 }
-const NBUF: usize = 21;
+const NBUF: usize = 23;
 
 #[repr(C)]
 struct Hrm {
@@ -113,6 +119,8 @@ impl MetalBackend {
             rot: pipe("dit_rot_half")?,
             flash64: pipe("flash_attn64")?,
             hilo: pipe("dit_flash128_hilo"),
+            split: pipe("h3_split_half")?,
+            col: pipe("h3_col_scale")?,
         };
         Some(Box::new(MetalH3 {
             be: self,
@@ -170,6 +178,8 @@ struct HConsts {
     b: [Option<usize>; 4],
     /// The residual scales.
     scale: Option<(usize, usize)>,
+    /// The output scales of qkv, out, fc1, fc2.
+    os: [Option<usize>; 4],
 }
 
 impl H3Session for MetalH3 {
@@ -227,6 +237,8 @@ impl H3Session for MetalH3 {
             AttnPrecision::Split if self.p.hilo.is_none() => AttnPrecision::F32,
             a => a,
         };
+        // The projections' inputs as hi + lo halves.
+        let pair = m.inputs == InputPrecision::Split;
         let r = n.next_multiple_of(MMA_TM);
         let wide = (2 * f).max(3 * inner);
         let ok = self.ensure(B::H, r * d * 4)
@@ -243,7 +255,8 @@ impl H3Session for MetalH3 {
             && self.ensure(B::Up, r * wide * 4)
             && self.ensure(B::U, r * rank * 4)
             && self.ensure(B::Uh, r * rank * 2)
-            && self.ensure(B::Urs, r * 4);
+            && self.ensure(B::Urs, r * 4)
+            && (!pair || self.ensure(B::Xl, r * f.max(inner).max(d) * 2) && self.ensure(B::Ul, r * rank * 2));
         if !ok {
             return false;
         }
@@ -267,6 +280,7 @@ impl H3Session for MetalH3 {
                     kn: put(b.k_norm),
                     b: [&b.qkv, &b.out, &b.fc1, &b.fc2].map(|l| l.bias.map(&mut put)),
                     scale: b.scale.map(|(s1, s2)| (put(s1), put(s2))),
+                    os: b.out_scale.map(|s| s.map(&mut put)),
                 })
                 .collect();
             if !self.upload(B::Stat, &c, 0) {
@@ -300,22 +314,54 @@ impl H3Session for MetalH3 {
             rs: at(B::Rs, 0),
         };
 
-        // y = W x (+ the side path `up (down x)`).
-        let gemm = |en: &Enc, l: &Lin, x: Xh, y: (Id, usize), ldy: usize| {
-            en.gemm(l, x, r, y, ldy, false);
+        // f32 rows `src` (nw wide) to hi + lo halves `hi`, `lo` with their scales `rs`.
+        let to_pair = |en: &Enc, src: B, nw: usize, hi: B, lo: B, rs: B| {
+            let e = en.e;
+            e.pipe(p.split);
+            e.buf(id(src), 0, 0);
+            e.buf(id(hi), 0, 1);
+            e.buf(id(lo), 0, 2);
+            e.buf(id(rs), 0, 3);
+            e.bytes(&U4([nw as u32, 0, 0, 0]), 4);
+            e.dispatch((r, 1), 256);
+            e.barrier();
+        };
+        // y = W x (+ the side path `up (down x)`), x = hi + lo with `pair` (the side path's
+        // inner rows too).
+        let gemm = |en: &Enc, l: &Lin, os: Option<usize>, y: (Id, usize), ldy: usize| {
+            if pair {
+                en.gemm_pair(l, main_x, at(B::Xl, 0), r, y, ldy, false);
+            } else {
+                en.gemm(l, main_x, r, y, ldy, false);
+            }
+            if let Some(so) = os {
+                let e = en.e;
+                e.pipe(p.col);
+                e.buf(y.0, y.1, 0);
+                e.buf(stat, so, 1);
+                e.bytes(&U4([l.n_out as u32, ldy as u32, 0, 0]), 2);
+                e.dispatch(((l.n_out / 4).div_ceil(256), r), 256);
+                e.barrier();
+            }
             if let Some((dn, up)) = &l.side {
                 let k = dn.n_out;
                 let u = Xh {
                     xh: at(B::Uh, 0),
                     rs: at(B::Urs, 0),
                 };
-                en.gemm(dn, x, r, at(B::U, 0), k, false);
-                en.to_half(at(B::U, 0), k, k, r, u);
-                en.gemm(up, u, r, y, ldy, true);
+                if pair {
+                    en.gemm_pair(dn, main_x, at(B::Xl, 0), r, at(B::U, 0), k, false);
+                    to_pair(en, B::U, k, B::Uh, B::Ul, B::Urs);
+                    en.gemm_pair(up, u, at(B::Ul, 0), r, y, ldy, true);
+                } else {
+                    en.gemm(dn, main_x, r, at(B::U, 0), k, false);
+                    en.to_half(at(B::U, 0), k, k, r, u);
+                    en.gemm(up, u, r, y, ldy, true);
+                }
             }
         };
         // The input of `l` from f32 rows `src` (n wide, contiguous): rotated in place first when
-        // `l` is stored rotated.
+        // `l` is stored rotated; hi + lo halves with `pair`.
         let input = |en: &Enc, l: &Lin, src: B, nw: usize| {
             let e = en.e;
             if l.rot.is_some() {
@@ -326,15 +372,18 @@ impl H3Session for MetalH3 {
                 e.bytes(&U4([nw as u32, 0, 0, 0]), 3);
                 e.dispatch((r, 1), 256);
                 e.barrier();
-            } else {
+            } else if !pair {
                 en.to_half(at(src, 0), nw, nw, r, main_x);
+            }
+            if pair {
+                to_pair(en, src, nw, B::Xh, B::Xl, B::Rs);
             }
         };
         // The norm of the rows (with the AdaLN shift / scale) into the input of `l` (half rows
-        // directly, or f32 rows rotated after).
+        // directly, or f32 rows rotated or split after).
         let norm_in = |en: &Enc, l: &Lin, w: usize, tab: usize, sc: usize, sh: usize| {
             let e = en.e;
-            let rot = l.rot.is_some();
+            let rot = l.rot.is_some() || pair;
             e.pipe(p.rms);
             e.buf(id(B::H), 0, 0);
             e.buf(stat, w, 1);
@@ -441,7 +490,7 @@ impl H3Session for MetalH3 {
                 let tab = i * tab_block * 4;
                 // Attention.
                 norm_in(&en, &b.qkv, o.norm1, tab, d, 0);
-                gemm(&en, &b.qkv, main_x, at(B::Qkv, 0), 3 * inner);
+                gemm(&en, &b.qkv, o.os[0], at(B::Qkv, 0), 3 * inner);
                 heads(&en, 0, B::Q, B::Ql, Some(o.qn), o.b[0]);
                 heads(&en, 1, B::K, B::Kl, Some(o.kn), o.b[0]);
                 heads(&en, 2, B::V, B::V, None, o.b[0]);
@@ -472,12 +521,12 @@ impl H3Session for MetalH3 {
                 }
                 e.barrier();
                 input(&en, &b.out, B::Att, inner);
-                gemm(&en, &b.out, main_x, at(B::Tmp, 0), d);
+                gemm(&en, &b.out, o.os[1], at(B::Tmp, 0), d);
                 gated(&en, tab, 2 * d, o.scale.map(|s| s.0), o.b[1]);
                 // Feed-forward.
                 norm_in(&en, &b.fc1, o.norm2, tab, 4 * d, 3 * d);
-                gemm(&en, &b.fc1, main_x, at(B::Up, 0), 2 * f);
-                let rot = b.fc2.rot.is_some();
+                gemm(&en, &b.fc1, o.os[2], at(B::Up, 0), 2 * f);
+                let rot = b.fc2.rot.is_some() || pair;
                 e.pipe(p.swiglu);
                 e.buf(id(B::Up), 0, 0);
                 e.buf(id(if rot { B::Xf } else { B::Xh }), 0, 1);
@@ -489,7 +538,7 @@ impl H3Session for MetalH3 {
                 if rot {
                     input(&en, &b.fc2, B::Xf, f);
                 }
-                gemm(&en, &b.fc2, main_x, at(B::Tmp, 0), d);
+                gemm(&en, &b.fc2, o.os[3], at(B::Tmp, 0), d);
                 gated(&en, tab, 5 * d, o.scale.map(|s| s.1), o.b[3]);
             }
         });

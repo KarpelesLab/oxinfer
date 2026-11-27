@@ -1467,7 +1467,7 @@ pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Pa
     };
     let (mut te, mut loras, mut shift, mut audio_shift) = (None, Vec::new(), None, None);
     let (mut corrector, mut corr_settings) = (None, CorrectorSettings::default());
-    let (mut gpu, mut attention) = (true, None);
+    let (mut gpu, mut attention, mut inputs) = (true, None, None);
     let num = |k: &str, v: &str| -> Result<f32> { v.parse().with_context(|| format!("{k}: not a number: {v:?}")) };
     for (k, v) in opts {
         match *k {
@@ -1494,9 +1494,12 @@ pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Pa
             "attention" | "gpu_attention" => {
                 attention = Some(crate::gpu::dit::AttnPrecision::parse(v).with_context(|| format!("{k}: {v:?} (half, split, f32)"))?)
             }
+            "inputs" | "gpu_inputs" => {
+                inputs = Some(crate::gpu::dit::InputPrecision::parse(v).with_context(|| format!("{k}: {v:?} (half, split)"))?)
+            }
             k if corr_settings.set(k, v)? => {}
             k => bail!(
-                "unknown MiniMax-H3 option {k:?} (text_encoder, transformer, vae, audio_vae, quant, lora, shift, audio_shift, corrector, corrector_strength, corrector_budget, corrector_floor, corrector_start, corrector_end, device, attention)"
+                "unknown MiniMax-H3 option {k:?} (text_encoder, transformer, vae, audio_vae, quant, lora, shift, audio_shift, corrector, corrector_strength, corrector_budget, corrector_floor, corrector_start, corrector_end, device, attention, inputs)"
             ),
         }
     }
@@ -1513,8 +1516,11 @@ pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Pa
     }
     pipe.dit.gpu = gpu;
     pipe.vae.gpu = gpu;
-    if let Some(a) = attention {
-        pipe.dit.gpu_attention = a;
+    if attention.is_some() {
+        pipe.dit.gpu_attention = attention;
+    }
+    if inputs.is_some() {
+        pipe.dit.gpu_inputs = inputs;
     }
     if let Some(c) = &mut pipe.corrector {
         c.gpu = gpu;

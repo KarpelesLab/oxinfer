@@ -945,13 +945,14 @@ and Sulphur-3's corrector run as whole passes on the GPU (`src/metal_h3.rs`,
 `src/metal_h3.metal`), one submission per forward (the blocks spread over a few command
 buffers): the packed sequence stays in float32 device buffers from the first block to the last,
 the projections run on the matrix-unit GEMMs of the diffusion-transformer plans (half inputs
-with a power of two per row), and the host keeps the text encoder and its refiner, the layers
+with a power of two per row, or hi + lo pairs of them: [below](#lora-and-precision)), and the host keeps the text encoder and its refiner, the layers
 before and after the blocks, the AdaLN tables (one small product per block and step) and the
 schedule. It takes the formats of the runs on this page: bf16 as stored; int8 rows with a row
 scale (`int8_tensorwise`, and the W4A8 / W6A8 codes, decoded to int8 at load) through a Q8 twin
 that borrows the int8 bytes; FP8 "scaled" weights (one `weight_scale` per matrix) through an FP8
-twin that borrows the bytes and repeats the scale over the 128 x 128 blocks of the FP8 GEMMs
-(`mma_F8_E4M3`); NVFP4 (`comfy_quant` `nvfp4`, repacked into ggml's blocks at load) as it is, on
+twin that borrows the bytes (`mma_F8_E4M3`); both twins carry unit scales, so the GEMMs read the
+int8 / E4M3 values exact in half rather than their products with the scale rounded to half, and
+the layer's scales multiply its outputs (`h3_col_scale`); NVFP4 (`comfy_quant` `nvfp4`, repacked into ggml's blocks at load) as it is, on
 `mma_NVFP4`; ConvRot inputs rotated on the device (`dit_rot_half`); LoRA updates
 as side paths (`up (down x)` in float16, the rank padded to 64); mixed files (the Ref2VA hybrid's
 bf16 and int8 blocks); the float16 VAE (biases, scaled residuals, 64-wide heads); structure
@@ -965,7 +966,8 @@ the image VAE's) takes the same path ([below](#minimax-h3-image-on-metal)).
 Attention: 128-wide heads on the fused matrix-unit kernels, by default with queries and keys as
 hi + lo half pairs (`--attention split`, load option `attention`, `Dit::gpu_attention`): as exact
 as float32 operands at the speed of half ones; `--attention half` (half operands) and
-`--attention f32` are the others. The VAE's and the corrector's 64-wide heads run in float32.
+`--attention f32` are the others (with a LoRA applied `f32` is the default: below). The VAE's and
+the corrector's 64-wide heads run in float32.
 
 M5 Max, a `--profile ci` build, the kept Sulphur-3 caption embedding, 448x256, 22 frames (1208
 rows), seed 60, 20 Euler forwards at shifts 12 / 3, one run each under the benchmark lock (the
@@ -1049,12 +1051,55 @@ audio + 350 text rows, 4 forwards at shifts 6 / 3, the same caption embedding an
 
 Both clips show the kitchen and the woman, sharp (the kettle, the knife block, the sink),
 dancing with her arms raised; 26.1 dB apart, the Metal clip's framing a little lower and wider
-in every frame (side by side) while pose and motion are the same. The turbo LoRA makes the
-transformer far more sensitive to the half inputs: at 448x256 one forward with it is 6.6e-3 from
-the CPU's (`f32` attention 6.5e-3, `half` 8.0e-3), 6.5e-4 without; its first block alone is
-within 2.0e-4 either way (so the side paths themselves are as exact as the projections), and
-at 1344x768 the first forward is 1.7e-2 / 3.2e-4 from the CPU's (max abs 0.81). A 124-frame
-clip at 1344x768 was not run on Metal (it would hold the shared GPU for half an hour).
+in every frame (side by side) while pose and motion are the same. That run predates the
+precision below (with which the Metal transformer is 25x closer to the CPU's at this size); a
+124-frame clip at 1344x768 was not run on Metal (it would hold the shared GPU for half an hour).
+
+#### LoRA and precision
+
+The turbo LoRA makes the sampling far more sensitive to rounding than the base model: at
+448x256 one forward with it was 6.3e-3 from the CPU's (the pruned int8 ConvRot file), 7.8e-4
+without, though one block alone is within 2e-4 either way; along the 4-step trajectory a
+2.3e-4 difference in the second forward's input becomes 2.3e-2 in its velocity and 17% at the
+last. Each of the GPU's half-precision roundings contributes, and the errors do not add in
+quadrature: hi + lo inputs on half the projections (qkv and fc1, or out and fc2) leave a forward
+at 2.3e-3 to 2.6e-3, all four at 5e-5. So with a LoRA applied (any LoRA; `Dit::gpu_precision`)
+the Metal transformer by default
+
+- splits each projection's input rows into hi + lo halves (`hi = half(x s)`, `lo = half(x s -
+  hi)`, the row's power of two `s`; `h3_split_half`) that the `*_x2` GEMMs multiply with each
+  weight tile dequantized once for both (bf16, Q8, scaled FP8, NVFP4, F16; two GEMMs for other
+  formats), the LoRA side paths' inner rows too (`--inputs split`, load option `inputs`,
+  `Dit::gpu_inputs`; `half` otherwise);
+- runs attention on float32 operands (`--attention f32`: at 1344x768 as fast as `split`, whose
+  half values and probabilities leave 1.6e-3 at 448x256; values and probabilities as hi + lo
+  pairs too gave 4.9e-5 at twice the attention's time);
+- refines the text rows on the CPU (`gpu::on_cpu`; once per clip, a fraction of a second): on
+  the GPU's half products they were 3.7e-4 from the CPU's, which moved the first forward by
+  2.8e-3 and the clip to 22.6 dB.
+
+Every model also gets the unit-scale int8 / FP8 twins ([above](#on-metal)): exact weights
+on the GEMMs at the cost of one pass over each output.
+
+M5 Max, a `--profile ci` build, `minimax_h3_fl2va_pruned_int8_convrot` with
+`minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16`, the kept caption embedding, seed 60,
+`h3_forward_bench` against the CPU's velocities on the same inputs (relative L2 of the video /
+audio velocities; times the steady forwards of runs under the benchmark lock):
+
+| | before | now (default with a LoRA) |
+|---|---|---|
+| 448x256 x 22, one forward | 1.8 s; 6.3e-3 / 3.3e-4 (max abs 8.9e-2) | 2.5 to 2.7 s; 5.5e-5 / 4.9e-6 (max abs 1.1e-3) |
+| 448x256 x 22, forwards 2 to 4 | 7.5e-3, 5.4e-3, 2.9e-3 | 6.5e-5, 4.8e-5, 1.2e-4 |
+| 1344x768 x 22, one forward (CPU 292 s) | 20 to 23 s; 1.25e-2 / 3.8e-4 (max abs 0.49) | 28.7 to 29.3 s; 4.4e-4 / 1.4e-5 (max abs 2.7e-2) |
+| 448x256 x 22 clip (4 forwards; CPU 181 s) | 21.0 s (steps 1.7 s after the first); 22.6 dB from the CPU clip | 20.7 s (steps 2.8 s; the text refined on the CPU); 40.7 dB |
+
+Other settings at 448x256 (one forward, video): `--inputs split --attention split` 1.6e-3;
+`--inputs half --attention f32` 2.5e-3 (1.5 to 2.0 s); unit scales alone 5.1e-3 (from 6.3e-3).
+At 1344x768: `--inputs half` 9.0e-3 (`f32`) / 1.0e-2 (`split`) at 19 to 20 s; `--inputs split
+--attention split` 5.3e-3 at 29 s (two GEMMs then). Without a LoRA nothing changes but the unit
+scales: the int8 ConvRot file's two forwards go from 7.8e-4 / 1.7e-3 to 5.9e-4 / 1.1e-3 at the
+same 1.5 to 1.6 s. The Metal clip's video decoded on the CPU is 45.7 dB from its own GPU decode,
+so what is left between the clips is the transformer's trajectory.
 
 ### MiniMax-H3-Image on Metal
 

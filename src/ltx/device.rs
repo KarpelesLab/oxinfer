@@ -28,6 +28,11 @@ pub(crate) struct Twins<'a> {
     gates: HashMap<usize, (Vec<f32>, Vec<f32>)>,
     /// By the address of the layer's `DLin`: its LoRA updates as one side path (down, up).
     sides: HashMap<usize, (crate::model::Lin<'a>, crate::model::Lin<'a>, usize)>,
+    /// Twins with unit scales, their layers' scales applied to the outputs instead (`[n_out]`
+    /// in `out_scales`): the GEMMs then read the int8 / E4M3 values as they are, exact in half,
+    /// rather than their products with the scales rounded to half.
+    pub(crate) unit_scales: bool,
+    out_scales: HashMap<usize, Vec<f32>>,
 }
 
 /// An f32 matrix `[n_out, n_in]` as a float16 "GGUF" layer.
@@ -85,32 +90,36 @@ fn key(d: &DLin) -> usize {
     d as *const DLin as usize
 }
 
-/// The Q8 twin of an int8 (row-scaled) layer.
-fn q8_twin<'a>(d: &DLin<'a>) -> Option<crate::model::Lin<'a>> {
+/// The Q8 twin of an int8 (row-scaled) layer (with `unit`, every scale 1 and the row scales
+/// returned).
+fn q8_twin<'a>(d: &DLin<'a>, unit: bool) -> Option<(crate::model::Lin<'a>, Option<Vec<f32>>)> {
     let crate::model::Weight::Gguf(m) = &d.w.w else { return None };
     if m.kind != crate::ggml::GgmlType::I8 || !d.n_in.is_multiple_of(crate::quant::QBLOCK) {
         return None;
     }
     let b = m.block_scales.as_ref()?;
     let bpr = d.n_in / crate::quant::QBLOCK;
+    let row = |r: usize| if b.s.len() == 1 { b.s[0] } else { b.s[r] };
     let mut sc = crate::quant::PageVec::<f32>::zeroed(d.n_out * bpr);
     for (r, c) in sc.chunks_mut(bpr).enumerate() {
-        c.fill(if b.s.len() == 1 { b.s[0] } else { b.s[r] });
+        c.fill(if unit { 1.0 } else { row(r) });
     }
     // SAFETY: the bytes are the mapped file's (or the layer's own buffer), which outlive the
     // transformer holding both the layer and its twin; i8 and u8 share a layout.
     let q: &'a [i8] = unsafe { std::slice::from_raw_parts(m.data.as_ptr() as *const i8, d.n_out * d.n_in) };
-    Some(crate::model::Lin::q8(crate::quant::QMatrix {
+    let lin = crate::model::Lin::q8(crate::quant::QMatrix {
         q: unsafe { crate::quant::QBuf::borrowed(q) },
         scales: sc.into(),
         n_out: d.n_out,
         n_in: d.n_in,
-    }))
+    });
+    Some((lin, unit.then(|| (0..d.n_out).map(row).collect())))
 }
 
 /// The FP8 twin of an FP8 layer with one scale for the whole matrix: the scale repeated over
-/// the 128 x 128 blocks of the device's FP8 GEMMs.
-fn fp8_twin<'a>(d: &DLin<'a>) -> Option<crate::model::Lin<'a>> {
+/// the 128 x 128 blocks of the device's FP8 GEMMs (with `unit`, 1 there and the scale returned
+/// per row).
+fn fp8_twin<'a>(d: &DLin<'a>, unit: bool) -> Option<(crate::model::Lin<'a>, Option<Vec<f32>>)> {
     let crate::model::Weight::Gguf(m) = &d.w.w else { return None };
     let b = m.block_scales.as_ref()?;
     if m.kind != crate::ggml::GgmlType::F8E4M3 || b.e8m0.is_some() || b.s.len() != 1 || m.data.len() != d.n_out * d.n_in {
@@ -118,11 +127,11 @@ fn fp8_twin<'a>(d: &DLin<'a>) -> Option<crate::model::Lin<'a>> {
     }
     const B: usize = 128;
     let mut sc = crate::quant::PageVec::<f32>::zeroed(d.n_out.div_ceil(B) * d.n_in.div_ceil(B));
-    sc.fill(b.s[0]);
+    sc.fill(if unit { 1.0 } else { b.s[0] });
     // SAFETY: as in `q8_twin`.
     let q: &'a [u8] = unsafe { std::slice::from_raw_parts(m.data.as_ptr(), d.n_out * d.n_in) };
     let g = crate::ggml::GgufMatrix::fp8(unsafe { crate::quant::QBuf::borrowed(q) }, sc.into(), d.n_out, d.n_in, (B, B)).ok()?;
-    Some(crate::model::Lin::gguf(g))
+    Some((crate::model::Lin::gguf(g), unit.then(|| vec![b.s[0]; d.n_out])))
 }
 
 impl<'a> Twins<'a> {
@@ -142,14 +151,22 @@ impl<'a> Twins<'a> {
                 self.gates.insert(key(d), (w, d.b.clone().unwrap_or_else(|| vec![0.0; d.n_out])));
             }
         } else {
-            if let Some(q) = q8_twin(d).or_else(|| fp8_twin(d)) {
+            if let Some((q, s)) = q8_twin(d, self.unit_scales).or_else(|| fp8_twin(d, self.unit_scales)) {
                 self.twin.insert(key(d), q);
+                if let Some(s) = s {
+                    self.out_scales.insert(key(d), s);
+                }
             }
             let rot = d.w.fold.as_ref().map(|f| f.block);
             if let Some(s) = side_of(d, rot) {
                 self.sides.insert(key(d), s);
             }
         }
+    }
+
+    /// The scales of `d`'s outputs when its twin has unit scales.
+    pub(crate) fn out_scale(&self, d: &DLin<'a>) -> Option<&[f32]> {
+        self.out_scales.get(&key(d)).map(|v| &v[..])
     }
 
     /// `d` as the device sees it: None when the device has no state for it or its input

@@ -49,7 +49,10 @@ pub fn run(args: &Args) -> Result<()> {
     };
     if let Some(a) = &args.h3_attention {
         pipe.dit.gpu_attention =
-            oxinfer::gpu::dit::AttnPrecision::parse(a).with_context(|| format!("--attention {a}: half, split or f32"))?;
+            Some(oxinfer::gpu::dit::AttnPrecision::parse(a).with_context(|| format!("--attention {a}: half, split or f32"))?);
+    }
+    if let Some(a) = &args.h3_inputs {
+        pipe.dit.gpu_inputs = Some(oxinfer::gpu::dit::InputPrecision::parse(a).with_context(|| format!("--inputs {a}: half or split"))?);
     }
     eprintln!(
         "[MiniMax-H3-Image: {} blocks, {} steps; text encoder {}; loaded in {:.1}s]",

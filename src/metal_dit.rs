@@ -236,10 +236,34 @@ impl Enc<'_, '_> {
         self.e.barrier();
     }
 
+    /// [`Self::gemm`] over hi + lo half inputs `x` + `xl` (the same row scales): one GEMM that
+    /// dequantizes each weight tile once for both where the format has one (`*_x2`), else two.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_pair(&self, l: &Lin, x: Xh, xl: (Id, usize), rows: usize, y: (Id, usize), ldy: usize, add: bool) {
+        let mw = l.dev.downcast_ref::<MetalWeight>().unwrap();
+        match self.be.mma_pipe_x2(&l.w, mw.offsets.is_some(), l.n_out, l.n_in) {
+            Some(p) => self.gemm_with(l, x, Some((p, xl)), rows, y, ldy, add),
+            None => {
+                self.gemm(l, x, rows, y, ldy, add);
+                self.gemm_nb(l, Xh { xh: xl, rs: x.rs }, rows, y, ldy, true);
+            }
+        }
+        self.e.barrier();
+    }
+
     /// [`Self::gemm`] without the barrier after it (GEMMs that may run together).
     fn gemm_nb(&self, l: &Lin, x: Xh, rows: usize, y: (Id, usize), ldy: usize, add: bool) {
+        self.gemm_with(l, x, None, rows, y, ldy, add);
+    }
+
+    /// The GEMM's dispatch, with `x2` that of an `*_x2` pipeline and the lo halves.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_with(&self, l: &Lin, x: Xh, x2: Option<((Id, usize), (Id, usize))>, rows: usize, y: (Id, usize), ldy: usize, add: bool) {
         let mw = l.dev.downcast_ref::<MetalWeight>().unwrap();
-        let (pipe, tn) = self.be.mma_pipe(&l.w, mw.offsets.is_some(), l.n_out, l.n_in, Tile::Dense).unwrap();
+        let (pipe, tn) = match x2 {
+            Some((p, _)) => p,
+            None => self.be.mma_pipe(&l.w, mw.offsets.is_some(), l.n_out, l.n_in, Tile::Dense).unwrap(),
+        };
         let (_, elem_bytes, scale_bytes) = format_index(&l.w);
         let s_off = match &l.w {
             WeightRef::Gguf(m) => gguf_s_off(m, mw),
@@ -264,6 +288,9 @@ impl Enc<'_, '_> {
             4,
         );
         e.buf(x.rs.0, x.rs.1, 5);
+        if let Some((_, xl)) = x2 {
+            e.buf(xl.0, xl.1, 8);
+        }
         if let Some((ob, gpr, gk)) = &mw.offsets {
             e.buf(ob.id, 0, 6);
             e.bytes(

@@ -1148,7 +1148,9 @@ typedef struct OxiVideo OxiVideo;
 
 /* Loads a video model. MiniMax-H3 (a release folder, a single-file transformer or a repo id);
  * `options`: key=value (text_encoder, transformer, vae, audio_vae, quant, lora, shift,
- * audio_shift, cache_dir). LTX-2.5 ("Lightricks/LTX-2.5": the parts a run reads are fetched from
+ * audio_shift, corrector, device=cpu, attention=split|half|f32, inputs=half|split: the Metal
+ * transformer's attention operands and projection inputs, by default split / half, f32 / split
+ * with a LoRA; cache_dir). LTX-2.5 ("Lightricks/LTX-2.5": the parts a run reads are fetched from
  * the public mirror comfyicu/LTX-2.5; a release folder or a transformer file); options:
  * transformer (int8, bf16, nvfp4, dev, dev-bf16 or a file), text_encoder, vae (conv, diff: the
  * diffusion decoder, or a file), audio_vae,

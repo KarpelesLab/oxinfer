@@ -421,8 +421,11 @@ pub struct Dit<'a> {
     /// Run the block stack on the accelerator's whole-pass session when it has one (Metal; else,
     /// or when it declines, on `device` or the CPU).
     pub gpu: bool,
-    /// The operands of that session's attention.
-    pub gpu_attention: crate::gpu::dit::AttnPrecision,
+    /// The operands of that session's attention (none: `Split`, or `F32` with a LoRA applied).
+    pub gpu_attention: Option<crate::gpu::dit::AttnPrecision>,
+    /// The inputs of that session's projections (none: `Half`, or `Split` with a LoRA applied:
+    /// a turbo LoRA amplifies the half inputs' rounding about tenfold).
+    pub gpu_inputs: Option<crate::gpu::dit::InputPrecision>,
     /// The session's view of int8 layers and LoRA side paths, made on the first device pass.
     twins: std::sync::OnceLock<crate::ltx::device::Twins<'a>>,
     session: std::sync::Mutex<Option<Box<dyn crate::gpu::dit::H3Session>>>,
@@ -667,7 +670,8 @@ impl<'a> Dit<'a> {
             inv_freq,
             device: Default::default(),
             gpu: true,
-            gpu_attention: crate::gpu::dit::AttnPrecision::Split,
+            gpu_attention: None,
+            gpu_inputs: None,
             twins: Default::default(),
             session: Default::default(),
             cfg,
@@ -679,16 +683,53 @@ impl<'a> Dit<'a> {
         self.heads_out.len()
     }
 
-    /// The refined text stream `[n, H]` (independent of the timestep: computed once).
+    /// The refined text stream `[n, H]` (independent of the timestep: computed once). On the
+    /// CPU kernels when the device's projections take hi + lo inputs ([`Dit::gpu_inputs`]):
+    /// those models amplify the half-precision GPU products' rounding of the text rows too.
     pub fn embed_text(&self, text: &[f32]) -> Vec<f32> {
         let h = self.cfg.hidden;
         let n = text.len() / self.cfg.text_dim;
-        let mut x = self.context.forward(text, n);
-        for b in &self.refiner {
-            self.block(b, &mut x, n, None, None);
+        let run = || {
+            let mut x = self.context.forward(text, n);
+            for b in &self.refiner {
+                self.block(b, &mut x, n, None, None);
+            }
+            rmsnorm_f32w_rows_inplace(&mut x, h, &self.refiner_norm, self.cfg.final_eps);
+            x
+        };
+        if self.gpu && self.gpu_precision().0 == crate::gpu::dit::InputPrecision::Split {
+            crate::gpu::on_cpu(run)
+        } else {
+            run()
         }
-        rmsnorm_f32w_rows_inplace(&mut x, h, &self.refiner_norm, self.cfg.final_eps);
-        x
+    }
+
+    /// Whether a LoRA is applied to the block stack.
+    fn lora_applied(&self) -> bool {
+        self.blocks.iter().any(|b| {
+            let qkv: &[DLin] = match &b.attn.qkv {
+                Qkv::Split(s) => &s[..],
+                Qkv::Interleaved(w) | Qkv::Stacked(w) => std::slice::from_ref(&**w),
+            };
+            qkv.iter()
+                .chain([&b.attn.out, &b.ff.fc1, &b.ff.fc2])
+                .any(|d| d.w.active_lora().is_some())
+        })
+    }
+
+    /// The device session's projection inputs and attention operands: [`Dit::gpu_inputs`] and
+    /// [`Dit::gpu_attention`], by default half / split, or with a LoRA applied (the turbo
+    /// LoRAs amplify the rounding of the half inputs, values and probabilities about tenfold)
+    /// hi + lo pairs / float32.
+    pub fn gpu_precision(&self) -> (crate::gpu::dit::InputPrecision, crate::gpu::dit::AttnPrecision) {
+        use crate::gpu::dit::{AttnPrecision, InputPrecision};
+        let lora = self.lora_applied();
+        (
+            self.gpu_inputs
+                .unwrap_or(if lora { InputPrecision::Split } else { InputPrecision::Half }),
+            self.gpu_attention
+                .unwrap_or(if lora { AttnPrecision::F32 } else { AttnPrecision::Split }),
+        )
     }
 
     /// The timestep embedding (`[time_dim]`) of a `t` in `[0, 1]`; in the curve form the row of
@@ -937,7 +978,10 @@ impl<'a> Dit<'a> {
         }
         let Some(be) = crate::gpu::active() else { return false };
         let twins = self.twins.get_or_init(|| {
+            // Unit-scale twins: the int8 / E4M3 values exact in half on the GEMMs, the layers'
+            // scales applied to their outputs.
             let mut t = crate::ltx::device::Twins::default();
+            t.unit_scales = true;
             for b in &self.blocks {
                 if let Qkv::Interleaved(w) | Qkv::Stacked(w) = &b.attn.qkv {
                     t.add(w, false);
@@ -953,7 +997,7 @@ impl<'a> Dit<'a> {
         let stacked = matches!(first.attn.qkv, Qkv::Stacked(_));
         let mut blocks = Vec::with_capacity(self.blocks.len());
         for b in &self.blocks {
-            let qkv = match &b.attn.qkv {
+            let qkv_d = match &b.attn.qkv {
                 Qkv::Stacked(w) if stacked => &**w,
                 Qkv::Interleaved(w) if !stacked => &**w,
                 _ => return false,
@@ -962,7 +1006,7 @@ impl<'a> Dit<'a> {
                 return false;
             }
             let (Some(qkv), Some(out), Some(fc1), Some(fc2)) =
-                (twins.lin(qkv), twins.lin(&b.attn.out), twins.lin(&b.ff.fc1), twins.lin(&b.ff.fc2))
+                (twins.lin(qkv_d), twins.lin(&b.attn.out), twins.lin(&b.ff.fc1), twins.lin(&b.ff.fc2))
             else {
                 return false;
             };
@@ -976,8 +1020,10 @@ impl<'a> Dit<'a> {
                 fc1,
                 fc2,
                 scale: None,
+                out_scale: [qkv_d, &b.attn.out, &b.ff.fc1, &b.ff.fc2].map(|d| twins.out_scale(d)),
             });
         }
+        let (inputs, attention) = self.gpu_precision();
         let model = H3Model {
             hidden: c.hidden,
             heads: c.heads,
@@ -988,8 +1034,9 @@ impl<'a> Dit<'a> {
             qk_eps: c.qk_eps,
             stacked,
             gate_first: first.ff.gate_first,
+            inputs,
             blocks,
-            attention: self.gpu_attention,
+            attention,
         };
         let key: Vec<u32> = key.iter().map(|&k| k as u32).collect();
         let n = x.len() / c.hidden;

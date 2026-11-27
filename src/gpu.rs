@@ -725,7 +725,28 @@ pub fn initialized() -> bool {
 }
 
 pub fn active() -> Option<&'static dyn Backend> {
+    if CPU_ONLY.with(|c| c.get()) {
+        return None;
+    }
     ACTIVE.get().and_then(|b| b.as_deref())
+}
+
+thread_local! {
+    static CPU_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` as if no backend were active on this thread ([`active`] is None there): its
+/// products on the CPU kernels in float32 (MiniMax-H3's text refiner beside a LoRA'd stack,
+/// whose sampling amplifies the half-precision GPU products' rounding).
+pub fn on_cpu<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CPU_ONLY.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(CPU_ONLY.with(|c| c.replace(true)));
+    f()
 }
 
 /// Picks and initialises a backend for the detected platform and the user's preference. `Auto`

@@ -1087,10 +1087,13 @@ inline void loadh(PTQ1_0W w, uint row, uint b, thread half4* out) {
 }
 #if MMA_UNITS
 #define MMA_WS threadgroup half Ws[64 * MKB];
-template <typename W, int TM>
+// With X2, the inputs are hi + lo half pairs (xh, xl: the same row scales) whose products
+// accumulate together, each weight tile dequantized once for both (`*_x2`).
+template <typename W, int TM, bool X2 = false>
 inline void mma_tile(W w, device const half* xh, device const float* rs, device float* y, uint n_out, uint n_in, uint rows,
-                     uint o0, uint t0, uint tid, threadgroup half* Ws, uint ldy = 0, uint add = 0) {
+                     uint o0, uint t0, uint tid, threadgroup half* Ws, uint ldy = 0, uint add = 0, device const half* xl = nullptr) {
     XT X((device half*)xh, dextents<int32_t, 2>(n_in, rows));
+    XT XL((device half*)(X2 ? xl : xh), dextents<int32_t, 2>(n_in, rows));
     YT Y(y, dextents<int32_t, 2>(n_out, rows));
     constexpr auto desc = matmul2d_descriptor(TM, 64, MKB, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroups<4>> op;
@@ -1108,15 +1111,20 @@ inline void mma_tile(W w, device const half* xh, device const float* rs, device 
         threadgroup_barrier(mem_flags::mem_threadgroup);
         auto a = X.template slice<MKB, TM>(k0, t0);
         op.run(a, Wt, c);
+        if (X2) {
+            auto al = XL.template slice<MKB, TM>(k0, t0);
+            op.run(al, Wt, c);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (ldy != 0 || add != 0) scale_store_ld(c, rs, t0, y, ldy != 0 ? ldy : n_out, o0, add != 0);
     else scale_store(c, rs, t0, Y.slice(o0, t0));
 }
-template <int TM, int TN>
+template <int TM, int TN, bool X2 = false>
 inline void mma_bf_tile(device const bfloat* w, device const half* xh, device const float* rs, device float* y, uint n_out, uint n_in, uint rows,
-                        uint o0, uint t0, uint ldy = 0, uint add = 0) {
+                        uint o0, uint t0, uint ldy = 0, uint add = 0, device const half* xl = nullptr) {
     XT X((device half*)xh, dextents<int32_t, 2>(n_in, rows));
+    XT XL((device half*)(X2 ? xl : xh), dextents<int32_t, 2>(n_in, rows));
     YT Y(y, dextents<int32_t, 2>(n_out, rows));
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Wt((device bfloat*)w, dextents<int32_t, 2>(n_in, n_out));
     constexpr auto desc = matmul2d_descriptor(TM, TN, static_cast<int>(dynamic_extent), false, true, false);
@@ -1126,6 +1134,10 @@ inline void mma_bf_tile(device const bfloat* w, device const half* xh, device co
     auto c = op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
     zero(c);
     op.run(a, b, c);
+    if (X2) {
+        auto al = XL.slice(0, t0);
+        op.run(al, b, c);
+    }
     if (ldy != 0 || add != 0) scale_store_ld(c, rs, t0, y, ldy != 0 ? ldy : n_out, o0, add != 0);
     else scale_store(c, rs, t0, Y.slice(o0, t0));
 }
@@ -1236,6 +1248,22 @@ MMAG_SIG(NAME) { MMAG_PRE WT w = MAKE; mma_tile<WT, GTM>(MMAG_ARGS); } \
 MMAG_SIG(NAME##_l) { MMAG_PRE WT w = MAKE; mma_tile<WT, 128>(MMAG_ARGS); } \
 MMAG_SIG(NAME##_s) { MMAG_PRE WT w = MAKE; mma_tile<WT, 16>(MMAG_ARGS); }
 MMAD(mma_q8, Q8W, MK_Q8) MMAD(mma_q4, Q4W, MK_Q4)
+#if MMA_UNITS
+// 128-token tiles of hi + lo half inputs (xl at buffer 8; metal_h3.rs `--inputs split`).
+#define MMAD_X2(NAME, WT, MAKE) \
+kernel void NAME##_x2(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]], device const half* xh [[buffer(2)]], \
+                      device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
+                      device const half* xl [[buffer(8)]], \
+                      uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { MMA_WS \
+    WT w = MAKE; mma_tile<WT, 128, true>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 128, tid, Ws, p._p0, p._p2, xl); }
+MMAD_X2(mma_q8, Q8W, MK_Q8) MMAD_X2(mma_F8_E4M3, F8W, MK_F8) MMAD_X2(mma_NVFP4, NvfW, MK_NV)
+MMAD_X2(mma_F16, F16W, MK_GG(F16W))
+kernel void mma_bf64_x2(device const ushort* qb [[buffer(0)]], device const half* xh [[buffer(2)]], device float* y [[buffer(3)]],
+                        constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], device const half* xl [[buffer(8)]],
+                        uint2 tg [[threadgroup_position_in_grid]]) {
+    mma_bf_tile<128, 64, true>((device const bfloat*)(qb + p.w_off), xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 128, p._p0, p._p2, xl);
+}
+#endif
 MMAG(mmag_q8, Q8W, MK_Q8) MMAG(mmag_q4, Q4W, MK_Q4)
 MMAD(mma_F8_E4M3, F8W, MK_F8) MMAG(mmag_F8_E4M3, F8W, MK_F8)
 MMAD(mma_NVFP4, NvfW, MK_NV) MMAG(mmag_NVFP4, NvfW, MK_NV)
@@ -3542,6 +3570,24 @@ impl MetalBackend {
             },
             (WeightRef::Gguf(g), _) => (pick(find(&m.gguf, g.kind)?, find(&m.gguf_s, g.kind)?), 64),
         })
+    }
+
+    /// The 128-token dense GEMM over hi + lo half inputs (`*_x2`, matrix units: bf16, Q8,
+    /// scaled FP8, NVFP4 and F16 weights; built on first use) and its outputs per threadgroup.
+    pub(crate) fn mma_pipe_x2(&self, w: &WeightRef, affine: bool, n_out: usize, n_in: usize) -> Option<(Id, usize)> {
+        let m = self.mma()?;
+        if !m.units || affine || !n_in.is_multiple_of(MMA_KB) || !n_out.is_multiple_of(64) {
+            return None;
+        }
+        let base = match w {
+            WeightRef::Bf16(_) => "mma_bf64".to_string(),
+            WeightRef::Q8(_) => "mma_q8".to_string(),
+            WeightRef::Gguf(g) if fp8_ok(g) && matches!(g.kind, GgmlType::F8E4M3 | GgmlType::NVFP4 | GgmlType::F16) => {
+                format!("mma_{}", g.kind.name())
+            }
+            _ => return None,
+        };
+        Some((self.named_pipeline(&format!("{base}_x2"))?, 64))
     }
 
     /// The gate / up pair GEMM pipelines with the GLU in their stores (`mmap_*`, matrix units

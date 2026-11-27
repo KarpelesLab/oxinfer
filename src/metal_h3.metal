@@ -128,6 +128,40 @@ kernel void h3_swiglu(device const float* gu [[buffer(0)]], device void* out [[b
 #undef H3_SW
 }
 
+// f32 rows of n to scaled half pairs: hi = half(x s), lo = half(x s - hi) (the same power of two
+// s per row, `rs` its inverse), so that hi + lo carries about 22 significant bits of each input
+// (lo's subnormals are 2^-24, 2^-39 of the row's largest value). 256 threads per row.
+kernel void h3_split_half(device const float* x [[buffer(0)]], device half* xh [[buffer(1)]], device half* xl [[buffer(2)]],
+                          device float* rs [[buffer(3)]], constant uint4& p [[buffer(4)]],
+                          uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    uint n4 = p.x / 4;
+    device const float4* row = (device const float4*)(x + (ulong)r * p.x);
+    float m = 0.f;
+    for (uint i = tid; i < n4; i += 256) { float4 v = abs(row[i]); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
+    m = dit_tg_max(m, sg, lane, red);
+    float sinv, s = dit_row_scale(m, sinv);
+    device half4* oh = (device half4*)(xh + (ulong)r * p.x);
+    device half4* ol = (device half4*)(xl + (ulong)r * p.x);
+    for (uint i = tid; i < n4; i += 256) {
+        float4 v = row[i] * s;
+        half4 h = half4(v);
+        oh[i] = h;
+        ol[i] = half4(v - float4(h));
+    }
+    if (tid == 0) rs[r] = sinv;
+}
+
+// y[r][c] *= s[c] over rows of n (`p.x`, a multiple of 4) `p.y` floats apart.
+kernel void h3_col_scale(device float* y [[buffer(0)]], device const float* s [[buffer(1)]], constant uint4& p [[buffer(2)]],
+                         uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    uint c = (tg.x * 256 + tid) * 4;
+    if (c >= p.x) return;
+    device float4* o = (device float4*)(y + (ulong)tg.y * p.y + c);
+    *o *= *(device const float4*)(s + c);
+}
+
 // ---- The H3 corrector (metal_h3.rs, crate::gpu::dit::CorrSession) ----
 // LayerNorm (weight w, bias b) of rows of n, then `* (1 + sc) + sh` with `has_mod` (one vector
 // for every row), into f32 rows of n or scaled half rows. 256 threads per row.

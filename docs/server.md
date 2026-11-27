@@ -122,7 +122,7 @@ found as the command line finds it (`OXINFER_H3_TEXT_ENCODER`, the release folde
 named with the `text_encoder` option (a folder, a Qwen3-VL-32B GGUF or ComfyUI's single file). Its
 model may also be ComfyUI's single-file transformer with the `vae` option (its image VAE file);
 `device` (`cpu`: the transformer and VAE decoder stay on the CPU with a GPU there) and
-`attention` (`split`, `half`, `f32`) are as for the video model ([video.md](video.md#minimax-h3-image-on-metal)).
+`attention` (`split`, `half`, `f32`) and `inputs` (`half`, `split`) are as for the video model ([video.md](video.md#minimax-h3-image-on-metal)).
 
 ### Video generation
 
@@ -174,8 +174,9 @@ folder's: paths, `org/name/file.safetensors` or repo ids), `quant` (the text enc
 `q8`), `lora` (`FILE[:SCALE]`, repeatable; a turbo LoRA sets the step count and the shifts),
 `shift`, `audio_shift`, `corrector` (Sulphur-3's) and its `corrector_*` settings, `device`
 (`cpu`: the transformer, its VAE decoder and the corrector stay on the CPU with a GPU there) and
-`attention` (the Metal transformer's attention operands: `split`, the default, `half` or `f32`;
-[video.md](video.md#on-metal)). In the library the pipeline is `minimax_h3::video::VideoPipeline`
+`attention` (the Metal transformer's attention operands: `split`, the default, `half` or `f32`)
+and `inputs` (its projections' inputs: `half`, the default, or `split`: hi + lo half pairs; with a
+LoRA the defaults are `f32` and `split`, [video.md](video.md#on-metal)). In the library the pipeline is `minimax_h3::video::VideoPipeline`
 (`VideoParams::cancel` stops it), the files `minimax_h3::encode`; in C `oxi_video_load`,
 `oxi_video_generate` and `oxi_video_free`.
 

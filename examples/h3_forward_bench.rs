@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! h3_forward_bench TRANSFORMER.safetensors DUMP_DIR [--lora FILE]... [--step I[,J...]] [--blocks N]
-//!     [--device cpu|cuda|metal] [--attention half|split|f32] [--write DIR] [--ref DIR]
+//!     [--device cpu|cuda|metal] [--attention half|split|f32] [--inputs half|split] [--write DIR]
+//!     [--ref DIR]
 //! ```
 //!
 //! `--step` names the forwards to run, one after the other (default 0).
@@ -96,7 +97,7 @@ fn main() -> Result<()> {
     }
     let dump = PathBuf::from(args.next().context("DUMP_DIR (or FILE.latents)")?);
     let (mut loras, mut steps, mut blocks, mut device) = (Vec::new(), vec![0usize], None, "cpu".to_string());
-    let (mut out, mut reference, mut attention) = (None, None, None);
+    let (mut out, mut reference, mut attention, mut inputs) = (None, None, None, None);
     while let Some(a) = args.next() {
         let mut v = || args.next().with_context(|| format!("{a} needs a value"));
         match a.as_str() {
@@ -105,6 +106,7 @@ fn main() -> Result<()> {
             "--blocks" => blocks = Some(v()?.parse::<usize>()?),
             "--device" => device = v()?,
             "--attention" => attention = Some(v()?),
+            "--inputs" => inputs = Some(v()?),
             "--write" => out = Some(PathBuf::from(v()?)),
             "--ref" => reference = Some(PathBuf::from(v()?)),
             _ => anyhow::bail!("unknown option {a}"),
@@ -127,7 +129,10 @@ fn main() -> Result<()> {
         dit.truncate_blocks(n);
     }
     if let Some(a) = &attention {
-        dit.gpu_attention = oxinfer::gpu::dit::AttnPrecision::parse(a).context("--attention: half, split or f32")?;
+        dit.gpu_attention = Some(oxinfer::gpu::dit::AttnPrecision::parse(a).context("--attention: half, split or f32")?);
+    }
+    if let Some(a) = &inputs {
+        dit.gpu_inputs = Some(oxinfer::gpu::dit::InputPrecision::parse(a).context("--inputs: half or split")?);
     }
     println!("[loaded in {:.1}s]", t0.elapsed().as_secs_f64());
     let h = dit.cfg.hidden;

@@ -1440,7 +1440,7 @@ fn load_image(ik: ImageKind, src: &str, opts: &[(&str, &str)], cache_dir: Option
                     crate::engine::resolve_model(v, cache_dir)
                 }
             };
-            let (mut te, mut vae, mut gpu, mut attention) = (None, None, true, None);
+            let (mut te, mut vae, mut gpu, mut attention, mut inputs) = (None, None, true, None, None);
             for (k, v) in opts {
                 match *k {
                     "text_encoder" => te = Some(part(v)?),
@@ -1450,7 +1450,10 @@ fn load_image(ik: ImageKind, src: &str, opts: &[(&str, &str)], cache_dir: Option
                         attention =
                             Some(crate::gpu::dit::AttnPrecision::parse(v).with_context(|| format!("{k}: {v:?} (half, split, f32)"))?)
                     }
-                    k => bail!("unknown MiniMax-H3-Image option {k:?} (text_encoder, vae, device, attention)"),
+                    "inputs" | "gpu_inputs" => {
+                        inputs = Some(crate::gpu::dit::InputPrecision::parse(v).with_context(|| format!("{k}: {v:?} (half, split)"))?)
+                    }
+                    k => bail!("unknown MiniMax-H3-Image option {k:?} (text_encoder, vae, device, attention, inputs)"),
                 }
             }
             let te = match te {
@@ -1465,8 +1468,11 @@ fn load_image(ik: ImageKind, src: &str, opts: &[(&str, &str)], cache_dir: Option
             };
             p.dit.gpu = gpu;
             p.vae.gpu = gpu;
-            if let Some(a) = attention {
-                p.dit.gpu_attention = a;
+            if attention.is_some() {
+                p.dit.gpu_attention = attention;
+            }
+            if inputs.is_some() {
+                p.dit.gpu_inputs = inputs;
             }
             ImageModel::H3Image(p)
         }

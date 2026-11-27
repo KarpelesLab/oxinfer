@@ -166,6 +166,8 @@ struct Args {
     h3_corrector_opts: Vec<(String, String)>,
     /// MiniMax-H3: the GPU attention's operands (`half`, `split`, `f32`).
     h3_attention: Option<String>,
+    /// MiniMax-H3: the GPU projections' inputs (`half`, `split`).
+    h3_inputs: Option<String>,
     /// MiniMax-H3: the motion / structure guidance fields by name (`still_prompt`, ...).
     h3_guidance: Vec<(String, String)>,
     mask: Option<PathBuf>,
@@ -534,7 +536,10 @@ fn usage() -> ! {
          \x20                      --corrector-budget F (0.5), --corrector-floor F (0.001),\n\
          \x20                      --corrector-start N (0), --corrector-end N (-1: the last step)\n\
          \x20 --attention MODE     the Metal transformer's attention operands: split (default:\n\
-         \x20                      queries and keys as half pairs), half or f32 (--device cpu: CPU)\n\
+         \x20                      queries and keys as half pairs; f32 with a --lora), half or f32\n\
+         \x20                      (--device cpu: CPU)\n\
+         \x20 --inputs MODE        the Metal transformer's projection inputs: half (default) or\n\
+         \x20                      split (hi + lo half pairs: two GEMMs; the default with a --lora)\n\
          \x20 --still-prompt TEXT  motion guidance (Sulphur-3's ComfyUI pack): the prompt's scene\n\
          \x20                      with every motion frozen; --motion-scale F (1), --stg-scale F (1),\n\
          \x20                      --stg-layers 20,21,22 (blocks bypassed for the structure term),\n\
@@ -825,6 +830,7 @@ fn parse_args() -> Result<Args> {
         h3_corrector: None,
         h3_corrector_opts: Vec::new(),
         h3_attention: None,
+        h3_inputs: None,
         h3_guidance: Vec::new(),
         transformer: None,
         qwen_image: Default::default(),
@@ -1108,6 +1114,7 @@ fn parse_args() -> Result<Args> {
             "--audio-vae" => a.audio_vae = Some(val()?),
             "--corrector" => a.h3_corrector = Some(val()?),
             "--attention" => a.h3_attention = Some(val()?),
+            "--inputs" => a.h3_inputs = Some(val()?),
             f @ ("--corrector-strength" | "--corrector-budget" | "--corrector-floor" | "--corrector-start" | "--corrector-end") => {
                 a.h3_corrector_opts.push((f[2..].replace('-', "_"), val()?))
             }
