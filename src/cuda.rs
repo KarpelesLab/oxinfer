@@ -645,7 +645,7 @@ struct GgKernels {
     pub(crate) gemmq: [*mut c_void; GEMMQ_TILES.len()],
     /// `gemmqp*_K`: the same over a gate / up pair of one format, writing act(gate) * up.
     pub(crate) gemmqp: [*mut c_void; GEMMQ_TILES.len()],
-    /// The format scales per 16 values (Q6_K).
+    /// The format scales per 16 values (Q6_K, Q3_K).
     pub(crate) k16: bool,
     /// `mvq_K` / `mvqp_K`: the int8 matvec and gate / up pair (Q4_K, Q6_K, Q8_0; null for the
     /// other formats) over x rounded by `dq8_x`.
@@ -672,7 +672,7 @@ impl GgKernels {
 
     /// Whether a plan with the int8 GEMM ([`gemm_i8`]) takes it for this format: every format
     /// with the kernels on a discrete card; on a unified-memory device not the formats with a
-    /// scale per 16 values (Q6_K: two 16-wide MMAs and twice the scaling a step), which
+    /// scale per 16 values (Q6_K, Q3_K: two 16-wide MMAs and twice the scaling a step), which
     /// the f16 GEMM runs faster there (measured on a GB10, docs/platforms.md, "The int8 prefill
     /// GEMM"; `OXINFER_CUDA_GEMM_I8=1` takes them too).
     pub(crate) fn i8(&self) -> bool {
@@ -873,6 +873,15 @@ pub(crate) fn ggml_tables_src() -> String {
         s.push_str("};\n");
     };
     arr("float", "kvalues_iq4nl", KVALUES_IQ4NL.iter().map(|v| format!("{v}.f")).collect());
+    // The same as bytes, four to a word (`gq_iq4` in `cuda_gemmq.cu`).
+    arr(
+        "unsigned int",
+        "kvalues_iq4nl_w",
+        KVALUES_IQ4NL
+            .chunks(4)
+            .map(|c| format!("{:#x}u", u32::from_le_bytes([c[0] as u8, c[1] as u8, c[2] as u8, c[3] as u8])))
+            .collect(),
+    );
     arr("float", "kvalues_mxfp4", KVALUES_MXFP4.iter().map(|v| format!("{v}.f")).collect());
     for (name, t) in [
         ("iq2xxs_grid", &IQ2XXS_GRID[..]),
@@ -1494,7 +1503,7 @@ impl CudaBackend {
                             .filter(|&f| unsafe { self.cu.cuFuncSetAttribute(f, 8, gemmq_shmem(bm, bn, ks) as c_int) == 0 })
                             .unwrap_or(std::ptr::null_mut())
                     }),
-                    k16: id == 14,
+                    k16: matches!(id, 11 | 14),
                     gemmqp: GEMMQ_TILES.map(|(sfx, bm, bn, _, ks, _)| {
                         get(format!("gemmqp{sfx}_{id}"))
                             .filter(|&f| unsafe { self.cu.cuFuncSetAttribute(f, 8, gemmq_shmem(bm, bn, ks) as c_int) == 0 })
@@ -4124,7 +4133,17 @@ mod tests {
         assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut fix, gemmq_fix_floats() * 4) }, 0);
         let words = vec![0u32; 1 + 2 * sms];
         let stw = be.upload_bytes(words.as_ptr() as *const u8, words.len() * 4).unwrap();
-        for kind in [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K, GgmlType::Q8_0] {
+        for kind in [
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+            GgmlType::Q8_0,
+            GgmlType::Q3_K,
+            GgmlType::IQ4_XS,
+            GgmlType::IQ4_NL,
+            GgmlType::IQ3_S,
+            GgmlType::IQ3_XXS,
+        ] {
             // (rows, outputs, inputs).
             for (t, n_out, n_in) in [(9usize, 200usize, 256usize), (64, 1100, 512), (100, 330, 768), (300, 520, 1024)] {
                 let bytes = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);

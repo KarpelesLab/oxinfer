@@ -1,11 +1,12 @@
 // The int8 prefill GEMM of the language models' plans (`gemmq*_K`, and `gemmqp*_K` over a gate /
-// up pair; appended to `inkling_cuda.cu` in the `GGML_ONLY` modules, for Q4_K, Q5_K, Q6_K and
-// Q8_0).
+// up pair; appended to `inkling_cuda.cu` in the `GGML_ONLY` modules, for the formats whose stored
+// values are 8-bit integers with a scale per 16 or 32: Q4_K, Q5_K, Q6_K, Q8_0, Q3_K, IQ4_XS,
+// IQ4_NL, IQ3_S, IQ3_XXS).
 //
 // Y[m][n] (+)= sum_k X[m][k] W[n][k] with X rounded to int8 per block of 32 as the decode plans'
 // int8 matvecs round it (`dq8_x`: q = round(x 127 / amax), per block d = amax / 127 and d sum q)
 // and the weights as the integers the format stores. A 32-wide K step is one
-// `mma.m16n8k32.s8` per 16 x 8 outputs (two `m16n8k16` for Q6_K, whose scales are per 16), and
+// `mma.m16n8k32.s8` per 16 x 8 outputs (two `m16n8k16` for the formats with a scale per 16), and
 // the step's integer sums are scaled in f32: sum += (float)C * d_x[m] * s_w[n], plus for the
 // formats with a minimum d_x sum_q[m] * min_w[n]. Against the f16 GEMM (`gemmh_K`) a step is half
 // the MMAs, an integer MMA with nothing carried in issues faster than an f16 one summing in f32,
@@ -33,12 +34,13 @@ struct GemmQ {
 
 template <int K>
 __device__ __forceinline__ constexpr bool has_gemmq() {
-    return K == K_Q4_K || K == K_Q5_K || K == K_Q6_K || K == K_Q8_0;
+    return K == K_Q4_K || K == K_Q5_K || K == K_Q6_K || K == K_Q8_0 || K == K_Q3_K || K == K_IQ4_XS || K == K_IQ4_NL || K == K_IQ3_S ||
+           K == K_IQ3_XXS;
 }
 // Formats with a scale per 16 values: two 16-wide MMAs a step.
 template <int K>
 __device__ __forceinline__ constexpr bool gq_k16() {
-    return K == K_Q6_K;
+    return K == K_Q6_K || K == K_Q3_K;
 }
 // Formats with a minimum per block.
 template <int K>
@@ -61,10 +63,55 @@ __device__ __forceinline__ void gq_ld16(const u8* p, u32* r) {
     for (int j = 0; j < 4; j++) r[j] = a[j];
     r[4] = *(const u16*)((const u8*)(a + 4) - (2 - odd));
 }
+// Four 4-bit indices (a byte each) as their four values of IQ4's table (`kvalues_iq4nl_w`: the
+// 16 values as 4 words): the low three bits select among 8 bytes, the fourth the half.
+__device__ __forceinline__ u32 gq_iq4(u32 idx) {
+    u32 t = (idx | (idx >> 4)) & 0x00ff00ffu, sel = (t | (t >> 8)) & 0xffffu;
+    u32 lo = __byte_perm(kvalues_iq4nl_w[0], kvalues_iq4nl_w[1], sel), hi = __byte_perm(kvalues_iq4nl_w[2], kvalues_iq4nl_w[3], sel);
+    u32 m = ((idx >> 3) & 0x01010101u) * 0xffu;
+    return (lo & ~m) | (hi & m);
+}
+// Four magnitudes (a byte each) negated where the bit of `s4` is set.
+__device__ __forceinline__ u32 gq_signs(u32 gw, u32 s4) {
+    u32 m = ((s4 * 0x00204081u) & 0x01010101u) * 0xffu;
+    return __vsub4(gw ^ m, m);
+}
 template <int K>
 __device__ __forceinline__ void gq_load(const u8* row, u32 b, u32 h, GqRaw& r) {
     u32 sub = b & 7;
-    if constexpr (K == K_Q4_K) {
+    if constexpr (K == K_Q3_K) {
+        const u8* B = row + 110 * (b >> 3);
+        const u8* pq = B + 32 + 32 * (sub >> 2) + 16 * h;
+        r.fs = 8 * ((u32)(u64)pq & 2);
+        gq_ld16(pq, r.a);
+        gq_ld16(B + 16 * h, r.c);
+        if (h == 0) {
+            r.hd.x = __float_as_uint(dqs<K>(row, b, 0).x);
+            r.hd.y = __float_as_uint(dqs<K>(row, b, 1).x);
+        }
+    } else if constexpr (K == K_IQ4_XS) {
+        // The block's 16 bytes: the low nibbles are its first 16 values, the high ones the rest.
+        const uint2* B = (const uint2*)(row + 136 * (b >> 3));
+        uint2 u0 = B[1 + 2 * sub], u1 = B[2 + 2 * sub];
+        r.a[0] = u0.x, r.a[1] = u0.y, r.a[2] = u1.x, r.a[3] = u1.y;
+        if (h == 0) r.hd.x = __float_as_uint(dqs<K>(row, b, 0).x);
+    } else if constexpr (K == K_IQ4_NL) {
+        const u8* B = row + 18 * b;
+        r.fs = 8 * ((u32)(u64)(B + 2) & 2);
+        gq_ld16(B + 2, r.a);
+        if (h == 0) r.hd.x = rd16(B);
+    } else if constexpr (K == K_IQ3_S) {
+        const u8* B = row + 110 * (b >> 3);
+        r.a[0] = rd32h(B + 2 + 8 * sub + 4 * h);
+        r.a[1] = B[66 + sub];
+        r.a[2] = rd16(B + 74 + 4 * sub + 2 * h);
+        if (h == 0) r.hd.x = __float_as_uint(dqs<K>(row, b, 0).x);
+    } else if constexpr (K == K_IQ3_XXS) {
+        const u8* B = row + 98 * (b >> 3);
+        r.a[0] = rd32h(B + 2 + 8 * sub + 4 * h);
+        r.a[1] = rd32h(B + 66 + 4 * sub);
+        if (h == 0) r.hd.x = __float_as_uint(dqs<K>(row, b, 0).x);
+    } else if constexpr (K == K_Q4_K) {
         const u8* B = row + 144 * (b >> 3);
         uint4 u = *(const uint4*)(B + 16 + 32 * (sub >> 1) + 16 * h);
         r.a[0] = u.x, r.a[1] = u.y, r.a[2] = u.z, r.a[3] = u.w;
@@ -98,7 +145,44 @@ __device__ __forceinline__ void gq_load(const u8* row, u32 b, u32 h, GqRaw& r) {
 template <int K>
 __device__ __forceinline__ void gq_unpack(u32 b, u32 h, const GqRaw& r, uint4& q, float2& s) {
     u32 sub = b & 7;
-    if constexpr (K == K_Q4_K || K == K_Q5_K) {
+    if constexpr (K == K_Q3_K) {
+        // Two bits and a bit of the mask a value: q - 4 without the bit.
+        u32 n = sub >> 2, jj = sub & 3;
+        u32 v[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            u32 u = __funnelshift_r(r.a[i], r.a[i + 1], r.fs) >> (2 * jj);
+            u32 hm = __funnelshift_r(r.c[i], r.c[i + 1], r.fs) >> (4 * n + jj);
+            v[i] = __vsub4((u & 0x03030303u) | ((hm & 0x01010101u) << 2), 0x04040404u);
+        }
+        q = make_uint4(v[0], v[1], v[2], v[3]);
+        if (h == 0) s = make_float2(__uint_as_float(r.hd.x), __uint_as_float(r.hd.y));
+    } else if constexpr (K == K_IQ4_XS || K == K_IQ4_NL) {
+        u32 v[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            u32 w = K == K_IQ4_NL ? __funnelshift_r(r.a[i], r.a[i + 1], r.fs) : r.a[i];
+            v[i] = gq_iq4((w >> (4 * h)) & 0x0f0f0f0fu);
+        }
+        q = make_uint4(v[0], v[1], v[2], v[3]);
+        if (h == 0) s = make_float2(K == K_IQ4_NL ? h2f((u16)r.hd.x) : __uint_as_float(r.hd.x), 0.f);
+    } else if constexpr (K == K_IQ3_S || K == K_IQ3_XXS) {
+        // Four grid entries of four magnitudes, a sign bit a value.
+        u32 v[4];
+#pragma unroll
+        for (int l = 0; l < 4; l++) {
+            u32 ix = (r.a[0] >> (8 * l)) & 255u;
+            if constexpr (K == K_IQ3_S) {
+                ix |= (r.a[1] << (8 - (4 * h + l))) & 256u;
+                v[l] = gq_signs(iq3s_grid[ix], (r.a[2] >> (4 * l)) & 15u);
+            } else {
+                u32 sg = ksign((r.a[1] >> (7 * (2 * h + (l >> 1)))) & 127u);
+                v[l] = gq_signs(iq3xxs_grid[ix], (sg >> (4 * (l & 1))) & 15u);
+            }
+        }
+        q = make_uint4(v[0], v[1], v[2], v[3]);
+        if (h == 0) s = make_float2(__uint_as_float(r.hd.x), 0.f);
+    } else if constexpr (K == K_Q4_K || K == K_Q5_K) {
         u32 sh = 4 * (sub & 1);
         u32 v[4];
 #pragma unroll
@@ -541,6 +625,21 @@ __device__ __forceinline__ void gemmg_body(const W& w, const W& w2, const GemmQ&
     GEMMQG(K, g, 64, 128, 256, 1, 4, 8)
 #ifdef HAS_8
 GEMMQ(8)
+#endif
+#ifdef HAS_11
+GEMMQ(11)
+#endif
+#ifdef HAS_18
+GEMMQ(18)
+#endif
+#ifdef HAS_20
+GEMMQ(20)
+#endif
+#ifdef HAS_21
+GEMMQ(21)
+#endif
+#ifdef HAS_23
+GEMMQ(23)
 #endif
 #ifdef HAS_12
 GEMMQ(12)
