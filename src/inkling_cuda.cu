@@ -1988,8 +1988,8 @@ template <int K, int BM, int BN, int NTH = 256>
 __device__ __forceinline__ void gemmh_seg(const W& w, const GemmH& p, u32 m0, u32 n0, u32 kb0, u32 kb1, float* fix) {
     // NTH / 32 warps, 4 along the outputs; each warp RPW rows x BN / 4 outputs.
     // NTH / 32 warps, WNW along the outputs (2 for the 256-row tile on 8 warps: 64 x 64 warp
-    // tiles, fewer fragment loads per MMA), else 4.
-    constexpr int WNW = NTH == 256 && BM == 256 ? 2 : 4, WMW = NTH / 32 / WNW, RPW = BM / WMW, RP = NTH / 4;
+    // tiles, fewer fragment loads per MMA; 1 for the 512 x 64 tile, the same warp tiles), else 4.
+    constexpr int WNW = BM == 512 ? 1 : NTH == 256 && BM == 256 ? 2 : 4, WMW = NTH / 32 / WNW, RPW = BM / WMW, RP = NTH / 4;
     constexpr int MT = RPW / 16, NT = BN / (8 * WNW); // 16-row and 8-column MMA tiles per warp
     auto& sm = gh_smem<BM, BN>();
     auto& As = sm.A;
@@ -2154,21 +2154,24 @@ __device__ __forceinline__ void gemmh_body(const W& w, const GemmH& p) {
 // a part of a tile that a block took from a later step on (only its first: the others start at
 // step 0) goes to `fix` (BM x BN floats per block), which `gemmhk_fix` adds in after, in the
 // blocks' order: the results do not depend on timing.
-__device__ __forceinline__ void hk_range(const GemmH& p, u32 g, u32 G, u32 bm, u64& k0, u64& k1) {
-    u64 tiles = (u64)((p.n_out + 127) / 128) * ((p.rows + bm - 1) / bm), W = tiles * (p.n_in / 32);
+__device__ __forceinline__ void hk_range(const GemmH& p, u32 g, u32 G, u32 bm, u32 bn, u64& k0, u64& k1) {
+    u64 tiles = (u64)((p.n_out + bn - 1) / bn) * ((p.rows + bm - 1) / bm), W = tiles * (p.n_in / 32);
     k0 = W * g / G;
     k1 = W * (g + 1) / G;
 }
-template <int K, int BM, int NTH>
+// BM x BN tiles: 128 x 128, 256 x 128, and 512 x 64 (`gemmhk5_K`: a step of up to 512 rows
+// unpacks each weight once, where the 256-row tiles unpack it twice; the activations' tile is
+// then read for every 64 outputs).
+template <int K, int BM, int NTH, int BN = 128>
 __device__ __forceinline__ void gemmhk_body(const W& w, const GemmH& p, float* fix) {
     u32 nb = p.n_in / 32, ntm = (p.rows + BM - 1) / BM;
     u64 k0, k1;
-    hk_range(p, blockIdx.x, gridDim.x, BM, k0, k1);
+    hk_range(p, blockIdx.x, gridDim.x, BM, BN, k0, k1);
     while (k0 < k1) {
         u32 tile = (u32)(k0 / nb), kb0 = (u32)(k0 % nb);
         u32 kb1 = (u32)min((u64)nb, kb0 + (k1 - k0));
-        u32 m0 = (tile % ntm) * BM, n0 = (tile / ntm) * 128;
-        gemmh_seg<K, BM, 128, NTH>(w, p, m0, n0, kb0, kb1, kb0 ? fix + (u64)blockIdx.x * BM * 128 : nullptr);
+        u32 m0 = (tile % ntm) * BM, n0 = (tile / ntm) * BN;
+        gemmh_seg<K, BM, BN, NTH>(w, p, m0, n0, kb0, kb1, kb0 ? fix + (u64)blockIdx.x * BM * BN : nullptr);
         k0 += kb1 - kb0;
     }
 }
@@ -2439,6 +2442,7 @@ __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
     extern "C" __global__ void __launch_bounds__(256, 3) gemmhs_##K(W w, GemmH p) { gemmh_body<K, 64, 64>(w, p); }                 \
     extern "C" __global__ void __launch_bounds__(256, 2) gemmhk_##K(W w, GemmH p, float* fix) { gemmhk_body<K, 128, 256>(w, p, fix); } \
     extern "C" __global__ void __launch_bounds__(256, 1) gemmhk2_##K(W w, GemmH p, float* fix) { gemmhk_body<K, 256, 256>(w, p, fix); } \
+    extern "C" __global__ void __launch_bounds__(256, 1) gemmhk5_##K(W w, GemmH p, float* fix) { gemmhk_body<K, 512, 256, 64>(w, p, fix); } \
     extern "C" __global__ void __launch_bounds__(256)                                                                                      \
         mvq_##K(W w, const u8* xq, const float2* xd, float* y, u32 n_in, u32 n_out, u32 ys, u32 mode) {                                  \
         mvq_body<K, false>(w, w, xq, xd, y, n_in, n_out, ys, mode, blockIdx.x);                                                            \
@@ -2464,32 +2468,32 @@ __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
                                                                 u32 nt) {                                                                 \
         mvq3t_body<K>(w0, w1, w2, xq, xd, y0, y1, y2, n_in, n0, n1, n2, ys0, ys1, ys2, nt);                                              \
     }
-// The stream-K GEMM's second pass (grid (blocks of `gemmhk`, bm / 8), `fix` as its, bm its
-// tile's rows): a block whose share ends inside a tile it began adds, to 8 rows of the tile
+// The stream-K GEMM's second pass (grid (blocks of `gemmhk`, bm bn / 1024), `fix` as its, bm x bn
+// its tile): a block whose share ends inside a tile it began adds, to 1024 outputs of the tile
 // (blockIdx.y), the parts of it that the next blocks took, summed in their order.
-extern "C" __global__ void __launch_bounds__(256) gemmhk_fix(GemmH p, const float* fix, u32 bm) {
+extern "C" __global__ void __launch_bounds__(256) gemmhk_fix(GemmH p, const float* fix, u32 bm, u32 bn) {
     u32 g = blockIdx.x, G = gridDim.x, nb = p.n_in / 32, ntm = (p.rows + bm - 1) / bm;
     u64 k0, k1;
-    hk_range(p, g, G, bm, k0, k1);
+    hk_range(p, g, G, bm, bn, k0, k1);
     if (k1 <= k0 || k1 % nb == 0) return;
     u64 tile = (k1 - 1) / nb, end = (tile + 1) * nb;
     if (tile * nb < k0) return; // the block took this tile from a later step: not its owner
-    u32 m0 = (u32)(tile % ntm) * bm, n0 = (u32)(tile / ntm) * 128;
+    u32 m0 = (u32)(tile % ntm) * bm, n0 = (u32)(tile / ntm) * bn;
     u32 i = blockIdx.y * 1024 + 4 * threadIdx.x; // 4 outputs of a row
     float4 sum = make_float4(0.f, 0.f, 0.f, 0.f);
     for (u32 h = g + 1; h < G; h++) {
         u64 h0, h1;
-        hk_range(p, h, G, bm, h0, h1);
+        hk_range(p, h, G, bm, bn, h0, h1);
         if (h0 >= end) break;
         if (h1 <= h0) continue;
-        float4 f = *(const float4*)(fix + (u64)h * bm * 128 + i);
+        float4 f = *(const float4*)(fix + (u64)h * bm * bn + i);
         sum.x += f.x;
         sum.y += f.y;
         sum.z += f.z;
         sum.w += f.w;
         if (h1 >= end) break;
     }
-    u32 rr = m0 + i / 128, cc = n0 + i % 128;
+    u32 rr = m0 + i / bn, cc = n0 + i % bn;
     if (rr >= p.rows) return;
     float* o = p.y + (u64)rr * p.ys + cc;
     const float v[4] = {sum.x, sum.y, sum.z, sum.w};

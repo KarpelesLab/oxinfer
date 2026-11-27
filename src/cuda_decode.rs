@@ -2370,10 +2370,10 @@ impl CudaPlan<'_> {
                                 256,
                                 &mut args![xa, n_in, xs, xh, flag],
                             ))
-                            && if let Some((f, g, threads, bm, shm)) = super::gemmh_stream_k(&k, n_out, tt, n_in) {
+                            && if let Some((f, g, threads, bm, bn, shm)) = super::gemmh_stream_k(&k, n_out, tt, n_in, w.rb) {
                                 let fix = pf.fix;
                                 be.launch_shm(f, (g, 1, 1), threads, shm, &mut args![w, p, fix])
-                                    && be.launch(k.gemmhk_fix, (g, bm / 8), 256, &mut args![p, fix, bm])
+                                    && be.launch(k.gemmhk_fix, (g, bm * bn / 1024), 256, &mut args![p, fix, bm, bn])
                             } else {
                                 let (f, bm, bn) = super::gemmh_tile(&k, n_out, tt);
                                 be.launch(f, (n_out.div_ceil(bn), tt.div_ceil(bm)), 256, &mut args![w, p])
