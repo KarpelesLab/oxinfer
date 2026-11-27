@@ -133,6 +133,14 @@ fn gemm_i8_env() -> Option<bool> {
     *ON.get_or_init(|| std::env::var("OXINFER_CUDA_GEMM_I8").ok().map(|v| v != "0"))
 }
 
+/// Whether a prefill plan with the int8 GEMM runs a gate / up pair of one format as one launch
+/// (`gemmqp_K`: both products over one tile of activations, then the activation), not as two
+/// GEMMs and a pass over their outputs. `OXINFER_CUDA_GEMM_PAIR=0`: never.
+pub(crate) fn gemm_pair() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OXINFER_CUDA_GEMM_PAIR").map_or(true, |v| v != "0"))
+}
+
 /// The int8 GEMM's tiles (`GEMMQ` in `cuda_gemmq.cu`): kernel suffix, rows, outputs, threads,
 /// 32-wide steps per group (0: a step at a time, two stages), blocks per SM.
 pub(crate) const GEMMQ_TILES: [(&str, u32, u32, u32, u32, u32); 3] =
@@ -5058,7 +5066,7 @@ mod tests {
                 "fast prefill plan: {what} differ by {worst:.2e} (largest value {scale:.2e})"
             );
         }
-        // The int8 GEMM: to x's rounding to int8
+        // The int8 GEMM (and the gate / up pair in one launch of it): to x's rounding to int8
         // of the f32 steps, as the int8 matvecs' steps are, and of those (the same rounding of
         // the same x until the sums' order moves a value across a step). The recurrent states
         // are the furthest: 2.2% of their largest value from the int8 matvecs' on an RTX 5080,

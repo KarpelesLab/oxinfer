@@ -1207,8 +1207,12 @@ impl CudaBackend {
                                 (LinMode::Add, None) => mv(k, wg, byte(y), 1),
                                 (LinMode::SiluPair | LinMode::GeluPair, Some((w2, d2))) => {
                                     let (k2, wg2) = as_gg(w2, &d2.downcast_ref::<CudaWeightBox>()?.0)??;
-                                    // One format: one launch for both and the activation.
-                                    if !pf && k.mvp == k2.mvp {
+                                    // One format: one launch for both and the activation (a
+                                    // prefill plan's int8 GEMM over the pair, `gemmqp_K`).
+                                    if k.mvp == k2.mvp && (!pf || (gemm_i8 && super::gemm_pair() && k.i8())) {
+                                        if pf {
+                                            gemm_in_max = gemm_in_max.max(n_in);
+                                        }
                                         ops.push(COp::Gmv {
                                             k,
                                             w: wg,
@@ -2447,6 +2451,18 @@ impl CudaPlan<'_> {
         let tt = t as u32;
         let st = |p: P| (p.ts / 4) as u32;
         Some(match *op {
+            // A gate / up pair of one format: both products and the activation in one launch of
+            // the int8 GEMM (plans with it only: `build_plan_mode`).
+            COp::Gmv {
+                k,
+                w,
+                w2: Some(w2),
+                x,
+                y,
+                n_out,
+                n_in,
+                mode,
+            } if t >= PF_GEMM_MIN && pf.qst != 0 => self.launch_gemmq(pf, &k, w, Some(w2), x, y, n_out, n_in, mode, tt)?,
             COp::Gmv {
                 k,
                 w,
