@@ -20,9 +20,10 @@
 //! per ggml format: [`COp::Gmv`]); a gate / up pair of one format is one matvec with the activation
 //! (`mvp_K`; two matvecs and the activation otherwise, and in prefill plans).
 //!
-//! Prefill plans (`Backend::decode_plan_prefill`: GGUF weights, and bf16 matrices read as the
-//! ggml BF16 format) are multi-token plans of up
-//! to 512 tokens whose matvecs run as tensor-core GEMMs over the stored blocks (`gemmi_K`) and
+//! Prefill plans (`Backend::decode_plan_prefill`: GGUF weights, bf16 matrices read as the
+//! ggml BF16 format, and in fast plans Q8 and Q4 ones through `CudaBackend::quant_wg`, when
+//! every op of their graph has a kernel over a step's tokens) are multi-token plans of up
+//! to 512 tokens (1024 for small graphs on a unified-memory device) whose matvecs run as tensor-core GEMMs over the stored blocks (`gemmi_K`) and
 //! whose other ops take every token of the step in one launch (`*_t` kernels: the Gated DeltaNet
 //! conv and rule loop over the tokens on the device; attention in batches of 32 tokens); ops
 //! without such a kernel run token by token, as in the other multi-token plans.
@@ -49,6 +50,15 @@ const MAX_TOKENS: usize = 16;
 /// arena keeps every activation of a step (about 0.4 MB per token for Qwen3.8-27B).
 const PF_MAX_TOKENS: usize = 2048;
 const PF_TOKENS: usize = 512;
+/// On a unified-memory device, the step of a graph whose activations take at most
+/// [`PF_WIDE_FLOATS`] floats per token (`OXINFER_GPU_PLAN_DEBUG=1` prints the figure:
+/// Llama-3.2-1B 29706, Qwen3.5-0.8B 35879, Qwen3.5-9B 79943, Qwen3.8-27B 109671): fewer steps
+/// for the smaller models, whose steps' fixed costs count. Measured on a DGX Spark against
+/// 512-token steps (docs/platforms.md, "Prompts on the GB10"); the 27B was level to 4% slower
+/// with 1024 and stays at 512. Discrete cards keep 512 (not measured there, and their memory is
+/// the model's).
+const PF_TOKENS_WIDE: usize = 1024;
+const PF_WIDE_FLOATS: usize = 100_000;
 /// Tokens per attention launch of a prefill plan (the split partials are kept per token).
 const PF_ATTN: usize = 32;
 /// Prefill plans take the GEMM from this many tokens on (a matvec per token below).
@@ -906,16 +916,24 @@ impl CudaBackend {
     }
 
     /// Compiles `g` as a prefill plan (`Backend::decode_plan_prefill`): steps of up to
-    /// `OXINFER_CUDA_PREFILL_TOKENS` tokens (default 512, at most `tokens`), the matmuls as
-    /// tensor-core GEMMs over the stored GGUF blocks and every other op over all the step's
-    /// tokens in one launch (attention in batches); bf16 matrices go through the ggml BF16
-    /// kernels. Graphs with weights in other formats (oxinfer's Q8 / Q4) are declined (their
-    /// prompts keep the op-by-op path).
+    /// `OXINFER_CUDA_PREFILL_TOKENS` tokens (default 512, or [`PF_TOKENS_WIDE`]; at most
+    /// `tokens`), the matmuls as tensor-core GEMMs over the stored GGUF blocks and every other
+    /// op over all the step's tokens in one launch (attention in batches); bf16 matrices go
+    /// through the ggml BF16 kernels, Q8 and Q4 ones (fast plans only) through `K_OQ8` /
+    /// `K_OQ4`. Graphs with affine Q4 weights are declined (their prompts keep the op-by-op
+    /// path).
     pub(super) fn build_plan_pf(&self, g: &Graph, tokens: usize) -> Option<CudaPlan<'_>> {
         let n = std::env::var("OXINFER_CUDA_PREFILL_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(PF_TOKENS);
+            .unwrap_or_else(|| {
+                let floats: usize = g.bufs.iter().sum();
+                if super::integrated() && floats <= PF_WIDE_FLOATS {
+                    PF_TOKENS_WIDE
+                } else {
+                    PF_TOKENS
+                }
+            });
         self.build_plan_mode(g, tokens.min(n).clamp(2, PF_MAX_TOKENS), true)
     }
 
@@ -1721,8 +1739,9 @@ impl CudaBackend {
             let (mut free, mut all) = (0usize, 0usize);
             unsafe { self.cu.cuMemGetInfo_v2(&mut free, &mut all) };
             debug(&format!(
-                "plan of {tokens} token(s){}: arena {} MB, {} of {} MB of VRAM free",
+                "plan of {tokens} token(s){}: {} floats a token, arena {} MB, {} of {} MB of VRAM free",
                 if pf { " (prefill)" } else { "" },
+                g.bufs.iter().sum::<usize>(),
                 total >> 20,
                 super::usable_free(free, all) >> 20,
                 all >> 20
