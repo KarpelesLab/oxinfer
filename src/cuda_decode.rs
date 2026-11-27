@@ -304,6 +304,9 @@ enum COp {
         kc: u32,
         /// Multi-token plans: where the inputs are kept for a replay (consecutive rows).
         save: P,
+        /// Prefill plans: every token of the step at once (`dgdn_conv_p`), when the output
+        /// shares no buffer with the input.
+        par: bool,
     },
     GdnRule {
         f: F,
@@ -599,6 +602,8 @@ struct PfFuncs {
     qk: F,
     combine: F,
     conv: F,
+    conv_p: F,
+    conv_st: F,
     rule: F,
     rule1k: F,
     /// The split rule's per-token kernels and scratch (address, floats per token).
@@ -1371,6 +1376,7 @@ impl CudaBackend {
                             dim: dim as u32,
                             kc: kc as u32,
                             save: if mt && !pf { save(dim) } else { P::default() },
+                            par: pf && x.buf != out.buf && std::env::var("OXINFER_CUDA_GDN_CONV").map_or(true, |v| v != "0"),
                         });
                     }
                     Op::GdnRule(ref r) => {
@@ -1766,6 +1772,8 @@ impl CudaBackend {
                     qk: self.func("dqk_rope_t")?,
                     combine: self.func("dattn_combine_t")?,
                     conv: self.func("dgdn_conv_t")?,
+                    conv_p: self.func("dgdn_conv_p")?,
+                    conv_st: self.func("dgdn_conv_st")?,
                     rule: self.func("dgdn_rule_t")?,
                     rule1k: self.func("dgdn_rule_t1k")?,
                     rule_qk: self.func("dgdn_qk_t")?,
@@ -2387,10 +2395,22 @@ impl CudaPlan<'_> {
                 })
             }
             COp::GdnConv {
-                x, out, state, w, dim, kc, ..
+                x,
+                out,
+                state,
+                w,
+                dim,
+                kc,
+                par,
+                ..
             } => {
                 let (xa, oa, sa, w, xs, os) = (x.a, out.a, slot.states[state].0, w.a, st(x), st(out));
-                be.launch(pf.conv, (dim.div_ceil(256), 1), 256, &mut args![xa, oa, sa, w, dim, kc, tt, xs, os])
+                if par {
+                    be.launch(pf.conv_p, (dim.div_ceil(256), tt), 256, &mut args![xa, oa, sa, w, dim, kc, xs, os])
+                        && be.launch(pf.conv_st, (dim.div_ceil(256), 1), 256, &mut args![xa, sa, dim, kc, tt, xs])
+                } else {
+                    be.launch(pf.conv, (dim.div_ceil(256), 1), 256, &mut args![xa, oa, sa, w, dim, kc, tt, xs, os])
+                }
             }
             COp::GdnRule {
                 c,

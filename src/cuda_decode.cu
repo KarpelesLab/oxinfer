@@ -898,6 +898,31 @@ extern "C" __global__ void dgdn_conv_t(const float* x, float* out, float* st, co
     for (unsigned int j = 0; j + 1 < kc; j++) st[j * dim + ch] = h[j];
 }
 
+// `dgdn_conv_t` with a block row per token (grid (dim / 256, nt)): a token's output takes the kc - 1
+// inputs before it (from the state for the step's first tokens) and its own, in dgdn_conv's
+// order, so the tokens need not run in turn. `out` must not share memory with `x`; the state is
+// left as it was (`dgdn_conv_st` then moves it on).
+extern "C" __global__ void dgdn_conv_p(const float* x, float* out, const float* st, const float* w, unsigned int dim, unsigned int kc,
+                                       unsigned int xs, unsigned int os) {
+    unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= dim) return;
+    size_t t = blockIdx.y;
+    float s = 0.f;
+    for (unsigned int j = 0; j + 1 < kc; j++) {
+        float h = t + j >= kc - 1 ? x[(t + j - (kc - 1)) * xs + ch] : st[(t + j) * dim + ch];
+        s += w[ch * kc + j] * h;
+    }
+    s += w[ch * kc + kc - 1] * x[t * xs + ch];
+    out[t * os + ch] = s / (1.0f + expf(-s));
+}
+// The conv state after nt tokens: the last kc - 1 inputs (the state's own rows where nt < kc - 1).
+extern "C" __global__ void dgdn_conv_st(const float* x, float* st, unsigned int dim, unsigned int kc, unsigned int nt, unsigned int xs) {
+    unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= dim) return;
+    for (unsigned int j = 0; j + 1 < kc; j++)
+        st[j * dim + ch] = nt + j >= kc - 1 ? x[(size_t)(nt + j - (kc - 1)) * xs + ch] : st[(nt + j) * dim + ch];
+}
+
 // `dgdn_rule` over nt tokens in order: the state stays in the threads' registers between tokens
 // (read once before the first, written once after the last).
 __device__ __forceinline__ void dgdn_rule_t_body(const float* c, const float* z, const float* b, const float* a, float* out,
