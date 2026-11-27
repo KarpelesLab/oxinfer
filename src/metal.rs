@@ -2375,7 +2375,7 @@ impl MetalBackend {
             gguf_shader_tables(),
             decode::shader_src(),
             dit::SRC
-        );
+        ) + dit::LTX_SRC;
         let compile = |src: &str, metal4: bool| -> Result<Id> {
             let src = CString::new(src)?;
             let ns_src = unsafe { msg_str(nsstring_cls, o.sel(c"stringWithUTF8String:"), src.as_ptr()) };
@@ -4237,6 +4237,10 @@ impl Backend for MetalBackend {
 
     fn flux_session(&'static self) -> Option<Box<dyn crate::gpu::dit::FluxSession>> {
         self.flux_session_impl()
+    }
+
+    fn ltx_session(&'static self) -> Option<Box<dyn crate::gpu::dit::LtxSession>> {
+        self.ltx_session_impl()
     }
 
     fn t5_session(&'static self) -> Option<Box<dyn crate::gpu::dit::T5Session>> {

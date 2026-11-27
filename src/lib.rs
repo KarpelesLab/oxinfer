@@ -94,6 +94,7 @@ pub mod longcat_avatar;
 pub mod longcat_chat;
 pub mod lookup;
 pub mod lora;
+pub mod ltx;
 #[cfg(feature = "media")]
 pub mod media;
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]

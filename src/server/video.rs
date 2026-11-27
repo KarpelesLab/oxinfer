@@ -62,9 +62,10 @@ struct State {
     started: Option<Instant>,
     finished: Option<Instant>,
     completed_at: Option<u64>,
-    /// The canvas and frame count, once known.
+    /// The canvas, frame count and rate, once known.
     size: Option<(usize, usize)>,
     frames: Option<usize>,
+    fps: Option<f64>,
     has_audio: bool,
     files: Files,
 }
@@ -89,7 +90,8 @@ impl Job {
     pub fn to_json(&self) -> Value {
         let s = lock(&self.st);
         let size = s.size.or(self.requested_size).map(|(w, h)| format!("{w}x{h}"));
-        let seconds = s.frames.map_or(self.seconds, |f| f as f64 / crate::minimax_h3::video::FPS as f64);
+        let fps = s.fps.unwrap_or(crate::minimax_h3::video::FPS as f64);
+        let seconds = s.frames.map_or(self.seconds, |f| f as f64 / fps);
         let elapsed = s
             .started
             .map(|t| s.finished.unwrap_or_else(Instant::now).duration_since(t).as_secs_f64());
@@ -112,7 +114,7 @@ impl Job {
             "step": s.step,
             "steps": s.steps,
             "frames": s.frames,
-            "fps": crate::minimax_h3::video::FPS,
+            "fps": fps,
             "has_audio": s.has_audio,
             "download": s.download,
             "elapsed": elapsed.map(|e| (e * 10.0).round() / 10.0),
@@ -203,6 +205,9 @@ struct Request {
     first: Option<std::path::PathBuf>,
     last: Option<std::path::PathBuf>,
     refs: Vec<std::path::PathBuf>,
+    /// Every field of the request (LTX-2.5 reads its own: `fps`, `one_stage`,
+    /// `temporal_upscale`, `audio`, `eta`, `sigmas`, `stage2_sigmas`, `noise`, `strength`).
+    fields: Value,
     temp: TempFiles,
 }
 
@@ -339,6 +344,7 @@ impl Request {
             first,
             last,
             refs,
+            fields,
             temp,
         })
     }
@@ -387,6 +393,7 @@ pub(super) fn create(api: &Arc<Api>, req: &ApiRequest) -> ApiResult<Output> {
             completed_at: None,
             size: None,
             frames: None,
+            fps: None,
             has_audio: false,
             files: Files::default(),
         }),
@@ -473,6 +480,13 @@ fn run(api: &Api, j: &Job, r: Request) -> ApiResult<()> {
         return Err(ApiError::new(499, "cancelled"));
     }
     let Loaded::Video(m) = lease.model() else { unreachable!() };
+    if let Some(l) = &m.ltx {
+        let video = run_ltx(j, &r, l)?;
+        drop(lease);
+        drop(r.temp);
+        return finish(j, video, r.format);
+    }
+    let Some(pipe) = &m.pipe else { unreachable!() };
     j.set(|s| {
         s.status = "in_progress";
         s.stage = "generating";
@@ -505,7 +519,6 @@ fn run(api: &Api, j: &Job, r: Request) -> ApiResult<()> {
     if let Some(f) = &r.last {
         p.last = Some(load_image(f)?);
     }
-    let pipe = &m.pipe;
     let (h, w, frames, _) = pipe.geometry(&p).map_err(bad)?;
     j.set(|s| {
         s.size = Some((w, h));
@@ -559,6 +572,82 @@ fn run(api: &Api, j: &Job, r: Request) -> ApiResult<()> {
     };
     drop(lease);
     drop(r.temp);
+    finish(j, video, r.format)
+}
+
+/// An LTX-2.5 job: the request's fields as [`crate::ltx::api::params_from_json`] reads them.
+fn run_ltx(j: &Job, r: &Request, pipe: &crate::ltx::Pipeline) -> ApiResult<crate::minimax_h3::video::Video> {
+    let cancelled = || j.cancel.load(Ordering::Relaxed);
+    let bad = |e: anyhow::Error| ApiError::bad(format!("{e:#}"));
+    let mut o = r.fields.clone();
+    o["prompt"] = Value::String(r.prompt.clone());
+    if let Some((w, h)) = r.size {
+        o["size"] = Value::String(format!("{w}x{h}"));
+    }
+    let mut p = crate::ltx::api::params_from_json(&o).map_err(bad)?;
+    if let Some(f) = r.frames {
+        p.frames = Some(f);
+    } else if let Some(sec) = r.seconds {
+        p.frames = Some((sec * p.fps as f64).round().max(1.0) as usize);
+    }
+    p.seed = r.seed.unwrap_or_else(super::media::random_seed);
+    p.cancel = Some(j.cancel.clone());
+    let mut imgs = Vec::new();
+    if let Some(f) = &r.first {
+        imgs.push((f.clone(), Some(0), p.images.first().map_or(1.0, |i| i.strength)));
+    }
+    if let Some(f) = &r.last {
+        imgs.push((f.clone(), None, 1.0));
+    }
+    #[cfg(feature = "media")]
+    let load = |f: &std::path::Path| crate::minimax_h3::encode::load_image(f);
+    #[cfg(not(feature = "media"))]
+    let load = |_: &std::path::Path| -> anyhow::Result<crate::sd::Image> {
+        anyhow::bail!("built without the `media` feature: images cannot be decoded")
+    };
+    crate::ltx::api::add_images(&mut p, imgs, &load).map_err(bad)?;
+    j.set(|s| {
+        s.status = "in_progress";
+        s.stage = "generating";
+        s.started = Some(Instant::now());
+        s.download = None;
+        s.progress = 2.0;
+        s.size = Some((p.width, p.height));
+        s.fps = Some(p.fps as f64);
+    });
+    // Progress: the text encoder, then the stages' steps (2 to 90 %), then the decoders.
+    let mut progress = |stage: &str, i: usize, n: usize| {
+        j.set(|s| {
+            let (lo, hi) = match stage {
+                "stage 1" => (2.0, 60.0),
+                "stage 2" => (60.0, 85.0),
+                "temporal" => (85.0, 90.0),
+                _ => (90.0, 95.0),
+            };
+            s.step = i;
+            s.steps = n;
+            s.stage = if stage == "vae" { "decoding" } else { "generating" };
+            s.progress = lo + (hi - lo) * i as f64 / n.max(1) as f64;
+        })
+    };
+    let video = pipe.generate(&p, &mut progress).map_err(|e| {
+        if cancelled() {
+            ApiError::new(499, "cancelled")
+        } else {
+            ApiError::internal(e)
+        }
+    })?;
+    j.set(|s| {
+        s.size = Some((video.width, video.height));
+        s.frames = Some(video.frames.len());
+        s.fps = Some(video.fps as f64);
+    });
+    Ok(video)
+}
+
+/// The job's files from its video.
+fn finish(j: &Job, video: crate::minimax_h3::video::Video, format: crate::minimax_h3::video::VideoFormat) -> ApiResult<()> {
+    let _ = format;
     j.set(|s| {
         s.stage = "encoding";
         s.progress = 95.0;
@@ -571,7 +660,7 @@ fn run(api: &Api, j: &Job, r: Request) -> ApiResult<()> {
     };
     #[cfg(feature = "media")]
     {
-        let f = r.format;
+        let f = format;
         let bytes = crate::minimax_h3::encode::encode_video(&video, f).map_err(ApiError::internal)?;
         files.video = Some((bytes, f.mime()));
     }

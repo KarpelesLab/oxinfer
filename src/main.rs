@@ -36,6 +36,7 @@ mod intervene_cli;
 mod janus_cli;
 mod lfm3_omni_cli;
 mod longcat_avatar_cli;
+mod ltx_cli;
 mod minimax_h3_cli;
 mod minimax_h3_video_cli;
 mod models_cli;
@@ -243,6 +244,8 @@ struct Args {
     moss: moss_image_cli::MossArgs,
     // LongCat-Video-Avatar.
     avatar: longcat_avatar_cli::AvatarArgs,
+    // LTX-2.5.
+    ltx: ltx_cli::LtxArgs,
     // Stable Diffusion 3 / 3.5.
     sd3: sd3_cli::Sd3Args,
     // BAGEL.
@@ -452,6 +455,21 @@ fn usage() -> ! {
          \x20 --mix-steps N, --mix-alpha F   DMD LoRA share of the first N of the 8 steps (default 4, 1)\n\
          \x20 --no-distill         the base model alone: --steps, --guidance, --audio-guidance (default 50, 4, 4)\n\
          \x20 --audio-mode para|add, --ref-index N, --mask-frames N, --avatar-base DIR\n\
+         \n\
+         LTX-2.5 (Lightricks/LTX-2.5, fetched from its public mirror comfyicu/LTX-2.5; a local folder\n\
+         or transformer file; see docs/ltx.md): text / image to video with a 48 kHz stereo soundtrack\n\
+         (-p, -o, --size WxH (multiples of 64; 32 with --one-stage), --seed, --lora as above):\n\
+         \x20 --frames N           rounded down to 8 k + 1 (default: the duration head's prediction)\n\
+         \x20 --fps F              frame rate (default 24); --no-audio skips the soundtrack\n\
+         \x20 --init-image FILE    the first frame (--strength F, default 1); --last-image FILE the last;\n\
+         \x20                      --image FILE@FRAME[:S] a guide image at FRAME (repeatable)\n\
+         \x20 --one-stage          the distilled schedule at the full size (no spatial upsampler)\n\
+         \x20 --temporal-upscale   twice the frames and rate after the last stage\n\
+         \x20 --transformer int8|bf16|nvfp4|dev|dev-bf16|FILE   the transformer (default int8)\n\
+         \x20 --distilled-lora     the release's distilled LoRA on the dev transformer\n\
+         \x20 --text-encoder FILE, --vae FILE, --audio-vae FILE, --upsampler FILE, --duration-head FILE\n\
+         \x20 --sigmas a,b,..,0, --stage2-sigmas a,..,0, --eta F (ancestral noise, default 1), --noise torch\n\
+         \x20 --exact-attention    the GPU's video attention on float32 operands (else half)\n\
          \n\
          MOSS-Image (lodestones/Kromoss, OpenMOSS-Team/MOSS-Image-*; see docs/moss-image.md): text to\n\
          image (-o, --steps, --guidance, --negative, --size, --seed, --lora as above):\n\
@@ -830,6 +848,7 @@ fn parse_args() -> Result<Args> {
         flux: Default::default(),
         moss: Default::default(),
         avatar: Default::default(),
+        ltx: Default::default(),
         sd3: Default::default(),
         bagel: Default::default(),
         ocr: Default::default(),
@@ -1164,6 +1183,7 @@ fn parse_args() -> Result<Args> {
             _ if a.iv.parse(&k, &mut val)? => {}
             _ if a.moss.parse(&k, &mut val)? => {}
             _ if a.avatar.parse(&k, &mut val)? => {}
+            _ if a.ltx.parse(&k, &mut val)? => {}
             _ if a.flux.parse(&k, &mut val)? => {}
             _ if a.sd3.parse(&k, &mut val)? => {}
             _ if a.bagel.parse(&k, &mut val)? => {}
@@ -1522,6 +1542,9 @@ fn main() -> Result<()> {
         args.model.clone()
     } else if spec.ends_with(".safetensors") {
         resolve_file(&spec, args.cache_dir.as_deref())?
+    } else if !args.model.exists() && oxinfer::ltx::is_repo(&spec) {
+        // LTX-2.5: its loader fetches the parts a run reads (from the public mirror).
+        args.model.clone()
     } else if !args.model.exists() && spec == oxinfer::longcat_avatar::AVATAR_REPO {
         // LongCat-Video-Avatar: its loader fetches the parts it reads (one of two transformers,
         // one of Whisper's five weight files) and the base repository's.
@@ -1559,6 +1582,9 @@ fn main() -> Result<()> {
         // (LongCat-Video-Avatar fetches its parts itself: two repositories.)
         if longcat_avatar_cli::wants(&args) {
             return longcat_avatar_cli::run(&args);
+        }
+        if ltx_cli::wants(&args) {
+            return ltx_cli::run(&args);
         }
         eprintln!("[model at {}]", args.model.display());
         return Ok(());
@@ -1920,6 +1946,9 @@ fn run(mut args: Args) -> Result<()> {
     }
     if longcat_avatar_cli::wants(&args) {
         return longcat_avatar_cli::run(&args);
+    }
+    if ltx_cli::wants(&args) {
+        return ltx_cli::run(&args);
     }
     if moss_image_cli::wants(&args) {
         return moss_image_cli::run(&args);

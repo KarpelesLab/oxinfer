@@ -91,11 +91,12 @@ pub(crate) enum ImageModel {
     H3Image(crate::minimax_h3::Pipeline),
 }
 
-/// A MiniMax-H3 video pipeline with the settings its options gave.
+/// A video pipeline with the settings its options gave: MiniMax-H3, or LTX-2.5 (`ltx`).
 pub(crate) struct VideoModel {
-    pub pipe: crate::minimax_h3::video::VideoPipeline,
+    pub pipe: Option<crate::minimax_h3::video::VideoPipeline>,
     /// The step count a turbo LoRA is distilled for (requests without `steps` take it).
     pub steps: Option<usize>,
+    pub ltx: Option<Box<crate::ltx::Pipeline>>,
 }
 /// A loaded model.
 pub(crate) enum Loaded {
@@ -1064,6 +1065,7 @@ impl Registry {
             Some(k) if k != Kind::Image => (k, None),
             // Told apart by its name: the repository has no config.json to probe.
             _ if crate::zonos::is_zonos(Path::new(&e.spec.source)) => (Kind::Speech, None),
+            _ if crate::ltx::is_repo(&e.spec.source) => (Kind::Video, None),
             _ if !Path::new(&e.spec.source).exists() && crate::fish::is_drama(Path::new(&e.spec.source)) => (Kind::Speech, None),
             _ => {
                 let path = self.probe_path(&e.spec)?;
@@ -1373,8 +1375,29 @@ fn load_image(ik: ImageKind, src: &str, opts: &[(&str, &str)], cache_dir: Option
 /// Loads a MiniMax-H3 video model with its options
 /// ([`crate::minimax_h3::video::load_with_options`]).
 fn load_video(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Path>) -> Result<VideoModel> {
+    // LTX-2.5: the release's repository id (its parts fetched from the public mirror) or a local
+    // folder / transformer file.
+    let ltx = if crate::ltx::is_repo(src) || crate::ltx::is_ltx(Path::new(src)) {
+        Some(src.to_string())
+    } else {
+        local_path(src, cache_dir)
+            .filter(|p| crate::ltx::is_ltx(p))
+            .map(|p| p.to_string_lossy().to_string())
+    };
+    if let Some(src) = ltx {
+        let pipe = crate::ltx::api::load_with_options(&src, opts, cache_dir)?;
+        return Ok(VideoModel {
+            pipe: None,
+            steps: None,
+            ltx: Some(Box::new(pipe)),
+        });
+    }
     let (pipe, steps) = crate::minimax_h3::video::load_with_options(src, opts, cache_dir)?;
-    Ok(VideoModel { pipe, steps })
+    Ok(VideoModel {
+        pipe: Some(pipe),
+        steps,
+        ltx: None,
+    })
 }
 
 /// Whether a model name a request gives may be listed on request ([`Registry::admit`]): a repo
@@ -1443,7 +1466,7 @@ pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>
             (Kind::Chat, None)
         };
     }
-    if crate::minimax_h3::video::is_h3_video(path) {
+    if crate::minimax_h3::video::is_h3_video(path) || crate::ltx::is_ltx(path) {
         return (Kind::Video, None);
     }
     if crate::moss_image::is_moss_image(path) {

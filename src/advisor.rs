@@ -857,6 +857,14 @@ pub const CATALOG: &[Model] = &[
              and Whisper of the repository with umT5 and the VAE of meituan-longcat/LongCat-Video; presets \
              longcat-avatar-int8, longcat-avatar; CUDA or the CPU; not in the server: docs/longcat-avatar.md",
         ),
+    Model::new("Lightricks/LTX-2.5", Kind::Video, 34.6, 39.7, &[TextToVideo, ImageToVideo])
+        .fixed(Format::Q8, "ComfyUI int8 ConvRot transformer and text encoder")
+        .note(
+            "22B audio-video DiT + Gemma 4 12B text encoder, the distilled two-stage pipeline (8 + 3 forwards) with a 48 kHz \
+             stereo soundtrack; image to video, the duration head, the spatial / temporal upsamplers, LoRAs (the distilled \
+             LoRA on the dev transformer); fetched from the public mirror comfyicu/LTX-2.5 (the release is gated); the \
+             transformer in whole passes on Metal (384x256, 25 frames, one stage: 0.55 s a forward, 13.7 s in all on an M5; 7.8 s a forward on the CPU) (docs/ltx.md)",
+        ),
 ];
 
 /// A curated stack: a base model of the catalog with LoRA files at set strengths, a trigger word
@@ -1562,6 +1570,7 @@ fn path_of(m: &Model) -> EnginePath {
         Kind::Speech if has(&["whisper"]) => EnginePath::Encoder,
         Kind::Speech => EnginePath::Matmuls,
         Kind::Tts if has(&["orpheus"]) => EnginePath::Graph,
+        Kind::Video if has(&["ltx-2"]) => EnginePath::Pipeline,
         Kind::Tts | Kind::Video => EnginePath::Cpu,
         Kind::Image | Kind::Embedding => EnginePath::Pipeline,
     }

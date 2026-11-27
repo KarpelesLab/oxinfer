@@ -1097,19 +1097,28 @@ int oxi_haru_respond(OxiHaru *h, const float *samples, size_t n, int sample_rate
 /* Frees a Haru handle (NULL is ignored). */
 void oxi_haru_free(OxiHaru *h);
 
-/* ---- Video generation (MiniMax-H3) --------------------------------------------------------- */
+/* ---- Video generation (MiniMax-H3, LTX-2.5) ------------------------------------------------ */
 
 typedef struct OxiVideo OxiVideo;
 
-/* Loads MiniMax-H3 (a release folder, a single-file transformer or a repo id); `options`:
- * key=value (text_encoder, transformer, vae, audio_vae, quant, lora, shift, audio_shift,
- * cache_dir). NULL on error. */
+/* Loads a video model. MiniMax-H3 (a release folder, a single-file transformer or a repo id);
+ * `options`: key=value (text_encoder, transformer, vae, audio_vae, quant, lora, shift,
+ * audio_shift, cache_dir). LTX-2.5 ("Lightricks/LTX-2.5": the parts a run reads are fetched from
+ * the public mirror comfyicu/LTX-2.5; a release folder or a transformer file); options:
+ * transformer (int8, bf16, nvfp4, dev, dev-bf16 or a file), text_encoder, vae, audio_vae,
+ * upsampler, temporal_upsampler, duration_head, text_bf16=1, temporal=1, distilled_lora=1,
+ * lora=FILE[:SCALE], device=cpu, exact_attention=1, cache_dir. NULL on error. */
 OxiVideo *oxi_video_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
 
 /* Generates a video. `params_json`:
  *   {"prompt": "...", "frames": 124 | "seconds": 5, "size": "1344x768", "steps": 50, "seed": 0,
  *    "first_frame": "first.png", "last_frame": "last.png",      (fl2va)
  *    "references": ["a.png", "voice.wav", "motion.mp4"], "ref_image_edge": 2048}   (ref2va)
+ * LTX-2.5: "size" in multiples of 64 (32 with "one_stage": true), "frames" rounded down to
+ * 8 k + 1 (none: the duration head's prediction), "fps": 24, "temporal_upscale": false,
+ * "audio": true, "eta": 1, "sigmas" / "stage2_sigmas" (arrays ending at 0), "noise": "torch",
+ * "first_frame" with "strength", "last_frame", "images": [{"path": "a.png", "frame": 40,
+ * "strength": 1}] (or "a.png@40:1"); "steps" is not read (the distilled schedules). */
  * `progress` gets each denoising step (non-zero cancels). Writes the video (needs the `media`
  * feature) to `out_video` in the format of its extension: .mp4 (H.264 + AAC; also for other
  * names), .webm (VP9 + Opus), .avi (Motion JPEG + 16-bit PCM); and the soundtrack to `out_wav`,

@@ -1,0 +1,148 @@
+# Video with sound: LTX-2.5
+
+`Lightricks/LTX-2.5` is a 22B audio-video diffusion transformer: a prompt (and optionally images)
+becomes a video with a 48 kHz stereo soundtrack. oxinfer runs the release's distilled pipeline
+(`ltx_pipelines.distilled`, `DistilledPipeline` of github.com/Lightricks/LTX-2) from its split
+files: `src/ltx/`.
+
+```sh
+# text to video: 768x512, 121 frames (5 s at 24 fps), the two-stage distilled pipeline
+./target/release/oxinfer --model Lightricks/LTX-2.5 \
+    -p "A golden retriever running through a sunny meadow, cinematic lighting" \
+    --size 768x512 --frames 121 -o dog.mp4
+# image to video: the image is the first frame
+./target/release/oxinfer --model Lightricks/LTX-2.5 --init-image first.png \
+    -p "The camera slowly dollies out as wind moves through the grass" -o clip.mp4
+# no --frames: the duration head picks the length from the prompt
+./target/release/oxinfer --model Lightricks/LTX-2.5 -p "..." -o clip.mp4
+# one stage at the full size (no spatial upsampler; sides multiples of 32)
+./target/release/oxinfer --model Lightricks/LTX-2.5 -p "..." --size 384x256 --frames 25 --one-stage -o small.mp4
+```
+
+The release repository is gated (accepting its terms shares the account's contact details), so
+oxinfer fetches its files from the public mirror `comfyicu/LTX-2.5` (the same files, checked
+against the mirror's LFS hashes): `--model Lightricks/LTX-2.5` and `--model comfyicu/LTX-2.5`
+download only what a run reads, 39.7 GB by default:
+
+| part | file | size |
+|---|---|---|
+| transformer (distilled, ComfyUI int8 ConvRot) | `diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors` | 21.5 GB |
+| text encoder (Gemma 4 12B and the projections, int8 ConvRot) | `text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors` | 15.4 GB |
+| video VAE (convolutional) | `vae/ltx-2.5-video-vae-conv-bf16.safetensors` | 1.45 GB |
+| audio VAE, vocoder, bandwidth extension | `vae/ltx-2.5-audio-vae-bf16.safetensors` | 0.36 GB |
+| spatial x2 latent upsampler | `latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors` | 1.0 GB |
+| duration head | `model_patches/ltx-2.5-duration-head-bf16.safetensors` | 3.8 MB |
+
+`--model DIR` takes a folder in the release's layout, `--model FILE` one of its transformer
+files (the other parts from the folder above it).
+
+| flag | |
+|---|---|
+| `--size WxH` | multiples of 64 (the first stage runs at half the size), 32 with `--one-stage`; default 768x512 |
+| `--frames N` | rounded down to `8 k + 1`; without it the duration head's prediction (1 to 20 s), or 121 without the head |
+| `--fps F` | the frame rate (default 24): the positions the transformer sees and the soundtrack's length |
+| `--seed N` | the noise seed (`--noise torch`: PyTorch's CPU generator; the reference draws on its device, so a seed does not reproduce its videos) |
+| `--init-image FILE` | the first frame (`--strength F`, default 1: kept as is) |
+| `--image FILE@FRAME[:STRENGTH]` | an image for the latent frame `FRAME` falls in (repeatable) |
+| `--one-stage` | the distilled schedule at the full size, no upsampler |
+| `--temporal-upscale` | twice the frames and the rate after the last stage (fetches the temporal upsampler, 0.26 GB) |
+| `--no-audio` | no soundtrack decoded (the audio stream is denoised anyway: the model is joint) |
+| `--transformer int8\|bf16\|nvfp4\|dev\|dev-bf16\|FILE` | the transformer file (default the distilled int8 one) |
+| `--distilled-lora` | the release's distilled LoRA (rank 450, 8.9 GB) on the dev transformer |
+| `--lora FILE[:SCALE]` | an LTX-2.x LoRA (repeatable) |
+| `--text-bf16` | fetch the bf16 text encoder (26.3 GB) instead of the int8 one |
+| `--text-encoder FILE`, `--vae FILE`, `--audio-vae FILE`, `--upsampler FILE`, `--temporal-upsampler FILE`, `--duration-head FILE` | parts from elsewhere |
+| `--sigmas a,b,..,0`, `--stage2-sigmas a,..,0` | other schedules than the distilled ones |
+| `--eta F` | the ancestral sampler's noise (1, the release's sampler for LTX-2.5; 0: plain Euler) |
+| `--device cpu` | everything on the CPU |
+| `-o FILE` | `.mp4` (H.264 and AAC), `.webm` (VP9 and Opus), `.avi`, `.webp` or a PNG sequence with a WAV, as for [MiniMax-H3](video.md) |
+
+## What runs
+
+1. **Text** ([`text.rs`](../src/ltx/text.rs)): `<bos>` and the stripped prompt's tokens (at most
+   1024) through the text encoder (transformers' `gemma4_unified` Gemma 4 12B: 48 layers, sliding
+   and global attention, `attention_k_eq_v`; oxinfer's Gemma 4); all 49 hidden states RMS-normed
+   per token and interleaved (`FeatureExtractorV2`), the two aggregate projections (to 4096 for
+   video, 2048 for audio); then the transformer's two connectors (8 blocks each over 1024 rows:
+   the prompt's rows, then 128 learned registers repeated; RoPE over the row index; a final RMS
+   norm). The reference left-pads the tokens to 1024 with an attention mask: that leaves the
+   prompt's rows as computed here (relative RoPE, a 1024-token window).
+2. **Stage 1** at half the size: noise (video, then audio: 25 latents a second), eight forwards on
+   `[1, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0]` with the ancestral Euler
+   sampler (eta 1: an Euler step to `sigma_down`, renoised to the next sigma; its own noise
+   generator, seeded `seed + 10000`).
+3. **Spatial upsampler** (the latents un-normalized by the VAE's statistics, doubled in height and
+   width, normalized again), then **stage 2** at the full size: video and audio latents noised to
+   `sigma = 0.909375` and three forwards on `[0.909375, 0.725, 0.421875, 0]` (noise seed
+   `seed + 20000`).
+4. **Decoders**: the convolutional video VAE ([`vae.rs`](../src/ltx/vae.rs)), the audio VAE
+   decoder (a stereo 64-bin mel spectrogram), the BigVGAN v2 vocoder (16 kHz) and its bandwidth
+   extension to 48 kHz ([`audio.rs`](../src/ltx/audio.rs)); the soundtrack cut to the video's
+   length (it is a little shorter: `4 n - 3` mel frames for `n` latents, as in the reference).
+
+The transformer ([`dit.rs`](../src/ltx/dit.rs)): two streams (video 4096 wide, 32 heads of 128;
+audio 2048, 32 heads of 64) through 48 blocks of self-attention (split RoPE over time, y and x,
+or time), text cross-attention (the context rows with a shift / scale of their own), audio-to-video
+and video-to-audio cross-attention (RoPE over time), and a GELU feed-forward, each with AdaLN
+shift / scale / gate from the row's timestep; every attention normalizes its queries and keys
+over all heads and scales each head by `2 sigmoid(to_gate_logits(x))`. Rows of a latent frame an
+image conditions have timestep `(1 - strength) sigma` and keep their clean latents after each
+step. The first latent frame's rows get the learned keyframe embedding.
+
+Images are resized to cover the canvas (bilinear) and center-cropped, then encoded by the VAE
+encoder. Frame 0 replaces the first latent frame, as the reference's `ImageReplace`; an image for
+any other frame (`--last-image`, `--image FILE@FRAME`) is appended as guide rows, as the
+reference's `VideoConditionByKeyframeIndex`: its clean latents at that frame's time, with the
+image's strength, dropped after each stage. The reference also re-compresses a conditioning
+image as H.264 at CRF 33 before encoding it (the compression it was trained against); oxinfer
+encodes the image as it is.
+
+`--temporal-upscale` doubles the latent frames with the temporal upsampler and refines the video
+with `[0.975, 0.909375, 0.725, 0.421875, 0]` (audio kept as it was): a simplified form of the
+release's DFR temporal rounds (`dfr_pipeline.py`), which tile the clip and carry keyframes.
+
+## On the GPU
+
+With Metal (M5's matrix units) every block of both streams runs as one submission per forward
+([`metal_ltx.rs`](../src/metal_ltx.rs), `crate::gpu::dit::LtxSession`): the projections on the
+matrix-unit GEMMs (int8 ConvRot rows as Q8 blocks over the same mapped bytes, their inputs rotated
+on the GPU; bf16 as stored), video attention on `flash_attn128_mma` (half operands), audio and the
+cross-attention between the streams on `flash_attn64` (float32), the norms, modulations, gates
+and residuals on the `ltx_*` kernels of `metal_ltx.metal`. The output heads, the text encoder
+and its connectors, the VAEs and the vocoder run on the CPU kernels (their convolutions and
+matmuls on the GPU's per-op path). `OXINFER_LTX_GPU=0` keeps the transformer on the CPU; the
+`device=cpu` option of the server and the C API does the same per model. NVFP4 weights have no
+Metal kernels here: that transformer runs on the CPU.
+
+## Library, C API, server
+
+`oxinfer::ltx::Pipeline::load(Paths)` and `generate(&Params, progress)` (a
+`minimax_h3::video::Video`: frames and the soundtrack); `oxinfer::ltx::api::load_with_options`
+takes a repository id, folder or file with the server's options. The C API's `oxi_video_load` /
+`oxi_video_generate` load LTX-2.5 for any of its names (options `transformer`, `text_encoder`,
+`vae`, `audio_vae`, `upsampler`, `temporal_upsampler`, `duration_head`, `text_bf16`, `temporal`,
+`distilled_lora`, `lora`, `device`; parameters `prompt`, `size`, `frames` / `seconds`, `fps`,
+`seed`, `one_stage`, `temporal_upscale`, `audio`, `eta`, `sigmas`, `stage2_sigmas`, `noise`,
+`first_frame` / `strength`, `last_frame`, `images`). The server's `/v1/videos` takes the same
+request fields for an LTX-2.5 model (`oxinfer serve --model Lightricks/LTX-2.5`).
+
+## Verification
+
+Against the release's code (`ltx-core` at github.com/Lightricks/LTX-2 c3a7efb, CPU, float32, on
+the int8 weights dequantized as ComfyUI's `comfy_kitchen` does, fixed random inputs; the scripts
+are `ref_*.py` beside `examples/ltx_check.rs`'s checks):
+
+| part | rel L2 | |
+|---|---|---|
+| transformer, 2 blocks, both streams, i2v-style mixed timesteps (CPU) | 2.2e-6 / 1.6e-6 | video / audio velocities |
+| the same on the Metal session | 8.8e-5 / 7.5e-5 | half-precision GEMM inputs and attention |
+| text connectors (video / audio) | 2.4e-6 / 2.4e-6 | `EmbeddingsProcessor.create_embeddings` with 20 valid tokens |
+| text encoder, first 6 layers (int8 ConvRot) | 2.7e-6 to 4.8e-6 | transformers' `Gemma4UnifiedTextModel`, same tokens |
+| feature extractor and projections | 1.5e-6 | `FeatureExtractorV2` over oxinfer's 49 hidden states |
+| video VAE decoder (3 x 4 x 6 latents) / encoder | 3.5e-6 / 6.0e-6 | `ConvVideoDecoder` / `VideoEncoder` |
+| audio decoder (20 latents) / vocoder with BWE | 6.3e-7 / 1.0e-5 | `AudioDecoder`, `VocoderWithBWE` |
+| spatial / temporal upsampler | 1.2e-5 / 2.2e-5 | `LatentUpsampler` with the VAE's statistics |
+
+Positions (video and audio) are bit-identical to the reference's. The whole pipeline was not
+compared with the reference's output (its noise comes from its device's generator); runs are
+checked by looking at their frames and listening to their soundtracks (below).

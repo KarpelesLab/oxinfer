@@ -2028,6 +2028,55 @@ fn video_jobs_with_a_tiny_minimax_h3() {
     std::fs::remove_dir_all(&base).ok();
 }
 
+#[test]
+fn video_jobs_with_a_tiny_ltx() {
+    let base = std::env::temp_dir().join(format!("oxinfer-ltx-tiny-{}", std::process::id()));
+    oxinfer::ltx::tiny::write_tiny_release(&base).unwrap();
+    let s = serve(&format!("model=ltx={}", base.display()));
+    let a = s.addr();
+    // Two stages; the frame count from `seconds` at the request's rate.
+    let req = json!({"model": "ltx", "prompt": "A red fox trots across the snow.", "size": "64x128", "seconds": 0.5, "fps": 16, "seed": 3});
+    let (st, body) = request(a, "POST", "/v1/videos", &req.to_string());
+    assert_eq!(st, 200, "{body}");
+    let id = serde_json::from_str::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+    let v = wait_video(a, &id, &["completed", "failed"]);
+    assert_eq!(v["status"], "completed", "{v}");
+    assert_eq!(
+        (
+            v["frames"].as_u64(),
+            v["size"].as_str(),
+            v["fps"].as_f64(),
+            v["has_audio"].as_bool()
+        ),
+        (Some(1), Some("64x128"), Some(16.0), Some(true)),
+        "{v}"
+    );
+    let (st, ct, png) = get_bytes(a, &format!("/v1/videos/{id}/content?variant=thumbnail"));
+    assert_eq!((st, ct.as_str(), &png[..4]), (200, "image/png", &b"\x89PNG"[..]));
+    // One stage with a first frame (a data: URL).
+    let first = format!("data:image/png;base64,{}", b64_encode(&png));
+    let req = json!({"model": "ltx", "prompt": "The fox turns around.", "size": "64x32", "frames": 9, "one_stage": true, "input_reference": first});
+    let (st, body) = request(a, "POST", "/v1/videos", &req.to_string());
+    assert_eq!(st, 200, "{body}");
+    let id2 = serde_json::from_str::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+    let v = wait_video(a, &id2, &["completed", "failed"]);
+    assert_eq!(
+        (v["status"].as_str(), v["frames"].as_u64(), v["size"].as_str()),
+        (Some("completed"), Some(9), Some("64x32")),
+        "{v}"
+    );
+    let (st, ct, mp4) = get_bytes(a, &format!("/v1/videos/{id2}/content"));
+    assert_eq!((st, ct.as_str(), &mp4[4..8]), (200, "video/mp4", &b"ftyp"[..]));
+    // A size the two-stage pipeline cannot take fails the job.
+    let req = json!({"model": "ltx", "prompt": "x", "size": "96x64", "frames": 9});
+    let (st, body) = request(a, "POST", "/v1/videos", &req.to_string());
+    assert_eq!(st, 200, "{body}");
+    let id3 = serde_json::from_str::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+    assert_eq!(wait_video(a, &id3, &["completed", "failed"])["status"], "failed");
+    s.stop().unwrap();
+    std::fs::remove_dir_all(&base).ok();
+}
+
 /// Models a request names without them being listed (`auto_models`): a repo in the cache joins
 /// the list; not without `auto_models`, not for another site's page, not past the memory budget.
 #[test]

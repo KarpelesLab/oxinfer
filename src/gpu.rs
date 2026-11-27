@@ -239,6 +239,11 @@ pub trait Backend: Send + Sync {
     fn t5_session(&'static self) -> Option<Box<dyn dit::T5Session>> {
         None
     }
+    /// A session running whole LTX-2.5 transformer passes on the device; None when the backend
+    /// has none.
+    fn ltx_session(&'static self) -> Option<Box<dyn dit::LtxSession>> {
+        None
+    }
     /// A session running whole CLIP text-encoder passes on the device; None when the backend
     /// has none.
     fn clip_session(&'static self) -> Option<Box<dyn dit::ClipSession>> {

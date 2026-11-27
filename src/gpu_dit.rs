@@ -228,3 +228,86 @@ pub trait ClipSession: Send {
     /// position embeddings `x` (`[t, dim]`). False when the device declined or failed.
     fn forward(&mut self, m: &ClipModel, x: &[f32], t: usize, penultimate: Option<&mut Vec<f32>>, out: &mut Vec<f32>) -> bool;
 }
+
+/// One gated attention of LTX-2.5's transformer (`crate::ltx::dit`): q / k / v / out projections
+/// with biases, RMS norms of the queries and keys over all heads (weights `qn` / `kn`), the
+/// per-head gate `2 sigmoid(gate_w x + gate_b)` (`[heads, q_dim]` float32).
+pub struct LtxAttn<'a> {
+    pub q: Lin<'a>,
+    pub k: Lin<'a>,
+    pub v: Lin<'a>,
+    pub o: Lin<'a>,
+    pub gate_w: &'a [f32],
+    pub gate_b: &'a [f32],
+    pub qn: &'a [f32],
+    pub kn: &'a [f32],
+    pub heads: usize,
+    pub hd: usize,
+}
+
+/// A GELU (tanh) feed-forward.
+pub struct LtxFf<'a> {
+    pub up: Lin<'a>,
+    pub down: Lin<'a>,
+}
+
+/// One stream's half of a block: self-attention, text cross-attention, feed-forward.
+pub struct LtxStream<'a> {
+    pub attn1: LtxAttn<'a>,
+    pub attn2: LtxAttn<'a>,
+    pub ff: LtxFf<'a>,
+}
+
+pub struct LtxBlock<'a> {
+    pub v: LtxStream<'a>,
+    pub a: LtxStream<'a>,
+    /// Video queries over audio rows, audio queries over video rows.
+    pub a2v: LtxAttn<'a>,
+    pub v2a: LtxAttn<'a>,
+}
+
+pub struct LtxModel<'a> {
+    pub dim: usize,
+    pub audio_dim: usize,
+    pub eps: f32,
+    pub blocks: Vec<LtxBlock<'a>>,
+    /// Attention with half-precision operands for 128-wide heads (else float32 ones).
+    pub half_attention: bool,
+}
+
+/// One stream of an LTX-2.5 forward: its rows after the patch projection, each row's
+/// modulation class and the per-block tables of this step.
+pub struct LtxIn<'a> {
+    /// `[rows, dim]`.
+    pub x: &'a [f32],
+    pub rows: usize,
+    /// Each row's class (its timestep), indexing the tables below.
+    pub cls: &'a [u32],
+    pub classes: usize,
+    /// Per block, per class, the 9 rows (shift, scale, gate of the self-attention, of the
+    /// feed-forward, of the text cross-attention's queries) of `dim`, the block's table added.
+    pub mods: &'a [f32],
+    /// Per block, per class, the 4 AV cross rows (scale, shift a2v; scale, shift v2a).
+    pub av: &'a [f32],
+    /// Per block, the AV cross gate (`dim`).
+    pub av_gate: &'a [f32],
+    /// Per block, the text rows' shift and scale (`2 dim`).
+    pub prompt: &'a [f32],
+    /// The text context (`[n_ctx, dim]`).
+    pub ctx: &'a [f32],
+    pub n_ctx: usize,
+    /// Rotary tables of the stream's own positions (`[rows, dim / 2]`) and of time alone for the
+    /// AV cross-attention (`[rows, audio_dim / 2]`).
+    pub cos: &'a [f32],
+    pub sin: &'a [f32],
+    pub ccos: &'a [f32],
+    pub csin: &'a [f32],
+}
+
+/// LTX-2.5 transformer passes on the device: every block of both streams, the activations kept
+/// in device buffers.
+pub trait LtxSession: Send {
+    /// The rows of both streams after the last block (`[rows, dim]` each) into `vout` / `aout`;
+    /// false when the device declined or failed (the caller runs the CPU path).
+    fn forward(&mut self, m: &LtxModel, v: &LtxIn, a: &LtxIn, vout: &mut Vec<f32>, aout: &mut Vec<f32>) -> bool;
+}

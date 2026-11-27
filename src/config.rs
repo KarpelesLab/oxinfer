@@ -162,6 +162,11 @@ impl TextConfig {
         } else {
             serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?
         };
+        Self::from_json(raw)
+    }
+
+    /// From a `config.json` object (its `text_config` when it has one).
+    pub fn from_json(raw: serde_json::Value) -> Result<Self> {
         let mt = raw.get("model_type").and_then(|v| v.as_str()).unwrap_or_default();
         let gemma3 = mt == "gemma3" || mt == "gemma3_text";
         let mut text = raw.get("text_config").cloned().unwrap_or(raw);

@@ -168,7 +168,7 @@ fn bias(f: &ModelFiles, p: &str, n: usize) -> Result<Vec<f32>> {
 
 /// A stride-1 convolution with PyTorch's `padding = (k - 1) * dilation / 2` (weight
 /// normalization folded in; no bias when the checkpoint has none).
-fn conv(f: &ModelFiles, p: &str, dilation: usize) -> Result<Conv> {
+pub(crate) fn conv(f: &ModelFiles, p: &str, dilation: usize) -> Result<Conv> {
     let (w, shape) = weight(f, p)?;
     let [co, ci, k] = shape3(&shape, p)?;
     if k.is_multiple_of(2) {
@@ -179,7 +179,7 @@ fn conv(f: &ModelFiles, p: &str, dilation: usize) -> Result<Conv> {
 
 /// PyTorch's `ConvTranspose1d(kernel, stride, padding = (kernel - stride) / 2)`: `t` steps to
 /// `t * stride`.
-struct Up {
+pub(crate) struct Up {
     conv: ConvT,
     c_in: usize,
     c_out: usize,
@@ -189,7 +189,7 @@ struct Up {
 }
 
 impl Up {
-    fn load(f: &ModelFiles, p: &str, stride: usize) -> Result<Self> {
+    pub(crate) fn load(f: &ModelFiles, p: &str, stride: usize) -> Result<Self> {
         let (w, shape) = weight(f, p)?;
         let [ci, co, k] = shape3(&shape, p)?;
         if k < stride || !(k - stride).is_multiple_of(2) {
@@ -217,7 +217,7 @@ impl Up {
     }
 
     /// `x` (`[t, c_in]`) to `[t * stride, c_out]`.
-    fn forward(&self, x: &[f32], t: usize) -> (Vec<f32>, usize) {
+    pub(crate) fn forward(&self, x: &[f32], t: usize) -> (Vec<f32>, usize) {
         // The causal form gives the first `t * stride` steps of the full output; the centered one
         // starts `crop` steps later, so its tail comes from zero steps after the input.
         let mut xp = bufs::take((t + self.extra) * self.c_in);
@@ -233,7 +233,7 @@ impl Up {
 }
 
 /// The anti-aliased SnakeBeta activation (`Activation1d`).
-struct Act {
+pub(crate) struct Act {
     snake: Snake,
     /// The upsampling filter, times the ratio (2).
     up: Vec<f32>,
@@ -241,7 +241,7 @@ struct Act {
 }
 
 impl Act {
-    fn load(f: &ModelFiles, p: &str) -> Result<Self> {
+    pub(crate) fn load(f: &ModelFiles, p: &str) -> Result<Self> {
         let alpha: Vec<f32> = f.f32(&format!("{p}.act.alpha"))?.iter().map(|a| a.exp()).collect();
         let inv: Vec<f32> = f.f32(&format!("{p}.act.beta"))?.iter().map(|b| 1.0 / (b.exp() + 1e-9)).collect();
         if alpha.len() != inv.len() || alpha.is_empty() {
@@ -260,7 +260,7 @@ impl Act {
     }
 
     /// `x` (`[t, c]`) to a new buffer of the same shape.
-    fn apply(&self, x: &[f32], t: usize) -> Vec<f32> {
+    pub(crate) fn apply(&self, x: &[f32], t: usize) -> Vec<f32> {
         let c = x.len() / t.max(1);
         let k = self.up.len();
         // `UpSample1d`: `pad` replicated steps on both sides, a transposed convolution of stride
@@ -338,7 +338,7 @@ impl Amp {
     }
 }
 
-fn add(x: &mut [f32], y: &[f32], c: usize) {
+pub(crate) fn add(x: &mut [f32], y: &[f32], c: usize) {
     rows_par(x, c, |r, row| {
         for (v, &o) in row.iter_mut().zip(&y[r * c..(r + 1) * c]) {
             *v += o;

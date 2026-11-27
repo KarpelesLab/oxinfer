@@ -2721,16 +2721,28 @@ pub unsafe extern "C" fn oxi_haru_free(h: *mut OxiHaru) {
     }
 }
 
-/// A MiniMax-H3 video pipeline handle.
+/// The pipelines behind a video handle.
+#[cfg(not(target_arch = "wasm32"))]
+enum VideoPipe {
+    /// MiniMax-H3 and the step count of its turbo LoRA.
+    H3(Box<crate::minimax_h3::video::VideoPipeline>, Option<usize>),
+    Ltx(Box<crate::ltx::Pipeline>),
+}
+
+/// A video pipeline handle (MiniMax-H3 or LTX-2.5).
 #[cfg(not(target_arch = "wasm32"))]
 pub struct OxiVideo {
-    pipe: Mutex<(crate::minimax_h3::video::VideoPipeline, Option<usize>)>,
+    pipe: Mutex<VideoPipe>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Loads MiniMax-H3 (a release folder, a single-file transformer or a repo id); `options` as the
-/// server's (`text_encoder`, `transformer`, `vae`, `audio_vae`, `quant`, `lora`, `shift`,
-/// `audio_shift`) plus `cache_dir`.
+/// Loads a video model: MiniMax-H3 (a release folder, a single-file transformer or a repo id;
+/// `options` as the server's: `text_encoder`, `transformer`, `vae`, `audio_vae`, `quant`, `lora`,
+/// `shift`, `audio_shift`) or LTX-2.5 (`Lightricks/LTX-2.5`, its parts fetched from the public
+/// mirror, a release folder or a transformer file; options `transformer` (`int8`, `bf16`,
+/// `nvfp4`, `dev`, `dev-bf16` or a file), `text_encoder`, `vae`, `audio_vae`, `upsampler`,
+/// `temporal_upsampler`, `duration_head`, `text_bf16`, `temporal`, `distilled_lora`, `lora`,
+/// `device`, `exact_attention`), plus `cache_dir`.
 #[cfg(not(target_arch = "wasm32"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxi_video_load(
@@ -2748,7 +2760,11 @@ pub unsafe extern "C" fn oxi_video_load(
             .map(|i| std::path::PathBuf::from(opts.remove(i).1));
         let o: Vec<(&str, &str)> = opts.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let p = with_progress(progress, user, || {
-            crate::minimax_h3::video::load_with_options(model, &o, cache.as_deref())
+            if crate::ltx::api::is_ltx_source(model) {
+                crate::ltx::api::load_with_options(model, &o, cache.as_deref()).map(|p| VideoPipe::Ltx(Box::new(p)))
+            } else {
+                crate::minimax_h3::video::load_with_options(model, &o, cache.as_deref()).map(|(p, s)| VideoPipe::H3(Box::new(p), s))
+            }
         })?;
         Ok(Box::into_raw(Box::new(OxiVideo {
             pipe: Mutex::new(p),
@@ -2759,7 +2775,10 @@ pub unsafe extern "C" fn oxi_video_load(
 
 /// Generates a video. `params_json`: `prompt` (required), `frames` or `seconds`, `size`
 /// (`"WxH"`), `steps`, `seed`, `first_frame` / `last_frame` (image files), `references` (files,
-/// ref2va), `ref_image_edge`. `progress` gets each denoising step (non-zero cancels). Writes the
+/// ref2va), `ref_image_edge`; LTX-2.5 also `fps`, `one_stage`, `temporal_upscale`, `audio`,
+/// `eta`, `sigmas`, `stage2_sigmas`, `noise`, `strength` and `images` (`{"path", "frame",
+/// "strength"}` objects or `FILE@FRAME[:STRENGTH]`). `progress` gets each denoising step
+/// (non-zero cancels). Writes the
 /// video (the `media` feature) to `out_video` in the format of its extension (`.mp4`: H.264 and
 /// AAC, also for other names; `.webm`: VP9 and Opus; `.avi`: Motion JPEG and PCM) and the
 /// soundtrack WAV to `out_wav` when they are not NULL. Returns 0, 2 when cancelled, or -1.
@@ -2781,7 +2800,31 @@ pub unsafe extern "C" fn oxi_video_generate(
         let out_wav = unsafe { opt_str_arg(out_wav, "out_wav") }?;
         let prompt = o["prompt"].as_str().context("params_json: no prompt")?;
         let g = v.pipe.lock().unwrap_or_else(|p| p.into_inner());
-        let (pipe, turbo_steps) = &*g;
+        if let VideoPipe::Ltx(pipe) = &*g {
+            let mut p = crate::ltx::api::params_from_json(&o)?;
+            #[cfg(feature = "media")]
+            let load = |f: &std::path::Path| crate::minimax_h3::encode::load_image(f);
+            #[cfg(not(feature = "media"))]
+            let load =
+                |_: &std::path::Path| -> Result<crate::sd::Image> { bail!("built without the `media` feature: images cannot be decoded") };
+            crate::ltx::api::add_images(&mut p, crate::ltx::api::images_from_json(&o)?, &load)?;
+            v.cancel.store(false, Ordering::Relaxed);
+            p.cancel = Some(v.cancel.clone());
+            let cancel = v.cancel.clone();
+            let mut step = |_: &str, i: usize, n: usize| {
+                if let Some(f) = progress
+                    && unsafe { f(user, i as c_int, n as c_int) } != 0
+                {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            };
+            let video = match pipe.generate(&p, &mut step) {
+                Err(_) if v.cancel.load(Ordering::Relaxed) => return Ok(2),
+                r => r?,
+            };
+            return write_video_files(&video, out_video, out_wav).map(|_| 0);
+        }
+        let VideoPipe::H3(pipe, turbo_steps) = &*g else { unreachable!() };
         let mut p = crate::minimax_h3::video::VideoParams::new(prompt);
         if let Some(s) = o["size"].as_str() {
             let (w, h) = s
@@ -2852,13 +2895,23 @@ pub unsafe extern "C" fn oxi_video_generate(
             Err(_) if v.cancel.load(Ordering::Relaxed) => return Ok(2),
             r => r?,
         };
+        write_video_files(&video, out_video, out_wav)?;
+        Ok(0)
+    })
+}
+
+/// Writes a generated video to `out_video` (its format from the extension) and its soundtrack to
+/// `out_wav`, each when given.
+#[cfg(not(target_arch = "wasm32"))]
+fn write_video_files(video: &crate::minimax_h3::video::Video, out_video: Option<&str>, out_wav: Option<&str>) -> Result<()> {
+    {
         if let Some(path) = out_video {
             #[cfg(feature = "media")]
             {
                 // The format from the extension: .mp4 (the default for others), .webm, .avi.
                 let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("mp4");
                 let f = crate::minimax_h3::video::VideoFormat::parse(ext).unwrap_or(crate::minimax_h3::video::VideoFormat::Mp4);
-                std::fs::write(path, crate::minimax_h3::encode::encode_video(&video, f)?).with_context(|| format!("write {path}"))?;
+                std::fs::write(path, crate::minimax_h3::encode::encode_video(video, f)?).with_context(|| format!("write {path}"))?;
             }
             #[cfg(not(feature = "media"))]
             bail!("built without the `media` feature: no video file can be written ({path})");
@@ -2866,8 +2919,8 @@ pub unsafe extern "C" fn oxi_video_generate(
         if let (Some(path), Some(a)) = (out_wav, &video.audio) {
             std::fs::write(path, a.to_wav()).with_context(|| format!("write {path}"))?;
         }
-        Ok(0)
-    })
+        Ok(())
+    }
 }
 
 /// Stops a running oxi_video_generate between two steps (any thread).
