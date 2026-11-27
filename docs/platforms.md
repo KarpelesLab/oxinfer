@@ -181,6 +181,12 @@ cuda`.
 
 Short inputs stay on the CPU (see `wants`), but opening the device costs about 0.1 s at start-up.
 
+The Qwen3.5-0.8B bf16 row is the op-by-op prompt path, which `OXINFER_PREFILL_GPU=0` still runs
+(logits bit-identical to the CPU's). By default the prompts of a model loaded as bf16 now take
+whole-pass plans (below): 22,000-25,000 tok/s on this model from 512 tokens on, the first step
+within the fast GEMM's rounding of the CPU's ([RTX 5080,
+CUDA](performance.md#rtx-5080-cuda-november-2026)).
+
 Prompt speed with `--quant` weights that fit, measured again in November 2026 with llama-bench
 style passes (Qwen3.5-9B: q4 391-397 tok/s at 512 tokens and 364-368 at 2048, and where the time
 goes): [x86-64 CPU kernels](performance.md#x86-64-cpu-kernels-november-2026).
@@ -271,6 +277,11 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   layer's q / k / v) run as one launch (`mvq3_K`, each block one matrix's `mvq_K` block, the
   same sums bit for bit, `cuda::tests`), so the small k / v ones do not take the GPU alone:
   934 -> 898 us / 4263 -> 4180; plain decode 844 -> 917 tok/s and 209.8 -> 218.9.
+  Multi-token steps of the int8 matvecs (speculative verification, batched rows) sweep the
+  weights once for up to 8 tokens (`mvqt_K`, `mvqpt_K`, `mvq3t_K`: a lane's block of a weight row
+  loaded and unpacked once, then `mvq_K`'s dot with each token's block of x in turn), each
+  token's sums its own launch's bit for bit (`cuda::tests`; `OXINFER_CUDA_MVQT=0`: a grid row
+  per token as before).
 - **Prompts, whole pass** (`decode_plan_prefill`, steps of up to 512 tokens,
   `OXINFER_CUDA_PREFILL_TOKENS`; `OXINFER_PREFILL_GPU=0` keeps the op-by-op path): the matmuls as
   tensor-core GEMMs. By default (`gemmh_*`) the activations go in as f16 rows (converted once per
@@ -396,8 +407,48 @@ the CPU), models with GGUF MoE experts (`qwen35moe`, Gemma 4 26B-A4B: the expert
 bf16 / Q8 / Q4 only; their dense matmuls take the GEMM in prompts), Hadamard-folded matrices,
 and models whose weights do not all fit in VRAM. Gemma GGUF files go through the same kernels
 (their sandwich norm one token at a time in a prefill plan) and were not run: none is on this
-machine. Prefill plans exist for GGUF weights only: bf16 / Q8 / Q4 prompts keep the op-by-op
-path.
+machine. Prefill plans exist for GGUF weights and for bf16 matrices (a safetensors checkpoint
+loaded without `--quant`: its rows are the ggml BF16 format's, read by that format's GEMM and
+matvec, the prompt's LM head included); oxinfer's Q8 / Q4 (`--quant`) and MLX affine Q4 prompts
+keep the op-by-op path.
+
+**Prompts of bf16 models, Gated DeltaNet layers, head dimension 256** (RTX 5080; the numbers and
+the commands are under [RTX 5080, CUDA](performance.md#rtx-5080-cuda-november-2026)). A prefill
+plan's ops beyond the GEMMs, as they are now:
+
+- **Attention at head dimension 256** (Qwen3.5) on the tensor cores as at 64 and 128
+  (`dfattn_256`: key tiles of 32, so that the f16 keys and values of a tile fit a block's 48 KB
+  of shared memory); before, those prompts took the decode kernel in batches of 32 tokens.
+- **The Gated DeltaNet rule** in four launches: the normed queries and keys (`dgdn_qk_t`) and
+  beta / decay (`dgdn_bd_t`) of every token at once, the recurrence alone in order, then the
+  output norm and gate of every token (`dgdn_out_t`). The recurrence runs a warp per column of a
+  head's state (`dgdn_seqw_HDK`: the lanes across the key dimensions, a column's sums by
+  shuffles, no barrier, every SM busy) on the fast plans, whose sums go in another order than the
+  decode kernel's (4e-7 of the largest value on random inputs); with `gpu_exact=1` a thread per
+  column in the decode kernel's order (`dgdn_seq_HDK`: the same states and outputs bit for bit,
+  `cuda::tests::dgdn_rule_split_matches`). `OXINFER_CUDA_GDN_SPLIT=0` gives the one kernel back
+  (a block per value head, nine barriers a token), `=exact` the exact order on fast plans.
+- **The Gated DeltaNet convolution** with a block row per token (`dgdn_conv_p`: a token's output
+  takes the kc - 1 inputs before it and its own; the same products in the same order, logits
+  byte for byte; `OXINFER_CUDA_GDN_CONV=0`).
+- **Recurrent states** go up for a pass's first chunk only (the later chunks find what the chunk
+  before left on the device), and the **KV caches**, host and device, take room for the whole
+  prompt at its first chunk (`generate::prompt_ahead`) instead of doubling every few chunks.
+
+**Concurrent requests** (`oxinfer serve --parallel N`). The plain decode steps of the requests
+decoding at once are one batched step (`DecodePlan::step_rows`, as on Metal): a multi-token plan's
+launches over the rows, the matvecs with every row in one launch (the int8 GGUF ones in one sweep
+of the weights, above), the norms, GLUs, element-wise ops, attention inputs and attention in one
+launch for all rows too (`dqk_rope_r` / `dattnr_D_G` read each row's cache from a table of
+addresses; `OXINFER_CUDA_ROWS_FUSED=0`: a launch per row), and the Gated DeltaNet ops per row on
+the row's own device states. Each row gets its one-token step's bits
+(`cuda::tests::ggml_plans_match_single_token_steps`: eight sequences at different positions, f32
+and int8 matvecs). A Gated DeltaNet model's rows are bound by their recurrent states, which come
+down to the host after every step (19 MB a row for Qwen3.5-0.8B).
+
+Of these, the bf16 plans were run on Qwen3.5-0.8B only (other families loaded as bf16 build the
+graphs their GGUF files build), and the batched rows on Llama-3.2-1B Q4_K_M, Qwen3.5-0.8B bf16
+and mlx-community/Qwen3-4B-4bit.
 
 Measured on the RTX 5080 against the CPU path (32 threads) and llama.cpp's CUDA backend (master
 `e300919`, 2026-11-22, `llama-bench -ngl 99 -p 512,2048 -n 128 -r 3`), `examples/parity_bench.rs`

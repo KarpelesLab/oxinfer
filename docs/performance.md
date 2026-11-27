@@ -452,6 +452,10 @@ chunks and decode rows in one pass (llama.cpp's mixed batches: at most ~2% here 
 see above; with `batch_fast` the rows could ride in the prompt's GEMMs, likewise bounded by the
 few steps between chunks).
 
+On CUDA the batched steps and their numbers (an RTX 5080, Llama-3.2-1B Q4_K_M: 508 -> 1834
+tok/s at 8 requests, llama-server 2951) are under [RTX 5080,
+CUDA](#rtx-5080-cuda-november-2026).
+
 ## Comparison with llama.cpp
 
 (Speculative decoding with DSpark drafts against llama.cpp master: see
@@ -2050,7 +2054,8 @@ and Qwen3.5-0.8B (with and without prompt lookup).
 - **DSpark's plain rounds** on Qwen3 / Gemma do not chain: they need the draft's features of
   every pass, which the one-token plan does not capture (Inkling's passes copy them into the
   token slot's capture rows). They cost a plain step as before.
-- **CUDA** plans have no chain yet (`DecodePlan::greedy` returns None there).
+- **CUDA** plans have no chain yet (`DecodePlan::greedy` returns None there; what it would save
+  on an RTX 5080: [RTX 5080, CUDA](#rtx-5080-cuda-november-2026)).
 - Three passes in flight: not tried; with one pass queued the GPU never waits on the host (the
   host's work per token, the KV rows and the callback, is far below a pass).
 
@@ -2658,7 +2663,9 @@ Where oxinfer is still behind on this machine:
   copy-out 0.38, pageable memory), attention and the Gated DeltaNet on the CPU 0.39 s, 0.79 s
   outside the timers (the zero-filling). The layers still run op by op with a host round trip
   per group of matmuls, as Metal's prefill did before its whole-pass plans. CUDA decoding (108
-  tok/s q4, 71-72 q8) is one plan per token and was not touched.
+  tok/s q4, 71-72 q8) is one plan per token and was not touched. (Since: bf16 weights take
+  whole-pass plans, [RTX 5080, CUDA](#rtx-5080-cuda-november-2026); `--quant` weights still run
+  op by op.)
 - **Decode kernels**: bound by memory bandwidth here, so nothing was gained there beyond the
   i-quant unpackers; the Gated DeltaNet update (two passes over each state per token, 8% of
   the 27B's decode) could read its states once less.
@@ -4956,6 +4963,122 @@ The release checkpoint (NVFP4) with its MTP head, now used unasked the same way 
 temperature 1, two rounds alternated, the machine at load 4): code 84.5 / 82.6 tok/s against
 83.9 / 85.6 with `--no-draft` (before: `--mtp` 77.0 / 86.8), chat 82.2 / 79.9 against
 74.6 / 79.9 (`--mtp` 78.6 / 78.9): level.
+
+#### RTX 5080, CUDA (November 2026)
+
+Chat models on a discrete card: an RTX 5080 (16 GB, 84 SMs) in a Threadripper 9970X, the machine
+shared with other jobs throughout (load averages 10-50; a lock kept the GPU runs apart, and the
+two builds of a row ran in one lock window). "Before" is master `b36e8a1`, "after" this work on
+top of it, both `--release`. `examples/parity_bench.rs` as in the matrix (`device=cuda lookup=0
+draft=none mtp=0`, a warm-up per size, median of 5; pp64 / pp512 / pp2048 / pp8192, then tg128),
+llama.cpp master `2a8bf0f` (2026-11-27) built on the machine with CUDA, `llama-bench -ngl 99 -p
+64,512,2048,8192 -n 128 -r 3`. tok/s:
+
+| model | | pp64 | pp512 | pp2048 | pp8192 | tg128 |
+|---|---|---:|---:|---:|---:|---:|
+| Qwen3.5-0.8B bf16 (safetensors) | before | 801 | 1895 | 1984 | 1705 | 313 |
+| | after | 6123 | 22341 | 24657 | 22508 | 312 |
+| Llama-3.2-1B Q4_K_M | before | 10751 | 26874 | 27835 | 17562 | 670 |
+| | after | 10526 | 27127 | 27664 | 23809 | 660 |
+| | llama.cpp | 17135 | 44497 | 45965 | 41121 | 771 |
+| Orpheus 3B Q4_K_M (decode over 22 tokens) | before | | 11779 | 11308 | | 310 |
+| | after | | 11746 | 11447 | | 311 |
+| | llama.cpp | 8422 | 18428 | 17882 | 15120 | 322 |
+| Inkling-2-Mini AD-IQ2_M (MoE, its own engine: not touched) | oxinfer | 441 | 1824 | 2137 | | 112.6 |
+| | llama.cpp | 1669 | 4233 | 3850 | | 106.8 |
+| mlx-community/Qwen3-4B-4bit (affine Q4: op-by-op prompts, not touched) | oxinfer | 443 | 664 | 512 | | 172 |
+
+(The GGUF rows' prompt columns but pp8192 are the same code before and after: they differ by what
+two runs of one build differ by. llama.cpp's Inkling-2-Mini prompts are twice what
+[inkling.md](inkling.md#threadripper-9970x-and-rtx-5080-16-gb) measured on this card against an
+earlier master, 2049 / 1760; oxinfer's are what they were.)
+
+Concurrent requests (`oxinfer serve --parallel 8 --model M,device=cuda,lookup=0,draft=none,mtp=0`,
+N streaming chat requests at once, greedy, 256 tokens each, after one warm-up request; aggregate
+tok/s = generated tokens / wall time; llama-server `-np 8 -c 32768 -ngl 99 -fa on`):
+
+| model | | N=1 | N=2 | N=4 | N=8 |
+|---|---|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | before | 586 | 492 | 505 | 508 |
+| | after | 631 | 991 | 1538 | 1834 |
+| | llama-server | 668 | 1189 | 1917 | 2951 |
+| Qwen3.5-0.8B bf16 | before | 273 | 252 | 251 | 246 |
+| | after | 301 | 258 | 315 | 346 |
+| mlx-community/Qwen3-4B-4bit | before | 169 | 143 | 140 | 137 |
+| | after | 171 | 181 | 254 | 311 |
+
+**What changed** (each with its own before / after in the commit, and the kernels in
+[platforms.md](platforms.md#cuda)):
+
+- **Prefill plans for bf16 weights.** A safetensors checkpoint loaded as bf16 kept the op-by-op
+  prompt path (a host round trip per group of matmuls, attention and the Gated DeltaNet on the
+  CPU): its matrices are the ggml BF16 format's rows, so the plans now read them through that
+  format's GEMM, and the prompt's LM head through its matvec (the head of Qwen3.5-0.8B's 248320
+  rows took ~9 ms on the CPU, more than a 64-token pass). Qwen3.5-0.8B pp512 1904 -> 9582, then
+  12027 with the head.
+- **Attention at head dimension 256 on the tensor cores** (`dfattn_256`): the 6 attention layers
+  of a 512-token Qwen3.5-0.8B step 4.8 -> 0.5 ms after none and 20.1 -> 1.6 ms after 1536
+  cached; pp2048 10556 -> 13314.
+- **The Gated DeltaNet rule on a warp per state column** (four launches, the recurrence without
+  barriers): the 18 rules of a 512-token step 16.9 -> 5.1 ms; pp512 13339 -> 18797. With the
+  one kernel's order of sums on a thread per column (what `gpu_exact=1` takes) 13339 -> 14011.
+- **The Gated DeltaNet convolution over every token at once**: 2.35 -> 0.53 ms a step, and the
+  recurrent states up for the first chunk only (2.0-3.9 ms a later chunk): pp2048 19838 -> 23006.
+- **Room for the whole prompt's keys and values at its first chunk**, host and device: an
+  8192-token Llama-3.2-1B prompt spent about 150 of its 490 ms between its steps where the
+  caches doubled (52 ms before the chunk at 2048 positions, 96 before the one at 4096);
+  pp8192 16710 -> 24198.
+- **Batched decode steps** (`step_rows`): N requests no longer share one request's rate. Then
+  one launch per op for all rows (Llama-3.2-1B, N=8: 1052 -> 1283) and the int8 GGUF matvecs in
+  one sweep of the weights for up to 8 tokens (1335 -> 1807; an 8-row step 2.75 ms of GPU time,
+  3.9 ms with the host's part).
+
+Agreement. `pf_check` (512 and 1500 tokens of the corpus, 32 greedy tokens) on Qwen3.5-0.8B bf16
+against the CPU's exact prompt: the same 32 tokens, the first step within 0.0088 and 0.0041 in
+log-probability over the top 20 (the fast GEMM's f16 operands, as on GGUF files: 0.006-0.02
+there), 2.7e-5 with `gpu_exact=1`; the op-by-op path (`OXINFER_PREFILL_GPU=0`) is still the
+CPU's bit for bit. Batched rows are their one-token steps bit for bit (`cuda::tests`), and 8
+replies of 256 tokens were the same text alone and in a batch of 8 on Llama-3.2-1B Q4_K_M (four
+runs) and Qwen3.5-0.8B (one), with `OXINFER_PREFILL_GPU=0`: with the fast prompts a request
+that finds its prompt in a session's cache reads the prompt's last token again on the decode
+kernels, and its first step then differs from a fresh prompt's by the GEMMs' rounding, whatever
+the batching (from 3 to 8 of 8 replies the same over eight such runs). Of the bf16 prefill plans only Qwen3.5-0.8B was run: the other families build the
+graphs their GGUF files build.
+
+**Measured and not kept.** Steps of 1024 / 2048 tokens for the prefill plans
+(`OXINFER_CUDA_PREFILL_TOKENS`; Llama-3.2-1B pp2048 28401 -> 29679 / 30643, pp512 28734 -> 27596 /
+28248: within the runs' spread at 512, and the arena grows with the step); 128-row GEMM tiles
+instead of 256 (`OXINFER_CUDA_GEMM_256=0`: 28684 / 28239 against 28734 / 28401, no difference on
+this card, where the PRO 6000 gained 10% from the larger tile); stream-K off (25345 / 25562:
+kept on).
+
+**What is left**, by size:
+
+- **The prefill GEMM against llama.cpp's** (0.61-0.64x on Llama-3.2-1B and Orpheus at 512 and
+  2048 tokens): 14.3 of a 512-token Llama-3.2-1B step's 17.8 ms and 38 of Orpheus's 46 are the
+  GEMMs (`OXINFER_CUDA_DECODE_TRACE=2`), which unpack the weights to f16 once per 256-row
+  tile; llama.cpp's whole pass takes 11.5 and 27.8 ms (512 tokens at its rate). At 64 tokens
+  the unpacking is paid for a quarter of a tile's rows (5.3 ms of kernels a pass; llama.cpp's
+  pass 3.7).
+- **Inkling-2-Mini prompts** (0.43-0.56x; 0.26x at 64 tokens): its own engine, not looked at
+  here beyond the measurement.
+- **Recurrent states on the device.** A Gated DeltaNet model's states come down to the host
+  after every step: 0.59 of a decoded Qwen3.5-0.8B token's 3.2 ms, and 14.6 of an 8-row batched
+  step's 21 ms (152 MB), which is why its batched rows gain 1.4x where Llama's gain 3.6x. Keeping
+  them on the device until the host reads them needs every reader of a session's states
+  (checkpoints, snapshots, rewinds, the CPU path, clones) to fetch them first.
+- **Prefill plans for oxinfer's Q8 / Q4 and MLX affine Q4** (Qwen3-4B-4bit: 664 tok/s at 512
+  tokens, op by op).
+- **Batched rows against llama-server** (0.62x at 8 rows): of an 8-row Llama-3.2-1B step's
+  3.9 ms, 2.75 are the kernels and 0.5-0.7 the rows' results coming down (4 MB of logits to
+  pageable memory, and the new keys and values).
+- **Single-stream decoding of small models** (0.86x on Llama-3.2-1B, 0.97x on Orpheus): of a
+  token's 1.46 ms, 1.29 are the step's kernels (one graph launch: 73 matvecs, 33 norms and 16
+  layers' attention inputs and attention by the per-op trace), 0.07 the logits' copy and 0.10
+  the host between steps; the greedy chain Metal has (the next pass queued before the host
+  reads a token) is not on CUDA.
+- **Long contexts**: attention reads f32 keys and values (8.4 of a 512-token Llama-3.2-1B
+  step's 25 ms after 7680 positions; pp8192 is 0.58x llama.cpp's where pp2048 is 0.60x).
 
 #### DGX Spark, CUDA (November 2026)
 
