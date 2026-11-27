@@ -122,14 +122,24 @@ CPU (`tools/bench/with-lock.sh` held for the GPU):
 
 | | tokens | sampling | total |
 |---|---|---|---|
-| 1024x1024, Metal | 4,175 | 32.0 s (130 tok/s) | 33.7 s |
-| 1184x880, Metal | 4,139 | 30.3 s (137 tok/s) | 32.0 s |
-| 880x1184, Metal | 4,158 | 28.4 s (147 tok/s) | 30.0 s |
-| 2 x 1024x1024, Metal (`--num-images 2`, one after the other) | 8,350 | 56.4 s (148 tok/s) | 59.7 s |
+| 1024x1024, Metal | 4,175 | 28.4-29.7 s (141-147 tok/s) | 30.2-31.6 s |
+| 2 x 1024x1024, Metal (`--num-images 2`, both images in each GPU step) | 8,350 | 47.3 s (176 tok/s) | 50.4 s |
+| 4 x 1024x1024, Metal (`--num-images 4`) | 16,700 | 70-76 s (219-238 tok/s) | 74-80 s |
 | 1024x1024, CPU (`--device cpu`) | 4,175 | 102 s (41 tok/s) | 107 s |
 | 1024x1024, the float32 release with `--quant q4`, CPU | 4,175 | 173 s (24 tok/s) | 3.1 min, after 3.9 min of loading |
 
-The prompt takes about 1 s, the tokenizer's decoder 0.5 s on Metal (its matmuls and attention
+Before the batched steps and the experts fix below (the first Metal plan): 1024x1024 in 33.7 s
+(130 tok/s), 1184x880 in 32.0 s, 880x1184 in 30.0 s, 2 x 1024x1024 one after the other in 59.7
+s. A step of one image is 6.2 ms of GPU time out of 6.8 ms (`OXINFER_METAL_TRACE`): it reads
+about 2.6 GB of weights (the visual rows of the head 0.56 GB of it), close to the memory's
+bandwidth, so one image goes no faster; several images share the weight reads of every step but
+their routed experts' (each token picks its own 6 of 128). A step of 4 images at 512x512 is
+12.1 ms of GPU time (279 tok/s in all): about what reading the shared weights once (1.9 GB) and
+each row's experts (0.78 GB a row) takes at the memory's bandwidth; per kind of op
+(`OXINFER_PF_PROFILE=1`), the routed experts take a third of it, the Mamba-2 input projections a
+sixth, the head a tenth.
+
+The prompt takes about 1 s (0.1 s once the plans are built), the tokenizer's decoder 0.5 s on Metal (its matmuls and attention
 on the GPU) and 4 to 7 s on the CPU. For comparison, the community GGUF's README reports 19 to 30
 tok/s on a Radeon RX 7800 XT with Vulkan (experts on the CPU) and 100 to 120 tok/s with llama.cpp
 on an A100.
@@ -147,11 +157,25 @@ needed operations of its own in the decode IR (`src/gpu_decode.rs`) and the Meta
 - `Op::Route` with sigmoid routing (`dec_topk`: `sigmoid(logit) + bias` chooses, the chosen
   sigmoids renormalized and scaled by 2.5);
 - `Experts::relu2`, the ungated squared-ReLU experts (the pair kernels with the up matrix in
-  both slots, its second read from the caches, and a squared-ReLU store), and `LinMode::Relu2`
-  for the shared expert.
+  the first slot, the second left unread in mode 9, and a squared-ReLU store), and
+  `LinMode::Relu2` for the shared expert.
 
-These run in one-token plans only (no multi-token or prefill plans, no batched rows; the CUDA
-backend declines them and decodes on the CPU). Inside the image grid only the visual tokens'
+They run in every kind of plan: one-token steps, multi-token plans (`dec_mamba2_t`: a SIMD-group
+per state row keeps its row in registers over the step's tokens; `dec_gdn_conv_t` with the bias;
+`dec_rms_norm_rt` for the grouped norm, every token's rows in one dispatch; `dec_topk` and
+`pf_topk` with the sigmoid routing; `mode 9` of the multi-token matvecs), prefill plans (the same,
+`pf_conv` with the bias, the routed experts as grouped GEMMs with a squared-ReLU `silu_half`, the
+shared expert a GEMM then `dec_ew_t` mode 6) and batched rows (`DecodePlan::step_rows`: each
+row's recurrent ops on the one-token kernels with its own state). The squared-ReLU experts no
+longer read their matrix twice (the pair kernels skip the second one in mode 9: the same bits,
+half the work), which took Lightning's decoding from 93 to 153 tok/s
+([Nemotron 3.5](nemotron.md#on-metal)). `NemotronModel::forward_rows_batch` runs one token of
+each of up to 16 sessions; `--num-images N` (the server's `n`) runs the prompt once and the N
+grids in lockstep on it, each image with its own seed: the same images as one at a time, byte
+for byte (the batch's rows are the one-token steps' bits, `OXINFER_GPU_DECODE_CHECK=1` compares
+each row with a one-token step of its session: 510 of 510 equal; image 0 of a 4-image batch is
+the PNG of a single run with that seed). The CUDA backend declines these ops and runs
+Nemotron-H on the CPU. Inside the image grid only the visual tokens'
 logits are computed: their 196,560 rows of the head (60% of the 0.94 GB Q8_0 head) are a
 matrix of their own (`NemotronModel::load_head_rows`, borrowed from the GGUF file; on the CPU,
 where the head is interleaved for its kernels, the whole head runs and is sliced).

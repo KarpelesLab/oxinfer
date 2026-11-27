@@ -656,6 +656,12 @@ impl NemotronImage {
             ..Default::default()
         };
         let n = o.num_images.max(1);
+        if n > 1
+            && o.structure == Structure::Grid
+            && let Some(out) = self.generate_batch(&ids, o, n, &mut st, progress)?
+        {
+            return Ok((out, st));
+        }
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let seed = o.seed.wrapping_add(i as u64);
@@ -673,6 +679,125 @@ impl NemotronImage {
             out.push(g);
         }
         Ok((out, st))
+    }
+
+    /// The grid of `n` images in lockstep (`Structure::Grid`): the prompt runs once, then each
+    /// step runs one token of every image in one GPU pass that reads the weights once
+    /// (`NemotronModel::forward_rows_batch`); image `i` samples with seed `o.seed + i`, as
+    /// generated one at a time. None (nothing run) when the batch cannot run on the GPU.
+    fn generate_batch(
+        &self,
+        ids: &[u32],
+        o: &GenerateOptions,
+        n: usize,
+        st: &mut Stats,
+        progress: &mut dyn FnMut(Progress) -> Flow,
+    ) -> Result<Option<Vec<Generated>>> {
+        const MAX_BATCH: usize = 16;
+        let v = self.vocab;
+        let (gw, gh) = (o.width / PATCH, o.height / PATCH);
+        let mut pre = ids.to_vec();
+        let mut head = self.encode_text("\n")?;
+        head.push(v.img_start);
+        head.extend(self.encode_text(&size_header(o.width, o.height))?);
+        head.push(v.vis_row);
+        pre.extend(&head);
+        // Probe: a batch plan for this many rows at all (before the prompt runs).
+        if !self.lm.can_batch(n.min(MAX_BATCH)) {
+            return Ok(None);
+        }
+        let t = Instant::now();
+        let mut sess = self.lm.new_session();
+        let first = self.lm.forward_rows(&mut sess, &pre);
+        st.prefill += t.elapsed().as_secs_f64();
+        let stopped = || anyhow!("generation stopped");
+        let steps = gh * gw;
+        let mut out = Vec::with_capacity(n);
+        let t = Instant::now();
+        let mut dec = 0.0;
+        for g0 in (0..n).step_by(MAX_BATCH) {
+            let b = MAX_BATCH.min(n - g0);
+            let mut samplers: Vec<Sampler> = (0..b)
+                .map(|j| Sampler::new(o.temperature, o.top_k, o.top_p, o.seed.wrapping_add((g0 + j) as u64)))
+                .collect();
+            let mut sessions: Vec<_> = (0..b).map(|_| sess.clone()).collect();
+            let mut logits: Vec<Vec<f32>> = vec![first.clone(); b];
+            let mut codes: Vec<Vec<u32>> = vec![Vec::with_capacity(steps); b];
+            // One batched step, or (a single image left, or no batch plan) one step per session.
+            let run = |sessions: &mut [crate::nemotron::NemotronSession], toks: &[u32], want: bool| -> Vec<Vec<f32>> {
+                if sessions.len() > 1 {
+                    if want {
+                        if let Some(l) = self.lm.forward_rows_batch(sessions, toks) {
+                            return l;
+                        }
+                    } else if self.lm.gpu_step_batch(sessions, toks, false, false).is_some() {
+                        return Vec::new();
+                    }
+                }
+                sessions
+                    .iter_mut()
+                    .zip(toks)
+                    .map(|(s, &tk)| {
+                        if want {
+                            self.lm.forward_rows(s, &[tk])
+                        } else {
+                            if self.lm.gpu_step(s, tk, false).is_none() {
+                                self.lm.forward_hidden(s, &[tk]);
+                            }
+                            Vec::new()
+                        }
+                    })
+                    .collect()
+            };
+            for r in 0..gh {
+                for c in 0..gw {
+                    let mut toks = Vec::with_capacity(b);
+                    for j in 0..b {
+                        let code = sample(&mut samplers[j], &logits[j]);
+                        codes[j].push(code);
+                        toks.push(v.vis_start + code);
+                        if self.cancel.load(Ordering::Relaxed)
+                            || progress(Progress {
+                                image: g0 + j,
+                                images: n,
+                                step: codes[j].len(),
+                                steps,
+                            }) == Flow::Stop
+                        {
+                            return Err(stopped());
+                        }
+                    }
+                    if c + 1 < gw {
+                        logits = run(&mut sessions, &toks, true);
+                    } else if r + 1 < gh {
+                        run(&mut sessions, &toks, false);
+                        logits = run(&mut sessions, &vec![v.vis_row; b], true);
+                    }
+                }
+            }
+            for cj in codes {
+                let mut tokens = head.clone();
+                for row in cj.chunks(gw) {
+                    tokens.extend(row.iter().map(|&c| v.vis_start + c));
+                    tokens.push(v.vis_row);
+                }
+                tokens.pop();
+                tokens.push(v.img_end);
+                st.tokens += tokens.len();
+                let td = Instant::now();
+                let image = self.decode_codes(&cj, (gh, gw))?;
+                dec += td.elapsed().as_secs_f64();
+                out.push(Generated {
+                    image,
+                    codes: cj,
+                    grid: (gh, gw),
+                    tokens,
+                });
+            }
+        }
+        st.decode += dec;
+        st.token_secs += t.elapsed().as_secs_f64() - dec;
+        Ok(Some(out))
     }
 
     /// One image from the prompt `ids`.

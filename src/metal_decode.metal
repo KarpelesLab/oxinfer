@@ -1457,6 +1457,14 @@ kernel void dec_rms_norm(device const float* x [[buffer(0)]], device float* out 
     threadgroup float red[32];
     rms_norm_body(x, out, w, p, r, tid, nt, sg, lane, red);
 }
+// Rows of several tokens (grid: rows, tokens): ts = the tokens' x and out strides.
+kernel void dec_rms_norm_rt(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], device const float* w [[buffer(2)]],
+                            constant NP& p [[buffer(3)]], constant uint2& ts [[buffer(4)]], uint2 r [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]], uint2 nt [[threads_per_threadgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[32];
+    rms_norm_body(x + (ulong)r.y * ts.x, out + (ulong)r.y * ts.y, w, p, r.x, tid, nt.x, sg, lane, red);
+}
 
 // ---- Attention inputs for one token: per-head RMSNorm (optional) and RoPE of the queries (into
 // `qo`, contiguous heads) and keys (into the key cache at `pos`), values copied into the value
@@ -2042,10 +2050,10 @@ ATTV_ALL(8, 1) ATTV_ALL(8, 2) ATTV_ALL(8, 4) ATTV_ALL(16, 1) ATTV_ALL(16, 2)
 // copies of the recurrent states, see `MetalPlan::greedy`).
 struct GC { uint dim; uint kc; };
 inline void gdn_conv_body(device const float* x, device float* out, device const float* si, device float* st, device const float* w,
-                          constant GC& p, uint ch) {
+                          constant GC& p, uint ch, float s0 = 0.f) {
     uint kc = p.kc;
     float xv = x[ch];
-    float s = 0.f;
+    float s = s0;
     for (uint j = 0; j + 1 < kc; j++) s += w[ch * kc + j] * si[j * p.dim + ch];
     s += w[ch * kc + kc - 1] * xv;
     out[ch] = s / (1.0f + exp(-s));
@@ -2073,12 +2081,34 @@ kernel void dec_mamba_conv(device const float* x [[buffer(0)]], device float* ou
     st[(kc - 2) * p.dim + ch] = xv;
 }
 
-// Mamba-2's selective state update of one token, one threadgroup per head (256 threads): each
-// SIMD-group takes rows p of the head's [hd, ns] state, a lane every 32nd state column (ns a
-// multiple of 32, at most 256), so each row is read and written as whole cache lines. dt =
-// softplus(dt_raw + dt_bias) clamped, S <- exp(dt a) S + (dt x_p) B, y_p = S_p . C + d x_p, out =
-// y * silu(z). The state is read from `si` and written to `st` (see `gdn_conv_body`).
+// Mamba-2's selective state update, a SIMD-group per row p of a head's [hd, ns] state, a lane
+// every 32nd state column (ns a multiple of 32, at most 256), so each row is read and written as
+// whole cache lines: dt = softplus(dt_raw + dt_bias) clamped, S <- exp(dt a) S + (dt x_p) B, y_p =
+// S_p . C + d x_p, out = y * silu(z). The one-token and multi-token kernels share these bodies
+// (explicit fmas, no contraction), so every token gets the same bits from either.
 struct M2P { uint nh; uint hd; uint ng; uint ns; float dt_min; float dt_max; uint _p0; uint _p1; };
+inline float mamba2_dt(float raw, float bias, constant M2P& p) {
+    float zz = raw + bias;
+    float dt = zz > 20.f ? zz : log(1.f + exp(zz));
+    return min(max(dt, p.dt_min), p.dt_max);
+}
+// One token on a row's slices `s` (nc of them, in registers): the row's partial sum of S_p . C.
+inline float mamba2_row(thread float* s, uint nc, float da, float dx, device const float* B, device const float* C, uint lane) {
+#pragma clang fp contract(off)
+    float y = 0.f;
+    for (uint i = 0; i < nc; i++) {
+        float v = fma(dx, B[lane + 32 * i], s[i] * da);
+        s[i] = v;
+        y = fma(v, C[lane + 32 * i], y);
+    }
+    return y;
+}
+inline float mamba2_out(float y, float d, float xv, float gz) {
+#pragma clang fp contract(off)
+    return fma(d, xv, y) * (gz / (1.0f + exp(-gz)));
+}
+// One token, one threadgroup per head (256 threads, rows sg, sg + 8, ...). The state is read from
+// `si` and written to `st` (see `gdn_conv_body`).
 kernel void dec_mamba2(device const float* xbc [[buffer(0)]], device const float* z [[buffer(1)]], device const float* dtr [[buffer(2)]],
                        device float* out [[buffer(3)]], device float* st [[buffer(4)]], device const float* cst [[buffer(5)]],
                        constant M2P& p [[buffer(6)]], device const float* si [[buffer(7)]],
@@ -2087,39 +2117,52 @@ kernel void dec_mamba2(device const float* xbc [[buffer(0)]], device const float
     uint g = h / (p.nh / p.ng), inner = p.nh * p.hd, nc = p.ns / 32, nsg = nt / 32;
     device const float* B = xbc + inner + g * p.ns;
     device const float* C = xbc + inner + (p.ng + g) * p.ns;
-    float b[8], c[8];
-    for (uint i = 0; i < 8; i++) {
-        b[i] = i < nc ? B[lane + 32 * i] : 0.f;
-        c[i] = i < nc ? C[lane + 32 * i] : 0.f;
-    }
-    float zz = dtr[h] + cst[2 * p.nh + h];
-    float dt = zz > 20.f ? zz : log(1.f + exp(zz));
-    dt = min(max(dt, p.dt_min), p.dt_max);
+    float dt = mamba2_dt(dtr[h], cst[2 * p.nh + h], p);
     float da = exp(dt * cst[h]);
     for (uint r = sg; r < p.hd; r += nsg) {
         float xv = xbc[h * p.hd + r];
-        float dx = dt * xv;
         ulong base = ((ulong)h * p.hd + r) * p.ns + lane;
-        float y = 0.f;
-        for (uint i = 0; i < nc; i++) {
-            float s = si[base + 32 * i] * da + dx * b[i];
-            st[base + 32 * i] = s;
-            y += s * c[i];
-        }
-        y = simd_sum(y);
-        if (lane == 0) {
-            float gz = z[h * p.hd + r];
-            out[h * p.hd + r] = (y + cst[p.nh + h] * xv) * (gz / (1.0f + exp(-gz)));
-        }
+        float s[8];
+        for (uint i = 0; i < nc; i++) s[i] = si[base + 32 * i];
+        float y = simd_sum(mamba2_row(s, nc, da, dt * xv, B, C, lane));
+        for (uint i = 0; i < nc; i++) st[base + 32 * i] = s[i];
+        if (lane == 0) out[h * p.hd + r] = mamba2_out(y, cst[p.nh + h], xv, z[h * p.hd + r]);
     }
 }
-// ts: tokens, input and output strides.
+// The tokens of a step in order (grid: heads, row blocks of threads / 32 rows): each SIMD-group
+// keeps its row in registers across the tokens. ts: tokens, the strides of xbc, of z / dt (one
+// projection row) and of out.
+kernel void dec_mamba2_t(device const float* xbc [[buffer(0)]], device const float* z [[buffer(1)]], device const float* dtr [[buffer(2)]],
+                         device float* out [[buffer(3)]], device float* st [[buffer(4)]], device const float* cst [[buffer(5)]],
+                         constant M2P& p [[buffer(6)]], constant uint4& ts [[buffer(7)]],
+                         uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]], uint2 nt [[threads_per_threadgroup]]) {
+    uint h = tg.x, r = tg.y * (nt.x / 32) + sg;
+    if (r >= p.hd) return;
+    uint g = h / (p.nh / p.ng), inner = p.nh * p.hd, nc = p.ns / 32;
+    ulong base = ((ulong)h * p.hd + r) * p.ns + lane;
+    float s[8];
+    for (uint i = 0; i < nc; i++) s[i] = st[base + 32 * i];
+    float a = cst[h], dd = cst[p.nh + h], db = cst[2 * p.nh + h];
+    for (uint t = 0; t < ts.x; t++) {
+        device const float* xb = xbc + (ulong)t * ts.y;
+        float dt = mamba2_dt(dtr[(ulong)t * ts.z + h], db, p);
+        float da = exp(dt * a);
+        float xv = xb[h * p.hd + r];
+        float y = simd_sum(mamba2_row(s, nc, da, dt * xv, xb + inner + g * p.ns, xb + inner + (p.ng + g) * p.ns, lane));
+        if (lane == 0) out[(ulong)t * ts.w + h * p.hd + r] = mamba2_out(y, dd, xv, z[(ulong)t * ts.z + h * p.hd + r]);
+    }
+    for (uint i = 0; i < nc; i++) st[base + 32 * i] = s[i];
+}
+// ts: tokens, input and output strides, and whether `bias` is set (Mamba-2's: silu(bias + sum)).
 kernel void dec_gdn_conv_t(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], device float* st [[buffer(2)]],
                            device const float* w [[buffer(3)]], constant GC& p [[buffer(4)]], constant uint4& ts [[buffer(5)]],
-                           uint ch [[thread_position_in_grid]]) {
+                           device const float* bias [[buffer(6)]], uint ch [[thread_position_in_grid]]) {
     if (ch >= p.dim) return;
-    for (uint t = 0; t < ts.x; t++) gdn_conv_body(x + (ulong)t * ts.y, out + (ulong)t * ts.z, st, st, w, p, ch);
+    float s0 = ts.w != 0 ? bias[ch] : 0.f;
+    for (uint t = 0; t < ts.x; t++) gdn_conv_body(x + (ulong)t * ts.y, out + (ulong)t * ts.z, st, st, w, p, ch, s0);
 }
+
 
 // The gated delta rule for one token, one threadgroup per value head: thread (part, j) keeps rows
 // 32 part .. 32 part + 31 of column j of the head's [hdk, hdv] state in registers (hdk / 32 parts,
@@ -2348,7 +2391,7 @@ kernel void pf_norm_half(device const float* x [[buffer(0)]], device float* out 
 // Expert e's weights are at the addresses tab[e] (data, scales, affine offsets). `sel` holds the k
 // chosen expert ids (as uint bits) then their weights. Pair kernels: threadgroup (row, slot s)
 // computes act[s] = silu(gate_e x) * (up_e x) (fused gate / up tables: up rows after r2off rows of
-// the same matrix); sum kernels: y += sum over slots of weight_s * (down_e act[s]).
+// the same matrix; mode 9, squared ReLU: relu(gate_e x)^2, the second matrix unread); sum kernels: y += sum over slots of weight_s * (down_e act[s]).
 struct EPX { device const uchar* q; device const uchar* s; device const uchar* o; device const uchar* _p; };
 #define MVX_SIG(NAME) \
 kernel void NAME(device const EPX* tab [[buffer(0)]], device const EPX* tab2 [[buffer(1)]], device const float* x [[buffer(2)]], \
@@ -2360,7 +2403,7 @@ MVX_SIG(NAME##_pair) { threadgroup float red[2]; \
     uint s = tg.y; EPX e = tab[as_type<uint>(sel[s])], e2 = tab2[as_type<uint>(sel[s])]; \
     float acc[1] = { 0.f }, acc2[1] = { 0.f }; \
     T f = MAKE(e); T f2 = MAKE(e2); \
-    mv_acc<T, X, CH, 1, 1>(f, f2, true, p._p, x, p.n_in, p.n_out, tg.x, sg, lane, acc, acc2, 1.f); \
+    mv_acc<T, X, CH, 1, 1>(f, f2, p.mode != 9u, p._p, x, p.n_in, p.n_out, tg.x, sg, lane, acc, acc2, 1.f); \
     mv_finish<1, 1>(acc, acc2, y + (ulong)s * p.n_out * (p.mode == 5u ? 2u : 1u), p.mode, tg.x, p.n_out, sg, lane, red, sel + 2 * p.ldy); } \
 MVX_SIG(NAME##_sum) { threadgroup float red[2]; \
     float acc[1] = { 0.f }, acc2[1] = { 0.f }; \
@@ -2453,7 +2496,8 @@ MVX_SIG(NAME##_pair) { threadgroup float red[2 * RPS * KS]; \
     uint s = tg.y, row = tg.x * RPS + lane % RPS; EPX e = tab[as_type<uint>(sel[s])], e2 = tab2[as_type<uint>(sel[s])]; \
     T f = MAKE(e); T f2 = MAKE(e2); \
     float a = 0.f, b = 0.f; \
-    xt_run2<T, X, CH, RPS, KS>(f, f2, row, p._p, x, p.n_in, sg, lane, a, b); \
+    if (p.mode == 9u) a = xt_run<T, X, CH, RPS, KS>(f, row, x, p.n_in, sg, lane); \
+    else xt_run2<T, X, CH, RPS, KS>(f, f2, row, p._p, x, p.n_in, sg, lane, a, b); \
     if (xt_reduce<RPS, KS>(a, b, sg, lane, red)) \
         mv_store(a, b, y + (ulong)s * p.n_out * (p.mode == 5u ? 2u : 1u), p.mode, row, p.n_out, sel + 2 * p.ldy); } \
 MVX_SIG(NAME##_sum) { threadgroup float red[2 * RPS * KS]; \
@@ -2504,6 +2548,15 @@ MVXB_SIG(NAME##_bsum) { threadgroup float red[2 * RPS * KS]; \
 #define MKX_Q8(e) MQ8{ (device const char*)(e).q, (device const float*)(e).s, p.n_in }
 #define MKX_Q4(e) MQ4{ (e).q, (device const half*)(e).s, p.n_in, (device const ushort*)(e).o, p.gpr, p.gk }
 
+// Sigmoid routing's weights (dec_topk and pf_topk alike): the chosen experts' sigmoid scores,
+// renormalized, times the scale (`scale[n]`).
+inline void route_sigmoid_weights(device const float* logits, device float* sel, uint k, uint n, device const float* scale,
+                                  threadgroup float* chosen) {
+#pragma clang fp reassociate(off)
+    float s = 0.f;
+    for (uint j = 0; j < k; j++) { float e = 1.0f / (1.0f + exp(-logits[as_type<uint>(sel[j])])); chosen[j] = e; s += e; }
+    for (uint j = 0; j < k; j++) sel[k + j] = chosen[j] / s * scale[n];
+}
 // Top k of n router logits (ties to the lower index), softmax over the chosen: ids (as uint bits)
 // then weights into `sel`. One threadgroup, one logit per thread (n <= 1024).
 // p.z != 0: the weights are then multiplied by scale[id].
@@ -2559,10 +2612,7 @@ kernel void dec_topk(device const float* logits [[buffer(0)]], device float* sel
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (tid == 0 && p.z == 2) {
-        // The chosen experts' sigmoid scores, renormalized, times the scale (`scale[n]`).
-        float s = 0.f;
-        for (uint j = 0; j < k; j++) { float e = 1.0f / (1.0f + exp(-logits[as_type<uint>(sel[j])])); chosen[j] = e; s += e; }
-        for (uint j = 0; j < k; j++) sel[k + j] = chosen[j] / s * scale[n];
+        route_sigmoid_weights(logits, sel, k, n, scale, chosen);
     } else if (tid == 0) {
         float m = chosen[0], s = 0.f;
         for (uint j = 0; j < k; j++) { float e = exp(chosen[j] - m); chosen[j] = e; s += e; }
@@ -2574,7 +2624,7 @@ kernel void dec_topk(device const float* logits [[buffer(0)]], device float* sel
 // ---- Elementwise: p.x = 0 scale (a * p.y), 1 softcap (tanh(a / p.y) * p.y), 2 combine
 // ((a * p.y + b * p.z) * p.w), 3 silu(a * p.y), 4 hyper-connection read (out = p.w * sum over
 // p.y streams of sigmoid(a) * b, streams n apart), 5 hyper-connection write (out[s m + i] +=
-// a[i] * 2 sigmoid(b[s] * p.z), m = p.y).
+// a[i] * 2 sigmoid(b[s] * p.z), m = p.y), 6 squared ReLU (max(a, 0)^2).
 inline void ew_body(device const float* a, device const float* b, device float* out, constant float4& p, uint n, uint i) {
     if (p.x == 4.f) {
         uint hc = (uint)p.y;
@@ -2594,6 +2644,7 @@ inline void ew_body(device const float* a, device const float* b, device float* 
         return;
     }
     float v = a[i];
+    if (p.x == 6.f) { float r = max(v, 0.f); out[i] = r * r; return; }
     if (p.x == 0.f) out[i] = v * p.y;
     else if (p.x == 1.f) out[i] = precise::tanh(v / p.y) * p.y;
     else if (p.x == 3.f) { float u = v * p.y; out[i] = u / (1.0f + precise::exp(-u)); }

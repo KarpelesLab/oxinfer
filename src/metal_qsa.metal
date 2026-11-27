@@ -298,6 +298,8 @@ kernel void pf_topk(device const float* logits [[buffer(0)]], device float* sel 
     sel += (ulong)t * ts.y;
     uint n = p.x, k = p.y;
     float v = tid < n ? logits[tid] : -INFINITY;
+    // Sigmoid routing (p.z == 2, as dec_topk): chosen by sigmoid(logit) + bias (`scale[0 .. n]`).
+    if (p.z == 2 && tid < n) v = 1.0f / (1.0f + exp(-v)) + scale[tid];
     uint nsg = (nt + 31) / 32;
     for (uint j = 0; j < k; j++) {
         float m = simd_max(v);
@@ -311,7 +313,9 @@ kernel void pf_topk(device const float* logits [[buffer(0)]], device float* sel 
         if (tid == 0) { sel[j] = as_type<float>(bidx); chosen[j] = best; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (tid == 0) {
+    if (tid == 0 && p.z == 2) {
+        route_sigmoid_weights(logits, sel, k, n, scale, chosen);
+    } else if (tid == 0) {
         float m = chosen[0], s = 0.f;
         for (uint j = 0; j < k; j++) { float e = exp(chosen[j] - m); chosen[j] = e; s += e; }
         for (uint j = 0; j < k; j++) sel[k + j] = chosen[j] / s * (p.z != 0 ? scale[as_type<uint>(sel[j])] : 1.f);
@@ -378,11 +382,12 @@ ATTN_PFX(2, 1) ATTN_PFX(2, 2) ATTN_PFX(2, 4) ATTN_PFX(2, 8) ATTN_PFX(4, 1) ATTN_
 // ts: x and out strides (y, z). pf_conv_state then shifts the chunk into the state.
 kernel void pf_conv(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], device const float* st [[buffer(2)]],
                     device const float* w [[buffer(3)]], constant GC& p [[buffer(4)]], constant uint4& ts [[buffer(5)]],
-                    uint2 gid [[thread_position_in_grid]]) {
+                    device const float* bias [[buffer(6)]], uint2 gid [[thread_position_in_grid]]) {
     uint ch = gid.x, t = gid.y;
     if (ch >= p.dim) return;
     uint kc = p.kc, hs = kc - 1;
-    float s = 0.f;
+    // (ts.w: Mamba-2's bias first, as dec_gdn_conv_t.)
+    float s = ts.w != 0 ? bias[ch] : 0.f;
     for (uint j = 0; j < kc; j++) {
         uint i = t + j;
         float v = i < hs ? st[i * p.dim + ch] : x[(ulong)(i - hs) * ts.y + ch];

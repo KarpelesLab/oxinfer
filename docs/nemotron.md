@@ -63,10 +63,39 @@ NeMo Automodel's `nemotron_v3/mtp.py` and llama.cpp do, so there is a reference)
 and the MoE latent projection (no released checkpoint uses them), weight streaming (`--stream`),
 and speculative decoding of any kind: verifying a draft means going back to an earlier position
 when it is refuted, which the Mamba state cannot do without snapshots, so prompt-lookup rounds
-are off too. One-token steps run as a whole on Metal (the decode plan of
+are off too. CUDA runs Nemotron-H on the CPU (its plans decline the Mamba-2 ops).
+
+### On Metal
+
+One-token steps run as a whole on Metal (the decode plan of
 [Nemotron-Labs-Image](nemotron-image.md#speed): Mamba-2, sigmoid routing and squared-ReLU
-experts in one submission; `--gpu-decode off` keeps them on the CPU); prompts run on the CPU
-kernels, an accelerator taking their matmuls; CUDA decodes on the CPU.
+experts in one submission), and prompts of 32 tokens and more on its prefill plan (chunks of
+2048 tokens, `OXINFER_PREFILL_TOKENS`, with the activations on the device for the whole chunk:
+matrix-unit GEMMs, the routed experts as grouped GEMMs over each expert's tokens, a SIMD-group
+per Mamba-2 state row that keeps its row in registers across the chunk's tokens, the
+convolution's tokens in parallel). `--gpu-decode off` keeps both on the CPU (an accelerator
+taking the prompt's matmuls), `OXINFER_PREFILL_GPU=0` the prompts alone.
+
+ggml-org's Q4_0 GGUF of Lightning on the M5 Max (greedy, the machine shared with other jobs,
+`tools/bench/with-lock.sh` held):
+
+| | oxinfer | llama.cpp de30697 (Metal) |
+|---|---|---|
+| decoding, 34-token prompt | 153 tok/s (before the prefill plan and the experts fix below: 93) | 104 tok/s (`llama-cli`), `llama-bench` tg128 115 |
+| decoding after a 3,056-token prompt | 136 tok/s (70) | |
+| prefill | 1,848 tok/s at 3,056 tokens (596 with the matmuls alone on the GPU) | `llama-bench` pp512 3,390, pp2048 2,761 |
+
+Decoding is ahead of llama.cpp; prompts run at about two thirds of its speed.
+
+The squared-ReLU experts had run on the pair kernels with the up matrix in both slots, reading
+it twice; they now skip the second matrix (mode 9 of `mvx_*_pair` / `mvxt_*_pair`), the same
+bits for half the work. Agreement (`OXINFER_GPU_DECODE_CHECK=1`, each step against the CPU from
+the same state, 100 greedy steps after the CPU's prefill): mean KL 3.4e-3 (4.1e-3 before),
+the same top token at every step; the CPU rounds the activations to int8 for the quantized
+blocks. The prefill plan against the CPU's logits after the 3,056-token prompt: KL 1.5e-3, the
+host path (GPU matmuls) 2.2e-3, the two 3.1e-4 apart, the same top token; the two paths'
+greedy continuations stay on the same summary of the prompt, worded differently after a few
+dozen tokens.
 
 ### Checkpoints
 

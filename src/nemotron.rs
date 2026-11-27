@@ -938,6 +938,24 @@ impl<'a> NemotronModel<'a> {
         layers: &[usize],
         feats: &mut Vec<f32>,
     ) -> Vec<f32> {
+        if layers.is_empty()
+            && let Some(hs) = self.gpu_prefill(sess, tokens, mm)
+        {
+            feats.clear();
+            return hs;
+        }
+        self.forward_capture_host(sess, tokens, mm, layers, feats)
+    }
+
+    /// [`Self::forward_capture`] on the host (the matmuls on the GPU backend where it takes them).
+    fn forward_capture_host(
+        &self,
+        sess: &mut NemotronSession,
+        tokens: &[u32],
+        mm: &[(usize, &[f32])],
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+    ) -> Vec<f32> {
         let t = tokens.len();
         assert!(t > 0);
         let c = &self.cfg;
@@ -1220,7 +1238,7 @@ impl NemotronModel<'_> {
     /// state update, the grouped RMSNorm), attention without positions, the sigmoid-routed
     /// squared-ReLU experts and their shared expert, dense MLPs, the head. None when a weight
     /// cannot go to the device.
-    fn gpu_graph<'s>(&'s self, rows: bool) -> Option<crate::gpu::decode::Graph<'s>> {
+    fn gpu_graph<'s>(&'s self, rows: bool, head: bool) -> Option<crate::gpu::decode::Graph<'s>> {
         use crate::gpu::decode::{Experts, Graph, LinMode, Mamba2, Op};
         use std::borrow::Cow;
         let c = &self.cfg;
@@ -1264,12 +1282,13 @@ impl NemotronModel<'_> {
         let eact = g.buf(k * mi);
         let sact = g.buf(si);
         let hidden = g.buf(h);
-        let (head, n_logits) = match (&self.head_rows, rows) {
+        let want_head = head;
+        let (head_w, n_logits) = match (&self.head_rows, rows) {
             (Some((r, Some(l))), true) => (l, r.len()),
             (_, true) => return None,
             _ => (&self.lm_head, c.vocab_size),
         };
-        let logits = g.buf(n_logits);
+        let logits = g.buf(if head { n_logits } else { 1 });
         g.input = x;
         g.hidden = hidden;
         g.n_hidden = h;
@@ -1419,8 +1438,10 @@ impl NemotronModel<'_> {
         }
         g.ops.push(Op::norm(x, hidden, &self.final_norm, h, eps));
         g.head_from = g.ops.len();
-        g.ops.push(lin(head, n_logits, h, hidden, logits, LinMode::Store)?);
-        g.logits = Some((logits, n_logits));
+        if want_head {
+            g.ops.push(lin(head_w, n_logits, h, hidden, logits, LinMode::Store)?);
+            g.logits = Some((logits, n_logits));
+        }
         Some(g)
     }
 
@@ -1437,7 +1458,7 @@ impl NemotronModel<'_> {
     fn gpu_plan(&self, rows: bool) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
         self.gpu_plans.get(rows as u64, || {
             let be = crate::gpu::active()?;
-            let g = self.gpu_graph(rows);
+            let g = self.gpu_graph(rows, true);
             if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
                 eprintln!(
                     "[nemotron gpu decode graph: {}]",
@@ -1450,6 +1471,242 @@ impl NemotronModel<'_> {
             }
             p
         })
+    }
+
+    /// The GPU prefill plan (`Backend::decode_plan_prefill`: chunks of
+    /// `crate::qwen::prefill_plan_tokens` tokens on the matrix-unit GEMMs, the activations on the
+    /// device for the whole chunk), compiled on first use; None when unavailable.
+    fn gpu_prefill_plan(&self) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
+        let tokens = crate::qwen::prefill_plan_tokens();
+        self.gpu_plans.get((1 << 61) | tokens as u64, || {
+            let be = crate::gpu::active()?;
+            let t0 = crate::clock::Instant::now();
+            let p = self.gpu_graph(false, false).and_then(|g| be.decode_plan_prefill(&g, tokens));
+            if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                eprintln!(
+                    "[nemotron gpu prefill plan: {} in {:.2}s]",
+                    if p.is_some() { "built" } else { "none" },
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+            p
+        })
+    }
+
+    /// A pass of `tokens` (at least `crate::qwen::PREFILL_GPU_MIN`) on the GPU prefill plan, in
+    /// chunks of the plan's size: the final-normed hidden states, as the host path gives them up
+    /// to rounding (half-precision GEMM inputs). None (nothing changed) when it cannot run there;
+    /// a failure past the first chunk finishes the pass on the host.
+    fn gpu_prefill(&self, sess: &mut NemotronSession, tokens: &[u32], mm: &[(usize, &[f32])]) -> Option<Vec<f32>> {
+        let t = tokens.len();
+        if !crate::qwen::prefill_gpu(t, "plan") || !self.gpu_ok(sess) {
+            return None;
+        }
+        let plan = self.gpu_prefill_plan()?;
+        let (c, h) = (&self.cfg, self.cfg.hidden_size);
+        let n = plan.tokens();
+        let mut x = crate::kernels::zeros(t * h);
+        for_chunks(&mut x, h, true, |ti, row| {
+            let tk = tokens[ti] as usize;
+            self.embed.row(if tk < c.vocab_size { tk } else { 0 }, row);
+        });
+        for (p, e) in mm {
+            x[p * h..(p + 1) * h].copy_from_slice(e);
+        }
+        let mut hidden = crate::kernels::zeros(t * h);
+        for l in sess.layers.iter_mut() {
+            if let LayerState::Attn(cache) = l {
+                cache.reserve(t);
+            }
+        }
+        let mut done = 0;
+        while done < t {
+            let m = n.min(t - done);
+            let ok = {
+                let _timer = prof::start(Cat::Matmul);
+                let mut kv: Vec<&mut LayerCache> = Vec::new();
+                let mut states: Vec<&mut [f32]> = Vec::new();
+                for l in sess.layers.iter_mut() {
+                    match l {
+                        LayerState::Attn(cache) => kv.push(cache),
+                        LayerState::Mamba { conv, ssm } => {
+                            states.push(&mut conv[..]);
+                            states.push(&mut ssm[..]);
+                        }
+                        LayerState::None => {}
+                    }
+                }
+                plan.step(
+                    &mut sess.gpu,
+                    crate::gpu::decode::Step {
+                        pos: sess.pos,
+                        t: m,
+                        rope_cs: &[],
+                        x: &x[done * h..(done + m) * h],
+                        x2: &[],
+                        kv: &mut kv,
+                        states: &mut states,
+                        hidden: &mut hidden[done * h..(done + m) * h],
+                        logits: None,
+                        params: None,
+                        capture: None,
+                        scratch: false,
+                        states_kept: false,
+                    },
+                )
+            };
+            if !ok {
+                if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                    eprintln!("[nemotron gpu prefill step failed at {}]", sess.pos);
+                }
+                break;
+            }
+            sess.pos += m;
+            done += m;
+        }
+        sess.gpu_kept = false;
+        if done == 0 {
+            return None;
+        }
+        if done < t {
+            let rest: Vec<(usize, &[f32])> = mm.iter().filter(|m| m.0 >= done).map(|&(i, e)| (i - done, e)).collect();
+            let hs = self.forward_capture_host(sess, &tokens[done..], &rest, &[], &mut Vec::new());
+            hidden.truncate(done * h);
+            hidden.extend_from_slice(&hs);
+        }
+        Some(hidden)
+    }
+
+    /// The GPU plan for one token of each of up to `tokens` sessions at once
+    /// ([`crate::gpu::decode::DecodePlan::step_rows`]); `rows`: the head of
+    /// [`Self::load_head_rows`].
+    fn gpu_batch_plan(&self, tokens: usize, rows: bool) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
+        let tokens = *[8usize, 16].iter().find(|&&n| n >= tokens)?;
+        self.gpu_plans.get((1 << 62) | ((rows as u64) << 32) | tokens as u64, || {
+            let be = crate::gpu::active()?;
+            let p = self.gpu_graph(rows, true).and_then(|g| be.decode_plan_multi(&g, tokens));
+            if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                eprintln!(
+                    "[nemotron gpu batch plan ({tokens}): {}]",
+                    if p.is_some() { "built" } else { "none" }
+                );
+            }
+            p
+        })
+    }
+
+    /// One token of each session (`toks[i]` for `sessions[i]`, independent sequences) in one GPU
+    /// step that reads the weights once for all: each session's logits (`[n, vocab]`, or the rows
+    /// of [`Self::load_head_rows`] with `rows`) when `want_logits`, each row what a one-token
+    /// step of its session gives. None (nothing changed) when it cannot run that way (no GPU
+    /// plan, more sessions than a plan takes, interventions).
+    pub fn gpu_step_batch(&self, sessions: &mut [NemotronSession], toks: &[u32], want_logits: bool, rows: bool) -> Option<Vec<f32>> {
+        let b = sessions.len();
+        if b < 2 || toks.len() != b || !sessions.iter().all(|s| self.gpu_ok(s)) {
+            return None;
+        }
+        let rows = rows && want_logits && matches!(self.head_rows, Some((_, Some(_))));
+        let plan = self.gpu_batch_plan(b, rows)?;
+        let n_logits = match (&self.head_rows, rows) {
+            (Some((r, Some(_))), true) => r.len(),
+            _ => self.cfg.vocab_size,
+        };
+        let check = (want_logits && crate::gpu::decode::check()).then(|| sessions.to_vec());
+        let h = self.cfg.hidden_size;
+        let mut x = vec![0f32; b * h];
+        for (row, &tk) in x.chunks_mut(h).zip(toks) {
+            self.embed.row(tk as usize, row);
+        }
+        let mut hidden = vec![0f32; b * h];
+        let mut logits = want_logits.then(|| vec![0f32; b * n_logits]);
+        let _timer = prof::start(Cat::Matmul);
+        let mut kvs: Vec<Vec<&mut LayerCache>> = Vec::with_capacity(b);
+        let mut sts: Vec<Vec<&mut [f32]>> = Vec::with_capacity(b);
+        let mut slots = Vec::with_capacity(b);
+        let mut poss = Vec::with_capacity(b);
+        for s in sessions.iter_mut() {
+            poss.push(s.pos);
+            let mut kv: Vec<&mut LayerCache> = Vec::new();
+            let mut st: Vec<&mut [f32]> = Vec::new();
+            for l in s.layers.iter_mut() {
+                match l {
+                    LayerState::Attn(cache) => kv.push(cache),
+                    LayerState::Mamba { conv, ssm } => {
+                        st.push(&mut conv[..]);
+                        st.push(&mut ssm[..]);
+                    }
+                    LayerState::None => {}
+                }
+            }
+            kvs.push(kv);
+            sts.push(st);
+            slots.push(&mut s.gpu);
+        }
+        let mut brows: Vec<crate::gpu::decode::Row> = slots
+            .into_iter()
+            .zip(kvs.iter_mut())
+            .zip(sts.iter_mut())
+            .enumerate()
+            .map(|(j, ((slot, kv), st))| crate::gpu::decode::Row {
+                slot,
+                pos: poss[j],
+                rope_cs: &[],
+                x: &x[j * h..(j + 1) * h],
+                x2: &[],
+                kv,
+                states: st,
+            })
+            .collect();
+        let ok = plan.step_rows(&mut brows, &mut hidden, logits.as_deref_mut());
+        drop(brows);
+        drop(kvs);
+        drop(sts);
+        drop(_timer);
+        for s in sessions.iter_mut() {
+            // (The batch's slot copies of the states are the host's, updated in place.)
+            s.gpu_kept = false;
+        }
+        if !ok {
+            return None;
+        }
+        if let (Some(cl), Some(l)) = (check, &logits) {
+            // `OXINFER_GPU_DECODE_CHECK`: each row against a one-token step of its session.
+            for (j, mut s) in cl.into_iter().enumerate() {
+                if let Some((_, Some(one))) = self.gpu_step_with(&mut s, toks[j], true, rows) {
+                    crate::gpu::decode::report(poss[j], &one, &l[j * n_logits..(j + 1) * n_logits]);
+                }
+            }
+        }
+        for s in sessions.iter_mut() {
+            s.pos += 1;
+        }
+        Some(logits.unwrap_or_default())
+    }
+
+    /// Whether [`Self::forward_rows_batch`] can take `n` sessions (a GPU plan for them builds).
+    pub fn can_batch(&self, n: usize) -> bool {
+        n > 1
+            && crate::gpu::decode_enabled()
+            && crate::gpu::active().is_some()
+            && self.gpu_batch_plan(n, matches!(self.head_rows, Some((_, Some(_))))).is_some()
+    }
+
+    /// [`Self::forward_rows`] for one token of each of several sessions at once on the GPU
+    /// ([`Self::gpu_step_batch`]): each session's logits of the rows of
+    /// [`Self::load_head_rows`] (all of them when none were set). None (nothing changed) when the
+    /// batch cannot run on the GPU.
+    pub fn forward_rows_batch(&self, sessions: &mut [NemotronSession], toks: &[u32]) -> Option<Vec<Vec<f32>>> {
+        let b = sessions.len();
+        let all = self.gpu_step_batch(sessions, toks, true, true)?;
+        let n = all.len() / b;
+        Some(
+            all.chunks(n)
+                .map(|l| match &self.head_rows {
+                    Some((r, None)) => l[r.clone()].to_vec(),
+                    _ => l.to_vec(),
+                })
+                .collect(),
+        )
     }
 
     /// Runs token `tok` through the GPU decode plan: the final-normed hidden state and, if

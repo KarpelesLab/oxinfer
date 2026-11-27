@@ -54,7 +54,7 @@ pub enum LinMode {
 pub enum Op<'a> {
     /// RMSNorm of `rows` rows of `n` values (row strides in floats) of `x * pre`: `out = x' /
     /// rms(x') * w`, or `out += ...` with `add`. `w` holds `n` weights shared by the rows, or
-    /// `rows * n`, each row its own (Nemotron-H's grouped norm; one-token plans only).
+    /// `rows * n`, each row its own (Nemotron-H's grouped norm).
     Norm {
         x: View,
         out: View,
@@ -145,7 +145,7 @@ pub enum Op<'a> {
     /// Causal depthwise conv of kernel `kc` over `dim` channels with SiLU: `out = silu(sum of
     /// w[ch][j] * input j)`, inputs being the `kc - 1` earlier ones in recurrent state `state`
     /// (`[kc - 1, dim]`, oldest first) and `x`; the state then shifts in `x`. With `bias`,
-    /// `out = silu(bias + sum ...)` (Mamba-2's convolution; one-token plans only).
+    /// `out = silu(bias + sum ...)` (Mamba-2's convolution).
     GdnConv {
         x: View,
         out: View,

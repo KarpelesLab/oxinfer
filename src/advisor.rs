@@ -327,7 +327,8 @@ const NEMO_IMAGE_F32: &str = "autoregressive (4,176 tokens a 1024x1024 image), r
      release is converted at load (--quant q4: 23 GB peak, 3.9 min); M5 Max CPU 24 tok/s, 3 min an image; the GGUFs load \
      faster; source images experimental";
 const NEMO_IMAGE_GGUF: &str = "18.9 GB + the 2.6 GB tokenizer folder of nvidia/Nemotron-Labs-Image-30B-A3B; a 1024x1024 \
-     image (4,176 tokens) in 34 s on the M5 Max GPU (130-148 tok/s), 107 s on its CPU (41 tok/s); also Q8_0, Q4_K_M";
+     image (4,176 tokens) in 30-32 s on the M5 Max GPU (141-147 tok/s; 4 at once in 74-80 s), 107 s on its CPU (41 tok/s); \
+     also Q8_0, Q4_K_M";
 const GLM_TINY: &str = "text only (no vision tower, no MTP); only its header was loaded, not its weights";
 
 /// The models oxinfer was run with (the README's model table), by kind and size. What each can

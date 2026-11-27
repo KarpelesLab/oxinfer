@@ -2469,6 +2469,9 @@ enum MOp {
         /// Multi-token plans: the x and out token strides in floats, and whether the kernel takes
         /// the tokens as rows (one row per token) rather than one dispatch per token.
         t: Option<(usize, usize, bool)>,
+        /// Multi-token plans of rows with weights of their own (Nemotron-H's grouped norm):
+        /// `dec_rms_norm_rt`, every token's rows in one dispatch.
+        rt: Option<Id>,
     },
     Mv {
         pipe: Id,
@@ -2652,10 +2655,10 @@ enum MOp {
         kc: u32,
         /// Multi-token plans: the pipeline and the x, out strides.
         t: Option<(Id, u32, u32)>,
-        /// Mamba-2's bias (constants offset; one-token plans, `dec_mamba_conv`).
+        /// Mamba-2's bias (constants offset; `dec_mamba_conv`, or the multi-token kernels' flag).
         bias: Option<usize>,
     },
-    /// Mamba-2's state update (`dec_mamba2`; one-token plans).
+    /// Mamba-2's state update (`dec_mamba2`).
     Mamba2 {
         pipe: Id,
         xbc: usize,
@@ -2666,6 +2669,9 @@ enum MOp {
         /// `a | d | dt_bias` in the constants.
         cst: usize,
         p: Mamba2Params,
+        /// Multi-token plans: `dec_mamba2_t` and its `ts` (the tokens set per step; the xbc, z / dt
+        /// and out strides).
+        t: Option<(Id, [u32; 4])>,
     },
     GdnRule {
         pipe: Id,
@@ -2858,6 +2864,8 @@ enum MOp {
         k: u32,
         scale: Option<usize>,
         ts: [u32; 4],
+        /// Sigmoid routing (`scale`: the selection bias then the scale, as `MOp::Topk`'s).
+        sigmoid: bool,
     },
     /// Prefill plans: routed experts as grouped matrix-unit GEMMs over the tokens of each expert;
     /// the step reads the routing back first (index into `MetalPlan::pf`'s experts). The second
@@ -3008,6 +3016,9 @@ struct PfExperts {
     n_exp: usize,
     /// GELU-tanh experts (Gemma 4), else SiLU.
     gelu: bool,
+    /// Ungated squared-ReLU experts (Nemotron-H): `inter` up rows per expert (the gate tables),
+    /// `relu(u)^2` for the down projection.
+    relu2: bool,
     /// The combine adds to `y` (a shared expert wrote it first).
     add: bool,
     /// Runtime LoRA updates of the experts (`Experts::lora`).
@@ -3719,9 +3730,9 @@ impl MetalBackend {
                     add,
                 } => 'norm: {
                     let threads = norm_threads(n);
-                    // Each row its own weights (Nemotron-H's grouped norm): one-token plans.
+                    // Each row its own weights (Nemotron-H's grouped norm).
                     let per_row = w.as_deref().is_some_and(|w| rows > 1 && w.len() == rows * n);
-                    if w.as_deref().is_some_and(|w| w.len() != n && !per_row) || (per_row && (mt || pf)) {
+                    if w.as_deref().is_some_and(|w| w.len() != n && !per_row) {
                         return None;
                     }
                     // One row per token when the op has one row, else one dispatch per token.
@@ -3774,6 +3785,11 @@ impl MetalBackend {
                         rows,
                         threads,
                         t: mt.then(|| (ts(x), ts(out), native)),
+                        rt: if per_row && mt {
+                            Some(self.named_pipeline("dec_rms_norm_rt")?)
+                        } else {
+                            None
+                        },
                     });
                     let span = |v: View, s: usize| rng(v, (rows - 1) * s + n);
                     let mut r = vec![span(x, x_stride)];
@@ -3793,7 +3809,7 @@ impl MetalBackend {
                     mode,
                 } => 'lin: {
                     use crate::gpu::decode::is_streamed;
-                    if mode == LinMode::Relu2 && (mt || pf || w2.is_some()) {
+                    if mode == LinMode::Relu2 && w2.is_some() {
                         return None;
                     }
                     // Prefill: matrix-unit GEMMs where the weights have them.
@@ -3860,6 +3876,21 @@ impl MetalBackend {
                             (LinMode::Store, None) => {
                                 set_y(&mut g1, byte(y), if ts(y) == n_out { 0 } else { ts(y) as u32 });
                                 emit.push(g1);
+                            }
+                            // Squared ReLU in place after the GEMM.
+                            (LinMode::Relu2, None) => {
+                                set_y(&mut g1, byte(y), if ts(y) == n_out { 0 } else { ts(y) as u32 });
+                                emit.push(g1);
+                                emit.push(MOp::Barrier);
+                                emit.push(MOp::Ew {
+                                    pipe: self.named_pipeline("dec_ew")?,
+                                    a: byte(y),
+                                    b: byte(y),
+                                    out: byte(y),
+                                    n: n_out as u32,
+                                    p: [6.0, 0.0, 0.0, 0.0],
+                                    t: Some((self.named_pipeline("dec_ew_t")?, [ts(y) as u32, ts(y) as u32, ts(y) as u32, 0])),
+                                });
                             }
                             // The residual add in the GEMM's stores (same sums as `pf_add_rows`).
                             (LinMode::Add, None) => {
@@ -4006,7 +4037,7 @@ impl MetalBackend {
                         return None;
                     }
                     let (nr, ks) = mv_variant(mw.fmt, n_in);
-                    let fv = if fast && n_in.is_multiple_of(32) {
+                    let fv = if fast && n_in.is_multiple_of(32) && mode != MvMode::Relu2 {
                         self.fv_pipe(&mw, tt)
                     } else {
                         None
@@ -4144,9 +4175,9 @@ impl MetalBackend {
                     if expert_scale.is_some_and(|s| s.len() != n_exp) {
                         return None;
                     }
-                    // Sigmoid routing: the selection bias then the scale where `dec_topk` reads its
-                    // per-expert scales (one-token plans).
-                    if sigmoid.is_some_and(|(b, _)| b.len() != n_exp || expert_scale.is_some() || mt || pf) {
+                    // Sigmoid routing: the selection bias then the scale where `dec_topk` /
+                    // `pf_topk` read their per-expert scales.
+                    if sigmoid.is_some_and(|(b, _)| b.len() != n_exp || expert_scale.is_some()) {
                         return None;
                     }
                     let sig_cst = sigmoid.map(|(b, sc)| {
@@ -4218,8 +4249,12 @@ impl MetalBackend {
                             sel: byte(sel),
                             n: n_exp as u32,
                             k: k as u32,
-                            scale: expert_scale.map(&mut cst),
+                            scale: match &sig_cst {
+                                Some(v) => Some(cst(v)),
+                                None => expert_scale.map(&mut cst),
+                            },
                             ts: [n_exp as u32, ts(sel) as u32, 0, 0],
+                            sigmoid: sig_cst.is_some(),
                         });
                         break 'route (
                             vec![rng(x, h), rng(logits, rows), (PF_RES + 3, 0, usize::MAX)],
@@ -4253,8 +4288,12 @@ impl MetalBackend {
                             sel: byte(sel),
                             n: n_exp as u32,
                             k: k as u32,
-                            scale: expert_scale.map(&mut cst),
+                            scale: match &sig_cst {
+                                Some(v) => Some(cst(v)),
+                                None => expert_scale.map(&mut cst),
+                            },
                             ts: [ts(logits) as u32, ts(sel) as u32, 0, 0],
+                            sigmoid: sig_cst.is_some(),
                         });
                     } else {
                         emit.push(MOp::Topk {
@@ -4277,7 +4316,11 @@ impl MetalBackend {
                 Op::Experts(ref ex) if pf => {
                     // (Experts that add to their output, after a shared expert: the combine
                     // adds; the fused tails of Gemma 4 write.)
-                    if ex.relu2 || ex.edits.is_some() || (ex.add && tails.iter().any(|t| t.experts == i)) {
+                    if ex.edits.is_some() || (ex.add && tails.iter().any(|t| t.experts == i)) {
+                        return None;
+                    }
+                    // Squared-ReLU experts: the up matrices alone (in `gate`), no LoRA updates.
+                    if ex.relu2 && (ex.up.is_some() || ex.lora.is_some()) {
                         return None;
                     }
                     let lora = match &ex.lora {
@@ -4305,7 +4348,7 @@ impl MetalBackend {
                         }
                         None => None,
                     };
-                    let fused = ex.up.is_none();
+                    let fused = ex.up.is_none() && !ex.relu2;
                     let n = ex.gate.len();
                     let g_rows = if fused { 2 * ex.inter } else { ex.inter };
                     let affine = |w: &WeightRef| matches!(w, WeightRef::Q4(m) if m.offsets.is_some());
@@ -4375,7 +4418,7 @@ impl MetalBackend {
                         .as_ref()
                         .is_none_or(|u| std::mem::discriminant(&u[0]) == std::mem::discriminant(&ex.gate[0]));
                     let pair = match &ex.gate[0] {
-                        _ if lora.is_some() || !pf_xpair() || !same => None,
+                        _ if lora.is_some() || !pf_xpair() || !same || ex.relu2 => None,
                         WeightRef::Gguf(gw)
                             if gw.block_scales.is_none()
                                 && ex
@@ -4425,6 +4468,7 @@ impl MetalBackend {
                         k: ex.k,
                         n_exp: n,
                         gelu: ex.gelu,
+                        relu2: ex.relu2,
                         add: ex.add,
                         lora,
                     });
@@ -4438,7 +4482,7 @@ impl MetalBackend {
                     if mt && ex.edits.is_some() {
                         return None;
                     }
-                    if ex.relu2 && (mt || ex.lora.is_some() || ex.up.is_some()) {
+                    if ex.relu2 && (ex.lora.is_some() || ex.up.is_some()) {
                         return None;
                     }
                     // Experts that stream: on-demand parts of the op's unit, one per expert.
@@ -4936,7 +4980,7 @@ impl MetalBackend {
                     if kc < 2 || w.len() != dim * kc || g.states.get(state) != Some(&((kc - 1) * dim)) {
                         return None;
                     }
-                    if bias.is_some_and(|b| b.len() != dim || mt || pf) {
+                    if bias.is_some_and(|b| b.len() != dim) {
                         return None;
                     }
                     emit.push(MOp::GdnConv {
@@ -4960,9 +5004,8 @@ impl MetalBackend {
                     )
                 }
                 Op::Mamba2(ref m) => {
-                    let ok = !mt
-                        && !pf
-                        && m.ng > 0
+                    let ok = m.ng > 0
+                        && (!mt || ts(m.z) == ts(m.dt))
                         && m.nh.is_multiple_of(m.ng)
                         && m.ns.is_multiple_of(32)
                         && m.ns <= 256
@@ -4993,6 +5036,14 @@ impl MetalBackend {
                             dt_max: m.dt_max,
                             _p0: 0,
                             _p1: 0,
+                        },
+                        t: if mt {
+                            Some((
+                                self.named_pipeline("dec_mamba2_t")?,
+                                [0, ts(m.xbc) as u32, ts(m.z) as u32, ts(m.out) as u32],
+                            ))
+                        } else {
+                            None
                         },
                     });
                     let inner = m.nh * m.hd;
@@ -6489,7 +6540,31 @@ impl MetalPlan<'_> {
     fn encode_multi(&self, e: &FastEnc, op: &MOp, arena: Id, consts: Id, kvb: &[(Id, Id)], stb: &[(Id, usize)], pos: usize, t: usize) {
         match op {
             MOp::Barrier => e.barrier(),
-            MOp::Mamba2 { .. } => unreachable!("one-token op in a multi-token plan"),
+            MOp::Mamba2 {
+                xbc,
+                z,
+                dt,
+                out,
+                state,
+                cst,
+                p,
+                t: tk,
+                ..
+            } => {
+                let (pipe, mut ts) = tk.expect("multi-token mamba2");
+                ts[0] = t as u32;
+                e.pipe(pipe);
+                e.buf(arena, *xbc, 0);
+                e.buf(arena, *z, 1);
+                e.buf(arena, *dt, 2);
+                e.buf(arena, *out, 3);
+                e.buf(stb[*state].0, stb[*state].1, 4);
+                e.buf(consts, *cst, 5);
+                e.bytes(p, 6);
+                e.bytes(&ts, 7);
+                // A SIMD-group per state row, 8 rows a threadgroup.
+                e.dispatch((p.nh as usize, (p.hd as usize).div_ceil(8)), 256);
+            }
             MOp::Norm {
                 pipe,
                 x,
@@ -6499,12 +6574,18 @@ impl MetalPlan<'_> {
                 rows,
                 threads,
                 t: tk,
+                rt,
             } => {
                 let (sx, so, native) = tk.expect("multi-token norm");
-                e.pipe(*pipe);
+                e.pipe(rt.unwrap_or(*pipe));
                 e.buf(consts, w.unwrap_or(0), 2);
                 e.bytes(p, 3);
-                if native {
+                if rt.is_some() {
+                    e.buf(arena, *x, 0);
+                    e.buf(arena, *out, 1);
+                    e.bytes(&[sx as u32, so as u32], 4);
+                    e.dispatch((*rows, t), *threads);
+                } else if native {
                     e.buf(arena, *x, 0);
                     e.buf(arena, *out, 1);
                     e.dispatch((t, 1), *threads);
@@ -6543,11 +6624,12 @@ impl MetalPlan<'_> {
                 scale,
                 t: tk,
                 slow,
+                sigmoid,
                 ..
             } => {
                 let (sl, ss) = tk.expect("multi-token top-k");
                 e.pipe(*pipe);
-                e.bytes(&[*n, *k, scale.is_some() as u32, *slow], 2);
+                e.bytes(&[*n, *k, if *sigmoid { 2 } else { scale.is_some() as u32 }, *slow], 2);
                 e.buf(consts, scale.unwrap_or(0), 3);
                 for j in 0..t {
                     e.buf(arena, *logits + j * sl, 0);
@@ -6576,6 +6658,7 @@ impl MetalPlan<'_> {
                 t: tk,
                 tb,
                 lora,
+                relu2,
                 ..
             } => {
                 // Every token's gate / up pairs, then every token's down projections.
@@ -6597,7 +6680,13 @@ impl MetalPlan<'_> {
                 e.pipe(*pair);
                 e.buf(tabs[0], 0, 0);
                 e.buf(if *fused { tabs[0] } else { tabs[1] }, 0, 1);
-                let am = if *gelu { MvMode::GeluPair } else { MvMode::SiluPair };
+                let am = if *relu2 {
+                    MvMode::Relu2
+                } else if *gelu {
+                    MvMode::GeluPair
+                } else {
+                    MvMode::SiluPair
+                };
                 e.bytes(&p(*inter, *h, am, *g, if *fused { *inter } else { 0 }), 4);
                 for j in 0..t {
                     e.buf(arena, *x + j * sx, 2);
@@ -6784,6 +6873,7 @@ impl MetalPlan<'_> {
                 dim,
                 kc,
                 t: tk,
+                bias,
                 ..
             } => {
                 let (pipe, sx, so) = tk.expect("multi-token conv");
@@ -6793,7 +6883,8 @@ impl MetalPlan<'_> {
                 e.buf(stb[*state].0, stb[*state].1, 2);
                 e.buf(consts, *w, 3);
                 e.bytes(&[*dim, *kc], 4);
-                e.bytes(&[t as u32, sx, so, 0], 5);
+                e.bytes(&[t as u32, sx, so, bias.is_some() as u32], 5);
+                e.buf(consts, bias.unwrap_or(0), 6);
                 e.dispatch(((*dim as usize).div_ceil(256), 1), 256);
             }
             MOp::GdnRule {
@@ -7506,11 +7597,12 @@ impl MetalPlan<'_> {
                 k,
                 scale,
                 ts,
+                sigmoid,
             } => {
                 e.pipe(*pipe);
                 e.buf(arena, *logits, 0);
                 e.buf(arena, *sel, 1);
-                e.bytes(&[*n, *k, scale.is_some() as u32, 0], 2);
+                e.bytes(&[*n, *k, if *sigmoid { 2 } else { scale.is_some() as u32 }, 0], 2);
                 e.buf(consts, scale.unwrap_or(0), 3);
                 e.bytes(ts, 4);
                 e.dispatch((t, 1), (*n as usize).next_multiple_of(32));
@@ -7558,7 +7650,11 @@ impl MetalPlan<'_> {
                             sel_stride: x.sel_stride as u32,
                             max_tiles: pf.max_tiles as u32,
                             // (The pair GEMMs: 32 outputs of each of gate and up a threadgroup.)
-                            gu_x: (if x.up.is_some() && x.pair.is_none() { mi } else { 2 * mi } / 64) as u32,
+                            gu_x: (if x.relu2 || (x.up.is_some() && x.pair.is_none()) {
+                                mi
+                            } else {
+                                2 * mi
+                            } / 64) as u32,
                             dn_x: (h / 64) as u32,
                             _p: 0,
                         },
@@ -7652,7 +7748,10 @@ impl MetalPlan<'_> {
                                 q._p = [mi as u32, w_up, x.gelu as u32];
                                 grouped(pp, x.tabs[0], st(3), st(5), st(4), &q, 3);
                             }
-                            None => grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(2 * mi, h, x.row_bytes.0), 3),
+                            None => {
+                                let rows = if x.relu2 { mi } else { 2 * mi };
+                                grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(rows, h, x.row_bytes.0), 3)
+                            }
                         },
                     }
                     bar();
@@ -7730,7 +7829,7 @@ impl MetalPlan<'_> {
                     e.bytes(
                         &Sh {
                             n: mi as u32,
-                            gelu: x.gelu as u32,
+                            gelu: if x.relu2 { 2 } else { x.gelu as u32 },
                             split,
                             limit: 0.0,
                         },
@@ -7924,6 +8023,7 @@ impl MetalPlan<'_> {
                 dim,
                 kc,
                 t: Some((_, sx, so)),
+                bias,
                 ..
             } => {
                 let (Some(conv), Some(shift)) = (self.be.named_pipeline("pf_conv"), self.be.named_pipeline("pf_conv_state")) else {
@@ -7935,7 +8035,8 @@ impl MetalPlan<'_> {
                 e.buf(stb[*state].0, stb[*state].1, 2);
                 e.buf(consts, *w, 3);
                 e.bytes(&[*dim, *kc], 4);
-                e.bytes(&[t as u32, *sx, *so, 0], 5);
+                e.bytes(&[t as u32, *sx, *so, bias.is_some() as u32], 5);
+                e.buf(consts, bias.unwrap_or(0), 6);
                 e.dispatch(((*dim as usize).div_ceil(256), t), 256);
                 e.barrier();
                 e.pipe(shift);
@@ -8693,6 +8794,7 @@ impl MetalPlan<'_> {
                 state,
                 cst,
                 p,
+                ..
             } => {
                 e.pipe(*pipe);
                 e.buf(arena, *xbc, 0);
@@ -8897,6 +8999,7 @@ impl MetalPlan<'_> {
                 op,
                 MOp::GdnConv { t: None, .. }
                     | MOp::GdnRule { t: None, .. }
+                    | MOp::Mamba2 { t: None, .. }
                     | MOp::QsaKey { .. }
                     | MOp::QsaScore { .. }
                     | MOp::QsaTopk { .. }
@@ -8974,7 +9077,7 @@ impl MetalPlan<'_> {
                             self.encode_row(e, op, arena, consts, kvb, pos, j);
                         }
                     }
-                    MOp::GdnConv { .. } | MOp::GdnRule { .. } => {
+                    MOp::GdnConv { .. } | MOp::GdnRule { .. } | MOp::Mamba2 { .. } => {
                         for (j, stb) in stbs.iter().enumerate() {
                             self.encode_row_rec(e, op, arena, consts, stb, j);
                         }
@@ -9053,7 +9156,7 @@ impl MetalPlan<'_> {
                 dim,
                 kc,
                 t: tk,
-                ..
+                bias,
             } => {
                 let (_, sx, so) = tk.expect("multi-token conv");
                 #[repr(C)]
@@ -9068,7 +9171,34 @@ impl MetalPlan<'_> {
                 e.buf(consts, *w, 3);
                 e.bytes(&Gc { dim: *dim, kc: *kc }, 4);
                 e.buf(stb[*state].0, stb[*state].1, 5);
+                if let Some(b) = bias {
+                    e.buf(consts, *b, 6);
+                }
                 e.dispatch(((*dim as usize).div_ceil(256), 1), 256);
+            }
+            MOp::Mamba2 {
+                pipe,
+                xbc,
+                z,
+                dt,
+                out,
+                state,
+                cst,
+                p,
+                t: tk,
+            } => {
+                let [_, sx, sz, so] = tk.expect("multi-token mamba2").1;
+                let (sx, sz, so) = (j * sx as usize * 4, j * sz as usize * 4, j * so as usize * 4);
+                e.pipe(*pipe);
+                e.buf(arena, *xbc + sx, 0);
+                e.buf(arena, *z + sz, 1);
+                e.buf(arena, *dt + sz, 2);
+                e.buf(arena, *out + so, 3);
+                e.buf(stb[*state].0, stb[*state].1, 4);
+                e.buf(consts, *cst, 5);
+                e.bytes(p, 6);
+                e.buf(stb[*state].0, stb[*state].1, 7);
+                e.dispatch((p.nh as usize, 1), 256);
             }
             MOp::GdnRule {
                 pipe,
@@ -9208,7 +9338,7 @@ impl DecodePlan for MetalPlan<'_> {
     }
 
     fn replay_recurrent(&self, slot: &mut Slot, states: &mut [&mut [f32]], keep: usize) -> bool {
-        if self.tokens < 2 || keep == 0 || keep > self.tokens {
+        if self.tokens < 2 || keep == 0 || keep > self.tokens || self.ops.iter().any(|o| matches!(o, MOp::Mamba2 { .. })) {
             return false;
         }
         let _g = self.lock.lock().unwrap();
@@ -10663,6 +10793,187 @@ mod tests {
                     }
                 }
             }
+        }
+        unsafe { (f.void)(arena, f.s_release) };
+    }
+
+    /// Nemotron-H's multi-token kernels give each token the bits of its one-token step:
+    /// `dec_mamba2_t` against `dec_mamba2` token by token (outputs and state), the biased
+    /// convolutions (`dec_gdn_conv_t`, `pf_conv` + `pf_conv_state`) against `dec_mamba_conv`, and
+    /// `pf_topk`'s sigmoid routing against `dec_topk`'s.
+    #[test]
+    fn nemotron_multi_token_kernels_match_one_token() {
+        let Ok(be) = MetalBackend::new() else { return };
+        let f = Fns::new(&be);
+        let new_len: MsgNewBufLen = be.o.msg_send();
+        const N: usize = 1 << 20;
+        let arena = unsafe { new_len(be.device, be.sels.new_buffer_len, N * 4, 0) };
+        assert!(!arena.is_null());
+        let ap = f.contents(arena) as *mut f32;
+        let a = unsafe { std::slice::from_raw_parts_mut(ap, N) };
+        let mut seed = 11u64;
+        let run = |enc: &dyn Fn(&FastEnc)| {
+            let (ok, _) = run_concurrent(&be, &f, std::slice::from_ref(&(0..1)), |e, _| enc(e));
+            assert!(ok);
+        };
+        // ---- Mamba-2: nh 8 heads of 16, 2 groups of state 64, 5 tokens.
+        let (nh, hd, ng, ns, t) = (8usize, 16usize, 2usize, 64usize, 5usize);
+        let inner = nh * hd;
+        let cd = inner + 2 * ng * ns;
+        let (sx, sz) = (cd + 3, inner + nh + 5);
+        // Offsets (floats): xbc rows, z / dt rows, outputs (one-token, multi), states, constants.
+        let (o_x, o_z, o_y1, o_y2, o_s1, o_s2, o_c) = (0, 8192, 16384, 24576, 32768, 65536, 98304);
+        for v in a[..o_y1].iter_mut() {
+            *v = lcg(&mut seed) * 2.0;
+        }
+        for i in 0..nh * hd * ns {
+            let v = lcg(&mut seed);
+            a[o_s1 + i] = v;
+            a[o_s2 + i] = v;
+        }
+        for h in 0..nh {
+            a[o_c + h] = -(0.5 + lcg(&mut seed)).abs();
+            a[o_c + nh + h] = lcg(&mut seed);
+            a[o_c + 2 * nh + h] = lcg(&mut seed);
+        }
+        let p = Mamba2Params {
+            nh: nh as u32,
+            hd: hd as u32,
+            ng: ng as u32,
+            ns: ns as u32,
+            dt_min: 0.0,
+            dt_max: f32::INFINITY,
+            _p0: 0,
+            _p1: 0,
+        };
+        let one = be.named_pipeline("dec_mamba2").unwrap();
+        let multi = be.named_pipeline("dec_mamba2_t").unwrap();
+        for j in 0..t {
+            run(&|e| {
+                e.pipe(one);
+                e.buf(arena, (o_x + j * sx) * 4, 0);
+                e.buf(arena, (o_z + j * sz) * 4, 1);
+                e.buf(arena, (o_z + j * sz + inner) * 4, 2);
+                e.buf(arena, (o_y1 + j * inner) * 4, 3);
+                e.buf(arena, o_s1 * 4, 4);
+                e.buf(arena, o_c * 4, 5);
+                e.bytes(&p, 6);
+                e.buf(arena, o_s1 * 4, 7);
+                e.dispatch((nh, 1), 256);
+            });
+        }
+        run(&|e| {
+            e.pipe(multi);
+            e.buf(arena, o_x * 4, 0);
+            e.buf(arena, o_z * 4, 1);
+            e.buf(arena, (o_z + inner) * 4, 2);
+            e.buf(arena, o_y2 * 4, 3);
+            e.buf(arena, o_s2 * 4, 4);
+            e.buf(arena, o_c * 4, 5);
+            e.bytes(&p, 6);
+            e.bytes(&[t as u32, sx as u32, sz as u32, inner as u32], 7);
+            e.dispatch((nh, hd.div_ceil(8)), 256);
+        });
+        let bits = |a: &[f32], o: usize, n: usize| a[o..o + n].iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(a, o_y1, t * inner), bits(a, o_y2, t * inner), "mamba2 outputs");
+        assert_eq!(bits(a, o_s1, nh * hd * ns), bits(a, o_s2, nh * hd * ns), "mamba2 states");
+        assert!(a[o_y1..o_y1 + t * inner].iter().all(|v| v.is_finite()));
+        // ---- The biased convolution: 3 channels' blocks of 300, kernel 4, 6 tokens.
+        let (dim, kc, t) = (300usize, 4usize, 6usize);
+        let (o_x, o_w, o_b, o_y1, o_y2, o_y3, o_s1, o_s2, o_s3) = (0, 4096, 8192, 16384, 20480, 24576, 32768, 36864, 40960);
+        for v in a[..o_y1].iter_mut() {
+            *v = lcg(&mut seed);
+        }
+        for i in 0..(kc - 1) * dim {
+            let v = lcg(&mut seed);
+            a[o_s1 + i] = v;
+            a[o_s2 + i] = v;
+            a[o_s3 + i] = v;
+        }
+        let gc = [dim as u32, kc as u32];
+        let one = be.named_pipeline("dec_mamba_conv").unwrap();
+        for j in 0..t {
+            run(&|e| {
+                e.pipe(one);
+                e.buf(arena, (o_x + j * dim) * 4, 0);
+                e.buf(arena, (o_y1 + j * dim) * 4, 1);
+                e.buf(arena, o_s1 * 4, 2);
+                e.buf(arena, o_w * 4, 3);
+                e.bytes(&gc, 4);
+                e.buf(arena, o_s1 * 4, 5);
+                e.buf(arena, o_b * 4, 6);
+                e.dispatch((dim.div_ceil(256), 1), 256);
+            });
+        }
+        let multi = be.named_pipeline("dec_gdn_conv_t").unwrap();
+        run(&|e| {
+            e.pipe(multi);
+            e.buf(arena, o_x * 4, 0);
+            e.buf(arena, o_y2 * 4, 1);
+            e.buf(arena, o_s2 * 4, 2);
+            e.buf(arena, o_w * 4, 3);
+            e.bytes(&gc, 4);
+            e.bytes(&[t as u32, dim as u32, dim as u32, 1], 5);
+            e.buf(arena, o_b * 4, 6);
+            e.dispatch((dim.div_ceil(256), 1), 256);
+        });
+        let (conv, shift) = (be.named_pipeline("pf_conv").unwrap(), be.named_pipeline("pf_conv_state").unwrap());
+        run(&|e| {
+            e.pipe(conv);
+            e.buf(arena, o_x * 4, 0);
+            e.buf(arena, o_y3 * 4, 1);
+            e.buf(arena, o_s3 * 4, 2);
+            e.buf(arena, o_w * 4, 3);
+            e.bytes(&gc, 4);
+            e.bytes(&[t as u32, dim as u32, dim as u32, 1], 5);
+            e.buf(arena, o_b * 4, 6);
+            e.dispatch((dim.div_ceil(256), t), 256);
+            e.barrier();
+            e.pipe(shift);
+            e.dispatch((dim.div_ceil(256), 1), 256);
+        });
+        assert_eq!(bits(a, o_y1, t * dim), bits(a, o_y2, t * dim), "dec_gdn_conv_t with a bias");
+        assert_eq!(bits(a, o_y1, t * dim), bits(a, o_y3, t * dim), "pf_conv with a bias");
+        assert_eq!(bits(a, o_s1, (kc - 1) * dim), bits(a, o_s2, (kc - 1) * dim));
+        assert_eq!(bits(a, o_s1, (kc - 1) * dim), bits(a, o_s3, (kc - 1) * dim));
+        // ---- Sigmoid routing: 128 experts, top 6, the bias then the scale.
+        let (n, k) = (128usize, 6usize);
+        for v in a[..n].iter_mut() {
+            *v = lcg(&mut seed) * 6.0;
+        }
+        for i in 0..n {
+            a[1024 + i] = lcg(&mut seed) * 0.1;
+        }
+        a[1024 + n] = 2.5;
+        let topk = be.named_pipeline("dec_topk").unwrap();
+        run(&|e| {
+            e.pipe(topk);
+            e.buf(arena, 0, 0);
+            e.buf(arena, 2048 * 4, 1);
+            e.bytes(&[n as u32, k as u32, 2u32, 0], 2);
+            e.buf(arena, 1024 * 4, 3);
+            e.dispatch((1, 1), n);
+        });
+        let pf = be.named_pipeline("pf_topk").unwrap();
+        run(&|e| {
+            e.pipe(pf);
+            e.buf(arena, 0, 0);
+            e.buf(arena, 3072 * 4, 1);
+            e.bytes(&[n as u32, k as u32, 2u32, 0], 2);
+            e.buf(arena, 1024 * 4, 3);
+            e.bytes(&[n as u32, 2 * k as u32, 0, 0], 4);
+            e.dispatch((1, 1), n);
+        });
+        assert_eq!(bits(a, 2048, 2 * k), bits(a, 3072, 2 * k), "pf_topk sigmoid routing");
+        // The host: the top k of sigmoid + bias, their sigmoids renormalized, times the scale.
+        let sig = |x: f32| 1.0 / (1.0 + (-x as f64).exp());
+        let mut ids: Vec<usize> = (0..n).collect();
+        ids.sort_by(|&x, &y| (sig(a[y]) + a[1024 + y] as f64).total_cmp(&(sig(a[x]) + a[1024 + x] as f64)));
+        let tot: f64 = ids[..k].iter().map(|&i| sig(a[i])).sum();
+        for j in 0..k {
+            assert_eq!(a[2048 + j].to_bits() as usize, ids[j]);
+            let want = sig(a[ids[j]]) / tot * 2.5;
+            assert!((a[2048 + k + j] as f64 - want).abs() < 1e-5, "weight {j}");
         }
         unsafe { (f.void)(arena, f.s_release) };
     }

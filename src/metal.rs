@@ -1448,20 +1448,21 @@ kernel void x_half(device const float* x [[buffer(0)]], device half* xh [[buffer
     for (uint i = tid; i < n4; i += 256) out[i] = half4(row[i] * s);
     if (tid == 0) rs[r] = inv;
 }
-// act(gate) * up (SiLU, or GELU-tanh with `gelu`; with `limit` > 0 gate clamped above and up
+// act(gate) * up (SiLU, or GELU-tanh with `gelu` = 1, squared ReLU of the gate alone with 2; with `limit` > 0 gate clamped above and up
 // both ways first, DeepSeek V4) of fused [gate | up] rows (n each) into scaled half rows, as x_half; with `split` = G nonzero, gate row r is at r * n and up row r at
 // (G + r) * n (gate and up experts stored apart).
 inline float4 silu_mul4(float4 g, float4 u) { return g / (1.0f + exp(-g)) * u; }
 inline float4 gelu_mul4(float4 g, float4 u) { return g / (1.0f + exp(-1.5957691f * (g + 0.044715f * g * g * g))) * u; }
-inline float4 act_mul4(float4 g, float4 u, uint gelu, float limit) { if (limit > 0.f) { g = min(g, limit); u = clamp(u, -limit, limit); } return gelu != 0 ? gelu_mul4(g, u) : silu_mul4(g, u); }
+inline float4 act_mul4(float4 g, float4 u, uint gelu, float limit) { if (gelu == 2) { float4 r = max(g, 0.f); return r * r; } if (limit > 0.f) { g = min(g, limit); u = clamp(u, -limit, limit); } return gelu != 0 ? gelu_mul4(g, u) : silu_mul4(g, u); }
 struct SH { uint n; uint gelu; uint split; float limit; };
 kernel void silu_half(device const float* gu [[buffer(0)]], device half* ah [[buffer(1)]], device float* rs [[buffer(2)]],
                       constant SH& p [[buffer(3)]],
                       uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float red[8];
-    device const float4* g = (device const float4*)(gu + (ulong)r * (p.split != 0 ? 1 : 2) * p.n);
-    device const float4* u = p.split != 0 ? (device const float4*)(gu + (ulong)(p.split + r) * p.n) : g + p.n / 4;
+    // (gelu == 2: squared ReLU of rows of n alone, Nemotron-H's ungated experts.)
+    device const float4* g = (device const float4*)(gu + (ulong)r * (p.split != 0 || p.gelu == 2 ? 1 : 2) * p.n);
+    device const float4* u = p.gelu == 2 ? g : p.split != 0 ? (device const float4*)(gu + (ulong)(p.split + r) * p.n) : g + p.n / 4;
     uint n4 = p.n / 4;
     float m = 0.f;
     for (uint i = tid; i < n4; i += 256) { float4 v = abs(act_mul4(g[i], u[i], p.gelu, p.limit)); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
