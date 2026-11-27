@@ -124,6 +124,54 @@ kernel void NAME(device const float* w [[buffer(0)]], device const float* x [[bu
     vi_gemm_k<NT>(w, x, y, bias, res, p, tg, sg, tid, part); }
 VI_GEMM_K(vi_gemm_k1, 1) VI_GEMM_K(vi_gemm_k4, 4)
 
+// The K-split product with 8 NO outputs x 8 NT rows a threadgroup: each SIMD-group's weight
+// tiles serve NT row tiles and its row tiles NO weight tiles (NO = 2, NT = 4 is vi_gemm_k4).
+template <int NO, int NT>
+inline void vi_gemm_x(device const float* w, device const float* x, device float* y, device const float* bias,
+                      device const float* res, constant ViG& p, uint3 tg, uint sg, uint tid, threadgroup float* part) {
+    constexpr int PLD = 8 * NO + 4;
+    uint g = tg.z;
+    uint o0 = tg.x * (8 * NO), t0 = tg.y * (8 * NT);
+    device const float* ws = w + (ulong)g * p.gw + (ulong)o0 * p.n_in;
+    device const float* xs = x + (ulong)g * p.gx + (ulong)t0 * p.ldx;
+    simdgroup_float8x8 c[NO][NT];
+    for (int i = 0; i < NO; i++)
+        for (int t = 0; t < NT; t++) c[i][t] = simdgroup_float8x8(0.f);
+    for (uint k = sg * 8; k < p.n_in; k += 32) {
+        simdgroup_float8x8 a[NO];
+        for (int i = 0; i < NO; i++) simdgroup_load(a[i], ws + (ulong)(8 * i) * p.n_in + k, p.n_in);
+        for (int t = 0; t < NT; t++) {
+            simdgroup_float8x8 b;
+            simdgroup_load(b, xs + (ulong)(8 * t) * p.ldx + k, p.ldx, ulong2(0, 0), true);
+            for (int i = 0; i < NO; i++) simdgroup_multiply_accumulate(c[i][t], a[i], b, c[i][t]);
+        }
+    }
+    threadgroup float* ps = part + sg * (8 * NT) * PLD;
+    for (int t = 0; t < NT; t++)
+        for (int i = 0; i < NO; i++) simdgroup_store(c[i][t], ps + (8 * t) * PLD + 8 * i, PLD, ulong2(0, 0), true);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < 8 * NO * 8 * NT; e += 128) {
+        uint r = e / (8 * NO), cc = e % (8 * NO);
+        uint t = t0 + r, o = o0 + cc;
+        if (t >= p.t || o >= p.n_out) continue;
+        uint at = r * PLD + cc, st = (8 * NT) * PLD;
+        float v = ((part[at] + part[at + st]) + part[at + 2 * st]) + part[at + 3 * st];
+        if (p.has_bias != 0) v += bias[(ulong)g * p.gb + o];
+        if (p.act == 1) v = vi_gelu(v);
+        else if (p.act == 2) v = vi_softplus(v);
+        if (p.has_res != 0) v += res[(ulong)g * p.gr + (ulong)t * p.ldr + o];
+        y[(ulong)g * p.gy + (ulong)t * p.ldy + o] = v;
+    }
+}
+#define VI_GEMM_X(NAME, NO, NT) \
+kernel void NAME(device const float* w [[buffer(0)]], device const float* x [[buffer(1)]], device float* y [[buffer(2)]], \
+                 device const float* bias [[buffer(3)]], device const float* res [[buffer(4)]], constant ViG& p [[buffer(5)]], \
+                 uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
+                 uint tid [[thread_index_in_threadgroup]]) { \
+    threadgroup float part[4 * 8 * NT * (8 * NO + 4)]; \
+    vi_gemm_x<NO, NT>(w, x, y, bias, res, p, tg, sg, tid, part); }
+VI_GEMM_X(vi_gemm_x22, 2, 2) VI_GEMM_X(vi_gemm_x23, 2, 3) VI_GEMM_X(vi_gemm_x41, 4, 1) VI_GEMM_X(vi_gemm_x42, 4, 2) VI_GEMM_X(vi_gemm_x43, 4, 3)
+
 // Reduction of one value over a threadgroup of 128 threads (4 SIMD-groups).
 inline float vi_sum(float v, threadgroup float* red, uint tid) {
     v = simd_sum(v);
@@ -404,4 +452,27 @@ kernel void vi_scan(device const float* u [[buffer(0)]], device const float* del
 kernel void vi_copy(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]], constant uint& n [[buffer(2)]],
                     uint gid [[thread_position_in_grid]]) {
     if (gid < n) dst[gid] = src[gid];
+}
+
+// The time attention's cache compaction (`KvCache::compact`): slots [s0, s1) of every row
+// (`rows` rows of `cap` slots of `hd` floats) take the slots `shift` later, the keys rotated
+// back by `shift` positions (the rotary tables' row `shift`: x1 c + x2 s, x2 c - x1 s). A
+// dispatch moves at most `shift` slots, so it reads none it writes.
+struct ViCompact { uint rows; uint cap; uint hd; uint hh; uint shift; uint s0; uint s1; uint _p; };
+kernel void vi_compact(device float* k [[buffer(0)]], device float* v [[buffer(1)]], device const float* cosb [[buffer(2)]],
+                       device const float* sinb [[buffer(3)]], constant ViCompact& p [[buffer(4)]],
+                       uint gid [[thread_position_in_grid]]) {
+    uint per = (p.s1 - p.s0) * p.hh;
+    if (gid >= p.rows * per) return;
+    uint rh = gid / per, r = gid % per;
+    uint s = p.s0 + r / p.hh, i = r % p.hh;
+    ulong base = (ulong)rh * p.cap * p.hd;
+    ulong src = base + (ulong)(p.shift + s) * p.hd, dst = base + (ulong)s * p.hd;
+    float c = cosb[p.shift * p.hh + i], sn = sinb[p.shift * p.hh + i];
+    float x1 = k[src + i], x2 = k[src + i + p.hh];
+    float a = x1 * c, b = x2 * sn, e = x1 * sn, f = x2 * c;
+    k[dst + i] = a + b;
+    k[dst + i + p.hh] = f - e;
+    v[dst + i] = v[src + i];
+    v[dst + i + p.hh] = v[src + i + p.hh];
 }

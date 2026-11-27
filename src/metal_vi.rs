@@ -1,10 +1,11 @@
 //! Realtime Inworld Voice Isolator stream steps on Metal ([`crate::gpu::vi`]): the weights in one
 //! device buffer (f32, rows padded for the GEMM's tiles), each session's lanes (key / value
-//! caches, Mamba conv tails and scan states) in shared buffers, a step (band encoders, every block
-//! of each lane, decoder heads) in one command buffer of the `vi_*` kernels of `metal_vi.metal`,
-//! all f32. The Mamba states are double-buffered (a step reads one copy and writes the other,
-//! kept only when the step completed), the cache bookkeeping (growth, compaction) is the CPU
-//! path's, done on the host between steps.
+//! caches, Mamba conv tails and scan states) in shared buffers, a step (band encoders, the blocks
+//! of its lanes, decoder heads) in one command buffer of the `vi_*` kernels of `metal_vi.metal`,
+//! all f32. The two lanes of a crossfade run together: their rows one after the other, every
+//! projection once over both. The Mamba states are double-buffered (a step reads one copy and
+//! writes the other, kept only when the step completed); the caches grow on the host between
+//! steps and are compacted on the GPU (`vi_compact`, a command buffer of its own).
 
 use super::decode::{FastEnc, Fns, run_concurrent};
 use super::*;
@@ -20,6 +21,30 @@ fn skip_op(op: &str) -> bool {
         .any(|x| x == op)
 }
 
+/// Profiling (`OXINFER_VI_STEP_TIMES=1` with `OXINFER_PF_PROFILE=1`): each step's GPU time by
+/// its lane count, summarized on stderr when the session ends.
+fn step_times() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var_os("OXINFER_VI_STEP_TIMES").is_some())
+}
+
+/// The `vi_gemm_x` variants' tiles: (outputs, rows) a threadgroup. On an M5 Max, a step's GPU
+/// time with each (one lane / two lanes, median ms): x22 3.12 / 5.09, x23 3.34 / 4.90, x41
+/// 3.19 / 5.10, x42 3.08 / 4.50, x43 3.27 / 4.58 (`vi_gemm_k4`, 16 x 32: 3.49 / 5.22; NO = 4 with
+/// NT = 4 or 6 spills: 11.6 / 19.9).
+const X_TILES: [(usize, usize); 5] = [(16, 16), (16, 24), (32, 8), (32, 16), (32, 24)];
+/// The default variant, `vi_gemm_x42`.
+const X42: usize = 3;
+
+/// Profiling: `OXINFER_VI_GEMM=x22|x23|x41|x42|x43` runs the projections on that variant.
+fn gemm_choice() -> Option<usize> {
+    static S: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        let v = std::env::var("OXINFER_VI_GEMM").ok()?;
+        ["x22", "x23", "x41", "x42", "x43"].iter().position(|n| *n == v)
+    })
+}
+
 /// Longest attention a query may take (`VI_SCMAX` in the shader).
 const SCMAX: usize = 4096;
 
@@ -28,6 +53,8 @@ struct Pipes {
     gemm: Id,
     /// `vi_gemm_k{1,4}`.
     gemm_k: [Id; 2],
+    /// `vi_gemm_x{23,26,43,44,46}` (see [`X_TILES`]).
+    gemm_x: [Id; 5],
     ln: Id,
     enc_in: Id,
     dec_out: Id,
@@ -37,6 +64,7 @@ struct Pipes {
     tail: Id,
     scan: Id,
     copy: Id,
+    compact: Id,
 }
 
 /// A shared buffer.
@@ -218,6 +246,13 @@ impl MetalBackend {
         let p = Pipes {
             gemm: pipe("vi_gemm")?,
             gemm_k: [pipe("vi_gemm_k1")?, pipe("vi_gemm_k4")?],
+            gemm_x: [
+                pipe("vi_gemm_x22")?,
+                pipe("vi_gemm_x23")?,
+                pipe("vi_gemm_x41")?,
+                pipe("vi_gemm_x42")?,
+                pipe("vi_gemm_x43")?,
+            ],
             ln: pipe("vi_ln")?,
             enc_in: pipe("vi_enc_in")?,
             dec_out: pipe("vi_dec_out")?,
@@ -227,6 +262,7 @@ impl MetalBackend {
             tail: pipe("vi_tail")?,
             scan: pipe("vi_scan")?,
             copy: pipe("vi_copy")?,
+            compact: pipe("vi_compact")?,
         };
         let (w, nh, nb) = (m.width, m.heads, m.edges.len());
         if nh == 0 || !w.is_multiple_of(nh) {
@@ -448,6 +484,8 @@ pub(crate) struct MetalViSession {
     cos: Option<Buf>,
     sin: Option<Buf>,
     rope_len: usize,
+    /// GPU seconds of each step by lane count (`OXINFER_VI_STEP_TIMES`).
+    times: [Vec<f64>; 2],
 }
 
 // SAFETY: one thread at a time (`&mut self`); Metal buffers are thread-safe objects.
@@ -455,6 +493,18 @@ unsafe impl Send for MetalViSession {}
 
 impl Drop for MetalViSession {
     fn drop(&mut self) {
+        for (l, t) in self.times.iter_mut().enumerate().filter(|(_, t)| !t.is_empty()) {
+            t.sort_by(f64::total_cmp);
+            let q = |f: f64| t[((t.len() - 1) as f64 * f).round() as usize] * 1e3;
+            eprintln!(
+                "[vi steps, {} lane(s): {} steps, GPU ms median {:.2}, p90 {:.2}, max {:.2}]",
+                l + 1,
+                t.len(),
+                q(0.5),
+                q(0.9),
+                q(1.0)
+            );
+        }
         let be = self.dev.be;
         let mut ids: Vec<Id> = self.acts.iter().flatten().map(|b| b.id).collect();
         ids.extend(self.cos.iter().chain(&self.sin).map(|b| b.id));
@@ -525,6 +575,7 @@ impl Device for MetalViDevice {
             cos: None,
             sin: None,
             rope_len: 0,
+            times: [Vec::new(), Vec::new()],
         }))
     }
 }
@@ -592,6 +643,17 @@ struct ViAtt {
     scale: f32,
 }
 #[repr(C)]
+struct ViCompact {
+    rows: u32,
+    cap: u32,
+    hd: u32,
+    hh: u32,
+    shift: u32,
+    s0: u32,
+    s1: u32,
+    _p: u32,
+}
+#[repr(C)]
 struct ViMb {
     inner: u32,
     k: u32,
@@ -606,6 +668,9 @@ struct ViMb {
     xw: u32,
     _p: u32,
 }
+
+/// A lane's carried Mamba state for a step: conv tails, scan states, the live copy (`None`: none).
+type Carry<'a> = Option<(&'a [Buf; 2], &'a [Buf; 2], usize)>;
 
 /// A buffer and a float offset in it.
 type At = (Id, usize);
@@ -693,9 +758,93 @@ impl MetalViSession {
         true
     }
 
-    /// The CPU path's cache bookkeeping before `nf` new slots: compaction past the capacity,
-    /// then room for them.
+    /// The compaction of lane `lane`'s caches that need it before `nf` new slots, on the GPU:
+    /// every block's moves in one command buffer of `vi_compact` dispatches, `shift` slots each
+    /// (a dispatch reads none of the slots it writes). `None` when it cannot run (nothing done:
+    /// the host compacts), `Some(false)` when its command buffer failed.
+    fn compact_gpu(&mut self, lane: usize, nf: usize) -> Option<bool> {
+        if skip_op("compact_gpu") {
+            return None;
+        }
+        let (nb, nh, hd) = (self.dev.nb, self.dev.heads, self.dev.width / self.dev.heads);
+        let (cache_frames, capacity) = (self.spec.cache_frames, self.spec.capacity);
+        // (block, keep, shift)
+        let mut jobs = Vec::new();
+        for (bi, b) in self.lanes[lane].blocks.iter().enumerate() {
+            if let DevBlock::Attn { end, .. } = b
+                && *end + nf > capacity
+            {
+                let keep = cache_frames.min(*end);
+                let shift = *end - keep;
+                if shift > 0 {
+                    jobs.push((bi, keep, shift));
+                }
+            }
+        }
+        if jobs.is_empty() {
+            return Some(true);
+        }
+        // a few dispatches a block at most (a shift of a handful of slots is the CPU's)
+        if jobs.iter().any(|&(_, keep, shift)| keep.div_ceil(shift) > 8) || !self.rope(jobs.iter().map(|j| j.2 + 1).max().unwrap_or(0)) {
+            return None;
+        }
+        let half = hd / 2;
+        let this = &*self;
+        let (ok, _) = run_concurrent(this.dev.be, &this.f, std::slice::from_ref(&(0..1)), |e, _| {
+            let d = &*this.dev;
+            e.pipe(d.p.compact);
+            for &(bi, keep, shift) in &jobs {
+                let DevBlock::Attn { k, v, cap, .. } = &this.lanes[lane].blocks[bi] else {
+                    unreachable!()
+                };
+                let (Some(k), Some(v)) = (k, v) else { continue };
+                let mut s0 = 0;
+                while s0 < keep {
+                    let s1 = (s0 + shift).min(keep);
+                    e.buf(k.id, 0, 0);
+                    e.buf(v.id, 0, 1);
+                    e.buf(this.cos.as_ref().unwrap().id, 0, 2);
+                    e.buf(this.sin.as_ref().unwrap().id, 0, 3);
+                    e.bytes(
+                        &ViCompact {
+                            rows: (nb * nh) as u32,
+                            cap: *cap as u32,
+                            hd: hd as u32,
+                            hh: half as u32,
+                            shift: shift as u32,
+                            s0: s0 as u32,
+                            s1: s1 as u32,
+                            _p: 0,
+                        },
+                        4,
+                    );
+                    e.dispatch(((nb * nh * (s1 - s0) * half).div_ceil(256), 1), 256);
+                    e.barrier();
+                    s0 = s1;
+                }
+            }
+        });
+        if !ok {
+            return Some(false);
+        }
+        for &(bi, keep, _) in &jobs {
+            if let DevBlock::Attn { end, .. } = &mut self.lanes[lane].blocks[bi] {
+                *end = keep;
+            }
+        }
+        Some(true)
+    }
+
+    /// The cache bookkeeping before `nf` new slots: compaction past the capacity (on the GPU,
+    /// else the CPU path's on the host), then room for them.
     fn prepare_cache(&mut self, lane: usize, nf: usize) -> bool {
+        // A compaction the GPU could not run leaves the caches for the host's below; one whose
+        // command buffer failed may have moved part of them: the step fails, and the stream
+        // carries on on the CPU from what the device holds.
+        match self.compact_gpu(lane, nf) {
+            Some(true) | None => {}
+            Some(false) => return false,
+        }
         let (nb, nh, hd) = (self.dev.nb, self.dev.heads, self.dev.width / self.dev.heads);
         let (cache_frames, capacity) = (self.spec.cache_frames, self.spec.capacity);
         let be = self.dev.be;
@@ -758,13 +907,23 @@ impl MetalViSession {
     }
 
     fn gemm(&self, e: &FastEnc, g: &Gemm) {
+        self.gemm_nb(e, g);
+        e.barrier();
+    }
+
+    /// [`Self::gemm`] without the barrier after it (independent products in a row).
+    fn gemm_nb(&self, e: &FastEnc, g: &Gemm) {
         if skip_op("gemm") {
             return;
         }
         let d = &*self.dev;
-        // Few rows: the K-split kernels (16 outputs a threadgroup); many: 32 x 32 tiles.
+        // A step's rows (46 bands x 2 frames a lane): the K-split kernels, 32 outputs x 16 rows a
+        // threadgroup (`vi_gemm_x42`) for the projections, 16 x 8 for the band-grouped ones of
+        // a frame or two; 32 x 32 tiles for blocks of many frames.
+        let x = gemm_choice().unwrap_or(X42);
         let (pipe, tile_o, tile_t) = match g.t {
             0..=8 => (d.p.gemm_k[0], 16, 8),
+            9..=256 if g.groups == 1 => (d.p.gemm_x[x], X_TILES[x].0, X_TILES[x].1),
             9..=128 => (d.p.gemm_k[1], 16, 32),
             _ => (d.p.gemm, 32, 32),
         };
@@ -796,7 +955,6 @@ impl MetalViSession {
             5,
         );
         e.dispatch3((g.n_out.div_ceil(tile_o), g.t.div_ceil(tile_t), g.groups), 128);
-        e.barrier();
     }
 
     /// A plain linear layer over `n` rows.
@@ -849,8 +1007,10 @@ impl MetalViSession {
         e.barrier();
     }
 
-    /// One Mamba direction over `seqs` sequences of `len` tokens (strides `ss`, `ps`), its
-    /// `out_proj(y) + x` into `yc` (`ldyc` wide, at column `col`).
+    /// One Mamba direction over each lane's `seqs` sequences of `len` tokens (strides `ss`, `ps`;
+    /// the lanes' `n` rows one after the other), its `out_proj(y) + x` into `yc` (`ldyc` wide, at
+    /// column `col`). The projections run over every lane's rows at once; the conv and the scan
+    /// per lane, with that lane's carried state (`carry`: tails, states, the live copy).
     #[allow(clippy::too_many_arguments)]
     fn mamba(
         &self,
@@ -863,7 +1023,7 @@ impl MetalViSession {
         ss: usize,
         ps: usize,
         reverse: bool,
-        carry: Option<(&[Buf; 2], &[Buf; 2], usize)>,
+        carry: &[Carry<'_>],
         ldyc: usize,
         col: usize,
     ) {
@@ -871,8 +1031,11 @@ impl MetalViSession {
         let w = d.width;
         let at = |a: A| (ids[a as usize], 0usize);
         let inner = m.inner;
-        self.lin(e, &m.in_proj, at(A::X), w, at(A::Ff), 2 * inner, 0, None, n);
-        let mp = ViMb {
+        let nl = carry.len();
+        let nt = n * nl;
+        let xw = m.x_proj.n_out;
+        self.lin(e, &m.in_proj, at(A::X), w, at(A::Ff), 2 * inner, 0, None, nt);
+        let mp = |c: bool| ViMb {
             inner: inner as u32,
             k: m.k as u32,
             len: len as u32,
@@ -880,34 +1043,36 @@ impl MetalViSession {
             ss: ss as u32,
             ps: ps as u32,
             reverse: reverse as u32,
-            has_tail: carry.is_some() as u32,
+            has_tail: c as u32,
             ns: 16,
             dt_rank: m.dt_rank as u32,
-            xw: m.x_proj.n_out as u32,
+            xw: xw as u32,
             _p: 0,
         };
-        e.pipe(d.p.conv);
-        e.buf(ids[A::Ff as usize], 0, 0);
-        e.buf(ids[A::U as usize], 0, 1);
-        e.buf(d.w.id, m.conv_w * 4, 2);
-        e.buf(d.w.id, m.conv_b * 4, 3);
-        match carry {
-            Some((tail, _, cur)) => e.buf(tail[cur].id, 0, 4),
-            None => e.buf(d.w.id, 0, 4),
-        }
-        e.bytes(&mp, 5);
-        e.dispatch(((seqs * len * inner).div_ceil(256), 1), 256);
-        if let Some((tail, _, cur)) = carry {
-            e.pipe(d.p.tail);
-            e.buf(ids[A::Ff as usize], 0, 0);
-            e.buf(tail[cur].id, 0, 1);
-            e.bytes(&mp, 2);
-            e.buf(tail[1 - cur].id, 0, 3);
-            e.dispatch(((seqs * inner).div_ceil(256), 1), 256);
+        for (li, c) in carry.iter().enumerate() {
+            let o = li * n;
+            e.pipe(d.p.conv);
+            e.buf(ids[A::Ff as usize], o * 2 * inner * 4, 0);
+            e.buf(ids[A::U as usize], o * inner * 4, 1);
+            e.buf(d.w.id, m.conv_w * 4, 2);
+            e.buf(d.w.id, m.conv_b * 4, 3);
+            match c {
+                Some((tail, _, cur)) => e.buf(tail[*cur].id, 0, 4),
+                None => e.buf(d.w.id, 0, 4),
+            }
+            e.bytes(&mp(c.is_some()), 5);
+            e.dispatch(((seqs * len * inner).div_ceil(256), 1), 256);
+            if let Some((tail, _, cur)) = c {
+                e.pipe(d.p.tail);
+                e.buf(ids[A::Ff as usize], o * 2 * inner * 4, 0);
+                e.buf(tail[*cur].id, 0, 1);
+                e.bytes(&mp(true), 2);
+                e.buf(tail[1 - *cur].id, 0, 3);
+                e.dispatch(((seqs * inner).div_ceil(256), 1), 256);
+            }
         }
         e.barrier();
-        let xw = m.x_proj.n_out;
-        self.lin(e, &m.x_proj, at(A::U), inner, at(A::Xp), xw, 0, None, n);
+        self.lin(e, &m.x_proj, at(A::U), inner, at(A::Xp), xw, 0, None, nt);
         // delta = softplus(dt_proj(xp[.., ..dt_rank]) + dt_bias)
         self.gemm(
             e,
@@ -922,31 +1087,34 @@ impl MetalViSession {
                 y: at(A::Dt),
                 ldy: inner,
                 res: None,
-                t: n,
+                t: nt,
                 groups: 1,
                 g: [0; 5],
             },
         );
         e.pipe(d.p.scan);
-        e.buf(ids[A::U as usize], 0, 0);
-        e.buf(ids[A::Dt as usize], 0, 1);
-        e.buf(ids[A::Xp as usize], 0, 2);
-        e.buf(ids[A::Ff as usize], 0, 3);
-        e.buf(d.w.id, m.a * 4, 4);
-        e.buf(d.w.id, m.d * 4, 5);
-        e.buf(ids[A::Y as usize], 0, 6);
-        match carry {
-            Some((_, ssm, cur)) => {
-                e.buf(ssm[cur].id, 0, 7);
-                e.buf(ssm[1 - cur].id, 0, 9);
+        for (li, c) in carry.iter().enumerate() {
+            let o = li * n;
+            e.buf(ids[A::U as usize], o * inner * 4, 0);
+            e.buf(ids[A::Dt as usize], o * inner * 4, 1);
+            e.buf(ids[A::Xp as usize], o * xw * 4, 2);
+            e.buf(ids[A::Ff as usize], o * 2 * inner * 4, 3);
+            e.buf(d.w.id, m.a * 4, 4);
+            e.buf(d.w.id, m.d * 4, 5);
+            e.buf(ids[A::Y as usize], o * inner * 4, 6);
+            match c {
+                Some((_, ssm, cur)) => {
+                    e.buf(ssm[*cur].id, 0, 7);
+                    e.buf(ssm[1 - *cur].id, 0, 9);
+                }
+                None => {
+                    e.buf(d.w.id, 0, 7);
+                    e.buf(ids[A::Y as usize], o * inner * 4, 9);
+                }
             }
-            None => {
-                e.buf(d.w.id, 0, 7);
-                e.buf(ids[A::Y as usize], 0, 9);
-            }
+            e.bytes(&mp(c.is_some()), 8);
+            e.dispatch(((seqs * inner).div_ceil(64), 1), 64);
         }
-        e.bytes(&mp, 8);
-        e.dispatch(((seqs * inner).div_ceil(64), 1), 64);
         e.barrier();
         self.lin(
             e,
@@ -957,194 +1125,228 @@ impl MetalViSession {
             ldyc,
             0,
             Some((at(A::X), w)),
-            n,
+            nt,
         );
     }
 
-    /// Encodes lane `lane`'s blocks and decoder over the features in `A::F` into `raw`.
-    fn encode_lane(&self, e: &FastEnc, ids: &[Id; NA], lane: usize, nf: usize, raw: Id) {
+    /// Encodes the blocks and decoder heads of `lanes` (one or two) over the features in `A::F`,
+    /// lane `i`'s decoder output into `raws[i]`. The lanes' rows sit one after the other in the
+    /// activations, so every projection runs once over all of them (one pass over the weights for
+    /// both lanes of a crossfade); the attention, the convs and scans with their state, and the
+    /// band-grouped decoder run per lane.
+    fn encode_lanes(&self, e: &FastEnc, ids: &[Id; NA], lanes: &[usize], nf: usize, raws: &[Id]) {
         let d = &*self.dev;
         let (w, nb, nh) = (d.width, d.nb, d.heads);
         let hd = w / nh;
         let n = nb * nf;
+        let nl = lanes.len();
+        let nt = n * nl;
         let at = |a: A| (ids[a as usize], 0usize);
         e.pipe(d.p.copy);
-        e.buf(ids[A::F as usize], 0, 0);
-        e.buf(ids[A::X as usize], 0, 1);
-        e.bytes(&((n * w) as u32), 2);
-        e.dispatch(((n * w).div_ceil(256), 1), 256);
+        for li in 0..nl {
+            e.buf(ids[A::F as usize], 0, 0);
+            e.buf(ids[A::X as usize], li * n * w * 4, 1);
+            e.bytes(&((n * w) as u32), 2);
+            e.dispatch(((n * w).div_ceil(256), 1), 256);
+        }
         e.barrier();
-        let l = &self.lanes[lane];
         let x = at(A::X);
         for (bi, blk) in d.blocks.iter().enumerate() {
             match blk {
                 BOff::Attn(t, b) => {
-                    let DevBlock::Attn { k, v, cap, end } = &l.blocks[bi] else {
-                        unreachable!()
-                    };
-                    let (kc, vc) = (k.as_ref().unwrap().id, v.as_ref().unwrap().id);
-                    let first = *end;
+                    // each lane's cache: (keys, values, capacity, first new slot)
+                    let caches: Vec<(Id, Id, usize, usize)> = lanes
+                        .iter()
+                        .map(|&l| {
+                            let DevBlock::Attn { k, v, cap, end } = &self.lanes[l].blocks[bi] else {
+                                unreachable!()
+                            };
+                            (k.as_ref().unwrap().id, v.as_ref().unwrap().id, *cap, *end)
+                        })
+                        .collect();
                     // Time.
-                    self.ln(e, &t.norm1, x, w, at(A::H), w, w, n, false);
-                    self.lin(e, &t.qkv, at(A::H), w, at(A::Qkv), 3 * w, 0, None, n);
+                    self.ln(e, &t.norm1, x, w, at(A::H), w, w, nt, false);
+                    self.lin(e, &t.qkv, at(A::H), w, at(A::Qkv), 3 * w, 0, None, nt);
                     e.pipe(d.p.rope_kv);
-                    e.buf(ids[A::Qkv as usize], 0, 0);
-                    e.buf(ids[A::Q as usize], 0, 1);
-                    e.buf(kc, 0, 2);
-                    e.buf(vc, 0, 3);
-                    e.buf(self.cos.as_ref().unwrap().id, 0, 4);
-                    e.buf(self.sin.as_ref().unwrap().id, 0, 5);
-                    e.bytes(
-                        &ViRope {
-                            nf: nf as u32,
-                            w: w as u32,
-                            nh: nh as u32,
-                            hd: hd as u32,
-                            cap: *cap as u32,
-                            first: first as u32,
-                            n: n as u32,
-                            _p: 0,
-                        },
-                        6,
-                    );
-                    e.dispatch(((n * nh * hd / 2).div_ceil(256), 1), 256);
+                    for (li, &(kc, vc, cap, first)) in caches.iter().enumerate() {
+                        e.buf(ids[A::Qkv as usize], li * n * 3 * w * 4, 0);
+                        e.buf(ids[A::Q as usize], li * n * w * 4, 1);
+                        e.buf(kc, 0, 2);
+                        e.buf(vc, 0, 3);
+                        e.buf(self.cos.as_ref().unwrap().id, 0, 4);
+                        e.buf(self.sin.as_ref().unwrap().id, 0, 5);
+                        e.bytes(
+                            &ViRope {
+                                nf: nf as u32,
+                                w: w as u32,
+                                nh: nh as u32,
+                                hd: hd as u32,
+                                cap: cap as u32,
+                                first: first as u32,
+                                n: n as u32,
+                                _p: 0,
+                            },
+                            6,
+                        );
+                        e.dispatch(((n * nh * hd / 2).div_ceil(256), 1), 256);
+                    }
                     e.barrier();
                     let att = |mode: u32, excl: bool, out: A| {
                         if skip_op("attn") {
                             return;
                         }
                         e.pipe(d.p.attn);
-                        e.buf(ids[A::Qkv as usize], 0, 0);
-                        e.buf(ids[A::Q as usize], 0, 1);
-                        e.buf(kc, 0, 2);
-                        e.buf(vc, 0, 3);
-                        e.buf(ids[out as usize], 0, 4);
-                        e.bytes(
-                            &ViAtt {
-                                mode,
-                                nf: nf as u32,
-                                nb: nb as u32,
-                                w: w as u32,
-                                nh: nh as u32,
-                                hd: hd as u32,
-                                cap: *cap as u32,
-                                first: first as u32,
-                                past: first.min(self.spec.cache_frames) as u32,
-                                window: d.window as u32,
-                                excl: excl as u32,
-                                scale: 1.0 / (hd as f32).sqrt(),
-                            },
-                            5,
-                        );
-                        e.dispatch((n * nh, 1), 128);
+                        for (li, &(kc, vc, cap, first)) in caches.iter().enumerate() {
+                            e.buf(ids[A::Qkv as usize], li * n * 3 * w * 4, 0);
+                            e.buf(ids[A::Q as usize], li * n * w * 4, 1);
+                            e.buf(kc, 0, 2);
+                            e.buf(vc, 0, 3);
+                            e.buf(ids[out as usize], li * n * w * 4, 4);
+                            e.bytes(
+                                &ViAtt {
+                                    mode,
+                                    nf: nf as u32,
+                                    nb: nb as u32,
+                                    w: w as u32,
+                                    nh: nh as u32,
+                                    hd: hd as u32,
+                                    cap: cap as u32,
+                                    first: first as u32,
+                                    past: first.min(self.spec.cache_frames) as u32,
+                                    window: d.window as u32,
+                                    excl: excl as u32,
+                                    scale: 1.0 / (hd as f32).sqrt(),
+                                },
+                                5,
+                            );
+                            e.dispatch((n * nh, 1), 128);
+                        }
                         e.barrier();
                     };
                     att(0, t.excl, A::O);
-                    self.lin(e, &t.proj, at(A::O), w, x, w, 0, Some((x, w)), n);
-                    self.ln(e, &t.norm2, x, w, at(A::H), w, w, n, false);
+                    self.lin(e, &t.proj, at(A::O), w, x, w, 0, Some((x, w)), nt);
+                    self.ln(e, &t.norm2, x, w, at(A::H), w, w, nt, false);
                     let fw = t.ffn1.n_out;
-                    self.lin(e, &t.ffn1, at(A::H), w, at(A::Ff), fw, 1, None, n);
-                    self.lin(e, &t.ffn2, at(A::Ff), fw, x, w, 0, Some((x, w)), n);
+                    self.lin(e, &t.ffn1, at(A::H), w, at(A::Ff), fw, 1, None, nt);
+                    self.lin(e, &t.ffn2, at(A::Ff), fw, x, w, 0, Some((x, w)), nt);
                     // Bands.
-                    self.ln(e, &b.norm1, x, w, at(A::H), w, w, n, false);
-                    self.lin(e, &b.qkv, at(A::H), w, at(A::Qkv), 3 * w, 0, None, n);
+                    self.ln(e, &b.norm1, x, w, at(A::H), w, w, nt, false);
+                    self.lin(e, &b.qkv, at(A::H), w, at(A::Qkv), 3 * w, 0, None, nt);
                     att(1, b.excl, A::O);
-                    self.lin(e, &b.proj, at(A::O), w, x, w, 0, Some((x, w)), n);
-                    self.ln(e, &b.norm2, x, w, at(A::H), w, w, n, false);
+                    self.lin(e, &b.proj, at(A::O), w, x, w, 0, Some((x, w)), nt);
+                    self.ln(e, &b.norm2, x, w, at(A::H), w, w, nt, false);
                     let fw = b.ffn1.n_out;
-                    self.lin(e, &b.ffn1, at(A::H), w, at(A::Ff), fw, 1, None, n);
-                    self.lin(e, &b.ffn2, at(A::Ff), fw, x, w, 0, Some((x, w)), n);
+                    self.lin(e, &b.ffn1, at(A::H), w, at(A::Ff), fw, 1, None, nt);
+                    self.lin(e, &b.ffn2, at(A::Ff), fw, x, w, 0, Some((x, w)), nt);
                 }
                 BOff::Mamba(tm, fm) => {
-                    let DevBlock::Mamba { tail, ssm } = &l.blocks[bi] else {
-                        unreachable!()
-                    };
+                    let carry: Vec<_> = lanes
+                        .iter()
+                        .map(|&l| {
+                            let DevBlock::Mamba { tail, ssm } = &self.lanes[l].blocks[bi] else {
+                                unreachable!()
+                            };
+                            Some((tail, ssm, self.lanes[l].cur))
+                        })
+                        .collect();
+                    let none = vec![None; nl];
                     // Time, causal: rows are bands, positions frames.
-                    self.mamba(e, &tm.fwd, ids, n, nb, nf, nf, 1, false, Some((tail, ssm, l.cur)), w, 0);
-                    self.lin(e, &tm.output_proj, at(A::Yc), w, at(A::P), w, 0, None, n);
-                    self.ln(e, &tm.norm, at(A::P), w, x, w, w, n, true);
+                    self.mamba(e, &tm.fwd, ids, n, nb, nf, nf, 1, false, &carry, w, 0);
+                    self.lin(e, &tm.output_proj, at(A::Yc), w, at(A::P), w, 0, None, nt);
+                    self.ln(e, &tm.norm, at(A::P), w, x, w, w, nt, true);
                     // Bands, both ways: rows are frames, positions bands.
-                    self.mamba(e, &fm.fwd, ids, n, nf, nb, 1, nf, false, None, 2 * w, 0);
-                    self.mamba(e, fm.bwd.as_ref().unwrap(), ids, n, nf, nb, 1, nf, true, None, 2 * w, w);
-                    self.lin(e, &fm.output_proj, at(A::Yc), 2 * w, at(A::P), w, 0, None, n);
-                    self.ln(e, &fm.norm, at(A::P), w, x, w, w, n, true);
+                    self.mamba(e, &fm.fwd, ids, n, nf, nb, 1, nf, false, &none, 2 * w, 0);
+                    self.mamba(e, fm.bwd.as_ref().unwrap(), ids, n, nf, nb, 1, nf, true, &none, 2 * w, w);
+                    self.lin(e, &fm.output_proj, at(A::Yc), 2 * w, at(A::P), w, 0, None, nt);
+                    self.ln(e, &fm.norm, at(A::P), w, x, w, w, nt, true);
                 }
             }
         }
-        // The decoder heads: FiLM + each band's LayerNorm, linear + GELU, linear, to the bins.
-        e.pipe(d.p.ln);
-        e.buf(ids[A::X as usize], 0, 0);
-        e.buf(ids[A::H as usize], 0, 1);
-        e.buf(d.w.id, d.dec_norm.w * 4, 2);
-        e.buf(d.w.id, d.dec_norm.b * 4, 3);
-        e.buf(d.w.id, d.dec_scale * 4, 4);
-        e.buf(d.w.id, d.dec_shift * 4, 5);
-        e.bytes(
-            &ViLn {
-                n: w as u32,
-                ldx: w as u32,
-                ldy: w as u32,
-                mode: 0,
-                rpg: nf as u32,
-                gw: w as u32,
-                film: 1,
-                _p: 0,
-            },
-            6,
-        );
-        e.dispatch((n, 1), 128);
-        e.barrier();
-        self.gemm(
-            e,
-            &Gemm {
-                w: d.l1,
-                n_out: w,
-                n_in: w,
-                bias: Some(d.l1_b),
-                act: 1,
-                x: at(A::H),
-                ldx: w,
-                y: at(A::P),
-                ldy: w,
-                res: None,
-                t: nf,
-                groups: nb,
-                g: [w * w, nf * w, nf * w, w, 0],
-            },
-        );
+        // The decoder heads: FiLM + each band's LayerNorm, linear + GELU, linear, to the bins;
+        // grouped by band, so per lane.
         let dl = d.dec_ld;
-        self.gemm(
-            e,
-            &Gemm {
-                w: d.l2,
-                n_out: dl,
-                n_in: w,
-                bias: Some(d.l2_b),
-                act: 0,
-                x: at(A::P),
-                ldx: w,
-                y: at(A::Dy),
-                ldy: dl,
-                res: None,
-                t: nf,
-                groups: nb,
-                g: [dl * w, nf * w, nf * dl, dl, 0],
-            },
-        );
+        e.pipe(d.p.ln);
+        for li in 0..nl {
+            e.buf(ids[A::X as usize], li * n * w * 4, 0);
+            e.buf(ids[A::H as usize], li * n * w * 4, 1);
+            e.buf(d.w.id, d.dec_norm.w * 4, 2);
+            e.buf(d.w.id, d.dec_norm.b * 4, 3);
+            e.buf(d.w.id, d.dec_scale * 4, 4);
+            e.buf(d.w.id, d.dec_shift * 4, 5);
+            e.bytes(
+                &ViLn {
+                    n: w as u32,
+                    ldx: w as u32,
+                    ldy: w as u32,
+                    mode: 0,
+                    rpg: nf as u32,
+                    gw: w as u32,
+                    film: 1,
+                    _p: 0,
+                },
+                6,
+            );
+            e.dispatch((n, 1), 128);
+        }
+        e.barrier();
+        for li in 0..nl {
+            self.gemm_nb(
+                e,
+                &Gemm {
+                    w: d.l1,
+                    n_out: w,
+                    n_in: w,
+                    bias: Some(d.l1_b),
+                    act: 1,
+                    x: (ids[A::H as usize], li * n * w),
+                    ldx: w,
+                    y: (ids[A::P as usize], li * n * w),
+                    ldy: w,
+                    res: None,
+                    t: nf,
+                    groups: nb,
+                    g: [w * w, nf * w, nf * w, w, 0],
+                },
+            );
+        }
+        e.barrier();
+        for li in 0..nl {
+            self.gemm_nb(
+                e,
+                &Gemm {
+                    w: d.l2,
+                    n_out: dl,
+                    n_in: w,
+                    bias: Some(d.l2_b),
+                    act: 0,
+                    x: (ids[A::P as usize], li * n * w),
+                    ldx: w,
+                    y: (ids[A::Dy as usize], li * n * dl),
+                    ldy: dl,
+                    res: None,
+                    t: nf,
+                    groups: nb,
+                    g: [dl * w, nf * w, nf * dl, dl, 0],
+                },
+            );
+        }
+        e.barrier();
         e.pipe(d.p.dec_out);
-        e.buf(ids[A::Dy as usize], 0, 0);
-        e.buf(raw, 0, 1);
-        e.buf(d.bands.id, 0, 2);
-        e.bytes(
-            &ViEnc {
-                nf: nf as u32,
-                bins: d.bins as u32,
-                ld: dl as u32,
-                _p: 0,
-            },
-            3,
-        );
-        e.dispatch((n, 1), 128);
+        for (li, &raw) in raws.iter().enumerate().take(nl) {
+            e.buf(ids[A::Dy as usize], li * n * dl * 4, 0);
+            e.buf(raw, 0, 1);
+            e.buf(d.bands.id, 0, 2);
+            e.bytes(
+                &ViEnc {
+                    nf: nf as u32,
+                    bins: d.bins as u32,
+                    ld: dl as u32,
+                    _p: 0,
+                },
+                3,
+            );
+            e.dispatch((n, 1), 128);
+        }
         e.barrier();
     }
 }
@@ -1160,8 +1362,8 @@ impl Session for MetalViSession {
             return false;
         }
         let n = nb * nf;
-        // Rows of slack past the last group's for the GEMM's 32-row tiles.
-        let rows = n + 64;
+        // Every lane's rows, and slack past the last group's for the GEMMs' tiles (up to 48 rows).
+        let rows = n * lanes.len() + 64;
         let inner = dev.inner.max(w);
         let ff = dev
             .blocks
@@ -1222,7 +1424,7 @@ impl Session for MetalViSession {
         unsafe { std::ptr::copy_nonoverlapping(spec.as_ptr(), self.f.contents(ids[A::Spec as usize]) as *mut f32, spec.len()) };
         let look = self.spec.look.unwrap_or(0);
         let this = &*self;
-        let (ok, _) = run_concurrent(dev.be, &this.f, std::slice::from_ref(&(0..1)), |e, _| {
+        let (ok, g) = run_concurrent(dev.be, &this.f, std::slice::from_ref(&(0..1)), |e, _| {
             let d = &*this.dev;
             e.pipe(d.p.enc_in);
             e.buf(ids[A::Spec as usize], 0, 0);
@@ -1258,12 +1460,13 @@ impl Session for MetalViSession {
                     g: [w * d.enc_ld, nf * d.enc_ld, nf * w, w, 0],
                 },
             );
-            for (i, &l) in lanes.iter().enumerate() {
-                this.encode_lane(e, &ids, l, nf, ids[if i == 0 { A::Raw0 } else { A::Raw1 } as usize]);
-            }
+            this.encode_lanes(e, &ids, lanes, nf, &[ids[A::Raw0 as usize], ids[A::Raw1 as usize]]);
         });
         if !ok {
             return false;
+        }
+        if step_times() {
+            self.times[lanes.len() - 1].push(g);
         }
         for (i, &l) in lanes.iter().enumerate() {
             let src = self.f.contents(ids[if i == 0 { A::Raw0 } else { A::Raw1 } as usize]) as *const f32;

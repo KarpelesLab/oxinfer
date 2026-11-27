@@ -88,13 +88,16 @@ On Metal a stream's steps run whole on the GPU (`src/metal_vi.rs`, `src/metal_vi
 `gpu::vi`): the realtime checkpoint's weights go up once (f32), each stream keeps both lanes'
 states on the device (the time attention's keys and values, the time Mambas' conv tails and scan
 states, double-buffered so a failed step leaves them as they were), and a step runs the band
-encoders, every block of each lane (one lane, two during a crossfade) and the decoder heads in
-one command buffer, all in f32 with the CPU's exponential and erf: projections on SIMD-group
-matrix GEMMs (16 outputs a threadgroup, K split over the four SIMD-groups), the LayerNorms,
-rotary positions, the attention over the cache (one threadgroup a query), the conv and the
-selective scan in kernels of their own. Only the spectra go up and the decoder outputs come back;
-the STFT, the overlap-add and the cache bookkeeping (growth, compaction) stay on the CPU. Should
-a step fail, the stream carries on on the CPU from the states the GPU held. `--device cpu` (load
+encoders, the blocks (one lane, or both during a crossfade: their rows one after the other, so
+every projection reads its weights once for both) and the decoder heads in one command buffer,
+all in f32 with the CPU's exponential and erf: projections on SIMD-group matrix GEMMs (32
+outputs x 16 rows a threadgroup, K split over the four SIMD-groups, `vi_gemm_x42`), the
+LayerNorms, rotary positions, the attention over the cache (one threadgroup a query), the conv
+and the selective scan in kernels of their own (per lane). Only the spectra go up and the
+decoder outputs come back; the STFT, the overlap-add and the caches' growth stay on the CPU. The
+plain stream's cache compaction (1200 slots of keys and values moved to the front, the keys
+rotated back) runs on the GPU too (`vi_compact`, a command buffer of its own before the step).
+Should a step fail, the stream carries on on the CPU from the states the GPU held. `--device cpu` (load
 option `device=cpu`) keeps it on the CPU, as does `OXINFER_VI_GPU=0`.
 
 ## Accuracy
@@ -123,14 +126,23 @@ with other builds:
 |---|---|---|
 | offline (per-op GPU matmuls and attention, scan on the CPU) | 4.5 s (2.4x real time) | 7.6 s (1.4x) |
 | realtime checkpoint, whole clip (`isolate`, 64-frame blocks; whole steps on the GPU) | 1.12 s (9.7x) | 7.3 s (1.5x) |
-| realtime checkpoint, 20 ms pushes, default windows | 2.63 s (4.1x; slowest push 34 ms) | 12.5 s (0.9x; 81 ms) |
-| realtime checkpoint, 20 ms pushes, plain stream | 2.63 s (4.1x; slowest push 48 ms) | 9.9 s (1.1x; 72 ms) |
+| realtime checkpoint, 20 ms pushes, default windows | 2.08 s (5.2x; slowest push 25 ms, the first; p99 5.1 ms) | 12.5 s (0.9x; 81 ms) |
+| realtime checkpoint, 20 ms pushes, plain stream | 2.35 s (4.6x; slowest push 43 ms, the first; p99 6.3 ms) | 9.9 s (1.1x; 72 ms) |
 
-A 20 ms push computes two frames (92 tokens) through every layer. On the GPU such a step takes
-4.5 ms (median of the command buffers' GPU time) with one lane and 8.7 ms (90th percentile) during
-the crossfades, where both lanes run, against 20 ms of audio; the matmuls are most of it (the
-attention about 0.8 ms, the other kernels 0.6 ms). The slowest pushes are the plain stream's cache
-compactions (every 600 frames: 1200 slots of keys moved and rotated back on the CPU) and moments
-where the shared GPU was busy. On the CPU a live stream runs at about real time (the matmuls of 92
-rows dominate). The reference package takes 297 s offline and 555 s streaming on the same machine
+A 20 ms push computes two frames (92 tokens) through every layer. On the GPU (`OXINFER_PF_PROFILE=1
+OXINFER_VI_STEP_TIMES=1` prints the steps' GPU times) such a step takes 2.99 ms (median; p90
+3.54) with one lane and 4.37 ms (p90 4.58) during the crossfades, where both lanes run, against
+20 ms of audio. Before the two lanes shared their projections and the projections moved to
+32 x 16 tiles these were 4.5 ms and 8.7 ms (p90) on a busier machine; in the same session as the
+numbers above, the previous code's run took 2.93 s against 2.08 s. The tiles, one lane / two
+lanes (median ms): 16 x 32 (the previous `vi_gemm_k4`) 3.49 / 5.22, 16 x 16 3.12 / 5.09, 16 x 24
+3.34 / 4.90, 32 x 8 3.19 / 5.10, 32 x 16 3.08 / 4.50, 32 x 24 3.27 / 4.58; 32 x 32 and 32 x 48
+spill registers (11.6 / 19.9); `OXINFER_VI_GEMM=x22|x23|x41|x42|x43` picks one. The slowest push
+is now the first (the caches allocated, the pipelines warmed). The plain stream compacts its
+caches every 600 frames once 1800 are held: on sample_14 four times over (43 s, compactions at
+18, 24, 30, 36 and 42 s) the compacting pushes took up to 126 ms with the compaction on the host
+(6 pushes over 20 ms) and now stay under 20 ms (slowest push 41 ms, the first; p99 5.6 ms); the
+output with the GPU's compaction is within 6e-8 (144.8 dB) of the host's, and 131.1 dB from the
+CPU path's as before. On the CPU a live stream runs at about real time (the matmuls of 92 rows
+dominate). The reference package takes 297 s offline and 555 s streaming on the same machine
 (its selective scan runs frame by frame in Python on the CPU).

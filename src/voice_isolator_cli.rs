@@ -140,18 +140,30 @@ pub fn run(args: &[String]) -> Result<()> {
         let mut s = iso.stream(&o)?;
         let piece = (sr as usize * piece_ms / 1000).max(1);
         let mut out = Vec::with_capacity(x.len());
-        let mut worst = 0f64;
+        let mut times = Vec::with_capacity(x.len() / piece + 1);
         for c in x.chunks(piece) {
             let tp = Instant::now();
             out.extend(s.push(c));
-            worst = worst.max(tp.elapsed().as_secs_f64());
+            times.push(tp.elapsed().as_secs_f64());
         }
         out.extend(s.flush());
         out.truncate(x.len());
+        // the pushes that took longer than the audio they carried
+        let late = times.iter().filter(|&&t| t * 1000.0 > piece_ms as f64).count();
+        let (at, worst) = times
+            .iter()
+            .copied()
+            .enumerate()
+            .fold((0, 0f64), |a, (i, t)| if t > a.1 { (i, t) } else { a });
+        times.sort_by(f64::total_cmp);
+        let p99 = times.get((times.len().saturating_sub(1) * 99) / 100).copied().unwrap_or(0.0);
         eprintln!(
-            "[streamed {secs:.2}s in {piece_ms} ms pieces: latency {:.0} ms, slowest push {:.1} ms]",
+            "[streamed {secs:.2}s in {piece_ms} ms pieces: latency {:.0} ms, slowest push {:.1} ms (at {:.2}s), p99 {:.1} ms, {late} of {} over {piece_ms} ms]",
             s.latency_samples() as f64 * 1000.0 / sr as f64,
-            worst * 1000.0
+            worst * 1000.0,
+            (at * piece) as f64 / sr as f64,
+            p99 * 1000.0,
+            times.len()
         );
         out
     } else {
