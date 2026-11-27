@@ -3307,6 +3307,121 @@ mod tests {
         }
     }
 
+    /// The prefill plans' Gated DeltaNet rule in three launches (`dgdn_qk_t`, `dgdn_bd_t`,
+    /// `dgdn_seq_HDK`, `dgdn_out_t`) gives `dgdn_rule_t`'s states bit for bit, and its outputs too
+    /// at a power-of-two value head dimension (within a rounding of the norm otherwise).
+    #[test]
+    fn dgdn_rule_split_matches() {
+        let Some(be) = backend() else { return };
+        assert!(be.bind());
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Dgr {
+            nk: u32,
+            nv: u32,
+            key_dim: u32,
+            flags: u32,
+            eps: f32,
+            qscale: f32,
+            hdk: u32,
+            hdv: u32,
+        }
+        let mut seed = 77;
+        for (nk, nv, hdk, hdv, flags) in [(4usize, 4usize, 128usize, 128usize, 0u32), (2, 4, 128, 128, 1), (4, 4, 128, 96, 0), (4, 4, 64, 128, 0), (2, 4, 64, 96, 1), (2, 6, 32, 64, 2), (3, 3, 128, 256, 3)] {
+            let nt = 37usize;
+            let key_dim = nk * hdk;
+            let (cn, zn) = (2 * key_dim + nv * hdv, nv * hdv);
+            // Rows a few floats apart, as a plan's (64-float aligned) rows are.
+            let (cs, zs, bs, as_, os, ss) = (cn + 16, zn + 16, nv + 16, nv + 32, zn + 48, (2 * key_dim + 2 * nv).next_multiple_of(16));
+            let c: Vec<f32> = (0..nt * cs).map(|_| rnd(&mut seed) * 2.0).collect();
+            let z: Vec<f32> = (0..nt * zs).map(|_| rnd(&mut seed) * 3.0).collect();
+            let b: Vec<f32> = (0..nt * bs).map(|_| rnd(&mut seed) * 4.0).collect();
+            let a: Vec<f32> = (0..nt * as_).map(|_| rnd(&mut seed) * 4.0).collect();
+            let st0: Vec<f32> = (0..nv * hdk * hdv).map(|_| rnd(&mut seed)).collect();
+            // decay coefficients (negative), dt bias, norm weights.
+            let mut cst: Vec<f32> = (0..nv).map(|_| -rnd(&mut seed).abs() - 0.1).collect();
+            cst.extend((0..nv).map(|_| rnd(&mut seed)));
+            cst.extend((0..hdv).map(|_| 1.0 + rnd(&mut seed)));
+            let p = Dgr {
+                nk: nk as u32,
+                nv: nv as u32,
+                key_dim: key_dim as u32,
+                flags,
+                eps: 1e-6,
+                qscale: (hdk as f32).powf(-0.5),
+                hdk: hdk as u32,
+                hdv: hdv as u32,
+            };
+            let up = |v: &[f32]| be.upload_bytes(v.as_ptr() as *const u8, v.len() * 4).unwrap();
+            let (dc, dz, db, da, dcst) = (up(&c), up(&z), up(&b), up(&a), up(&cst));
+            let (ds0, ds1) = (up(&st0), up(&st0));
+            let zeros = vec![0f32; nt * os.max(ss)];
+            let (do0, do1, dsc) = (up(&zeros), up(&zeros), up(&zeros));
+            let (tt, csu, zsu, bsu, asu, osu, ssu) = (nt as u32, cs as u32, zs as u32, bs as u32, as_ as u32, os as u32, ss as u32);
+            macro_rules! args {
+                ($($v:expr),* $(,)?) => { [$( &$v as *const _ as *mut c_void ),*] };
+            }
+            let threads = (hdk / 32 * hdv) as u32;
+            let whole = be.func(if threads > 512 { "dgdn_rule_t1k" } else { "dgdn_rule_t" }).unwrap();
+            assert!(be.launch(
+                whole,
+                (nv as u32, 1),
+                threads,
+                &mut args![dc, dz, db, da, do0, ds0, dcst, p, tt, csu, zsu, bsu, asu, osu]
+            ));
+            let f = |n: &str| be.func(n).unwrap();
+            assert!(be.launch(f("dgdn_qk_t"), (nk as u32, tt), hdk as u32, &mut args![dc, dsc, p, csu, ssu]));
+            assert!(be.launch(
+                f("dgdn_bd_t"),
+                (tt, 1),
+                (nv as u32).next_multiple_of(32),
+                &mut args![db, da, dsc, dcst, p, bsu, asu, ssu]
+            ));
+            assert!(be.launch(
+                f(&format!("dgdn_seq_{hdk}")),
+                (nv as u32, 1),
+                hdv as u32,
+                &mut args![dc, dsc, do1, ds1, p, tt, csu, ssu, osu]
+            ));
+            assert!(be.launch(f("dgdn_out_t"), (nv as u32, tt), hdv as u32, &mut args![dz, do1, dcst, p, zsu, osu]));
+            let down = |d: u64, n: usize| {
+                let mut v = vec![0f32; n];
+                assert_eq!(unsafe { be.cu.cuMemcpyDtoH_v2(v.as_mut_ptr() as *mut c_void, d, n * 4) }, 0);
+                v
+            };
+            let (o0, o1) = (down(do0, nt * os), down(do1, nt * os));
+            let (s0, s1) = (down(ds0, st0.len()), down(ds1, st0.len()));
+            assert!(o0.iter().any(|&v| v != 0.0) && o0.iter().all(|v| v.is_finite()), "{hdk} x {hdv}");
+            assert!(s0.iter().zip(&s1).all(|(a, b)| a.to_bits() == b.to_bits()), "states differ at {hdk} x {hdv}");
+            if hdv.is_power_of_two() {
+                assert!(o0.iter().zip(&o1).all(|(a, b)| a.to_bits() == b.to_bits()), "outputs differ at {hdk} x {hdv}");
+            } else {
+                let worst = o0.iter().zip(&o1).map(|(a, b)| (a - b).abs() / a.abs().max(1e-3)).fold(0f32, f32::max);
+                assert!(worst < 1e-6, "outputs differ at {hdk} x {hdv}: {worst:e}");
+            }
+            assert!(s0.iter().zip(&st0).any(|(a, b)| a != b));
+            // The warp-per-column kernel sums in another order: to rounding.
+            let (ds2, do2) = (up(&st0), up(&zeros));
+            assert!(be.launch(
+                f(&format!("dgdn_seqw_{hdk}")),
+                ((hdv as u32).div_ceil(4), nv as u32),
+                128,
+                &mut args![dc, dsc, do2, ds2, p, tt, csu, ssu, osu]
+            ));
+            assert!(be.launch(f("dgdn_out_t"), (nv as u32, tt), hdv as u32, &mut args![dz, do2, dcst, p, zsu, osu]));
+            let (o2, s2) = (down(do2, nt * os), down(ds2, st0.len()));
+            let omax = o0.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let smax = s0.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let eo = o0.iter().zip(&o2).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / omax;
+            let es = s0.iter().zip(&s2).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max) / smax;
+            eprintln!("seqw {hdk} x {hdv}: outputs {eo:e} states {es:e}");
+            assert!(eo < 2e-5 && es < 2e-5, "seqw at {hdk} x {hdv}: outputs {eo:e}, states {es:e}");
+            for ptr in [dc, dz, db, da, dcst, ds0, ds1, ds2, do0, do1, do2, dsc] {
+                unsafe { be.cu.cuMemFree_v2(ptr) };
+            }
+        }
+    }
+
     /// The prefill plans' tensor-core attention (`dfattn_D`): queries of a step after cached
     /// positions, causal, with and without a window and an output gate, grouped heads, a partial
     /// last tile of queries, against the f64 definition (to f16's rounding of the operands).

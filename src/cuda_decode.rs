@@ -319,6 +319,11 @@ enum COp {
         /// Kept c, z, b, a rows (multi-token plans) and their lengths.
         save: [P; 4],
         lens: [u32; 4],
+        /// Prefill plans: the rule in three launches (`dgdn_seq_HDK` between the per-token
+        /// parts, see `cuda_decode.cu`), when the output shares no buffer with the inputs;
+        /// `seq_warp`: `dgdn_seqw_HDK`, a warp per column of the state (fast plans).
+        seq: F,
+        seq_warp: bool,
     },
     Glu {
         f: F,
@@ -596,6 +601,11 @@ struct PfFuncs {
     conv: F,
     rule: F,
     rule1k: F,
+    /// The split rule's per-token kernels and scratch (address, floats per token).
+    rule_qk: F,
+    rule_bd: F,
+    rule_out: F,
+    gdn: (u64, u32),
 }
 unsafe impl Send for CudaPlan<'_> {}
 unsafe impl Sync for CudaPlan<'_> {}
@@ -859,8 +869,13 @@ impl CudaBackend {
             a: A | str_off as u64,
             ts: 0,
         };
+        // `OXINFER_CUDA_GDN_SPLIT`: `0` the prefill plans' Gated DeltaNet rule in one kernel
+        // (`dgdn_rule_t`), `exact` the split rule in its order of sums on fast plans too.
+        let gdn_split = std::env::var("OXINFER_CUDA_GDN_SPLIT").unwrap_or_default();
         let mut part_floats = 0usize;
         let mut pair_floats = 0usize;
+        // A token's row of the split Gated DeltaNet rule's scratch (prefill plans).
+        let mut gdn_floats = 0usize;
         // The widest input of a GGUF matmul (the fast prefill GEMM's f16 rows).
         let mut gemm_in_max = 0usize;
         let mut consts: Vec<f32> = Vec::new();
@@ -1397,6 +1412,20 @@ impl CudaBackend {
                             threads: (r.hdk / 32 * r.hdv) as u32,
                             save: if mt && !pf { lens.map(&mut save) } else { [P::default(); 4] },
                             lens: lens.map(|n| n as u32),
+                            seq: if pf
+                                && matches!(r.hdk, 32 | 64 | 128)
+                                && (fast_gemm || r.hdv <= 256)
+                                && r.nv <= 1024
+                                && [r.c, r.z, r.b, r.a].iter().all(|v| v.buf != r.out.buf)
+                                && gdn_split != "0"
+                            {
+                                gdn_floats = gdn_floats.max(2 * key_dim + 2 * r.nv);
+                                let name = if fast_gemm && gdn_split != "exact" { "dgdn_seqw" } else { "dgdn_seq" };
+                                self.func(&format!("{name}_{}", r.hdk))?
+                            } else {
+                                std::ptr::null_mut()
+                            },
+                            seq_warp: fast_gemm && gdn_split != "exact",
                         });
                     }
                     Op::Route {
@@ -1562,6 +1591,8 @@ impl CudaBackend {
         let q8d_off = region(if q8 { gemm_in_max / 32 * 8 * tokens } else { 4 });
         let part_off = region(part_floats.max(1) * 4);
         let pair_off = region(pair_floats.max(1) * tokens * 4);
+        let gdn_floats = gdn_floats.next_multiple_of(16);
+        let gdn_off = region(gdn_floats.max(1) * tokens * 4);
         let save_off: Vec<usize> = saves.iter().map(|&n| region(n * 4)).collect();
         if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
             let (mut free, mut all) = (0usize, 0usize);
@@ -1737,6 +1768,10 @@ impl CudaBackend {
                     conv: self.func("dgdn_conv_t")?,
                     rule: self.func("dgdn_rule_t")?,
                     rule1k: self.func("dgdn_rule_t1k")?,
+                    rule_qk: self.func("dgdn_qk_t")?,
+                    rule_bd: self.func("dgdn_bd_t")?,
+                    rule_out: self.func("dgdn_out_t")?,
+                    gdn: (arena + gdn_off as u64, gdn_floats as u32),
                 })
             } else {
                 None
@@ -2367,10 +2402,30 @@ impl CudaPlan<'_> {
                 cst,
                 p,
                 threads,
+                seq,
+                seq_warp,
                 ..
             } => {
                 let (ca, za, ba, aa, oa, sa, cst) = (c.a, z.a, b.a, a.a, out.a, slot.states[state].0, cst.a);
                 let (cs, zs, bs, as_, os) = (st(c), st(z), st(b), st(a), st(out));
+                if !seq.is_null() {
+                    let (sc, ss) = pf.gdn;
+                    return Some(
+                        be.launch(pf.rule_qk, (p.nk, tt), p.hdk, &mut args![ca, sc, p, cs, ss])
+                            && be.launch(
+                                pf.rule_bd,
+                                (tt, 1),
+                                p.nv.next_multiple_of(32),
+                                &mut args![ba, aa, sc, cst, p, bs, as_, ss],
+                            )
+                            && if seq_warp {
+                                be.launch(seq, (p.hdv.div_ceil(4), p.nv), 128, &mut args![ca, sc, oa, sa, p, tt, cs, ss, os])
+                            } else {
+                                be.launch(seq, (p.nv, 1), p.hdv, &mut args![ca, sc, oa, sa, p, tt, cs, ss, os])
+                            }
+                            && be.launch(pf.rule_out, (p.nv, tt), p.hdv, &mut args![za, oa, cst, p, zs, os]),
+                    );
+                }
                 be.launch(
                     if threads > 512 { pf.rule1k } else { pf.rule },
                     (p.nv, 1),

@@ -968,6 +968,148 @@ extern "C" __global__ void __launch_bounds__(1024) dgdn_rule_t1k(const float* c,
     dgdn_rule_t_body(c, z, b, a, out, state, cst, p, nt, cs, zs, bs, as, os);
 }
 
+// ---- `dgdn_rule_t` in three launches, the same states bit for bit and the same outputs where
+// the value head dimension is a power of two (`dgdn_rule_split_matches`; the kernels are built
+// with fast math, and the output norm's mean over another dimension rounds apart in the last bit):
+// what a token's update does not take from the token before it runs for every token at once,
+// and the recurrence alone stays sequential, without a barrier per token.
+//  - dgdn_qk_t: grid (nk, nt), hdk threads: the normed queries and keys of every token into
+//    scratch rows (`ss` floats apart: nk * hdk queries, then as many keys).
+//  - dgdn_bd_t: grid (nt), a thread per value head: beta and decay after them (nv each).
+//  - dgdn_seq_HDK: grid (nv), hdv threads, thread j keeping column j of the head's state (HDK
+//    values) in registers across the tokens; the sums over a column go in dgdn_rule's order (32
+//    at a time, then the parts in turn). It leaves the raw outputs in `out`.
+//  - dgdn_out_t: grid (nv, nt), hdv threads: the output norm and gate over `out` in place.
+extern "C" __global__ void dgdn_qk_t(const float* c, float* sc, DGR p, unsigned int cs, unsigned int ss) {
+    __shared__ float red2[32];
+    unsigned int hk = blockIdx.x, tid = threadIdx.x, hdk = p.hdk;
+    const float* ct = c + (size_t)blockIdx.y * cs;
+    float* st = sc + (size_t)blockIdx.y * ss;
+    float q = ct[hk * hdk + tid], k = ct[p.key_dim + hk * hdk + tid];
+    float qinv = 1.0f / sqrtf(dtg_sum(q * q, hdk, red2) + 1e-6f) * p.qscale;
+    float kinv = 1.0f / sqrtf(dtg_sum(k * k, hdk, red2) + 1e-6f);
+    st[hk * hdk + tid] = q * qinv;
+    st[p.key_dim + hk * hdk + tid] = k * kinv;
+}
+extern "C" __global__ void dgdn_bd_t(const float* b, const float* a, float* sc, const float* cst, DGR p, unsigned int bs, unsigned int as,
+                                     unsigned int ss) {
+    unsigned int hv = threadIdx.x;
+    size_t t = blockIdx.x;
+    if (hv >= p.nv) return;
+    float beta = 1.0f / (1.0f + expf(-b[t * bs + hv]));
+    float ga = a[t * as + hv] + cst[p.nv + hv];
+    float spl = ga > 20.f ? ga : logf(1.0f + expf(ga));
+    float decay = expf(cst[hv] * spl);
+    float* st = sc + t * ss + 2 * p.key_dim;
+    st[hv] = beta;
+    st[p.nv + hv] = decay;
+}
+template <int HDK>
+__device__ __forceinline__ void dgdn_seq_body(const float* c, const float* sc, float* out, float* state, DGR p, unsigned int nt,
+                                              unsigned int cs, unsigned int ss, unsigned int os) {
+    unsigned int hv = blockIdx.x, j = threadIdx.x, hdv = p.hdv;
+    unsigned int hk = (p.flags & 1u) ? hv % p.nk : hv / (p.nv / p.nk);
+    float* S = state + (size_t)hv * HDK * hdv + j;
+    float s[HDK];
+#pragma unroll
+    for (int d = 0; d < HDK; d++) s[d] = S[(size_t)d * hdv];
+    for (size_t t = 0; t < nt; t++) {
+        const float* st = sc + t * ss;
+        const float* qn = st + hk * HDK;
+        const float* kn = st + p.key_dim + hk * HDK;
+        float beta = st[2 * p.key_dim + hv], decay = st[2 * p.key_dim + p.nv + hv];
+        float kvm = 0.f;
+#pragma unroll
+        for (int part = 0; part < HDK / 32; part++) {
+            float kv = 0.f;
+#pragma unroll
+            for (int d = 0; d < 32; d++) {
+                s[part * 32 + d] = s[part * 32 + d] * decay;
+                kv = fmaf(s[part * 32 + d], kn[part * 32 + d], kv);
+            }
+            kvm += kv;
+        }
+        float delta = (c[t * cs + 2 * p.key_dim + hv * hdv + j] - kvm) * beta;
+        float ov = 0.f;
+#pragma unroll
+        for (int part = 0; part < HDK / 32; part++) {
+            float o = 0.f;
+#pragma unroll
+            for (int d = 0; d < 32; d++) {
+                s[part * 32 + d] = fmaf(kn[part * 32 + d], delta, s[part * 32 + d]);
+                o = fmaf(s[part * 32 + d], qn[part * 32 + d], o);
+            }
+            ov += o;
+        }
+        out[t * os + hv * hdv + j] = ov;
+    }
+#pragma unroll
+    for (int d = 0; d < HDK; d++) S[(size_t)d * hdv] = s[d];
+}
+#define DGDN_SEQ(HDK) \
+extern "C" __global__ void __launch_bounds__(256) dgdn_seq_##HDK(const float* c, const float* sc, float* out, float* state, DGR p, \
+                                                                 unsigned int nt, unsigned int cs, unsigned int ss, unsigned int os) { \
+    dgdn_seq_body<HDK>(c, sc, out, state, p, nt, cs, ss, os); }
+DGDN_SEQ(32) DGDN_SEQ(64) DGDN_SEQ(128)
+// `dgdn_seqw_HDK` (fast prefill plans): dgdn_seq with a warp per column of the state instead of
+// a thread, lane l keeping the HDK / 32 values of key dimensions l, l + 32, ...; a column's sums
+// are each lane's own values, then the lanes by shuffles, so a token takes ~50 instructions a
+// thread and no barrier, and every SM has warps of it (grid (hdv / 4, nv), 128 threads). The
+// sums go in another order than dgdn_rule's: its outputs and states differ in the last bits.
+template <int HDK>
+__device__ __forceinline__ void dgdn_seqw_body(const float* c, const float* sc, float* out, float* state, DGR p, unsigned int nt,
+                                               unsigned int cs, unsigned int ss, unsigned int os) {
+    constexpr int NP = HDK / 32;
+    unsigned int hv = blockIdx.y, lane = threadIdx.x & 31, hdv = p.hdv;
+    unsigned int j = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (j >= hdv) return;
+    unsigned int hk = (p.flags & 1u) ? hv % p.nk : hv / (p.nv / p.nk);
+    float* S = state + (size_t)hv * HDK * hdv + (size_t)lane * hdv + j;
+    float s[NP];
+#pragma unroll
+    for (int i = 0; i < NP; i++) s[i] = S[(size_t)i * 32 * hdv];
+    const float* qn = sc + hk * HDK + lane;
+    const float* kn = qn + p.key_dim;
+    const float* bd = sc + 2 * p.key_dim + hv;
+    const float* v = c + 2 * p.key_dim + hv * hdv + j;
+    float* o_ = out + hv * hdv + j;
+    for (size_t t = 0; t < nt; t++) {
+        float beta = bd[t * ss], decay = bd[t * ss + p.nv];
+        float k[NP], kv = 0.f;
+#pragma unroll
+        for (int i = 0; i < NP; i++) {
+            k[i] = kn[t * ss + i * 32];
+            s[i] = s[i] * decay;
+            kv = fmaf(s[i], k[i], kv);
+        }
+        float delta = (v[t * cs] - warp_sum(kv)) * beta;
+        float o = 0.f;
+#pragma unroll
+        for (int i = 0; i < NP; i++) {
+            s[i] = fmaf(k[i], delta, s[i]);
+            o = fmaf(s[i], qn[t * ss + i * 32], o);
+        }
+        o = warp_sum(o);
+        if (lane == 0) o_[t * os] = o;
+    }
+#pragma unroll
+    for (int i = 0; i < NP; i++) S[(size_t)i * 32 * hdv] = s[i];
+}
+#define DGDN_SEQW(HDK) \
+extern "C" __global__ void __launch_bounds__(128) dgdn_seqw_##HDK(const float* c, const float* sc, float* out, float* state, DGR p, \
+                                                                  unsigned int nt, unsigned int cs, unsigned int ss, unsigned int os) { \
+    dgdn_seqw_body<HDK>(c, sc, out, state, p, nt, cs, ss, os); }
+DGDN_SEQW(32) DGDN_SEQW(64) DGDN_SEQW(128)
+extern "C" __global__ void dgdn_out_t(const float* z, float* out, const float* cst, DGR p, unsigned int zs, unsigned int os) {
+    __shared__ float red2[32];
+    unsigned int hv = blockIdx.x, j = threadIdx.x, hdv = p.hdv;
+    size_t t = blockIdx.y;
+    float ov = out[t * os + hv * hdv + j];
+    float r = rsqrtf(dtg_sum(ov * ov, hdv, red2) / (float)hdv + p.eps);
+    float zz = z[t * zs + hv * hdv + j];
+    out[t * os + hv * hdv + j] = ov * r * cst[2 * p.nv + j] * ((p.flags & 2u) ? dsig(zz) : zz / (1.0f + expf(-zz)));
+}
+
 // The fast prefill GEMM's input (`gemmh_K`): the step's rows (n floats each, xs apart; grid
 // (blocks, tokens)) as f16 rows of n, with dguard_t's check (f16 holds up to 65504; the same
 // bound as the split GEMM keeps the declined steps alike).
