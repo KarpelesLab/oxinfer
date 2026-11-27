@@ -771,7 +771,9 @@ mod tests {
             e.config_mut().max_tokens = 12;
             e
         };
-        let m = vec![Message::user("Hello there, how are you?")];
+        // A system message of its own: the default system prompt tells the time to the second, so
+        // the replies of two requests a second apart are those of two different prompts.
+        let m = vec![Message::system("You answer briefly."), Message::user("Hello there, how are you?")];
         let alone = |lora: Option<&std::path::Path>| {
             let mut o = o.clone();
             if let Some(l) = lora {
