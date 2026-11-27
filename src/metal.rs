@@ -904,43 +904,81 @@ inline void load(PQ2_0W w, uint row, uint b, thread float4* out) {
     device const uchar* B = gblk(w.g, row, b / 4, 34);
     load_t2(B + 2 + 8 * (b % 4), h2f(B), out);
 }
-// Base-3 digit n (3^n in p) of byte q minus one, as ggml reads TQ1_0 / PTQ1_0 bytes.
-inline float trit(uint q, uint p) { return float((((q * p) & 255u) * 3u) >> 8) - 1.f; }
 // PTQ1_0: 24 bytes of five trits in runs of 16 and 8 (digit n of byte m of a run of c bytes is
-// value n c + m of the run's 5 c), 2 bytes of four trits (value 120 + 2 n + h), then the scale.
-inline float ptq1_at(device const uchar* B, uint e) {
-    const uint p3[5] = {1u, 3u, 9u, 27u, 81u};
-    if (e < 80) return trit(B[e % 16], p3[e / 16]);
-    if (e < 120) return trit(B[16 + (e - 80) % 8], p3[(e - 80) / 8]);
-    return trit(B[24 + (e - 120) % 2], p3[(e - 120) / 2]);
-}
+// value n c + m of the run's 5 c), 2 bytes of four trits (value 120 + 2 n + h), then the scale;
+// digit n of byte q is (((q 3^n) & 255) * 3) >> 8, minus one, as ggml reads TQ1_0 / PTQ1_0 bytes.
 struct PTQ1_0W { GgW g; };
-// The GEMM loaders read a 32-block (quarter s of a block) as 8 runs of four values, each run one
-// base-3 digit (3^n = PTQ1_P[s][i]) of the four bytes at PTQ1_OFF[s][i], except the last two
-// runs of quarter 3 (values 120..127), digits (n, n, n + 1, n + 1) of bytes (24, 25, 24, 25).
-// Tables rather than branches: the two quarters a SIMD-group's lanes load at a K step then run
-// the same instructions (`ptq1_at` value by value ran the prompts at half the 2-bit files' speed).
-constant uchar PTQ1_OFF[4][8] = {{0, 4, 8, 12, 0, 4, 8, 12}, {0, 4, 8, 12, 0, 4, 8, 12},
-                                 {0, 4, 8, 12, 16, 20, 16, 20}, {16, 20, 16, 20, 16, 20, 24, 24}};
-constant uchar PTQ1_P[4][8] = {{1, 1, 1, 1, 3, 3, 3, 3}, {9, 9, 9, 9, 27, 27, 27, 27},
-                               {81, 81, 81, 81, 1, 1, 3, 3}, {9, 9, 27, 27, 81, 81, 1, 9}};
-// The trits (-1, 0, 1) of quarter `s` of the block at B, the values `ptq1_at` reads.
-inline void ptq1_trits(device const uchar* B, uint s, thread int4* t) {
-    for (uint i = 0; i < 8; i++) {
-        uint4 q = uint4(ld4(B + PTQ1_OFF[s][i]));
-        uint p = PTQ1_P[s][i];
-        bool tail = s == 3 && i >= 6;
-        q = tail ? q.xyxy : q;
-        uint4 pv = tail ? uint4(p, p, 3 * p, 3 * p) : uint4(p);
-        t[i] = int4((((q * pv) & 255u) * 3u) >> 8) - 1;
+// The GEMM loaders read a block as its 7 words (26 bytes of trits, then the scale) and a 32-value
+// quarter of it as 8 runs of four values, each run one digit of the four bytes of a word. The
+// digits are computed for two bytes at a time in the 16-bit halves of a 32-bit word (bytes 0 and 2
+// in one word, 1 and 3 in another): x = q 3^n mod 256 in each half, then 3 x, whose high byte is
+// the digit and whose low byte the next digit's x; a digit t becomes a half by its bits (1024 + t,
+// minus 1025: t - 1 exactly), times the scale. The values of ggml's formula in about half the
+// instructions of computing them byte by byte (in floats or integers alike), whose GEMMs ran ~7%
+// slower than the 2-bit files' (two shifts and a mask a value).
+struct PTQ1B { uint w0, w1, w2, w3, w4, w5, w6; };
+inline PTQ1B ptq1_fetch(device const uchar* B) {
+    device const uint* W = (device const uint*)B;   // (blocks of 28 bytes: 4-byte aligned)
+    return PTQ1B{W[0], W[1], W[2], W[3], W[4], W[5], W[6]};
+}
+#define PK_M 0x00FF00FFu
+// The digits of x (q 3^n mod 256 in each 16-bit half), x becoming the next digit's.
+inline uint pk_dig(thread uint& x) {
+    uint y = x + (x << 1);
+    x = y & PK_M;
+    return (y >> 8) & 0x00030003u;
+}
+// Four values from the digits of bytes 0, 2 (a) and 1, 3 (b): (t - 1) d.
+inline half4 pk_out(uint a, uint b, half d) {
+    half2 ha = (as_type<half2>(a | 0x64006400u) - 1025.h) * d, hb = (as_type<half2>(b | 0x64006400u) - 1025.h) * d;
+    return half4(ha.x, hb.x, ha.y, hb.y);
+}
+// Digit n (p = 3^n) of the four bytes of w.
+inline half4 pk_run(uint w, uint p, half d) {
+    uint xl = ((w & PK_M) * p) & PK_M, xh = (((w >> 8) & PK_M) * p) & PK_M;
+    return pk_out(pk_dig(xl), pk_dig(xh), d);
+}
+// Quarter blk of the block's first half: digits (2 blk, 2 blk + 1) of words 0..3.
+template <typename P>
+inline void pk_q01(PTQ1B k, uint blk, half d, P out) {
+    uint p = blk ? 9u : 1u;
+    uint ws[4] = {k.w0, k.w1, k.w2, k.w3};
+    for (uint i = 0; i < 4; i++) {
+        uint xl = ((ws[i] & PK_M) * p) & PK_M, xh = (((ws[i] >> 8) & PK_M) * p) & PK_M;
+        uint al = pk_dig(xl), ah = pk_dig(xh);
+        out[i] = pk_out(al, ah, d);
+        out[i + 4] = pk_out(pk_dig(xl), pk_dig(xh), d);
     }
 }
+// Quarter 2 + blk: quarter 2 digit 4 of words 0..3, then digits 0 and 1 of words 4, 5; quarter 3
+// digits 2, 3, 4 of words 4, 5, then values 120 + 2 n + h of bytes 24 + h as digits 0 and 2 of
+// the word (b24, b25, 3 b24, 3 b25) mod 256 (digit n of 3 q mod 256 is digit n + 1 of q). The
+// words and digits are picked by selects: the lanes of a SIMD-group load quarters 2 and 3.
+template <typename P>
+inline void pk_q23(PTQ1B k, uint blk, half d, P out) {
+    bool s3 = blk != 0;
+    uint b24 = k.w6 & 255u, b25 = (k.w6 >> 8) & 255u;
+    uint tl = b24 | (b25 << 8) | (((3u * b24) & 255u) << 16) | (((3u * b25) & 255u) << 24);
+    out[0] = pk_run(s3 ? k.w4 : k.w0, s3 ? 9u : 81u, d);
+    out[1] = pk_run(s3 ? k.w5 : k.w1, s3 ? 9u : 81u, d);
+    out[2] = pk_run(s3 ? k.w4 : k.w2, s3 ? 27u : 81u, d);
+    out[3] = pk_run(s3 ? k.w5 : k.w3, s3 ? 27u : 81u, d);
+    out[4] = pk_run(k.w4, s3 ? 81u : 1u, d);
+    out[5] = pk_run(k.w5, s3 ? 81u : 1u, d);
+    out[6] = pk_run(s3 ? tl : k.w4, s3 ? 1u : 3u, d);
+    out[7] = pk_run(s3 ? tl : k.w5, s3 ? 9u : 3u, d);
+}
+// Quarter b % 4 of the block, +-d or 0 in half.
+inline void ptq1_quarter(PTQ1_0W w, uint row, uint b, thread half4* out) {
+    PTQ1B k = ptq1_fetch(gblk(w.g, row, b / 4, 28));
+    half d = as_type<half>(ushort(k.w6 >> 16));
+    if ((b & 2) == 0) pk_q01(k, b & 1, d, out);
+    else pk_q23(k, b & 1, d, out);
+}
 inline void load(PTQ1_0W w, uint row, uint b, thread float4* out) {
-    device const uchar* B = gblk(w.g, row, b / 4, 28);
-    float d = h2f(B + 26);
-    int4 t[8];
-    ptq1_trits(B, b % 4, t);
-    for (uint i = 0; i < 8; i++) out[i] = float4(t[i]) * d;
+    half4 h[8];
+    ptq1_quarter(w, row, b, h);
+    for (uint i = 0; i < 8; i++) out[i] = float4(h[i]);
 }
 struct F16W { GgW g; };
 inline void load(F16W w, uint row, uint b, thread float4* out) {
@@ -1078,13 +1116,42 @@ inline void loadh(Q4_0W w, uint row, uint b, thread half4* out) {
     }
 }
 // PTQ1_0 in half: +-d or 0, the same values.
-inline void loadh(PTQ1_0W w, uint row, uint b, thread half4* out) {
-    device const uchar* B = gblk(w.g, row, b / 4, 28);
-    half d = as_type<half>(ushort(rd16(B + 26)));
-    int4 t[8];
-    ptq1_trits(B, b % 4, t);
-    for (uint i = 0; i < 8; i++) out[i] = half4(t[i]) * d;
+inline void loadh(PTQ1_0W w, uint row, uint b, thread half4* out) { ptq1_quarter(w, row, b, out); }
+#if MMA_UNITS
+// PTQ1_0 tiles (`mma_tile`'s, chosen over it as the more specialized overload): each block's 7
+// words are read once for its two K steps, whose quarters are then known to be 0 / 1 and 2 / 3.
+template <typename W, int TM>
+inline void mma_tile(PTQ1_0W w, device const half* xh, device const float* rs, device float* y, uint n_out, uint n_in, uint rows,
+                     uint o0, uint t0, uint tid, threadgroup half* Ws, uint ldy = 0, uint add = 0) {
+    XT X((device half*)xh, dextents<int32_t, 2>(n_in, rows));
+    YT Y(y, dextents<int32_t, 2>(n_out, rows));
+    constexpr auto desc = matmul2d_descriptor(TM, 64, MKB, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    typedef tensor<threadgroup half, extents<int32_t, MKB, 64>, tensor_inline> WT;
+    WT Wt(Ws, extents<int32_t, MKB, 64>());
+    auto a0 = X.template slice<MKB, TM>(0, t0);
+    auto c = op.template get_destination_cooperative_tensor<decltype(a0), WT, float>();
+    zero(c);
+    uint row = tid / 2, blk = tid % 2;   // each thread dequantizes one quarter of a block of one row
+    threadgroup half4* wd = (threadgroup half4*)(Ws + row * MKB + blk * 32);
+    for (uint kb = 0; kb < n_in / 128; kb++) {
+        PTQ1B k = ptq1_fetch(gblk(w.g, o0 + row, kb, 28));
+        half d = as_type<half>(ushort(k.w6 >> 16));
+        pk_q01(k, blk, d, wd);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto a = X.template slice<MKB, TM>(kb * 128, t0);
+        op.run(a, Wt, c);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        pk_q23(k, blk, d, wd);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto a1 = X.template slice<MKB, TM>(kb * 128 + MKB, t0);
+        op.run(a1, Wt, c);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (ldy != 0 || add != 0) scale_store_ld(c, rs, t0, y, ldy != 0 ? ldy : n_out, o0, add != 0);
+    else scale_store(c, rs, t0, Y.slice(o0, t0));
 }
+#endif
 #if MMA_UNITS
 #define MMA_WS threadgroup half Ws[64 * MKB];
 // With X2, the inputs are hi + lo half pairs (xh, xl: the same row scales) whose products
