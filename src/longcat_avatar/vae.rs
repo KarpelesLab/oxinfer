@@ -9,7 +9,8 @@
 //! A causal convolution `[cout, cin, kt, k, k]` runs here as one 2D convolution over the `kt`
 //! input frames laid side by side in the channels (`[cout, kt * cin, k, k]`), so it goes through
 //! [`crate::sd::ops::Conv`] (and to the accelerator when one is active). Frames are
-//! channels-last `[h * w, c]`.
+//! channels-last `[h * w, c]`. On CUDA the same passes run with the frames kept on the device
+//! (`vae/dev.rs`), the code below being what they are checked against and the fallback.
 //!
 //! [`crate::qwen_image::vae`] is the same network collapsed to a single frame.
 
@@ -19,7 +20,17 @@ use crate::sd::ops::{Conv, Tensors, silu};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
+#[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
+mod dev;
+
 type Frame = Vec<f32>;
+
+/// The device engine of a VAE: decided at the first pass.
+#[derive(Default)]
+struct Device {
+    #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
+    engine: std::sync::OnceLock<Option<dev::Engine>>,
+}
 
 /// A bias or a norm gain, rounded to bfloat16 as the kernels are: the reference loads the whole
 /// VAE in bfloat16, and with these left as stored the released VAE's latents sit 1.7e-3 (mean)
@@ -400,6 +411,7 @@ pub struct VideoVae {
     quant: Option<Conv>,
     dec: Stack,
     post_quant: Conv,
+    device: Device,
 }
 
 /// A 1x1x1 convolution as a 2D one.
@@ -520,6 +532,7 @@ impl VideoVae {
             },
             post_quant: conv111(&t, "post_quant_conv")?,
             cfg,
+            device: Device::default(),
         })
     }
 
@@ -552,16 +565,24 @@ impl VideoVae {
                 frames.len()
             );
         }
-        let mut st = State { caches: Vec::new(), at: 0 };
         let mut out: Vec<Frame> = Vec::new();
         let (mut lh, mut lw) = (0, 0);
-        let mut at = 0;
-        while at < frames.len() {
-            let n = if at == 0 { 1 } else { st_t };
-            let (y, a, b) = enc.forward(&frames[at..at + n], &mut st, h, w);
-            (lh, lw) = (a, b);
-            out.extend(y);
-            at += n;
+        #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
+        if let Some(e) = self.device.engine.get_or_init(dev::Engine::new)
+            && let Some((y, a, b)) = dev::encode(e, self, frames, h, w)
+        {
+            (out, lh, lw) = (y, a, b);
+        }
+        if out.is_empty() {
+            let mut st = State { caches: Vec::new(), at: 0 };
+            let mut at = 0;
+            while at < frames.len() {
+                let n = if at == 0 { 1 } else { st_t };
+                let (y, a, b) = enc.forward(&frames[at..at + n], &mut st, h, w);
+                (lh, lw) = (a, b);
+                out.extend(y);
+                at += n;
+            }
         }
         let z = self.cfg.z_dim;
         let t = out.len();
@@ -585,16 +606,29 @@ impl VideoVae {
         if z.len() != zd * t * h * w || t == 0 {
             bail!("latents: {} values for {zd} x {t} x {h} x {w}", z.len());
         }
-        let mut st = State { caches: Vec::new(), at: 0 };
-        let mut out = Vec::new();
-        for f in 0..t {
+        let latent = |f: usize| -> Frame {
             let mut fr = vec![0f32; h * w * zd];
             for p in 0..h * w {
                 for c in 0..zd {
                     fr[p * zd + c] = z[(c * t + f) * h * w + p];
                 }
             }
-            let (x, _, _) = self.post_quant.forward(&fr, h, w, 1);
+            self.post_quant.forward(&fr, h, w, 1).0
+        };
+        #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
+        if let Some(e) = self.device.engine.get_or_init(dev::Engine::new) {
+            let x: Vec<Frame> = (0..t).map(latent).collect();
+            if let Some(mut out) = dev::decode(e, self, &x, h, w, progress) {
+                for g in &mut out {
+                    g.iter_mut().for_each(|v| *v = v.clamp(-1.0, 1.0));
+                }
+                return Ok(out);
+            }
+        }
+        let mut st = State { caches: Vec::new(), at: 0 };
+        let mut out = Vec::new();
+        for f in 0..t {
+            let x = latent(f);
             let (y, _, _) = self.dec.forward(&[x], &mut st, h, w);
             for mut g in y {
                 g.iter_mut().for_each(|v| *v = v.clamp(-1.0, 1.0));

@@ -785,6 +785,23 @@ impl Conv {
     pub fn pad_before(&self) -> usize {
         self.pad.0
     }
+
+    /// Zero padding before and after the input.
+    pub(crate) fn pads(&self) -> (usize, usize) {
+        self.pad
+    }
+
+    /// The kernel as float32 rows `[cout][ky][kx][cin]` and the bias, for an engine that keeps
+    /// its own copy on a device (None for split float32 layers and rows that cannot be read).
+    pub(crate) fn rows_f32(&self) -> Option<(Vec<f32>, Option<&[f32]>)> {
+        let l = &self.lin;
+        let mut w = vec![0f32; l.n_out * l.n_in];
+        let idx: Vec<u32> = (0..l.n_out as u32).collect();
+        if l.lo.is_some() || !l.w.rows(&idx, l.n_in, &mut w) {
+            return None;
+        }
+        Some((w, l.b.as_deref()))
+    }
 }
 
 impl GroupNorm {

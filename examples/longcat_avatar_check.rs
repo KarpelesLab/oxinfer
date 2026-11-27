@@ -381,11 +381,94 @@ fn main() -> Result<()> {
     let opt = |k: &str| args.iter().find_map(|a| a.strip_prefix(k)).map(std::path::PathBuf::from);
     let avatar = opt("--avatar=").unwrap_or_else(|| dir.join("LongCat-Video-Avatar-1.6"));
     let base = opt("--base=").unwrap_or_else(|| dir.join("LongCat-Video"));
-    // `bench-vae` (only when named): the time to decode 5 latent frames of 64 x 96 (17 frames of
-    // 768 x 512) and to encode 13 of them back.
+    // `bench-vae` and `bench-dit` (only when named): times on made-up inputs at the size of the
+    // repository's example (768 x 512); `--dump=PREFIX` writes the outputs, `--against=PREFIX`
+    // compares them with those written before.
+    let dump = |name: &str, v: &[f32]| -> Result<()> {
+        let file = |p: std::path::PathBuf| p.with_file_name(format!("{}-{name}.bin", p.file_name().unwrap().to_string_lossy()));
+        if let Some(p) = opt("--dump=") {
+            std::fs::write(file(p), v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+        }
+        if let Some(p) = opt("--against=") {
+            cmp(&format!("{name} against the earlier run"), v, &read(&file(p))?);
+        }
+        Ok(())
+    };
+    let num = |k: &str, d: usize| {
+        args.iter()
+            .find_map(|a| a.strip_prefix(k))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    if parts.contains(&"bench-dit") {
+        // One forward of `--frames=N` latent frames (default 24: a clip of 93) of 64 x 96 with a
+        // reference frame, `--reps=N` times; `--int8`; `--lora=a|b` (the DMD or the OPSD LoRA at 1).
+        let sub = if args.iter().any(|a| a == "--int8") {
+            "base_model_int8"
+        } else {
+            "base_model"
+        };
+        let dit = Dit::load(&avatar.join(sub))?;
+        let which = args.iter().find_map(|a| a.strip_prefix("--lora="));
+        let loras = match which {
+            Some(_) => Some((
+                LoraNet::load(&avatar.join("loraA/lora.safetensors"))?,
+                LoraNet::load(&avatar.join("loraB/lora.safetensors"))?,
+            )),
+            None => None,
+        };
+        let nets: Vec<(&LoraNet, f32)> = match (&loras, which) {
+            (Some((a, b)), Some("a")) => vec![(a, 1.0), (b, 0.0)],
+            (Some((a, b)), _) => vec![(a, 0.0), (b, 1.0)],
+            _ => Vec::new(),
+        };
+        let mut seed = 7u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        };
+        let c = &dit.cfg;
+        let (t, h, w) = (num("--frames=", 24), 64, 96);
+        let x: Vec<f32> = (0..c.in_channels * t * h * w).map(|_| rnd()).collect();
+        let text: Vec<f32> = (0..51 * c.caption_channels).map(|_| 0.1 * rnd()).collect();
+        let frames = 1 + c.vae_scale * (t - 1);
+        let audio: Vec<f32> = (0..frames * c.audio_window * c.audio_block * c.audio_channel)
+            .map(|_| rnd())
+            .collect();
+        let ts: Vec<f32> = (0..t).map(|f| if f == 0 { 0.0 } else { 900.0 }).collect();
+        for rep in 0..num("--reps=", 2) {
+            let t0 = std::time::Instant::now();
+            let y = dit.forward(
+                &x,
+                (t, h, w),
+                &ts,
+                &Cond {
+                    text: &text,
+                    text_len: c.model_max_length,
+                    audio: &audio,
+                    humans: 1,
+                    num_cond: 1,
+                    num_ref: 0,
+                    ref_img_index: 10,
+                    mask_frame_range: 0,
+                    ref_masks: None,
+                    lora: Active { nets: &nets },
+                },
+            )?;
+            println!("{sub} forward {rep}: {:.2} s", t0.elapsed().as_secs_f64());
+            if rep == 0 {
+                dump(&format!("dit-{sub}-{}", which.unwrap_or("none")), &y)?;
+            }
+        }
+        if !parts.contains(&"bench-vae") {
+            return Ok(());
+        }
+    }
     if parts.contains(&"bench-vae") {
+        // `--frames=N` latent frames of 64 x 96 (default 5: 17 frames of 768 x 512), and 13 of
+        // them encoded back.
         let vae = VideoVae::load(&base.join("vae"), true)?;
-        let (t, h, w) = (5, 64, 96);
+        let (t, h, w) = (num("--frames=", 5), 64, 96);
         let z: Vec<f32> = (0..vae.cfg.z_dim * t * h * w)
             .map(|i| ((i * 2654435761usize) % 1000) as f32 / 500.0 - 1.0)
             .collect();
@@ -399,13 +482,16 @@ fn main() -> Result<()> {
             t0.elapsed().as_secs_f64()
         );
         print!("{}", oxinfer::sd::ops::timing::report());
+        dump("vae-dec", &fr.concat())?;
+        let n = 13.min(fr.len());
         let t0 = std::time::Instant::now();
-        let lat = vae.encode(&fr[..13], h * 8, w * 8)?;
+        let lat = vae.encode(&fr[..n], h * 8, w * 8)?;
         println!(
-            "VAE encode: 13 frames in {:.1} s ({} values)",
+            "VAE encode: {n} frames in {:.1} s ({} values)",
             t0.elapsed().as_secs_f64(),
             lat.len()
         );
+        dump("vae-enc", &lat)?;
         return Ok(());
     }
     if on("sched") {
