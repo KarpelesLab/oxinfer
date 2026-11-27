@@ -20,6 +20,7 @@
 
 mod det;
 mod img;
+pub mod layout;
 mod page;
 mod rec;
 
@@ -59,12 +60,16 @@ const DET_FAINT: det::Faint = det::Faint { thresh: 0.1, max: 24 };
 /// recognizers (eight lines at 512 pixels).
 pub const AUTO_MIN: [usize; 3] = [1_500_000, 131_072, 131_072];
 
-/// The files a model folder holds for the scripts in `scripts`.
-pub fn files_for(scripts: &[bool; 4]) -> Vec<String> {
+/// The files a model folder holds for the scripts in `scripts` (and LayoutNet's weights with
+/// `layoutnet`).
+pub fn files_for(scripts: &[bool; 4], layoutnet: bool) -> Vec<String> {
     let mut v: Vec<String> = ["det.onnx", "det.meta.json", "router.onnx", "config.json"]
         .iter()
         .map(|s| s.to_string())
         .collect();
+    if layoutnet {
+        v.push(layout::FILE.into());
+    }
     for (g, _) in GROUPS.iter().zip(scripts).filter(|(_, on)| **on) {
         v.push(format!("rec_{g}.onnx"));
         v.push(format!("rec_{g}.charset.json"));
@@ -74,7 +79,7 @@ pub fn files_for(scripts: &[bool; 4]) -> Vec<String> {
 }
 
 /// Loader options. Keys for [`OcrOptions::set`]: `scripts` (comma-separated: latin, cjk, rtl,
-/// world, or all), `det_long_side`, `threads`, `cache_dir`, `device`.
+/// world, or all), `layoutnet`, `det_long_side`, `threads`, `cache_dir`, `device`.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct OcrOptions {
@@ -91,11 +96,14 @@ pub struct OcrOptions {
     /// recognizers on it, the page heuristics on the CPU), or `auto` (the GPU for the inputs it
     /// runs faster than the CPU, see [`AUTO_MIN`]).
     pub device: crate::platform::DevicePref,
+    /// Load LayoutNet (`tablenet.bin`: tables and layout blocks, [`layout`]), 17 MB more.
+    pub layoutnet: bool,
 }
 
 impl Default for OcrOptions {
     fn default() -> Self {
         Self {
+            layoutnet: false,
             scripts: [true; 4],
             det_long_side: 1600,
             threads: None,
@@ -133,12 +141,13 @@ fn parse_bool(key: &str, v: &str) -> Result<bool> {
 }
 
 impl OcrOptions {
-    pub const KEYS: &'static [&'static str] = &["scripts", "det_long_side", "threads", "cache_dir", "device"];
+    pub const KEYS: &'static [&'static str] = &["scripts", "layoutnet", "det_long_side", "threads", "cache_dir", "device"];
 
     /// Sets an option by key (see [`OcrOptions::KEYS`]).
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
             "scripts" => self.scripts = parse_scripts(value)?,
+            "layoutnet" | "tables" => self.layoutnet = parse_bool(key, value)?,
             "det_long_side" | "long_side" => self.det_long_side = parse_side(value)?,
             "threads" => self.threads = Some(value.parse().with_context(|| format!("threads: {value:?}"))?),
             "cache_dir" => self.cache_dir = Some(PathBuf::from(value)),
@@ -194,6 +203,12 @@ pub struct OcrRunOptions {
     /// reading them, as LiteParse does (on in [`Self::plain`] too: it is the image, not a
     /// heuristic). Pixels given as such are read as they are.
     pub exif: bool,
+    /// Layout blocks and tables with LayoutNet ([`OcrPage::layout`]; when it is loaded,
+    /// [`OcrOptions::layoutnet`]).
+    pub structure: bool,
+    /// The image's resolution in pixels per inch for the layout (default: an encoded image's own,
+    /// PNG `pHYs` / JPEG JFIF, else 150): LayoutNet works in page points.
+    pub dpi: Option<f32>,
 }
 
 impl Default for OcrRunOptions {
@@ -212,6 +227,8 @@ impl Default for OcrRunOptions {
             bidi: true,
             layout: true,
             exif: true,
+            structure: true,
+            dpi: None,
         }
     }
 }
@@ -231,6 +248,8 @@ impl OcrRunOptions {
         "bidi",
         "layout",
         "exif",
+        "structure",
+        "dpi",
         "plain",
     ];
 
@@ -247,6 +266,7 @@ impl OcrRunOptions {
             clean: false,
             bidi: false,
             layout: false,
+            structure: false,
             ..Self::default()
         }
     }
@@ -268,6 +288,14 @@ impl OcrRunOptions {
             "bidi" => self.bidi = b(value)?,
             "layout" => self.layout = b(value)?,
             "exif" => self.exif = b(value)?,
+            "structure" => self.structure = b(value)?,
+            "dpi" => {
+                let d: f32 = value.parse().with_context(|| format!("dpi: {value:?}"))?;
+                if !(d.is_finite() && (1.0..=10000.0).contains(&d)) {
+                    bail!("dpi {d}: expected 1 to 10000");
+                }
+                self.dpi = Some(d);
+            }
             "plain" => {
                 if b(value)? {
                     *self = Self::plain();
@@ -324,6 +352,9 @@ pub struct OcrPage {
     pub exif_orientation: Option<u16>,
     /// Wall time of the page.
     pub seconds: f64,
+    /// Layout blocks and tables (LayoutNet loaded and [`OcrRunOptions::structure`] on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<layout::Layout>,
 }
 
 /// What was loaded.
@@ -339,6 +370,8 @@ pub struct OcriaInfo {
     /// Parameters of the loaded models (constants, folded).
     pub params: usize,
     pub device: String,
+    /// LayoutNet is loaded.
+    pub layoutnet: bool,
     pub load_secs: f64,
 }
 
@@ -350,6 +383,7 @@ pub struct Ocria {
     thresh: f32,
     merge: f32,
     long_side: usize,
+    layoutnet: Option<layout::LayoutNet>,
     info: OcriaInfo,
 }
 
@@ -375,7 +409,7 @@ pub fn resolve(spec: &str, opts: &OcrOptions) -> Result<PathBuf> {
     }
     #[cfg(feature = "hf")]
     {
-        let files = files_for(&opts.scripts);
+        let files = files_for(&opts.scripts, opts.layoutnet);
         let names: Vec<&str> = files.iter().map(String::as_str).collect();
         crate::hf::resolve_files(spec, &names, opts.cache_dir.as_deref())
     }
@@ -487,7 +521,15 @@ impl Ocria {
         if recs.iter().all(Option::is_none) {
             bail!("no recognizer to load");
         }
-        let params = det.params() + router.model.params() + recs.iter().flatten().map(|r| r.model.params()).sum::<usize>();
+        let layoutnet = if opts.layoutnet {
+            Some(layout::LayoutNet::load(&dir.join(layout::FILE))?)
+        } else {
+            None
+        };
+        let params = det.params()
+            + router.model.params()
+            + recs.iter().flatten().map(|r| r.model.params()).sum::<usize>()
+            + layoutnet.as_ref().map_or(0, |l| l.params());
         // The models on the GPU: all of them asked for by name, those it runs faster with `auto`.
         let gpu = crate::gpu::ensure(opts.device)?;
         let (on, min) = match opts.device {
@@ -536,6 +578,7 @@ impl Ocria {
             det_long_side: opts.det_long_side,
             params,
             device,
+            layoutnet: layoutnet.is_some(),
             load_secs: t0.elapsed().as_secs_f64(),
         };
         Ok(Self {
@@ -545,6 +588,7 @@ impl Ocria {
             thresh,
             merge,
             long_side: opts.det_long_side,
+            layoutnet,
             info,
         })
     }
@@ -577,6 +621,14 @@ impl Ocria {
     /// its EXIF orientation unless `opts.exif` is off.
     pub fn ocr_image_bytes(&self, bytes: &[u8], opts: &OcrRunOptions) -> Result<OcrPage> {
         let img = decode_image(bytes, opts.exif)?;
+        let mut o;
+        let opts = if opts.dpi.is_none() && opts.structure && self.layoutnet.is_some() {
+            o = opts.clone();
+            o.dpi = image_dpi(bytes, img.width, img.height);
+            &o
+        } else {
+            opts
+        };
         let mut page = self.ocr_rgb(&img.rgb, img.width, img.height, opts)?;
         page.exif_orientation = img.orientation;
         Ok(page)
@@ -699,6 +751,17 @@ impl Ocria {
                 faint: k >= n_lines,
             });
         }
+        // LayoutNet reads the lines in the detector's order, as LiteParse gets them
+        let layout = match &self.layoutnet {
+            Some(net) if opts.structure => {
+                let t0 = stage_start();
+                let dpi = opts.dpi.unwrap_or(layout::DEFAULT_DPI);
+                let l = layout::analyze(net, &layout::ocr_results(&lines), &img0.data, w, h, dpi);
+                stage("layout", t0);
+                Some(l)
+            }
+            _ => None,
+        };
         if opts.layout {
             let order = reading_order(&frame);
             let mut taken: Vec<Option<OcrLine>> = lines.into_iter().map(Some).collect();
@@ -715,6 +778,7 @@ impl Ocria {
             sideways,
             exif_orientation: None,
             seconds: t0.elapsed().as_secs_f64(),
+            layout,
         })
     }
 
@@ -899,6 +963,13 @@ pub struct UprightImage {
     pub height: usize,
     /// The EXIF orientation applied (2 to 8), if any.
     pub orientation: Option<u16>,
+}
+
+/// The resolution an encoded image records ([`layout::image_dpi`]), as one value for a
+/// `w` x `h` image: its long side's.
+pub fn image_dpi(bytes: &[u8], w: usize, h: usize) -> Option<f32> {
+    let (x, y) = layout::image_dpi(bytes)?;
+    Some(if w >= h { x } else { y })
 }
 
 /// Decodes an encoded image (PNG, JPEG, WebP, GIF, BMP; the `media` feature) to RGB, turned

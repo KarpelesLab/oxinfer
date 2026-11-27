@@ -3620,7 +3620,8 @@ fn ocr_run_options(options_json: *const c_char) -> Result<crate::ocria::OcrRunOp
 }
 
 /// Loads OCRia-nano-1: the repo id `llamaindex/OCRia-nano-1` or a folder of its files; `key=value`
-/// options (`scripts=latin,cjk,rtl,world`, `det_long_side`, `threads`, `cache_dir`, `device`).
+/// options (`scripts=latin,cjk,rtl,world`, `layoutnet=1` for LayoutNet's tables and layout blocks,
+/// `det_long_side`, `threads`, `cache_dir`, `device`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxi_ocria_load(
     model: *const c_char,
@@ -3664,7 +3665,9 @@ pub unsafe extern "C" fn oxi_ocria_info_json(o: *const OxiOcria) -> *mut c_char 
 }
 
 /// OCR of an RGB (`channels` 3) or grey (1) image, row-major with `stride` bytes per row (0:
-/// `width * channels`). Returns the page as JSON (free with `oxi_string_free`), NULL on error.
+/// `width * channels`). Returns the page as JSON (free with `oxi_string_free`), NULL on error;
+/// with LayoutNet loaded it holds `layout` (blocks, tables with their cells, `markdown`; the
+/// image taken at `options_json`'s `dpi`, default 150).
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn oxi_ocria_rgb(
@@ -3709,7 +3712,8 @@ pub unsafe extern "C" fn oxi_ocria_rgb(
 }
 
 /// OCR of an image file (PNG, JPEG, WebP, GIF, BMP). Returns the page as JSON (free with
-/// `oxi_string_free`), NULL on error.
+/// `oxi_string_free`), NULL on error; with LayoutNet loaded it holds `layout` (the image's
+/// resolution its own unless `dpi` is given).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxi_ocria_file(o: *const OxiOcria, path: *const c_char, options_json: *const c_char) -> *mut c_char {
     guard(std::ptr::null_mut(), || {

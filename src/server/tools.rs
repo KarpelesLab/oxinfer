@@ -407,8 +407,11 @@ pub(super) fn depth_video(api: &Arc<Api>, req: &ApiRequest) -> ApiResult<Output>
 
 /// `POST /v1/ocr`: the text of an image (PNG, JPEG, WebP, GIF, BMP) with OCRia-nano-1. Fields:
 /// `model`, `file` (or `image`), `response_format` (`json`, the default: the page with its
-/// lines, boxes, text and confidences; `text`: the text alone), and the page options
-/// ([`crate::ocria::OcrRunOptions::KEYS`]: `plain`, `det_long_side`, `det_thresh`, the switches).
+/// lines, boxes, text and confidences, and with LayoutNet loaded its `layout`: blocks, tables,
+/// Markdown; `text`: the text alone; `markdown`: the page as Markdown from LayoutNet's blocks and
+/// tables, the model loaded with `layoutnet`), and the page options
+/// ([`crate::ocria::OcrRunOptions::KEYS`]: `plain`, `det_long_side`, `det_thresh`, the switches,
+/// `structure`, `dpi`).
 pub(super) fn ocr(api: &Arc<Api>, req: &ApiRequest) -> ApiResult<Output> {
     let f = Fields::parse(req, "image")?;
     let model = f
@@ -420,8 +423,8 @@ pub(super) fn ocr(api: &Arc<Api>, req: &ApiRequest) -> ApiResult<Output> {
         .as_ref()
         .ok_or_else(|| ApiError::bad("file (or image) is required").param("file"))?;
     let format = f.get("response_format").unwrap_or("json").to_string();
-    if !["json", "text"].contains(&format.as_str()) {
-        return Err(ApiError::bad(format!("response_format {format:?}: expected json or text")).param("response_format"));
+    if !["json", "text", "markdown"].contains(&format.as_str()) {
+        return Err(ApiError::bad(format!("response_format {format:?}: expected json, text or markdown")).param("response_format"));
     }
     let mut o = crate::ocria::OcrRunOptions::default();
     // `plain` first: it resets the others.
@@ -435,8 +438,17 @@ pub(super) fn ocr(api: &Arc<Api>, req: &ApiRequest) -> ApiResult<Output> {
     }
     api.models.check(&model, Kind::Ocr)?;
     let img = crate::ocria::decode_image(&file.data, o.exif).map_err(|e| ApiError::bad(format!("decode image: {e:#}")))?;
+    if o.dpi.is_none() {
+        o.dpi = crate::ocria::image_dpi(&file.data, img.width, img.height);
+    }
     let mut lease = api.models.acquire(&model, Kind::Ocr)?;
     let Loaded::Ocr(m) = lease.model() else { unreachable!() };
+    if format == "markdown" && !(m.info().layoutnet && o.structure) {
+        return Err(
+            ApiError::bad("response_format markdown needs LayoutNet: load the model with layoutnet=1 (and keep structure on)")
+                .param("response_format"),
+        );
+    }
     let mut page = m
         .ocr_rgb(&img.rgb, img.width, img.height, &o)
         .map_err(|e| ApiError::new(500, format!("{e:#}")))?;
@@ -451,6 +463,10 @@ pub(super) fn ocr(api: &Arc<Api>, req: &ApiRequest) -> ApiResult<Output> {
     };
     Ok(match format.as_str() {
         "text" => body("text/plain; charset=utf-8", page.text.into_bytes()),
+        "markdown" => body(
+            "text/markdown; charset=utf-8",
+            page.layout.map(|l| l.markdown).unwrap_or_default().into_bytes(),
+        ),
         _ => {
             let mut v = serde_json::to_value(&page).unwrap_or_default();
             if let Value::Object(m) = &mut v {
@@ -609,6 +625,33 @@ mod tests {
             panic!()
         };
         assert_eq!(r.status, 400);
+        // Markdown needs LayoutNet; with it, the page's layout and its Markdown.
+        let body = json!({ "model": "ocr", "file": crate::b64::encode(&png), "response_format": "markdown" });
+        let Output::Full(r) = api.handle(&ApiRequest::post_json("/v1/ocr", &body.to_string())) else {
+            panic!()
+        };
+        assert_eq!(r.status, 400);
+        std::fs::write(dir.join("tablenet.bin"), crate::ocria::layout::tests::tiny_tablenet()).unwrap();
+        let mut opts = ServerOptions::default();
+        opts.set("model", &format!("ocr={},scripts=latin,layoutnet=1", dir.display()))
+            .unwrap();
+        let api = Api::new(opts).unwrap();
+        let Output::Full(r) = api.handle(&ApiRequest::post_json("/v1/ocr", &body.to_string())) else {
+            panic!()
+        };
+        assert_eq!(
+            (r.status, r.content_type.as_str(), r.body.as_slice()),
+            (200, "text/markdown; charset=utf-8", &b"x\n\nx"[..])
+        );
+        let body = json!({ "model": "ocr", "file": crate::b64::encode(&png), "dpi": 300 });
+        let Output::Full(r) = api.handle(&ApiRequest::post_json("/v1/ocr", &body.to_string())) else {
+            panic!()
+        };
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(
+            (v["layout"]["dpi"].as_f64(), v["layout"]["blocks"].as_array().map(Vec::len)),
+            (Some(300.0), Some(2))
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

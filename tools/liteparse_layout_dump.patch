@@ -1,0 +1,69 @@
+--- a/crates/liteparse/src/parser.rs
++++ b/crates/liteparse/src/parser.rs
+@@ -1103,6 +1103,9 @@
+         if !table_inputs.is_empty() {
+             crate::projection::collect_signals(true);
+         }
++        if let Some(d) = std::env::var_os("LP_DUMP") {
++            let _ = std::fs::write(std::path::Path::new(&d).join("pages_pre_proj.json"), serde_json::to_vec(&pages).unwrap());
++        }
+         #[cfg(not(target_arch = "wasm32"))]
+         let mut parsed_pages = self.project(pages);
+         #[cfg(target_arch = "wasm32")]
+--- a/crates/liteparse/src/main.rs
++++ b/crates/liteparse/src/main.rs
+@@ -526,6 +526,9 @@
+             if let Some(n) = cmd.num_workers {
+                 config.num_workers = n;
+             }
++            if let Ok(p) = std::env::var("LP_OCR_PAGE_IMAGE") {
++                config.ocr_page_images.insert(1, p);
++            }
+ 
+             let lp = LiteParse::new(config);
+             let result = if cmd.file == "-" {
+--- a/crates/liteparse/src/table_model/mod.rs
++++ b/crates/liteparse/src/table_model/mod.rs
+@@ -847,6 +847,30 @@
+                     text,
+                 });
+             }
++        }
++    }
++    if let Some(d) = std::env::var_os("LP_DUMP") {
++        let dir = std::path::Path::new(&d);
++        let j = serde_json::json!({
++            "wh": [input.wh.0, input.wh.1],
++            "units": units.iter().map(|u| serde_json::json!({"bx": u.bx, "pbox": u.pbox, "text": u.text, "h": u.h, "words": u.words, "minor": u.minor, "q": u.q})).collect::<Vec<_>>(),
++            "sig": sig.map(|s| serde_json::json!({
++                "width": s.width, "height": s.height,
++                "items": s.items.iter().map(|it| serde_json::json!({"text": it.text, "bx": it.bx, "flow": it.flow, "lc": it.lc, "rc": it.rc, "cc": it.cc, "snap": it.snap.to_string(), "block": it.block, "faint": it.faint, "words": it.words, "ocr": it.ocr})).collect::<Vec<_>>(),
++                "leaves": s.leaves.iter().map(|(b, p)| serde_json::json!({"bx": b, "path": p})).collect::<Vec<_>>(),
++            })),
++            "feats": feats,
++            "rules": rules.map(|r| serde_json::json!({"h": r.h, "v": r.v})),
++            "img": page_img.map(|im| serde_json::json!({"w": im.w, "h": im.h, "k": im.k})),
++            "node": logits.node, "cls": logits.cls, "n_cls": logits.n_cls,
++            "pair": logits.pair,
++            "tables": out.iter().map(|t| serde_json::json!({"bbox": [t.bbox.x, t.bbox.y, t.bbox.width, t.bbox.height], "n_rows": t.grid.n_rows, "n_cols": t.grid.n_cols, "head_rows": t.grid.head_rows, "cells": t.grid.cells.iter().map(|c| serde_json::json!({"r0": c.r0, "c0": c.c0, "r1": c.r1, "c1": c.c1, "text": c.text, "bx": c.bx})).collect::<Vec<_>>()})).collect::<Vec<_>>(),
++            "blocks": blocks.iter().map(|b| serde_json::json!({"bbox": [b.bbox.x, b.bbox.y, b.bbox.width, b.bbox.height], "class": BLOCK_CLASSES[b.class], "text": b.text})).collect::<Vec<_>>(),
++            "classes": classes.iter().map(|c| serde_json::json!({"bbox": [c.bbox.x, c.bbox.y, c.bbox.width, c.bbox.height], "chars": c.chars, "probs": c.probs})).collect::<Vec<_>>(),
++        });
++        let _ = std::fs::write(dir.join("model.json"), serde_json::to_vec(&j).unwrap());
++        if let Some(im) = page_img {
++            let _ = std::fs::write(dir.join("page_img.raw"), &im.px);
+         }
+     }
+     PageModel {
+--- a/crates/liteparse/src/ocr_merge.rs
++++ b/crates/liteparse/src/ocr_merge.rs
+@@ -1578,6 +1578,9 @@
+             continue;
+         }
+ 
++        if let Some(d) = std::env::var_os("LP_DUMP") {
++            let _ = std::fs::write(std::path::Path::new(&d).join("ocr_results.json"), serde_json::to_vec(&serde_json::json!({"dpi": page_dpi, "results": ocr_results})).unwrap());
++        }
+         if ocr_results.is_empty() {
+             continue;
+         }

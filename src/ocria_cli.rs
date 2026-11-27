@@ -1,5 +1,6 @@
 //! `oxinfer ocr IMAGE...`: OCR with OCRia-nano-1 ([`oxinfer::ocria`]): the text of each image in
-//! reading order, or with `--json` its lines (boxes, text, confidence, script, words).
+//! reading order, or with `--json` its lines (boxes, text, confidence, script, words); with
+//! `--markdown` / `--tables` its layout blocks and tables (LayoutNet, [`oxinfer::ocria::layout`]).
 
 use anyhow::{Context, Result, bail};
 use oxinfer::ocria::{OcrOptions, OcrRunOptions, Ocria, REPO};
@@ -9,13 +10,20 @@ pub const USAGE: &str = "usage: oxinfer ocr IMAGE... [options]\n\
 \n\
 OCR of images (PNG, JPEG, WebP, GIF, BMP) with OCRia-nano-1 (llamaindex/OCRia-nano-1): a line\n\
 detector, a script router and four line recognizers (Latin, CJK, right-to-left, world scripts).\n\
-Prints each image's text in reading order, or its lines as JSON.\n\
+Prints each image's text in reading order, or its lines as JSON; with LayoutNet (--markdown,\n\
+--tables) its layout blocks (headings, lists, paragraphs, ...) and tables.\n\
 \n\
   --model SPEC          the repo id (default llamaindex/OCRia-nano-1) or a folder of its files\n\
   --scripts LIST        recognizers to load: latin,cjk,rtl,world or all (default all)\n\
   --long-side N         detector input long side (default 1600)\n\
   --json                JSON: one object per image (lines with box, bbox, text, confidence, script,\n\
-                        words; text; script; upside_down; sideways), an array for several images\n\
+                        words; text; script; upside_down; sideways; with --tables layout: blocks,\n\
+                        tables with their cells, markdown), an array for several images\n\
+  --markdown            the page as Markdown from LayoutNet's layout blocks and tables (headings,\n\
+                        lists, pipe tables or HTML ones with spanning cells); loads LayoutNet\n\
+  --tables              load LayoutNet (tablenet.bin, 17 MB): tables and layout blocks in --json\n\
+  --dpi N               the image's resolution for the layout (default: its own, else 150)\n\
+  --no-structure        no LayoutNet pass even when it is loaded\n\
   --plain               the models' outputs only: no second detection pass, gutter split,\n\
                         orientation retry, script rescue, junk filter, faint tokens, lookalike\n\
                         folding, right-to-left reordering or column order\n\
@@ -37,7 +45,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut lo = OcrOptions::default();
     let mut ro = OcrRunOptions::default();
     let mut model = REPO.to_string();
-    let (mut json, mut quiet, mut repeat, mut profile) = (false, false, 1usize, false);
+    let (mut json, mut quiet, mut repeat, mut profile, mut md) = (false, false, 1usize, false, false);
     let mut images = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -64,6 +72,12 @@ pub fn run(args: &[String]) -> Result<()> {
                 ro.set("det_long_side", &v)?;
             }
             "--json" => json = true,
+            "--markdown" | "--md" => {
+                md = true;
+                lo.layoutnet = true;
+            }
+            "--tables" | "--layoutnet" => lo.layoutnet = true,
+            "--dpi" => ro.set("dpi", &val()?)?,
             "--plain" => {
                 let side = ro.det_long_side;
                 ro = OcrRunOptions::plain();
@@ -105,6 +119,10 @@ pub fn run(args: &[String]) -> Result<()> {
         let t1 = Instant::now();
         let img = oxinfer::ocria::decode_image(&bytes, ro.exif).with_context(|| path.clone())?;
         let decode = t1.elapsed().as_secs_f64();
+        let mut ro = ro.clone();
+        if ro.dpi.is_none() {
+            ro.dpi = oxinfer::ocria::image_dpi(&bytes, img.width, img.height);
+        }
         let mut best = f64::INFINITY;
         let mut page = None;
         for _ in 0..repeat {
@@ -138,7 +156,10 @@ pub fn run(args: &[String]) -> Result<()> {
             if images.len() > 1 {
                 println!("==> {path} <==");
             }
-            println!("{}", page.text);
+            match (&page.layout, md) {
+                (Some(l), true) => println!("{}", l.markdown),
+                _ => println!("{}", page.text),
+            }
         }
     }
     if json {

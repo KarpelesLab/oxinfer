@@ -172,7 +172,8 @@ fn options_parse() {
     let j: OcrRunOptions = serde_json::from_str(r#"{"faint": false, "det_long_side": 1024}"#).unwrap();
     assert!(!j.faint && j.rescue && j.det_long_side == Some(1024));
     assert!(serde_json::from_str::<OcrRunOptions>(r#"{"nope": 1}"#).is_err());
-    assert_eq!(files_for(&[true, false, false, false]).len(), 7);
+    assert_eq!(files_for(&[true, false, false, false], false).len(), 7);
+    assert!(files_for(&[true, false, false, false], true).contains(&"tablenet.bin".to_string()));
 }
 
 #[test]

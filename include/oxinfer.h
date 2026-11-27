@@ -1272,24 +1272,31 @@ typedef struct OxiOcria OxiOcria;
 
 /* Loads OCRia-nano-1 (line detector, script router, Latin / CJK / right-to-left / world line
  * recognizers): the repo id llamaindex/OCRia-nano-1 or a folder of its files. `options`: key=value
- * lines or ;-separated pairs: scripts (latin,cjk,rtl,world or all; default all), det_long_side
+ * lines or ;-separated pairs: scripts (latin,cjk,rtl,world or all; default all), layoutnet (1: also
+ * LayoutNet, tablenet.bin: tables and layout blocks in each page's "layout"), det_long_side
  * (default 1600), threads, cache_dir, device (auto: the GPU for large pages and batches of lines,
  * cpu, metal: always the GPU). NULL on error. */
 OxiOcria *oxi_ocria_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
 void oxi_ocria_free(OxiOcria *o);
 /* {"name", "path", "scripts", "det_thresh", "det_merge", "det_long_side", "params", "device",
- *  "load_secs"}; free with oxi_string_free. */
+ *  "layoutnet", "load_secs"}; free with oxi_string_free. */
 char *oxi_ocria_info_json(const OxiOcria *o);
 
 /* OCR of one image: `channels` 3 (RGB) or 1 (grey) bytes per pixel, rows `stride` bytes apart (0:
  * width x channels). Returns the page as JSON: {"width", "height", "lines": [{"text", "confidence",
  * "box" (4 corners in reading order), "bbox" [x0, y0, x1, y1], "script", "words": [{"text", "bbox"}],
  * "faint"}], "text" (the lines in reading order), "script", "upside_down", "sideways", "exif_orientation"
- * (oxi_ocria_file: the EXIF orientation the photo was turned upright by, or null), "seconds"};
+ * (oxi_ocria_file: the EXIF orientation the photo was turned upright by, or null), "seconds", and
+ * with LayoutNet loaded "layout": {"dpi", "blocks": [{"kind" (heading, paragraph, list_item,
+ * page_header, page_footer, code, table, table_text, figure_text), "level" (headings: 1 title, 2),
+ * "bbox", "text", "table" (index into tables)}] in reading order, "tables": [{"bbox", "rows",
+ * "cols", "header_rows", "cells": [{"row", "col", "row_span", "col_span", "text", "bbox"}]}],
+ * "markdown", "grid_text"} (boxes in image pixels)};
  * free with oxi_string_free; NULL on error. `options_json` (NULL for defaults): {"det_long_side",
- * "det_thresh", "det_merge", and the switches "adaptive", "gutter", "orient", "rescue", "junk",
+ * "det_thresh", "det_merge", "dpi" (the image's resolution for the layout: default 150, its own
+ * for oxi_ocria_file), and the switches "adaptive", "gutter", "orient", "rescue", "junk",
  * "faint", "clean", "bidi", "layout", "exif" (oxi_ocria_file: photos upright per their EXIF
- * orientation) (all true by default)}. */
+ * orientation), "structure" (LayoutNet's pass when loaded) (all true by default)}. */
 char *oxi_ocria_rgb(const OxiOcria *o, const uint8_t *pixels, size_t width, size_t height, int channels, size_t stride,
                     const char *options_json);
 /* The same for an image file (PNG, JPEG, WebP, GIF, BMP). */

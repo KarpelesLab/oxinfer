@@ -13,11 +13,14 @@ natively, on its own ONNX interpreter (no ONNX Runtime), with LiteParse's pipeli
 | `rec_cjk.onnx` | Chinese, Japanese, Korean (6213 characters) | 1.27M |
 | `rec_rtl.onnx` (+ `rec_rtl.meta.json`: visual order) | Arabic, Hebrew (323 characters) | 0.71M |
 | `rec_world.onnx` | about 17 more scripts: Devanagari and the Indic scripts, Thai, Armenian, Georgian, ... (1711 characters) | 0.98M |
+| `tablenet.bin` (LayoutNet, optional) | tables (rows, columns, spanning cells, header rows) and 13 layout-block classes over the page's text units: a 6-layer transformer with a CNN image branch | 4.27M |
 
 The recognizers decode in the graph: they output the best class and its probability at each step
-(one step per 4 pixels of a 32-pixel-high line), and the CTC collapse happens outside. The
-repository's LayoutNet (`tablenet.onnx`: tables and layout blocks for LiteParse's PDF parsing) is
-not used. The models are under their own license (`LICENSE` in the repository).
+(one step per 4 pixels of a 32-pixel-high line), and the CTC collapse happens outside. LayoutNet
+runs with LiteParse's text projection and table decoder around it, ported: a page's layout blocks
+(headings, paragraphs, list items, page headers and footers, code) and its tables, as LiteParse
+parses an image (see [Layout and tables](#layout-and-tables)). The models are under their own
+license (`LICENSE` in the repository).
 
 ## Use
 
@@ -25,6 +28,8 @@ not used. The models are under their own license (`LICENSE` in the repository).
 oxinfer ocr scan.png                 # the text, in reading order
 oxinfer ocr page1.png page2.jpg --json
 oxinfer ocr receipt.png --scripts latin --json   # only the Latin recognizer (3 model files)
+oxinfer ocr report.png --markdown    # headings, lists and tables as Markdown (LayoutNet)
+oxinfer ocr invoice.png --tables --json          # the lines plus "layout": blocks, tables, cells
 ```
 
 `oxinfer ocr IMAGE...` takes PNG, JPEG, WebP, GIF or BMP files (the `media` feature) and fetches
@@ -34,13 +39,21 @@ all), `--long-side N` (detector input, default 1600), `--json`, `--plain` (no pa
 heuristics, see below), `--no-adaptive`, `--no-gutter`, `--no-orient`, `--no-rescue`, `--no-junk`,
 `--no-faint`, `--no-clean`, `--no-bidi`, `--no-layout`, `--no-exif`, `--thresh T`, `--merge G`,
 `--repeat N` (timing), `--device auto|cpu|metal` (where the models run, see [Speed](#speed)),
-`--threads`, `--cache-dir`, `-q`.
+`--threads`, `--cache-dir`, `-q`; for the layout `--tables` (load LayoutNet), `--markdown` (print
+the page as Markdown; loads it), `--dpi N` (the image's resolution, default its own, else 150),
+`--no-structure`.
 
 `--json` prints the page: `lines` (each with `text`, `confidence`, `box`: the four corners in
 reading order, `bbox`: its extent, `script`: the recognizer that read it, `words`: word boxes on
 upright left-to-right lines, `faint`), `text` (the lines one per line, in reading order),
 `script` (the page's), `upside_down`, `sideways`, `exif_orientation` (the EXIF orientation the
-photo was turned upright by, or null), `seconds`.
+photo was turned upright by, or null), `seconds`, and with LayoutNet loaded `layout`: `blocks` in
+reading order (`kind`: `heading` with its `level`, 1 for a title, `paragraph`, `list_item`,
+`page_header`, `page_footer`, `code`, `table` with the index of its table, `table_text` /
+`figure_text` for LayoutNet's table and figure-text blocks outside every table; `bbox` in image
+pixels; `text`), `tables` (`bbox`, `rows`, `cols`, `header_rows`, `cells`: `row`, `col`,
+`row_span`, `col_span`, `text`, `bbox`), `markdown`, `grid_text` (LiteParse's projected text,
+columns kept apart on a character grid) and `dpi`.
 
 Library:
 
@@ -54,23 +67,37 @@ for l in &page.lines {
 }
 // RGB (or grey) pixels already in memory:
 let page = ocr.ocr_rgb(&rgb, width, height, &OcrRunOptions::default())?;
+// with LayoutNet: tables and layout blocks
+let mut o = OcrOptions::default();
+o.layoutnet = true;
+let ocr = Ocria::load("llamaindex/OCRia-nano-1", &o)?;
+let page = ocr.ocr_file("invoice.png".as_ref(), &OcrRunOptions::default())?;
+let layout = page.layout.unwrap();
+println!("{}", layout.markdown);
+for t in &layout.tables {
+    for c in &t.cells {
+        println!("{} {} {:?}", c.row, c.col, c.text);
+    }
+}
 ```
 
 `Ocria` is `Sync`: one instance serves pages from several threads.
 
-C: `oxi_ocria_load` (`scripts=latin,cjk`, `det_long_side`, `threads`, `cache_dir`, `device`),
+C: `oxi_ocria_load` (`scripts=latin,cjk`, `layoutnet=1`, `det_long_side`, `threads`, `cache_dir`, `device`),
 `oxi_ocria_rgb` (pixels, 1 or 3 channels, a row stride) and `oxi_ocria_file` return the page as
 JSON (`options_json`: the switches below), `oxi_ocria_info_json`, `oxi_ocria_free` (see
 `include/oxinfer.h`).
 
 Server: a model of kind `ocr` (a folder holding `det.onnx` and `router.onnx` is detected, the repo
-id is recognized by name; `scripts=latin+cjk` in its options), `POST /v1/ocr` with the image as a
-multipart `file` (or `image`) part or base64 in a JSON body, `response_format` `json` (the page as
-above, the default) or `text`, and the switches below as fields:
+id is recognized by name; `scripts=latin+cjk`, `layoutnet=1` in its options), `POST /v1/ocr` with
+the image as a multipart `file` (or `image`) part or base64 in a JSON body, `response_format`
+`json` (the page as above, the default), `text` or `markdown` (LayoutNet's), and the switches
+below (with `structure` and `dpi`) as fields:
 
 ```sh
-oxinfer serve --model ocr=llamaindex/OCRia-nano-1
+oxinfer serve --model ocr=llamaindex/OCRia-nano-1,layoutnet=1
 curl -s localhost:8080/v1/ocr -F model=ocr -F file=@scan.png -F response_format=text
+curl -s localhost:8080/v1/ocr -F model=ocr -F file=@report.png -F response_format=markdown
 ```
 
 ## The pipeline
@@ -213,15 +240,84 @@ recognizers 38.1 and 25.1 ms; router 6.1 and 5.4 ms. (The CPU figures here are a
 milliseconds above the table before: the machine was busier.) The first GPU load compiles the
 Metal library (seconds, once per OS shader cache).
 
+## Layout and tables
+
+With LayoutNet loaded (`layoutnet`, the `tablenet.bin` of the repository), each page also gets
+its layout (`structure`, on by default), as LiteParse gets it when it parses an image: the stages
+are ported from LiteParse (`crates/liteparse/src`, Apache-2.0: `projection.rs`, `table_model/`,
+the image page's part of `ocr_merge.rs` and `layout.rs`; `src/ocria/layout/`):
+
+- **the OCR merge**: the lines in the detector's order become the page's text items in points
+  (`72 / dpi` a pixel; the image's own resolution, PNG `pHYs` / JPEG JFIF, else 150 dpi, as
+  LiteParse sizes an image's page): readings at 0.1 or under and short fragments in a script the
+  page doesn't use dropped, table-border characters stripped around numbers, word boxes, the font
+  size from the quad's height; a skewed scan (0.3 to 10 degrees, the length-weighted median of
+  its long lines) turned upright about the page centre, and a page whose text all runs a quarter
+  or half turn round re-expressed upright;
+- **the projection**: LiteParse's grid projection, the text laid out on a character grid
+  (anchors, snapping, flowing prose, floating items) with the per-item signals LayoutNet reads
+  (left / right / centre anchor-group sizes, snap, line block, flowing prose), and the XY-cut
+  region tree whose leaves are its last signal;
+- **the render**: the page as PDFium renders it at 150 dpi (the image itself at 150 dpi, else
+  resampled to that size) in grey with OpenCV's integer weights; its ruling lines (runs of dark
+  pixels joined into horizontal and vertical segments) and, area-resampled to a long side of 1024,
+  the image branch's canvas;
+- **LayoutNet**: 66 features per unit (geometry, text shape, Fourier terms of the centre, the
+  projection signals, ruling-line flags) and two ids (block, leaf), pair inputs from the ruling
+  lines; the input MLP, the CNN image branch (per-unit samples and stride-32 patch tokens the top
+  layers cross-attend to), 6 pre-norm encoder layers, node, class and five pair heads (same
+  table, row, column, cell, block), on oxinfer's f32 GEMM;
+- **the decoder**: tables from the in-table and same-table logits (average linkage, absorption,
+  the header band), each table's cells, rows and columns (span-aware linkage, header rows,
+  wrapped-row folds), its lattice when ruling lines enclose it; tables of contents, charts and
+  prose read as grids dropped; the layout blocks (same-block components split at wide gaps,
+  paragraph breaks and heading changes, each labelled by its units' summed class logits);
+- **the page's blocks**: LiteParse's `with_model_blocks`: the tables, then each layout block
+  outside them by class (title and heading as headings of level 1 and 2, list item, page header,
+  page footer, code, else paragraph), in XY-cut reading order over the block boxes. LiteParse
+  leaves LayoutNet's table and figure-text blocks to its own heuristic tables and figures; here
+  they stay, as `table_text` and `figure_text`. A page the model skips (under 2 units or 20
+  characters, over 1500 units) keeps its projected lines as paragraphs, where LiteParse
+  classifies them heuristically.
+
+Boxes come back in image pixels (turned back from a deskewed or upright frame). The Markdown is
+oxinfer's, from these blocks: headings as `#` / `##`, list items (`-`, or their own numbers),
+tables as pipe tables (several header rows joined) or HTML when a cell spans, code fenced;
+LiteParse's own Markdown stage (its heuristic block classifier, 20,000 lines more) is not ported.
+
+### Against LiteParse
+
+LiteParse 2.21.3 (`lit parse IMAGE --format markdown --ocr-backend ocria-nano`, with its
+`tablenet.bin` on the Rust path it takes on macOS and the page image given as its OCR input), with
+the dump hooks of `tools/liteparse_layout_dump.patch`, on nine pages made by
+`tools/ocria_layout_pages.py`: an invoice with a ruled table, a two-column report with headings,
+bullet lists and an unruled table, a form with key-value lines, a numbered list and a table with a
+spanning header, a financial statement, a ruled schedule with merged and wrapped cells, a
+three-column newsletter with running header and footer, the 2000 x 2600 test page of the OCR checks
+(turned 1.5 degrees: the deskew), the invoice scanned sideways, and the report as a 300 dpi JPEG:
+
+- **each stage on LiteParse's own OCR results** (`src/ocria/layout/tests.rs`, with
+  `OXINFER_LAYOUT_REF` and `OXINFER_LAYOUT_MODEL`): the merged text items identical (text, boxes,
+  rotations, font sizes, the deskew angle), the projection's signals identical on every item
+  (anchor counts, snap, block, flowing prose, leaf paths), the ruling lines and the image branch's
+  canvas identical, the 68 features identical, LayoutNet's node and class logits within 7.7e-6
+  (Accelerate's GEMM there, oxinfer's here), and the same tables cell by cell (spans, header
+  rows, text), the same 142 layout blocks and the same page blocks (kind, level, text, order).
+  On the 300 dpi JPEG, PDFium's resampling to 150 dpi and ours differ on 9% of the canvas pixels
+  (0.09 grey levels on average) and the logits by up to 0.02: still the same tables and blocks;
+- **the whole pipeline, oxinfer's OCR against LiteParse's** (`tools/ocria_layout_e2e.py`): 207 of
+  207 table cells and 73 of 74 page blocks the same; the other one differs by a space the two OCR
+  runs read differently on the JPEG ("• Ship" / "•Ship").
+
+Speed (M5 Max, release build, `tools/bench/with-lock.sh`, best of 10, image decoding excluded,
+`device=auto`): the layout adds 14 to 18 ms a page: the 2000 x 2600 test page 49.9 -> 63.5 ms,
+the 1700 x 2200 report (82 lines) 44.1 -> 62.5 ms, the invoice (42 lines) 30.0 -> 44.9 ms. Of
+it: the projection 0.2-0.3 ms, the render and its ruling lines 5-7 ms, LayoutNet 10-12 ms (the
+image branch's CNN most of it). LiteParse reports its table model at 20 ms a page on the same
+machine.
+
 ## Not implemented
 
-- LayoutNet (`tablenet.onnx` / `tablenet.bin`: tables, rows, columns, spanning cells and 13
-  layout-block classes). Its input is 66 features per text unit, most of them signals of
-  LiteParse's text projection (flowing prose, left / right / centre anchor counts, column snap,
-  line blocks, XY-cut leaves: `projection.rs`, 7,100 lines) and of the page render (ruling lines,
-  the image branch's canvas), and its pair logits become tables through LiteParse's decoder
-  (`table_model/`, 6,400 lines). Without that projection the network would see inputs it was not
-  trained on and nothing could be checked against LiteParse, so it waits for a port of the
-  projection itself;
-- the rest of LiteParse's document parsing (PDF rendering, merging the OCR with the PDF text
-  layer, Markdown).
+- the rest of LiteParse's document parsing: PDF rendering, merging the OCR with a PDF's text
+  layer, its heuristic block classifier and Markdown stage (`markdown_layout/`), the document-level
+  header / footer dedup.
