@@ -374,9 +374,11 @@ enum COp {
         lens: [u32; 4],
         /// Prefill plans: the rule in three launches (`dgdn_seq_HDK` between the per-token
         /// parts, see `cuda_decode.cu`), when the output shares no buffer with the inputs;
-        /// `seq_warp`: `dgdn_seqw_HDK`, a warp per column of the state (fast plans).
+        /// `seq_warp`: `dgdn_seqw_HDK`, a warp per column of the state (fast plans);
+        /// `seq_block`: `dgdn_seqb`, a block per value head (many heads on few SMs).
         seq: F,
         seq_warp: bool,
+        seq_block: bool,
     },
     Glu {
         f: F,
@@ -969,6 +971,20 @@ impl CudaBackend {
         // `OXINFER_CUDA_GDN_SPLIT`: `0` the prefill plans' Gated DeltaNet rule in one kernel
         // (`dgdn_rule_t`), `exact` the split rule in its order of sums on fast plans too.
         let gdn_split = std::env::var("OXINFER_CUDA_GDN_SPLIT").unwrap_or_default();
+        // The recurrence with a block per value head (`dgdn_seqb`, in `dgdn_seq`'s order): on a
+        // unified-memory device from 32 value heads on, where a warp per state column leaves
+        // its few SMs many more blocks than they hold (DGX Spark, the rule of a 512-token step:
+        // Qwen3.5-9B's 32 heads and Qwen3.8-27B's 48, docs/platforms.md; Qwen3.5-0.8B's 16 are
+        // level and keep the warps). `OXINFER_CUDA_GDN_SPLIT=block` / `warp` takes one always.
+        let gdn_block = |r: &crate::gpu::decode::GdnRule| {
+            r.hdk / 32 * r.hdv <= 512
+                && r.hdk <= 256
+                && match gdn_split.as_str() {
+                    "block" => true,
+                    "" => super::integrated() && r.nv >= 32,
+                    _ => false,
+                }
+        };
         let mut part_floats = 0usize;
         let mut pair_floats = 0usize;
         // A token's row of the split Gated DeltaNet rule's scratch (prefill plans).
@@ -1534,16 +1550,21 @@ impl CudaBackend {
                                 && gdn_split != "0"
                             {
                                 gdn_floats = gdn_floats.max(2 * key_dim + 2 * r.nv);
-                                let name = if fast_gemm && gdn_split != "exact" {
-                                    "dgdn_seqw"
+                                if gdn_block(r) {
+                                    self.func("dgdn_seqb")?
                                 } else {
-                                    "dgdn_seq"
-                                };
-                                self.func(&format!("{name}_{}", r.hdk))?
+                                    let name = if fast_gemm && gdn_split != "exact" {
+                                        "dgdn_seqw"
+                                    } else {
+                                        "dgdn_seq"
+                                    };
+                                    self.func(&format!("{name}_{}", r.hdk))?
+                                }
                             } else {
                                 std::ptr::null_mut()
                             },
-                            seq_warp: fast_gemm && gdn_split != "exact",
+                            seq_warp: fast_gemm && gdn_split != "exact" && !gdn_block(r),
+                            seq_block: gdn_block(r),
                         });
                     }
                     Op::Route {
@@ -2571,6 +2592,7 @@ impl CudaPlan<'_> {
                 threads,
                 seq,
                 seq_warp,
+                seq_block,
                 ..
             } => {
                 let (ca, za, ba, aa, oa, sa, cst) = (c.a, z.a, b.a, a.a, out.a, slot.states[state].0, cst.a);
@@ -2585,7 +2607,9 @@ impl CudaPlan<'_> {
                                 p.nv.next_multiple_of(32),
                                 &mut args![ba, aa, sc, cst, p, bs, as_, ss],
                             )
-                            && if seq_warp {
+                            && if seq_block {
+                                be.launch(seq, (p.nv, 1), threads, &mut args![ca, sc, oa, sa, p, tt, cs, ss, os])
+                            } else if seq_warp {
                                 be.launch(seq, (p.hdv.div_ceil(4), p.nv), 128, &mut args![ca, sc, oa, sa, p, tt, cs, ss, os])
                             } else {
                                 be.launch(seq, (p.nv, 1), p.hdv, &mut args![ca, sc, oa, sa, p, tt, cs, ss, os])

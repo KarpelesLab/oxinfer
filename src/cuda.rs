@@ -3577,6 +3577,37 @@ mod tests {
                 hdv as u32,
                 &mut args![dc, dsc, do1, ds1, p, tt, csu, ssu, osu]
             ));
+            // The block-per-head recurrence (`dgdn_seqb`): dgdn_seq's states and raw outputs,
+            // bit for bit.
+            if threads <= 512 {
+                let (ds2, do2) = (up(&st0), up(&zeros));
+                assert!(be.launch(
+                    f("dgdn_seqb"),
+                    (nv as u32, 1),
+                    threads,
+                    &mut args![dc, dsc, do2, ds2, p, tt, csu, ssu, osu]
+                ));
+                let get = |d: u64, n: usize| {
+                    let mut v = vec![0f32; n];
+                    assert_eq!(unsafe { be.cu.cuMemcpyDtoH_v2(v.as_mut_ptr() as *mut c_void, d, n * 4) }, 0);
+                    v
+                };
+                let (raw1, raw2) = (get(do1, nt * os), get(do2, nt * os));
+                let (st1, st2) = (get(ds1, st0.len()), get(ds2, st0.len()));
+                assert!(raw1.iter().any(|&v| v != 0.0));
+                assert!(
+                    st1.iter().zip(&st2).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "dgdn_seqb: states differ at {hdk} x {hdv}"
+                );
+                assert!(
+                    raw1.iter().zip(&raw2).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "dgdn_seqb: outputs differ at {hdk} x {hdv}"
+                );
+                unsafe {
+                    be.cu.cuMemFree_v2(ds2);
+                    be.cu.cuMemFree_v2(do2);
+                }
+            }
             assert!(be.launch(f("dgdn_out_t"), (nv as u32, tt), hdv as u32, &mut args![dz, do1, dcst, p, zsu, osu]));
             let down = |d: u64, n: usize| {
                 let mut v = vec![0f32; n];

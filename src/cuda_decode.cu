@@ -1144,6 +1144,69 @@ extern "C" __global__ void __launch_bounds__(128) dgdn_seqw_##HDK(const float* c
                                                                   unsigned int nt, unsigned int cs, unsigned int ss, unsigned int os) { \
     dgdn_seqw_body<HDK>(c, sc, out, state, p, nt, cs, ss, os); }
 DGDN_SEQW(32) DGDN_SEQW(64) DGDN_SEQW(128)
+// `dgdn_seqb`: dgdn_seq with a block per value head and the head's state spread over hdk / 32 *
+// hdv threads (thread (part, j) keeps 32 values of column j in registers), as `dgdn_rule_t`
+// holds it: three barriers a token, the token's normed query and key in shared memory, the next
+// token's rows prefetched. The sums go in dgdn_seq's order (its states and outputs bit for bit).
+// Grid (nv), hdk / 32 * hdv threads (up to 512). With many value heads on few SMs it is the
+// fastest of the three (a DGX Spark's 48: `CudaPlan`'s choice, docs/platforms.md).
+__device__ __forceinline__ void dgdn_prefetch(const void* p) { asm volatile("prefetch.global.L1 [%0];" ::"l"(p)); }
+extern "C" __global__ void __launch_bounds__(512) dgdn_seqb(const float* c, const float* sc, float* out, float* state, DGR p,
+                                                            unsigned int nt, unsigned int cs, unsigned int ss, unsigned int os) {
+    __shared__ float qs[256], ks[256], red[512], redo[512];
+    unsigned int hv = blockIdx.x, tid = threadIdx.x;
+    unsigned int hdk = p.hdk, hdv = p.hdv, np = hdk / 32;
+    unsigned int hk = (p.flags & 1u) ? hv % p.nk : hv / (p.nv / p.nk);
+    unsigned int part = tid / hdv, j = tid % hdv;
+    float* S = state + (size_t)hv * hdk * hdv + (size_t)part * 32 * hdv + j;
+    float s[32];
+#pragma unroll
+    for (int d = 0; d < 32; d++) s[d] = S[(size_t)d * hdv];
+    for (size_t t = 0; t < nt; t++) {
+        const float* st = sc + t * ss;
+        const float* ct = c + t * cs;
+        float beta = st[2 * p.key_dim + hv], decay = st[2 * p.key_dim + p.nv + hv];
+        if (tid < hdk) {
+            qs[tid] = st[hk * hdk + tid];
+            ks[tid] = st[p.key_dim + hk * hdk + tid];
+        }
+        float vt = ct[2 * p.key_dim + hv * hdv + j];
+        if (t + 1 < nt && (tid & 15) == 0) {
+            if (tid < hdk) {
+                dgdn_prefetch(st + ss + hk * hdk + tid);
+                dgdn_prefetch(st + ss + p.key_dim + hk * hdk + tid);
+            }
+            if (tid < hdv) dgdn_prefetch(ct + cs + 2 * p.key_dim + hv * hdv + tid);
+        }
+        __syncthreads();
+        float kv = 0.f;
+#pragma unroll
+        for (int d = 0; d < 32; d++) {
+            s[d] = s[d] * decay;
+            kv = fmaf(s[d], ks[part * 32 + d], kv);
+        }
+        red[part * hdv + j] = kv;
+        __syncthreads();
+        float kvm = 0.f;
+        for (unsigned int i = 0; i < np; i++) kvm += red[i * hdv + j];
+        float delta = (vt - kvm) * beta;
+        float o = 0.f;
+#pragma unroll
+        for (int d = 0; d < 32; d++) {
+            s[d] = fmaf(ks[part * 32 + d], delta, s[d]);
+            o = fmaf(s[d], qs[part * 32 + d], o);
+        }
+        redo[part * hdv + j] = o;
+        __syncthreads();
+        if (tid < hdv) {
+            float ov = 0.f;
+            for (unsigned int i = 0; i < np; i++) ov += redo[i * hdv + j];
+            out[t * os + hv * hdv + j] = ov;
+        }
+    }
+#pragma unroll
+    for (int d = 0; d < 32; d++) S[(size_t)d * hdv] = s[d];
+}
 extern "C" __global__ void dgdn_out_t(const float* z, float* out, const float* cst, DGR p, unsigned int zs, unsigned int os) {
     __shared__ float red2[32];
     unsigned int hv = blockIdx.x, j = threadIdx.x, hdv = p.hdv;
