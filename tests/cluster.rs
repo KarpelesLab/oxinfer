@@ -29,6 +29,10 @@ impl Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
+        // (A failed test leaves requests running: the listener would wait for them.)
+        for r in self.api.requests() {
+            self.api.cancel(&r.id);
+        }
         self.stop();
     }
 }
@@ -37,7 +41,9 @@ fn node_at(listen: &str, opts: &str) -> Node {
     let mut o = ServerOptions::from_pairs(opts).unwrap();
     o.set("listen", listen).unwrap();
     o.set("log", "0").unwrap();
-    o.set("learn_dir", "none").unwrap();
+    if !opts.contains("learn_dir") {
+        o.set("learn_dir", "none").unwrap();
+    }
     let api = Api::new(o).unwrap();
     let http = http::start(api.clone()).unwrap();
     Node { api, http: Some(http) }
@@ -386,5 +392,104 @@ fn balancing_and_cancel() {
     let id = a.api.requests()[0].id.clone();
     assert!(a.api.cancel(&id));
     assert_eq!(first.join().unwrap().0, 499);
+    wait_for("both machines idle", || a.api.requests().is_empty() && b.api.requests().is_empty());
+
+    // Two requests arriving together: one each (the second is counted against the first's
+    // machine before the first has started there).
+    for round in 0..3 {
+        let go = Arc::new(std::sync::Barrier::new(2));
+        let pair: Vec<_> = (0..2)
+            .map(|_| {
+                let (go, body) = (go.clone(), slow(false));
+                std::thread::spawn(move || {
+                    go.wait();
+                    request(addr, "POST", "/v1/images/generations", None, &body)
+                })
+            })
+            .collect();
+        wait_for("two requests in flight", || a.api.requests().len() == 2);
+        wait_for("one of them on the peer", || b.api.requests().len() == 1);
+        let here = a.api.requests().iter().filter(|r| r.peer.is_none()).count();
+        assert_eq!(here, 1, "round {round}: {:?}", a.api.requests());
+        for r in a.api.requests() {
+            assert!(a.api.cancel(&r.id));
+        }
+        for t in pair {
+            assert_eq!(t.join().unwrap().0, 499);
+        }
+        wait_for("both machines idle again", || {
+            a.api.requests().is_empty() && b.api.requests().is_empty()
+        });
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A model no machine lists goes to the machine with the memory for it; a profile always to the
+/// machine that has it.
+#[test]
+fn models_on_request_and_profiles() {
+    // A repo in the cache both machines read (its weights are not real: loading it fails, on
+    // the machine that was chosen).
+    let base = std::env::temp_dir().join(format!("oxinfer-cluster-auto-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let m = base.join("hub/org--model");
+    std::fs::create_dir_all(&m).unwrap();
+    std::fs::write(m.join("config.json"), r#"{"model_type": "bert"}"#).unwrap();
+    std::fs::write(m.join("modules.json"), "[]").unwrap();
+    std::fs::write(m.join("model.safetensors"), vec![0u8; 3 << 20]).unwrap();
+    let cache = format!("cache_dir={}; auto_models=1", base.join("hub").display());
+    let embed = json!({"model": "org/model", "input": "hi"}).to_string();
+    let listed = |n: &Node| n.api.models().iter().any(|(id, ..)| id == "org/model");
+    {
+        // The front has no memory for it, the peer has.
+        let b = node(&format!("api_key=k; {cache}"));
+        let a = node(&format!("{cache}; memory_gb=0.001; peer={},key=k", b.addr()));
+        let (st, body) = request(a.addr(), "POST", "/v1/embeddings", None, &embed);
+        assert_eq!(st, 500, "{body}");
+        assert!(body.contains("load org/model"), "{body}");
+        assert!(listed(&b) && !listed(&a));
+    }
+    {
+        // Both have: the front takes it.
+        let b = node(&format!("api_key=k; {cache}"));
+        let a = node(&format!("{cache}; peer={},key=k", b.addr()));
+        let (st, body) = request(a.addr(), "POST", "/v1/embeddings", None, &embed);
+        assert_eq!(st, 500, "{body}");
+        assert!(listed(&a) && !listed(&b));
+    }
+    {
+        // Neither has: the last machine's refusal.
+        let b = node(&format!("api_key=k; {cache}; memory_gb=0.001"));
+        let a = node(&format!("{cache}; memory_gb=0.001; peer={},key=k", b.addr()));
+        let (st, body) = request(a.addr(), "POST", "/v1/embeddings", None, &embed);
+        assert_eq!(st, 507, "{body}");
+        assert!(!listed(&a) && !listed(&b));
+    }
+
+    // Profiles: `p1` exists on the peer only, `p2` nowhere (it is then the front's).
+    let dir = tiny_chat("profiles");
+    let (la, lb) = (base.join("learn-a"), base.join("learn-b"));
+    std::fs::create_dir_all(lb.join("both/p1")).unwrap();
+    let mdl = format!("model=both={},device=cpu", dir.display());
+    let b = node(&format!("api_key=k; {mdl}; learn_dir={}", lb.display()));
+    let a = node(&format!("api_key=k; {mdl}; learn_dir={}; peer={}", la.display(), b.addr()));
+    let chat = |model: &str| {
+        let body = json!({"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}).to_string();
+        let (st, body) = request(a.addr(), "POST", "/v1/chat/completions", Some("k"), &body);
+        assert_eq!(st, 200, "{model}: {body}");
+    };
+    let forwarded = || a.api.status()["peers"][0]["forwarded"].as_u64().unwrap();
+    for n in 1..=3 {
+        chat("both@p1");
+        assert_eq!(forwarded(), n, "both@p1 runs where the profile is");
+    }
+    for _ in 0..3 {
+        chat("both@p2");
+    }
+    assert_eq!(forwarded(), 3, "both@p2 stays on the front");
+    assert!(la.join("both/p2").is_dir() && !lb.join("both/p2").exists());
+    assert!(!la.join("both/p1").exists());
+    drop((a, b));
+    std::fs::remove_dir_all(&base).ok();
     std::fs::remove_dir_all(&dir).ok();
 }

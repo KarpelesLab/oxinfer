@@ -69,6 +69,8 @@ struct TaskState {
     download: Option<(u64, Option<u64>)>,
     /// The peer the request was forwarded to.
     peer: Option<String>,
+    /// The name the server that forwarded the request here gave it.
+    origin: Option<String>,
 }
 
 /// A tracked request.
@@ -297,6 +299,7 @@ impl Activity {
                 step: None,
                 download: None,
                 peer: None,
+                origin: None,
             }),
             hooks: Mutex::new(Vec::new()),
         });
@@ -323,6 +326,19 @@ impl Activity {
             }
             None => false,
         }
+    }
+
+    /// Cancels the requests another server forwarded here under `name`; returns how many.
+    pub fn cancel_origin(&self, name: &str) -> usize {
+        let ts: Vec<Arc<Task>> = lock(&self.tasks)
+            .iter()
+            .filter(|t| t.state().origin.as_deref() == Some(name))
+            .cloned()
+            .collect();
+        for t in &ts {
+            t.cancel();
+        }
+        ts.len()
     }
 
     /// Cancels every request in flight for `model`; returns how many.
@@ -416,6 +432,11 @@ pub(crate) fn set_stage(stage: Stage) {
 
 pub(crate) fn set_model(model: &str) {
     with_current(|t| t.state().model = Some(model.to_string()));
+}
+
+/// The request was forwarded here under `name`.
+pub(crate) fn set_origin(task: &Task, name: &str) {
+    task.state().origin = Some(name.to_string());
 }
 
 /// The request runs on a peer.

@@ -19,7 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// The header of a request another oxinfer server forwarded (its value: that server's address).
+/// The header of a request another oxinfer server forwarded (its value: that server's name for
+/// the request, which `POST /v1/cluster/cancel` takes).
 pub(crate) const FORWARDED: &str = "X-Oxinfer-Forwarded";
 
 /// The longest a connection to a peer may take to open.
@@ -30,6 +31,12 @@ const ANSWER: Duration = Duration::from_secs(3);
 pub(crate) const POLL: Duration = Duration::from_secs(2);
 /// A peer that has not answered for this long has the requests forwarded to it ended.
 const STALLED: Duration = Duration::from_secs(30);
+/// Connections to a peer kept open after a forwarded request, and for how long: a request sent
+/// within that time of another's end takes one of them, and does not wait for the peer to
+/// accept a connection (its listener looks for new ones every 25 ms). Not for longer: a peer
+/// that is being stopped waits for its open connections.
+const IDLE_MAX: usize = 4;
+const IDLE_FOR: Duration = Duration::from_secs(2);
 /// Conversations remembered ([`Routes`]).
 const MEMORY: usize = 8192;
 
@@ -103,6 +110,8 @@ struct PeerModel {
     loaded: bool,
     /// Requests it is running or has waiting.
     requests: usize,
+    /// Those of them that are not this server's (when it was asked).
+    others: usize,
     /// Conversations it runs at once.
     parallel: usize,
     profiles: Vec<String>,
@@ -143,6 +152,8 @@ pub(crate) struct Peer {
     inflight: Mutex<HashMap<String, usize>>,
     /// Their connections, to end them when the peer is gone.
     conns: Mutex<HashMap<u64, TcpStream>>,
+    /// Connections whose last response was read to its end, with when.
+    idle: Mutex<Vec<(TcpStream, Instant)>>,
     forwarded: AtomicU64,
 }
 
@@ -159,8 +170,13 @@ struct Routes {
 pub(crate) struct Peers {
     list: Vec<Arc<Peer>>,
     routes: Mutex<Routes>,
+    /// Requests of each model the plans sent to this machine and that are not finished.
+    local: Mutex<HashMap<String, usize>>,
+    /// Held while a request's machine is chosen and counted.
+    planning: Mutex<()>,
     next_conn: AtomicU64,
-    /// This server's address, as [`FORWARDED`] names it.
+    /// This server's name in the names it gives the requests it forwards ([`FORWARDED`]): its
+    /// address and when it started.
     me: String,
     log: bool,
 }
@@ -175,16 +191,30 @@ pub(crate) struct Plan {
     /// The model is listed nowhere and may be listed on request: a machine that cannot take it
     /// (no memory, no disk, cannot fetch it) passes it on.
     pub auto: bool,
+    /// The request counted on the first machine of `order` from the moment it was chosen, so
+    /// that requests arriving together do not all see it idle.
+    first: std::cell::RefCell<Option<KeyGuard>>,
 }
 
-/// Counts a conversation's request in flight until dropped.
+/// Counts a request on its machine, and its conversation's request in flight, until dropped.
 pub(crate) struct KeyGuard {
     peers: Arc<Peers>,
     key: Option<u64>,
+    at: usize,
+    model: String,
 }
 
 impl Drop for KeyGuard {
     fn drop(&mut self) {
+        {
+            let mut f = lock(self.peers.counts(self.at));
+            if let Some(n) = f.get_mut(&self.model) {
+                *n -= 1;
+                if *n == 0 {
+                    f.remove(&self.model);
+                }
+            }
+        }
         if let Some(k) = self.key {
             let mut r = lock(&self.peers.routes);
             if let Some(n) = r.inflight.get_mut(&k) {
@@ -200,23 +230,35 @@ impl Drop for KeyGuard {
 /// A request forwarded to a peer, until its response is done.
 struct Flight {
     peer: Arc<Peer>,
-    model: String,
     conn: u64,
-    stream: TcpStream,
+    /// The request's name on the peer.
+    name: String,
+    /// The connection the request went out on.
+    stream: Option<TcpStream>,
+    /// The response was read to its end: the connection stays open for the next request.
+    done: bool,
+    /// The peer may be running the request: told to stop it when the response is not read to
+    /// its end.
+    tell: bool,
 }
 
 impl Drop for Flight {
     fn drop(&mut self) {
-        // (Every clone of the socket: the peer sees the connection end and stops the request.)
-        let _ = self.stream.shutdown(Shutdown::Both);
-        lock(&self.peer.conns).remove(&self.conn);
-        let mut f = lock(&self.peer.inflight);
-        if let Some(n) = f.get_mut(&self.model) {
-            *n -= 1;
-            if *n == 0 {
-                f.remove(&self.model);
+        if !self.done {
+            // (Every clone of the socket: the peer sees the connection end.)
+            if let Some(s) = &self.stream {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+            // A response that is not streamed is not written until it is done: the peer would
+            // not see the connection end before. Told, it stops at once.
+            if self.tell {
+                let (peer, name) = (self.peer.clone(), std::mem::take(&mut self.name));
+                let _ = std::thread::Builder::new()
+                    .name("oxinfer-peer-cancel".into())
+                    .spawn(move || peer.cancel(&name));
             }
         }
+        lock(&self.peer.conns).remove(&self.conn);
     }
 }
 
@@ -254,6 +296,8 @@ struct Reply {
     content_type: String,
     r: BufReader<TcpStream>,
     framing: Framing,
+    /// The peer closes the connection after this response.
+    close: bool,
 }
 
 fn read_line(r: &mut BufReader<TcpStream>) -> std::io::Result<String> {
@@ -267,10 +311,7 @@ fn read_line(r: &mut BufReader<TcpStream>) -> std::io::Result<String> {
 
 /// Sends a request and reads the response's head.
 fn request(mut s: TcpStream, method: &str, target: &str, headers: &[(&str, &str)], body: &[u8]) -> std::io::Result<Reply> {
-    let mut head = format!(
-        "{method} {target} HTTP/1.1\r\nConnection: close\r\nContent-Length: {}\r\n",
-        body.len()
-    );
+    let mut head = format!("{method} {target} HTTP/1.1\r\nContent-Length: {}\r\n", body.len());
     for (k, v) in headers {
         // (Header values come from this server's options and the client's request line.)
         if !v.contains(['\r', '\n']) {
@@ -278,9 +319,10 @@ fn request(mut s: TcpStream, method: &str, target: &str, headers: &[(&str, &str)
         }
     }
     head.push_str("\r\n");
-    s.write_all(head.as_bytes())?;
-    s.write_all(body)?;
-    s.flush()?;
+    // (One write: the request leaves in one go.)
+    let mut out = head.into_bytes();
+    out.extend_from_slice(body);
+    s.write_all(&out)?;
     let mut r = BufReader::with_capacity(64 << 10, s);
     let status_line = read_line(&mut r)?;
     let status: u16 = status_line
@@ -288,7 +330,7 @@ fn request(mut s: TcpStream, method: &str, target: &str, headers: &[(&str, &str)
         .nth(1)
         .and_then(|c| c.parse().ok())
         .ok_or_else(|| io_err(format!("not an HTTP response: {status_line:?}")))?;
-    let (mut content_type, mut framing) = (String::new(), Framing::Close);
+    let (mut content_type, mut framing, mut close) = (String::new(), Framing::Close, false);
     for _ in 0..200 {
         let line = read_line(&mut r)?;
         if line.is_empty() {
@@ -297,6 +339,7 @@ fn request(mut s: TcpStream, method: &str, target: &str, headers: &[(&str, &str)
                 content_type,
                 r,
                 framing,
+                close,
             });
         }
         let Some((k, v)) = line.split_once(':') else { continue };
@@ -309,6 +352,7 @@ fn request(mut s: TcpStream, method: &str, target: &str, headers: &[(&str, &str)
                 }
             }
             "transfer-encoding" if v.to_ascii_lowercase().contains("chunked") => framing = Framing::Chunked { left: 0 },
+            "connection" if v.eq_ignore_ascii_case("close") => close = true,
             _ => {}
         }
     }
@@ -368,6 +412,11 @@ impl Reply {
         }
     }
 
+    /// The connection, when the response was read to its end and the peer keeps it open.
+    fn into_idle(self) -> Option<TcpStream> {
+        (matches!(self.framing, Framing::Done) && !self.close && self.r.buffer().is_empty()).then(|| self.r.into_inner())
+    }
+
     fn read_all(&mut self, cap: usize) -> std::io::Result<Vec<u8>> {
         let mut out = Vec::new();
         while self.read(&mut out)? {
@@ -382,21 +431,89 @@ impl Reply {
 // ---- the peers' state ------------------------------------------------------------------------
 
 impl Peer {
+    /// Sends a request on a connection kept from an earlier one, else on a new one, and reads
+    /// the response's head. `each` sees every connection tried, before it is used. The error
+    /// says whether the peer took a connection.
+    fn exchange(
+        &self,
+        method: &str,
+        target: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        answer_in: Option<Duration>,
+        each: &mut dyn FnMut(&TcpStream),
+    ) -> Result<Reply, (bool, std::io::Error)> {
+        // (A poll, which closes its connection, takes a new one.)
+        let kept = if headers.iter().any(|h| h.0 == "Connection") {
+            None
+        } else {
+            self.prune();
+            lock(&self.idle).pop().map(|(s, _)| s)
+        };
+        let mut fresh = kept.is_none();
+        let mut s = match kept {
+            Some(s) => s,
+            None => connect(&self.addr).map_err(|e| (false, e))?,
+        };
+        loop {
+            each(&s);
+            let r = s
+                .set_read_timeout(answer_in)
+                .and_then(|()| request(s, method, target, headers, body));
+            match r {
+                Ok(r) => return Ok(r),
+                // A kept connection the peer had closed: once more on a new one.
+                Err(_) if !fresh => {
+                    fresh = true;
+                    s = connect(&self.addr).map_err(|e| (false, e))?;
+                }
+                Err(e) => return Err((true, e)),
+            }
+        }
+    }
+
+    /// Closes the kept connections that were idle for too long.
+    fn prune(&self) {
+        lock(&self.idle).retain(|(_, t)| t.elapsed() < IDLE_FOR);
+    }
+
+    /// Keeps the response's connection for the next request, when it can be.
+    fn keep(&self, reply: Reply) -> bool {
+        let Some(s) = reply.into_idle() else { return false };
+        let mut idle = lock(&self.idle);
+        if idle.len() < IDLE_MAX {
+            idle.push((s, Instant::now()));
+        }
+        true
+    }
+
+    /// Tells the peer to stop the request forwarded to it as `name` (if it still runs).
+    fn cancel(&self, name: &str) {
+        let auth = format!("Bearer {}", self.key);
+        let headers = [
+            ("Host", self.addr.as_str()),
+            ("Authorization", auth.as_str()),
+            ("Content-Type", "application/json"),
+            (FORWARDED, "cancel"),
+            ("Connection", "close"),
+        ];
+        let body = json!({ "request": name }).to_string();
+        if let Ok(mut r) = self.exchange("POST", "/v1/cluster/cancel", &headers, body.as_bytes(), Some(ANSWER), &mut |_| {}) {
+            let _ = r.read_all(1 << 16);
+        }
+    }
+
     /// `GET /v1/cluster`: the status and the body, or the error with whether the peer took the
     /// connection.
     fn get_cluster(&self, with_key: bool) -> Result<(u16, Vec<u8>), (bool, std::io::Error)> {
-        let s = connect(&self.addr).map_err(|e| (false, e))?;
-        let run = || -> std::io::Result<(u16, Vec<u8>)> {
-            s.set_read_timeout(Some(ANSWER))?;
-            let auth = format!("Bearer {}", self.key);
-            let mut headers = vec![("Host", self.addr.as_str()), (FORWARDED, "poll")];
-            if with_key {
-                headers.push(("Authorization", auth.as_str()));
-            }
-            let mut r = request(s.try_clone()?, "GET", "/v1/cluster", &headers, &[])?;
-            Ok((r.status, r.read_all(4 << 20)?))
-        };
-        run().map_err(|e| (true, e))
+        let auth = format!("Bearer {}", self.key);
+        let mut headers = vec![("Host", self.addr.as_str()), (FORWARDED, "poll"), ("Connection", "close")];
+        if with_key {
+            headers.push(("Authorization", auth.as_str()));
+        }
+        let mut r = self.exchange("GET", "/v1/cluster", &headers, &[], Some(ANSWER), &mut |_| {})?;
+        let body = r.read_all(4 << 20).map_err(|e| (true, e))?;
+        Ok((r.status, body))
     }
 
     /// Asks the peer for its state; returns what changed, to log (`Some(None)`: it is back).
@@ -434,7 +551,7 @@ impl Peer {
             .ok()
             .filter(|_| status == 200)
             .and_then(|v| parse_info(&v));
-        let Some(info) = info else {
+        let Some(mut info) = info else {
             return fail(
                 &mut st,
                 true,
@@ -454,6 +571,11 @@ impl Peer {
                 );
             }
             st.key_checked = true;
+        }
+        // What it runs for others: this server's own requests there are counted as they are
+        // sent and as they end, not every two seconds.
+        for m in &mut info.models {
+            m.others = m.requests.saturating_sub(self.inflight(&m.id));
         }
         st.info = Some(info);
         st.seen = Some(Instant::now());
@@ -525,6 +647,7 @@ fn parse_info(v: &Value) -> Option<Info> {
                 id: m.get("id")?.as_str()?.to_string(),
                 loaded: m.get("loaded").and_then(Value::as_bool).unwrap_or(false),
                 requests: m.get("requests").and_then(Value::as_u64).unwrap_or(0) as usize,
+                others: 0,
                 parallel: m.get("parallel").and_then(Value::as_u64).unwrap_or(1).max(1) as usize,
                 profiles: m
                     .get("profiles")
@@ -605,14 +728,24 @@ impl Peers {
                 st: Mutex::new(State::default()),
                 inflight: Mutex::new(HashMap::new()),
                 conns: Mutex::new(HashMap::new()),
+                idle: Mutex::new(Vec::new()),
                 forwarded: AtomicU64::new(0),
             }));
         }
         Ok(Arc::new(Self {
             list,
             routes: Mutex::new(Routes::default()),
+            local: Mutex::new(HashMap::new()),
+            planning: Mutex::new(()),
             next_conn: AtomicU64::new(1),
-            me: opts.listen.clone(),
+            me: format!(
+                "{}@{:x}",
+                opts.listen,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64)
+                    ^ ((std::process::id() as u64) << 40)
+            ),
             log: opts.log,
         }))
     }
@@ -625,6 +758,7 @@ impl Peers {
     pub fn refresh(&self) {
         std::thread::scope(|s| {
             for p in &self.list {
+                p.prune();
                 s.spawn(move || match p.poll() {
                     Some(Some(why)) => eprintln!("[WARNING: peer {} {why}]", p.addr),
                     Some(None) if self.log => eprintln!("[peer {} is up]", p.addr),
@@ -664,8 +798,16 @@ impl Peers {
     }
 
     /// Where the request may run (None: here, as without peers): see the module's notes.
-    pub fn plan(&self, api: &Api, req: &ApiRequest, path: &str) -> Option<Plan> {
-        if self.list.is_empty() || req.forwarded || !req.method.eq_ignore_ascii_case("POST") || path.starts_with("/v1/videos") {
+    /// The requests counted on machine `at` (0: this one), by model.
+    fn counts(&self, at: usize) -> &Mutex<HashMap<String, usize>> {
+        match at {
+            0 => &self.local,
+            i => &self.list[i - 1].inflight,
+        }
+    }
+
+    pub fn plan(self: &Arc<Self>, api: &Api, req: &ApiRequest, path: &str) -> Option<Plan> {
+        if self.list.is_empty() || req.forwarded.is_some() || !req.method.eq_ignore_ascii_case("POST") || path.starts_with("/v1/videos") {
             return None;
         }
         let name = super::requested_model(req)?;
@@ -685,6 +827,7 @@ impl Peers {
                     model,
                     key: None,
                     auto: false,
+                    first: Default::default(),
                 });
             }
             return self.plan_auto(api, req, &model);
@@ -707,8 +850,12 @@ impl Peers {
                 model,
                 key: None,
                 auto: false,
+                first: Default::default(),
             });
         }
+        let key = conversation_key(req, path, &model);
+        // One request at a time from here to its count on the machine chosen.
+        let _one = lock(&self.planning);
         // (class, requests, machine): a loaded model with a free session first, then one to
         // load, then one whose requests would wait; fewer requests first; this machine first.
         let mut cands: Vec<(u8, usize, usize)> = Vec::new();
@@ -724,16 +871,17 @@ impl Peers {
                 .iter()
                 .filter(|r| r.peer.is_none() && r.model.as_deref().is_some_and(|x| x == model || learn::base_model(x) == model))
                 .count();
+            // (Those chosen for this machine that have not reached it yet count too.)
+            let n = n.max(lock(&self.local).get(&model).copied().unwrap_or(0));
             cands.push((class(m.loaded, n, parallel_of(api, m)), n, 0));
         }
         for (i, m) in remote.iter().enumerate() {
             if let Some(m) = m {
-                let n = m.requests.max(self.list[i].inflight(&model));
+                let n = m.others + self.list[i].inflight(&model);
                 cands.push((class(m.loaded, n, m.parallel), n, i + 1));
             }
         }
         cands.sort();
-        let key = conversation_key(req, path, &model);
         // The machine that holds the conversation's cache, while it can take it now and no
         // request of the same conversation is running (which would hold that cache).
         if let Some(k) = key {
@@ -746,11 +894,14 @@ impl Peers {
                 cands.insert(0, c);
             }
         }
+        let order: Vec<usize> = cands.into_iter().map(|c| c.2).collect();
+        let first = order.first().map(|&at| self.guard(key, at, &model));
         Some(Plan {
-            order: cands.into_iter().map(|c| c.2).collect(),
+            order,
             model,
             key,
             auto: false,
+            first: std::cell::RefCell::new(first),
         })
     }
 
@@ -785,13 +936,24 @@ impl Peers {
             model: model.to_string(),
             key: None,
             auto: true,
+            first: Default::default(),
         })
     }
 
-    /// Remembers where the plan's conversation runs, and counts its request until the guard is
-    /// dropped.
+    /// Counts the plan's request on machine `at` and remembers that its conversation runs there,
+    /// until the guard is dropped.
     pub fn begin(self: &Arc<Self>, plan: &Plan, at: usize) -> KeyGuard {
-        if let Some(k) = plan.key {
+        // (Counted there already when it is the machine the plan chose.)
+        let first = plan.first.borrow_mut().take();
+        match first {
+            Some(g) if g.at == at => g,
+            _ => self.guard(plan.key, at, &plan.model),
+        }
+    }
+
+    fn guard(self: &Arc<Self>, key: Option<u64>, at: usize, model: &str) -> KeyGuard {
+        *lock(self.counts(at)).entry(model.to_string()).or_insert(0) += 1;
+        if let Some(k) = key {
             let mut r = lock(&self.routes);
             r.tick += 1;
             let tick = r.tick;
@@ -807,14 +969,16 @@ impl Peers {
         }
         KeyGuard {
             peers: self.clone(),
-            key: plan.key,
+            key,
+            at,
+            model: model.to_string(),
         }
     }
 
     /// Forwards the request to peer `at - 1`. `Err(None)`: the peer could not be reached (or
     /// refused the key) before anything of a response arrived, so another machine may take the
     /// request.
-    pub fn forward(self: &Arc<Self>, plan: &Plan, at: usize, req: &ApiRequest, path: &str) -> Result<Output, Option<ApiError>> {
+    pub fn forward(self: &Arc<Self>, at: usize, req: &ApiRequest, path: &str) -> Result<Output, Option<ApiError>> {
         let peer = self.list[at - 1].clone();
         let unreachable = |e: &dyn std::fmt::Display| {
             let msg = format!("unreachable ({e})");
@@ -826,34 +990,26 @@ impl Peers {
                 st.error = Some(msg);
             }
         };
-        let stream = connect(&peer.addr).map_err(|e| {
-            unreachable(&e);
-            None
-        })?;
         let conn = self.next_conn.fetch_add(1, Ordering::Relaxed);
-        if let Ok(c) = stream.try_clone() {
-            lock(&peer.conns).insert(conn, c);
-        }
-        *lock(&peer.inflight).entry(plan.model.clone()).or_insert(0) += 1;
-        let ours = stream
-            .try_clone()
-            .map_err(|e| Some(ApiError::new(500, format!("peer {}: {e}", peer.addr))))?;
-        let flight = Flight {
-            peer: peer.clone(),
-            model: plan.model.clone(),
-            conn,
-            stream: ours,
-        };
-        // A cancel (the status page's) ends the connection, and with it the peer's work.
+        let name = format!("{}-{conn}", self.me);
+        // A cancel (the status page's) ends the connection, and with it the peer's work; so
+        // does the peer going away.
         let task = activity::current();
         if let Some(t) = &task {
             activity::set_peer(t, &peer.addr);
-            if let Ok(c) = stream.try_clone() {
+        }
+        let mut ours = None;
+        let mut each = |s: &TcpStream| {
+            if let Ok(c) = s.try_clone() {
+                lock(&peer.conns).insert(conn, c);
+            }
+            if let (Some(t), Ok(c)) = (&task, s.try_clone()) {
                 t.on_cancel(Box::new(move || {
                     let _ = c.shutdown(Shutdown::Both);
                 }));
             }
-        }
+            ours = s.try_clone().ok();
+        };
         let target = if req.query.is_empty() {
             path.to_string()
         } else {
@@ -863,7 +1019,7 @@ impl Peers {
         let mut headers = vec![
             ("Host", peer.addr.as_str()),
             ("Authorization", auth.as_str()),
-            (FORWARDED, self.me.as_str()),
+            (FORWARDED, name.as_str()),
         ];
         if let Some(ct) = &req.content_type {
             headers.push(("Content-Type", ct));
@@ -875,10 +1031,24 @@ impl Peers {
             headers.push(("User-Agent", ua));
         }
         let cancelled = || task.as_ref().is_some_and(|t| t.cancelled());
-        let mut reply = match request(stream, &req.method, &target, &headers, &req.body) {
+        let sent = peer.exchange(&req.method, &target, &headers, &req.body, None, &mut each);
+        let mut flight = Flight {
+            peer: peer.clone(),
+            conn,
+            name: name.clone(),
+            stream: ours,
+            done: false,
+            tell: true,
+        };
+        let mut reply = match sent {
             Ok(r) => r,
+            Err((false, e)) => {
+                flight.tell = false;
+                unreachable(&e);
+                return Err(None);
+            }
             Err(_) if cancelled() => return Err(Some(activity::cancelled_error())),
-            Err(e) => {
+            Err((true, e)) => {
                 // (The request may have started there: not one to run again elsewhere.)
                 return Err(Some(
                     ApiError::new(502, format!("peer {}: no response ({e})", peer.addr)).code("peer_unavailable"),
@@ -886,6 +1056,7 @@ impl Peers {
             }
         };
         if reply.status == 401 || reply.status == 403 {
+            flight.tell = false;
             let msg = "refuses this server's key (give the peer's --api-key as key=KEY)";
             let mut st = lock(&peer.st);
             st.up = false;
@@ -907,10 +1078,12 @@ impl Peers {
                     ));
                 }
             };
+            let (status, content_type) = (reply.status, std::mem::take(&mut reply.content_type));
+            flight.done = peer.keep(reply);
             drop(flight);
             return Ok(Output::Full(ApiResponse {
-                status: reply.status,
-                content_type: reply.content_type,
+                status,
+                content_type,
                 body,
             }));
         }
@@ -921,7 +1094,7 @@ impl Peers {
         Ok(Output::Stream {
             content_type: reply.content_type.clone(),
             producer: Box::new(move |sink| {
-                let _flight = flight;
+                let mut flight = flight;
                 let mut buf = Vec::with_capacity(16 << 10);
                 loop {
                     buf.clear();
@@ -931,7 +1104,10 @@ impl Peers {
                                 break;
                             }
                         }
-                        Ok(false) => break,
+                        Ok(false) => {
+                            flight.done = flight.peer.keep(reply);
+                            break;
+                        }
                         Err(e) => {
                             if events {
                                 let e = ApiError::new(502, format!("peer {addr}: its response ended early ({e})")).code("peer_unavailable");
@@ -1019,6 +1195,12 @@ mod tests {
         let p = PeerSpec::from_json(&json!({"addr": "h:2", "key": "x"})).unwrap();
         assert_eq!((p.addr.as_str(), p.key.as_deref()), ("h:2", Some("x")));
         assert!(PeerSpec::from_json(&json!({"addr": "h:2", "port": 1})).is_err());
+        // As server options: the flag's form, and a configuration file's.
+        let o = super::super::ServerOptions::from_pairs("peer=h:1; peer=h:2,key=x").unwrap();
+        assert_eq!(o.peers.len(), 2);
+        assert_eq!((o.peers[1].addr.as_str(), o.peers[1].key.as_deref()), ("h:2", Some("x")));
+        let o = super::super::ServerOptions::from_json(&json!({"peers": ["h:1,key=a", {"addr": "h:2"}], "api_key": "k"})).unwrap();
+        assert_eq!((o.peers[0].key.as_deref(), o.peers[1].key.as_deref()), (Some("a"), None));
     }
 
     #[test]

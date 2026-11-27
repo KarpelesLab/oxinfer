@@ -613,9 +613,10 @@ pub struct ApiRequest {
     /// belongs to, as the client names it. Kept with the episode of a `MODEL@PROFILE` request, so
     /// that an outcome can name the conversation instead of response ids.
     pub session: Option<String>,
-    /// Another oxinfer server forwarded the request (the `X-Oxinfer-Forwarded` header): it runs
-    /// here, whatever [`ServerOptions::peers`] says.
-    pub forwarded: bool,
+    /// Another oxinfer server forwarded the request (the `X-Oxinfer-Forwarded` header, that
+    /// server's name for the request): it runs here, whatever [`ServerOptions::peers`] says, and
+    /// that server can cancel it by this name (`POST /v1/cluster/cancel`).
+    pub forwarded: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -634,7 +635,7 @@ impl ApiRequest {
             peer: None,
             user_agent: None,
             session: None,
-            forwarded: false,
+            forwarded: None,
             body,
         }
     }
@@ -1053,6 +1054,9 @@ impl Api {
         let mut reg = self
             .activity
             .start(kind, &path, requested_model(req), req.peer.clone(), req.user_agent.clone());
+        if let Some(name) = &req.forwarded {
+            activity::set_origin(&reg.task, name);
+        }
         let scope = activity::enter(&reg.task);
         let out = self.run(plan.as_ref(), req, &path);
         drop(scope);
@@ -1127,7 +1131,7 @@ impl Api {
                 return self.dispatch(req, path).map(|o| (o, Some(guard)));
             }
             let guard = self.peers.begin(plan, at);
-            match self.peers.forward(plan, at, req, path) {
+            match self.peers.forward(at, req, path) {
                 Ok(Output::Full(r)) if more && pass(r.status) => {
                     let msg = serde_json::from_slice::<Value>(&r.body)
                         .ok()
@@ -1159,6 +1163,16 @@ impl Api {
             "/v1/models" if get => Ok(Output::Full(ApiResponse::json(200, &self.models_json()))),
             // What this machine tells the servers that name it as a peer (docs/cluster.md).
             "/v1/cluster" if get => Ok(Output::Full(ApiResponse::json(200, &peer::node_json(self)))),
+            // A front cancels a request it forwarded here, by the name it gave it.
+            "/v1/cluster/cancel" if post => {
+                let v = json_body(req)?;
+                let name = v
+                    .get("request")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ApiError::bad("request: the forwarded request's name").param("request"))?;
+                let n = self.activity.cancel_origin(name);
+                Ok(Output::Full(ApiResponse::json(200, &json!({ "cancelled": n }))))
+            }
             p if p.starts_with("/v1/models/") && get => {
                 let id = &p["/v1/models/".len()..];
                 let m = self
