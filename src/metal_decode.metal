@@ -3487,14 +3487,29 @@ kernel void dec_fold(device const float* x [[buffer(0)]], device float* out [[bu
         v[i] = p.has_signs != 0 ? a * signs[d] : a;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint h = 1; h < p.block; h *= 2) {
-        for (uint i = tid; i < p.block / 2; i += nt) {
-            uint a = (i / h) * 2 * h + i % h;
-            float u = v[a], w = v[a + h];
-            v[a] = u + w;
-            v[a + h] = u - w;
+    if (p._p0 != 0) {
+        // ComfyUI's ConvRot (`fwht_regular`): radix-4 butterflies of the regular Hadamard matrix.
+        for (uint h = 1; h < p.block; h *= 4) {
+            for (uint i = tid; i < p.block / 4; i += nt) {
+                uint a = (i / h) * 4 * h + i % h;
+                float x0 = v[a], x1 = v[a + h], x2 = v[a + 2 * h], x3 = v[a + 3 * h], t = x0 + x1 + x2 + x3;
+                v[a] = t - 2.f * x3;
+                v[a + h] = t - 2.f * x2;
+                v[a + 2 * h] = t - 2.f * x1;
+                v[a + 3 * h] = t - 2.f * x0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        for (uint h = 1; h < p.block; h *= 2) {
+            for (uint i = tid; i < p.block / 2; i += nt) {
+                uint a = (i / h) * 2 * h + i % h;
+                float u = v[a], w = v[a + h];
+                v[a] = u + w;
+                v[a + h] = u - w;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
     device float* o = out + (ulong)tg.y * p.os + b0;
     for (uint i = tid; i < p.block; i += nt) o[i] = v[i] * p.scale;

@@ -266,8 +266,10 @@ and residuals on the `ltx_*` kernels of `metal_ltx.metal`. The rest, also as who
   input instead of half's 11, the precision the soundtrack needs); the STFT log-mel between them
   and the 3x sinc upsampling stay on the CPU (`OXINFER_LTX_VOC_GPU=0`: the CPU path);
 - the text encoder (Gemma 4 12B) runs on the GPU prefill plan with every layer's output copied
-  out when the model has one (`OXINFER_LTX_TEXT_GPU=0`: the host path); the int8 ConvRot file's
-  rotated layers have no plan, so it stays on the host path (CPU kernels, per-op GPU matmuls).
+  out (`OXINFER_LTX_TEXT_GPU=0`: the host path); the int8 ConvRot file's layers become Q8 views
+  of their mapped bytes (the row scale repeated per block of 32, `Model::q8_views_of_i8`) and the
+  plan rotates their inputs (`Op::Fold` with ConvRot's regular Hadamard transform, `dec_fold`'s
+  radix-4 butterflies): a 12-token prompt in 0.33 s instead of 3.3 s.
 
 The image encoder (one frame per conditioning image, 0.7 s at 768x512), the latent upsamplers,
 the audio VAE decoder and the output heads stay on the CPU kernels with per-op GPU convolutions
@@ -333,6 +335,7 @@ are `ref_*.py` beside `examples/ltx_check.rs`'s checks):
 | the same on the Metal session | 8.8e-5 / 7.5e-5 | half-precision GEMM inputs and attention |
 | text connectors (video / audio) | 2.4e-6 / 2.4e-6 | `EmbeddingsProcessor.create_embeddings` with 20 valid tokens |
 | text encoder, first 6 layers (int8 ConvRot) | 2.7e-6 to 4.8e-6 | transformers' `Gemma4UnifiedTextModel`, same tokens |
+| the same on the Metal prefill plan, all 49 states / video and audio features | 4e-5 to 2e-3 / 8.1e-4, 5.9e-4 | from the host path (half GEMM inputs; `ltx_check text`) |
 | feature extractor and projections | 1.5e-6 | `FeatureExtractorV2` over oxinfer's 49 hidden states |
 | video VAE decoder (3 x 4 x 6 latents) / encoder | 3.5e-6 / 6.0e-6 | `ConvVideoDecoder` / `VideoEncoder` |
 | audio decoder (20 latents) / vocoder with BWE | 6.3e-7 / 1.0e-5 | `AudioDecoder`, `VocoderWithBWE` |
@@ -393,5 +396,4 @@ precision of the int8 and bf16 sessions; `ltx_check dit` with `LTX_SAVE` and `LT
 - The NVFP4 file is repacked into ggml's blocks at load (3 s, 18.7 GB of anonymous memory beside
   the mapped file: 34 GB resident at 384x256): the kernels do not read ComfyUI's packing (high
   nibble first, scales in cuBLAS's tiled order) in place.
-- The int8 ConvRot text encoder has no whole GPU pass (the prefill plans have no input
-  rotation); the image encoder and the upsamplers run per op.
+- The image encoder and the upsamplers run per op.

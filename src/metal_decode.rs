@@ -2938,7 +2938,8 @@ enum MOp {
 
 /// `dec_fold` parameters (see the shader's `FoldP`): the row width, the rotation block, the
 /// value-head permutation (head width, key heads, repeat; a head width of 0: none), the token
-/// strides of x and out, whether there are signs, and `1 / sqrt(block)`.
+/// strides of x and out, whether there are signs, `1 / sqrt(block)`, and whether the rotation is
+/// ConvRot's regular one.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct FoldParams {
@@ -4877,7 +4878,7 @@ impl MetalBackend {
                 }
                 Op::Fold { x, out, n, fold } => {
                     let bl = fold.block;
-                    if fold.regular
+                    if (fold.regular && !bl.trailing_zeros().is_multiple_of(2))
                         || !(2..=1024).contains(&bl)
                         || !n.is_multiple_of(bl)
                         || !(fold.signs.is_empty() || fold.signs.len() == n)
@@ -4904,7 +4905,8 @@ impl MetalBackend {
                             has_signs: !fold.signs.is_empty() as u32,
                             // (The CPU's `fwht` scale, rounded the same way.)
                             scale: 1.0 / (bl as f32).sqrt(),
-                            _p: [0; 3],
+                            // ConvRot's regular rotation (radix-4) instead of Sylvester's.
+                            _p: [fold.regular as u32, 0, 0],
                         },
                     });
                     (vec![rng(x, n)], vec![rng(out, n)])

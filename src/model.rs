@@ -718,6 +718,36 @@ pub enum Weight<'a> {
 }
 
 impl<'a> Lin<'a> {
+    /// A Q8 layer over the bytes of this int8 layer with one scale per row (ComfyUI's int8,
+    /// `GgufMatrix::i8`): the row's scale repeated per block of 32, the same input transform.
+    /// The bytes are borrowed: the result must not outlive this layer. None for other weights.
+    pub(crate) fn q8_view_of_i8(&self) -> Option<Lin<'a>> {
+        let Weight::Gguf(m) = &self.w else { return None };
+        if m.kind != crate::ggml::GgmlType::I8 || !m.n_in.is_multiple_of(crate::quant::QBLOCK) || self.lora.is_some() {
+            return None;
+        }
+        let b = m.block_scales.as_ref()?;
+        if b.s.len() != 1 && b.s.len() != m.n_out {
+            return None;
+        }
+        let bpr = m.n_in / crate::quant::QBLOCK;
+        let mut sc = crate::quant::PageVec::<f32>::zeroed(m.n_out * bpr);
+        for (r, c) in sc.chunks_mut(bpr).enumerate() {
+            c.fill(if b.s.len() == 1 { b.s[0] } else { b.s[r] });
+        }
+        // SAFETY: i8 and u8 share a layout; the caller keeps this layer (and its bytes) alive
+        // while the view lives.
+        let q: &'a [i8] = unsafe { std::slice::from_raw_parts(m.data.as_ptr() as *const i8, m.n_out * m.n_in) };
+        let mut l = Lin::q8(crate::quant::QMatrix {
+            q: unsafe { crate::quant::QBuf::borrowed(q) },
+            scales: sc.into(),
+            n_out: m.n_out,
+            n_in: m.n_in,
+        });
+        l.fold = self.fold.clone();
+        Some(l)
+    }
+
     pub fn bf16(w: &'a [u16]) -> Self {
         // SAFETY: the PhantomData ties the borrow to 'a, so `w` outlives this Lin.
         Self {
@@ -1482,6 +1512,35 @@ pub struct Layer<'a> {
     ple: Option<PleLayer<'a>>,
     moe: Option<GemmaMoe<'a>>,
     layer_scalar: f32,
+}
+
+impl<'a> Model<'a> {
+    /// The int8 layers with row scales (ComfyUI's int8 ConvRot text encoders) replaced by Q8
+    /// views of their bytes ([`Lin::q8_view_of_i8`]), which the device's GEMMs and plans take
+    /// (their Hadamard transform as the plan's `Op::Fold`); returns the replaced layers, which
+    /// must outlive the model's use of the views (they hold the bytes when not mapped).
+    pub fn q8_views_of_i8(&mut self) -> Vec<Lin<'a>> {
+        let mut old = Vec::new();
+        let mut swap = |l: &mut Lin<'a>| {
+            if let Some(v) = l.q8_view_of_i8() {
+                old.push(std::mem::replace(l, v));
+            }
+        };
+        for layer in &mut self.layers {
+            swap(&mut layer.q);
+            swap(&mut layer.o);
+            swap(&mut layer.gate);
+            swap(&mut layer.up);
+            swap(&mut layer.down);
+            if let Some(k) = &mut layer.k {
+                swap(k);
+            }
+            if let Some(v) = &mut layer.v {
+                swap(v);
+            }
+        }
+        old
+    }
 }
 
 pub struct Model<'a> {

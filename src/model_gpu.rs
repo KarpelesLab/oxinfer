@@ -52,9 +52,13 @@ impl<'a> Model<'a> {
         // Streamed weights (units outside the resident set, routed experts) are wrapped by the
         // plan per step (see `crate::gpu::decode::Graph::units`).
         let streams = self.stream.is_some();
+        // Hadamard-folded weights take their input through an `Op::Fold` first (`fold_in`).
         let dev = |l: &'s Lin, n_out: usize, n_in: usize| -> Option<&'s crate::gpu::DeviceWeight> {
             if l.is_transient() {
-                return streams.then(crate::gpu::decode::streamed_weight);
+                return (streams && l.fold.is_none()).then(crate::gpu::decode::streamed_weight);
+            }
+            if l.fold.is_some() {
+                return l.device_weight_unfolded(n_out, n_in);
             }
             l.device_weight(n_out, n_in)
         };
@@ -81,7 +85,56 @@ impl<'a> Model<'a> {
             crate::gpu::decode::View,
             LinMode,
         );
+        // The jobs with each folded weight's input replaced by its transform (`Op::Fold`, one per
+        // input and transform; transforms that do the same share one; the k-th transform of a
+        // width in a call goes to scratch buffer k of that width). Folded weights take no LoRA
+        // updates on the device.
+        let fold_bufs: std::cell::RefCell<Vec<(usize, usize, crate::gpu::decode::View)>> = Default::default();
+        let same = |a: &crate::hadamard::Fold, b: &crate::hadamard::Fold| {
+            std::ptr::eq(a, b) || (a.block == b.block && a.regular == b.regular && a.perm == b.perm && a.signs == b.signs)
+        };
+        let fold_in = |g: &mut Graph<'s>, jobs: &[Job<'s>]| -> Option<Vec<Job<'s>>> {
+            let mut done: Vec<(crate::gpu::decode::View, &'s crate::hadamard::Fold, crate::gpu::decode::View)> = Vec::new();
+            let mut out = Vec::with_capacity(jobs.len());
+            for &(l, n_out, n_in, x, y, mode) in jobs {
+                let Some(f) = l.fold.as_deref() else {
+                    out.push((l, n_out, n_in, x, y, mode));
+                    continue;
+                };
+                if l.has_lora() {
+                    return None;
+                }
+                let v = match done.iter().find(|d| d.0 == x && same(d.1, f)) {
+                    Some(d) => d.2,
+                    None => {
+                        let k = done.iter().filter(|d| g.bufs[d.2.buf] == n_in).count();
+                        let v = {
+                            let mut fb = fold_bufs.borrow_mut();
+                            match fb.iter().find(|e| e.0 == n_in && e.1 == k) {
+                                Some(e) => e.2,
+                                None => {
+                                    let v = g.buf(n_in);
+                                    fb.push((n_in, k, v));
+                                    v
+                                }
+                            }
+                        };
+                        g.ops.push(Op::Fold {
+                            x,
+                            out: v,
+                            n: n_in,
+                            fold: f,
+                        });
+                        done.push((x, f, v));
+                        v
+                    }
+                };
+                out.push((l, n_out, n_in, v, y, mode));
+            }
+            Some(out)
+        };
         let put_all = |g: &mut Graph<'s>, jobs: &[Job<'s>]| -> Option<()> {
+            let jobs = &fold_in(g, jobs)?[..];
             for &(l, n_out, n_in, x, y, mode) in jobs {
                 g.ops.push(lin(l, n_out, n_in, x, y, mode)?);
             }
@@ -300,7 +353,8 @@ impl<'a> Model<'a> {
             }
             let inter = layer.inter;
             let (gw, uw) = (layer.gate.as_ref(), layer.up.as_ref());
-            if pairable(&gw, &uw) && !layer.gate.has_lora() && !layer.up.has_lora() {
+            if pairable(&gw, &uw) && !layer.gate.has_lora() && !layer.up.has_lora() && layer.gate.fold.is_none() && layer.up.fold.is_none()
+            {
                 g.ops.push(Op::Linear {
                     w: gw,
                     dev: dev(&layer.gate, inter, h)?,

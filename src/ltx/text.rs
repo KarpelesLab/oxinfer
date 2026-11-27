@@ -25,6 +25,8 @@ pub const MAX_TOKENS: usize = 1024;
 
 pub struct TextEncoder<'a> {
     pub model: Model<'a>,
+    /// The int8 layers the model's Q8 views read (on the GPU: [`Model::q8_views_of_i8`]).
+    _int8: Vec<crate::model::Lin<'a>>,
     tok: crate::tokenizer::Tokenizer,
     video_proj: DLin<'a>,
     audio_proj: DLin<'a>,
@@ -56,7 +58,14 @@ impl<'a> TextEncoder<'a> {
             .unwrap_or(2) as u32;
         let cfg = crate::config::TextConfig::from_json(raw)?;
         let (h, nl) = (cfg.hidden_size, cfg.num_hidden_layers);
-        let model = Model::load(cfg, files, Quant::Bf16)?;
+        let mut model = Model::load(cfg, files, Quant::Bf16)?;
+        // On the GPU, ComfyUI's int8 ConvRot layers as Q8 views (the prefill plan's GEMMs take
+        // those, after its Hadamard transform of their input).
+        let int8 = if crate::gpu::active().is_some() && std::env::var("OXINFER_LTX_TEXT_GPU").map_or(true, |v| v != "0") {
+            model.q8_views_of_i8()
+        } else {
+            Vec::new()
+        };
         let tok = crate::tokenizer::Tokenizer::from_bytes(files.bytes("tokenizer_json").context("LTX text encoder: no tokenizer")?)
             .map_err(|e| anyhow::anyhow!("LTX text encoder tokenizer: {e}"))?;
         let flat = h * (nl + 1);
@@ -78,6 +87,7 @@ impl<'a> TextEncoder<'a> {
             video_proj: DLin::load(files, vn, vd, flat, true)?,
             audio_proj: DLin::load(files, an, ad, flat, true)?,
             model,
+            _int8: int8,
             tok,
             bos,
         })
