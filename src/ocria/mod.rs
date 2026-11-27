@@ -180,6 +180,10 @@ pub struct OcrRunOptions {
     /// Order the lines (and the text) by columns and rows (XY cut); off: the detector's
     /// row-band order.
     pub layout: bool,
+    /// Turn encoded photos upright per their EXIF orientation (JPEG APP1, PNG `eXIf`) before
+    /// reading them, as LiteParse does (on in [`Self::plain`] too: it is the image, not a
+    /// heuristic). Pixels given as such are read as they are.
+    pub exif: bool,
 }
 
 impl Default for OcrRunOptions {
@@ -197,6 +201,7 @@ impl Default for OcrRunOptions {
             clean: true,
             bidi: true,
             layout: true,
+            exif: true,
         }
     }
 }
@@ -215,6 +220,7 @@ impl OcrRunOptions {
         "clean",
         "bidi",
         "layout",
+        "exif",
         "plain",
     ];
 
@@ -251,6 +257,7 @@ impl OcrRunOptions {
             "clean" => self.clean = b(value)?,
             "bidi" => self.bidi = b(value)?,
             "layout" => self.layout = b(value)?,
+            "exif" => self.exif = b(value)?,
             "plain" => {
                 if b(value)? {
                     *self = Self::plain();
@@ -303,6 +310,8 @@ pub struct OcrPage {
     pub upside_down: bool,
     /// Read a quarter turn round.
     pub sideways: bool,
+    /// The EXIF orientation the image was turned upright by (2 to 8; None: none applied).
+    pub exif_orientation: Option<u16>,
     /// Wall time of the page.
     pub seconds: f64,
 }
@@ -522,10 +531,13 @@ impl Ocria {
         }
     }
 
-    /// OCR of an encoded image (PNG, JPEG, WebP, GIF, BMP; the `media` feature).
+    /// OCR of an encoded image (PNG, JPEG, WebP, GIF, BMP; the `media` feature), upright per
+    /// its EXIF orientation unless `opts.exif` is off.
     pub fn ocr_image_bytes(&self, bytes: &[u8], opts: &OcrRunOptions) -> Result<OcrPage> {
-        let img = crate::mm::decode_images(&[bytes.to_vec()])?.remove(0);
-        self.ocr_rgb(&img.data, img.width, img.height, opts)
+        let img = decode_image(bytes, opts.exif)?;
+        let mut page = self.ocr_rgb(&img.rgb, img.width, img.height, opts)?;
+        page.exif_orientation = img.orientation;
+        Ok(page)
     }
 
     /// OCR of an image file.
@@ -659,6 +671,7 @@ impl Ocria {
             script: GROUPS[self.group_for(dom)].to_string(),
             upside_down: flip,
             sideways,
+            exif_orientation: None,
             seconds: t0.elapsed().as_secs_f64(),
         })
     }
@@ -835,6 +848,43 @@ pub fn profile_report() -> String {
     p.iter()
         .map(|(k, n, t)| format!("{k:>20}: {n:6} calls {:9.2} ms\n", t * 1e3))
         .collect()
+}
+
+/// A decoded image, upright.
+pub struct UprightImage {
+    pub rgb: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    /// The EXIF orientation applied (2 to 8), if any.
+    pub orientation: Option<u16>,
+}
+
+/// Decodes an encoded image (PNG, JPEG, WebP, GIF, BMP; the `media` feature) to RGB, turned
+/// upright per its EXIF orientation when `exif` (PIL's `exif_transpose`, as LiteParse's image
+/// loading does).
+pub fn decode_image(bytes: &[u8], exif: bool) -> Result<UprightImage> {
+    let img = crate::mm::decode_images(&[bytes.to_vec()])?.remove(0);
+    let o = exif
+        .then(|| crate::depth_pro::read_exif(bytes).and_then(|e| e.orientation))
+        .flatten()
+        .filter(|o| (2..=8).contains(o));
+    Ok(match o {
+        Some(o) => {
+            let (rgb, width, height) = crate::depth_pro::apply_orientation(&img.data, img.width, img.height, o);
+            UprightImage {
+                rgb,
+                width,
+                height,
+                orientation: Some(o),
+            }
+        }
+        None => UprightImage {
+            rgb: img.data,
+            width: img.width,
+            height: img.height,
+            orientation: None,
+        },
+    })
 }
 
 /// `f` over `0..n` on the pool, the results in order.

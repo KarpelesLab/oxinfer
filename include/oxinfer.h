@@ -1281,10 +1281,12 @@ char *oxi_ocria_info_json(const OxiOcria *o);
 /* OCR of one image: `channels` 3 (RGB) or 1 (grey) bytes per pixel, rows `stride` bytes apart (0:
  * width x channels). Returns the page as JSON: {"width", "height", "lines": [{"text", "confidence",
  * "box" (4 corners in reading order), "bbox" [x0, y0, x1, y1], "script", "words": [{"text", "bbox"}],
- * "faint"}], "text" (the lines in reading order), "script", "upside_down", "sideways", "seconds"};
+ * "faint"}], "text" (the lines in reading order), "script", "upside_down", "sideways", "exif_orientation"
+ * (oxi_ocria_file: the EXIF orientation the photo was turned upright by, or null), "seconds"};
  * free with oxi_string_free; NULL on error. `options_json` (NULL for defaults): {"det_long_side",
  * "det_thresh", "det_merge", and the switches "adaptive", "gutter", "orient", "rescue", "junk",
- * "faint", "clean", "bidi", "layout" (all true by default)}. */
+ * "faint", "clean", "bidi", "layout", "exif" (oxi_ocria_file: photos upright per their EXIF
+ * orientation) (all true by default)}. */
 char *oxi_ocria_rgb(const OxiOcria *o, const uint8_t *pixels, size_t width, size_t height, int channels, size_t stride,
                     const char *options_json);
 /* The same for an image file (PNG, JPEG, WebP, GIF, BMP). */

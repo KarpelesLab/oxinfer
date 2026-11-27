@@ -196,3 +196,48 @@ fn reading_order_follows_columns() {
     assert_eq!(reading_order(&row), [1, 0]);
     assert!(reading_order(&[]).is_empty());
 }
+
+/// A PNG with an `eXIf` chunk of orientation `o` (after IHDR).
+#[cfg(feature = "media")]
+fn png_with_orientation(w: usize, h: usize, rgb: &[u8], o: u16) -> Vec<u8> {
+    fn crc(d: &[u8]) -> u32 {
+        let mut c = !0u32;
+        for &b in d {
+            c ^= b as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+        }
+        !c
+    }
+    let png = crate::png::encode_rgb(w, h, rgb);
+    // TIFF, big-endian: one IFD entry, Orientation (SHORT).
+    let mut tiff = b"MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01".to_vec();
+    tiff.extend_from_slice(&o.to_be_bytes());
+    tiff.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    let mut chunk = b"eXIf".to_vec();
+    chunk.extend_from_slice(&tiff);
+    let mut out = png[..33].to_vec();
+    out.extend_from_slice(&(tiff.len() as u32).to_be_bytes());
+    out.extend_from_slice(&chunk);
+    out.extend_from_slice(&crc(&chunk).to_be_bytes());
+    out.extend_from_slice(&png[33..]);
+    out
+}
+
+#[cfg(feature = "media")]
+#[test]
+fn exif_orientation_turns_photos_upright() {
+    // A 4 x 2 image, top-left pixel red; orientation 6 (stored turned a quarter clockwise round).
+    let (w, h) = (4, 2);
+    let mut rgb = vec![255u8; w * h * 3];
+    rgb[..3].copy_from_slice(&[200, 0, 0]);
+    let png = png_with_orientation(w, h, &rgb, 6);
+    let up = decode_image(&png, true).unwrap();
+    assert_eq!((up.width, up.height, up.orientation), (2, 4, Some(6)));
+    // Orientation 6: the stored top-left pixel ends at the top-right.
+    assert_eq!(&up.rgb[3..6], &[200, 0, 0]);
+    let raw = decode_image(&png, false).unwrap();
+    assert_eq!((raw.width, raw.height, raw.orientation), (4, 2, None));
+    assert_eq!(raw.rgb, rgb);
+}

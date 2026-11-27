@@ -434,13 +434,13 @@ pub(super) fn ocr(api: &Arc<Api>, req: &ApiRequest) -> ApiResult<Output> {
         }
     }
     api.models.check(&model, Kind::Ocr)?;
-    let img = crate::mm::decode_images(std::slice::from_ref(&file.data)).map_err(|e| ApiError::bad(format!("decode image: {e:#}")))?;
-    let img = &img[0];
+    let img = crate::ocria::decode_image(&file.data, o.exif).map_err(|e| ApiError::bad(format!("decode image: {e:#}")))?;
     let mut lease = api.models.acquire(&model, Kind::Ocr)?;
     let Loaded::Ocr(m) = lease.model() else { unreachable!() };
-    let page = m
-        .ocr_rgb(&img.data, img.width, img.height, &o)
+    let mut page = m
+        .ocr_rgb(&img.rgb, img.width, img.height, &o)
         .map_err(|e| ApiError::new(500, format!("{e:#}")))?;
+    page.exif_orientation = img.orientation;
     drop(lease);
     let body = |ct: &str, b: Vec<u8>| {
         Output::Full(ApiResponse {

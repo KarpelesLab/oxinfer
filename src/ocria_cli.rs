@@ -21,6 +21,7 @@ Prints each image's text in reading order, or its lines as JSON.\n\
                         folding, right-to-left reordering or column order\n\
   --no-adaptive, --no-gutter, --no-orient, --no-rescue, --no-junk, --no-faint, --no-clean,\n\
   --no-bidi, --no-layout   turn one of them off\n\
+  --no-exif             read photos as stored (default: upright per their EXIF orientation)\n\
   --thresh T            detector threshold (default det.meta.json's, 0.55)\n\
   --merge G             collinear merge gap in line heights (default 0.6; 0 off)\n\
   --repeat N            run each image N times (timing)\n\
@@ -99,12 +100,13 @@ pub fn run(args: &[String]) -> Result<()> {
     for path in &images {
         let bytes = std::fs::read(path).with_context(|| format!("read {path}"))?;
         let t1 = Instant::now();
-        let img = oxinfer::mm::decode_images(&[bytes]).with_context(|| path.clone())?.remove(0);
+        let img = oxinfer::ocria::decode_image(&bytes, ro.exif).with_context(|| path.clone())?;
         let decode = t1.elapsed().as_secs_f64();
         let mut best = f64::INFINITY;
         let mut page = None;
         for _ in 0..repeat {
-            let p = ocr.ocr_rgb(&img.data, img.width, img.height, &ro).with_context(|| path.clone())?;
+            let mut p = ocr.ocr_rgb(&img.rgb, img.width, img.height, &ro).with_context(|| path.clone())?;
+            p.exif_orientation = img.orientation;
             best = best.min(p.seconds);
             page = Some(p);
         }

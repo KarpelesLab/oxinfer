@@ -32,13 +32,14 @@ the models on first use (only the files of `--scripts`; 14 MB for all four scrip
 `--model` (the repo id, or a folder holding the files), `--scripts latin,cjk,rtl,world` (default
 all), `--long-side N` (detector input, default 1600), `--json`, `--plain` (no page-level
 heuristics, see below), `--no-adaptive`, `--no-gutter`, `--no-orient`, `--no-rescue`, `--no-junk`,
-`--no-faint`, `--no-clean`, `--no-bidi`, `--no-layout`, `--thresh T`, `--merge G`, `--repeat N`
-(timing), `--threads`, `--cache-dir`, `-q`.
+`--no-faint`, `--no-clean`, `--no-bidi`, `--no-layout`, `--no-exif`, `--thresh T`, `--merge G`,
+`--repeat N` (timing), `--threads`, `--cache-dir`, `-q`.
 
 `--json` prints the page: `lines` (each with `text`, `confidence`, `box`: the four corners in
 reading order, `bbox`: its extent, `script`: the recognizer that read it, `words`: word boxes on
 upright left-to-right lines, `faint`), `text` (the lines one per line, in reading order),
-`script` (the page's), `upside_down`, `sideways`, `seconds`.
+`script` (the page's), `upside_down`, `sideways`, `exif_orientation` (the EXIF orientation the
+photo was turned upright by, or null), `seconds`.
 
 Library:
 
@@ -75,6 +76,9 @@ curl -s localhost:8080/v1/ocr -F model=ocr -F file=@scan.png -F response_format=
 
 Ported from LiteParse (`crates/liteparse/src/ocr/ocria`, Apache-2.0), with its defaults:
 
+- `exif`: an encoded photo (JPEG APP1, PNG `eXIf`) is turned upright per its EXIF orientation
+  before anything else, as LiteParse's image loading does (PIL's `exif_transpose`; pixels given
+  as such, `oxi_ocria_rgb` and `Ocria::ocr_rgb`, are read as they are);
 - detection at a long side of 1600 (never enlarged; sides rounded to multiples of 32) with
   OpenCV's `INTER_AREA` resize, the map thresholded at `det.meta.json`'s 0.55, 4-connected
   components (at least 2 cells, mean probability 0.6+) turned into rotated rectangles grown by the
@@ -84,7 +88,11 @@ Ported from LiteParse (`crates/liteparse/src/ocr/ocria`, Apache-2.0), with its d
 - `gutter`: boxes that run across a column gutter (blank columns lined up with other boxes'
   edges, judged by Otsu's threshold) are cut;
 - `orient`: pages whose boxes look sideways are detected again a quarter turn round and kept turned
-  when they read clearly better;
+  when they read clearly better; upside-down pages are the router's vote below. That is all of
+  LiteParse's page orientation for images: beyond it there are only the per-page rotations a
+  caller gives for a PDF (`page_orientation_corrections`, `/Rotate` rewrites) and the small-angle
+  deskew of tilted scans while merging OCR with a PDF's text layer, which have no image
+  counterpart here;
 - crops: a perspective warp of each quad (OpenCV's fixed-point bicubic, replicated borders), turned
   upright when tall;
 - the router reads every line tiled to 512 pixels; the page's script is the one with most of the
@@ -177,5 +185,4 @@ request per model at a time).
 
 - LayoutNet (`tablenet.onnx` / `tablenet.bin`: tables and layout blocks), and the rest of
   LiteParse's document parsing (PDF rendering, merging the OCR with the PDF text layer, Markdown);
-- EXIF orientation of photos (the image is read as stored);
 - the GPU: the models are a few million parameters, run on the CPU's GEMM and vectorized loops.
