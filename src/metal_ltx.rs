@@ -24,6 +24,7 @@ struct Pipes {
     gelu: Id,
     rot: Id,
     flash64: Id,
+    side_gain: Id,
 }
 
 pub(crate) struct MetalLtx {
@@ -122,6 +123,14 @@ struct Lhd {
     n_valid: u32,
 }
 #[repr(C)]
+struct Lsg {
+    k: u32,
+    n: u32,
+    start: [u32; 4],
+    gain: [f32; 4],
+}
+
+#[repr(C)]
 struct Lgd {
     n: u32,
     ld_y: u32,
@@ -183,6 +192,7 @@ impl MetalBackend {
             gelu: pipe("ltx_gelu")?,
             rot: pipe("dit_rot_half")?,
             flash64: pipe("flash_attn64")?,
+            side_gain: pipe("ltx_side_gain")?,
         };
         Some(Box::new(MetalLtx {
             be: self,
@@ -284,7 +294,9 @@ impl LtxSession for MetalLtx {
     fn forward(&mut self, m: &LtxModel, v: &LtxIn, a: &LtxIn, ptb: &LtxPerturb, vout: &mut Vec<f32>, aout: &mut Vec<f32>) -> bool {
         let be = self.be;
         let (dv, da) = (m.dim, m.audio_dim);
-        if m.blocks.is_empty() || v.rows == 0 || a.rows == 0 {
+        // One stream may be empty (text to audio: no video rows); its blocks are left out, and
+        // the audio-video cross-attention with them.
+        if m.blocks.is_empty() || (v.rows == 0 && a.rows == 0) {
             return false;
         }
         // Every layer on the GEMMs, the inputs of an attention's q / k / v alike (rotated or not),
@@ -355,7 +367,9 @@ impl LtxSession for MetalLtx {
             return false;
         }
         // Static constants: once per model.
-        let key = m.blocks[0].v.attn1.q.dev as *const _ as *const u8 as usize;
+        // (The gates' weights change with a LoRA's strength: part of the key.)
+        let key =
+            (m.blocks[0].v.attn1.q.dev as *const _ as *const u8 as usize) ^ (m.blocks[0].v.attn1.gate_w.as_ptr() as usize).rotate_left(17);
         if self.stat.as_ref().map(|s| s.0) != Some(key) {
             let (c, offs) = statics(m);
             if !self.upload(B::Stat, &c) {
@@ -421,6 +435,23 @@ impl LtxSession for MetalLtx {
                     rs: at(B::Urs, 0),
                 };
                 en.gemm(dn, x, r, at(B::U, 0), k, false);
+                if !l.side_gains.is_empty() {
+                    let mut g = Lsg {
+                        k: k as u32,
+                        n: l.side_gains.len().min(4) as u32,
+                        start: [0; 4],
+                        gain: [1.0; 4],
+                    };
+                    for (i, &(s, v)) in l.side_gains.iter().take(4).enumerate() {
+                        (g.start[i], g.gain[i]) = (s as u32, v);
+                    }
+                    let e = en.e;
+                    e.pipe(p.side_gain);
+                    e.buf(id(B::U), 0, 0);
+                    e.bytes(&g, 1);
+                    e.dispatch((k.div_ceil(256), r), 256);
+                    e.barrier();
+                }
                 en.to_half(at(B::U, 0), k, k, r, u);
                 en.gemm(up, u, r, y, ldy, true);
             }
@@ -651,6 +682,9 @@ impl LtxSession for MetalLtx {
                     } else {
                         (B::Ha, da, ra, sin.rows)
                     };
+                    if n == 0 {
+                        continue;
+                    }
                     let cls = Some(if vid { B::ClsV } else { B::ClsA });
                     let mods = if vid { B::ModV } else { B::ModA };
                     let ld = 9 * d;
@@ -686,7 +720,7 @@ impl LtxSession for MetalLtx {
                     gated(&en, h, d, n, sc.attn2.bo, tab, ld, 8 * d, cls);
                 }
                 // Audio-video cross-attention over both streams as they are now.
-                if !ptb.cross {
+                if !ptb.cross && v.rows > 0 && a.rows > 0 {
                     let (tv, ta) = ((B::AvV, i * v.classes * 4 * dv * 4), (B::AvA, i * a.classes * 4 * da * 4));
                     rms(&en, B::Hv, B::AvQv, dv, rv, tv, 4 * dv, 0, dv, Some(B::ClsV), true);
                     rms(&en, B::Ha, B::AvKa, da, ra, ta, 4 * da, 0, da, Some(B::ClsA), true);
@@ -725,6 +759,9 @@ impl LtxSession for MetalLtx {
                     } else {
                         (B::Ha, da, ra, sin.rows)
                     };
+                    if n == 0 {
+                        continue;
+                    }
                     let cls = Some(if vid { B::ClsV } else { B::ClsA });
                     let ld = 9 * d;
                     let tab = (if vid { B::ModV } else { B::ModA }, i * sin.classes * ld * 4);
@@ -861,7 +898,7 @@ impl MetalLtx {
         if !ok {
             return false;
         }
-        let key = b0.attn.q.dev as *const _ as *const u8 as usize;
+        let key = (b0.attn.q.dev as *const _ as *const u8 as usize) ^ (b0.attn.gate_w.as_ptr() as usize).rotate_left(17);
         if self.cstat.as_ref().map(|s| s.0) != Some(key) {
             let (c, offs) = conn_statics(blocks);
             if !self.upload(B::CStat, &c) {
@@ -899,6 +936,23 @@ impl MetalLtx {
                     rs: at(B::Urs, 0),
                 };
                 en.gemm(dn, x, r, at(B::U, 0), k, false);
+                if !l.side_gains.is_empty() {
+                    let mut g = Lsg {
+                        k: k as u32,
+                        n: l.side_gains.len().min(4) as u32,
+                        start: [0; 4],
+                        gain: [1.0; 4],
+                    };
+                    for (i, &(s, v)) in l.side_gains.iter().take(4).enumerate() {
+                        (g.start[i], g.gain[i]) = (s as u32, v);
+                    }
+                    let e = en.e;
+                    e.pipe(p.side_gain);
+                    e.buf(id(B::U), 0, 0);
+                    e.bytes(&g, 1);
+                    e.dispatch((k.div_ceil(256), r), 256);
+                    e.barrier();
+                }
                 en.to_half(at(B::U, 0), k, k, r, u);
                 en.gemm(up, u, r, y, ldy, true);
             }

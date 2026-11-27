@@ -223,6 +223,7 @@ impl Pair {
             n_in: self.n_in,
             bias,
             side: None,
+            side_gains: Vec::new(),
             rot: None,
         })
     }

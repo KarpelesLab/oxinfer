@@ -283,6 +283,7 @@ fn dit_dense<'a>(d: &'a Dense) -> Option<DitLin<'a>> {
         n_in: d.n_in,
         bias: d.b.as_deref(),
         side: None,
+        side_gains: Vec::new(),
         rot: None,
     })
 }

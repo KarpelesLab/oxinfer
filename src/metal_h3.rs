@@ -27,6 +27,16 @@ struct Pipes {
     hilo: Option<Id>,
     split: Id,
     col: Id,
+    side_gain: Id,
+}
+
+/// `metal_ltx.metal`'s `LSG`: a LoRA side path's run-time strengths over its rank columns.
+#[repr(C)]
+struct Lsg {
+    k: u32,
+    n: u32,
+    start: [u32; 4],
+    gain: [f32; 4],
 }
 
 pub(crate) struct MetalH3 {
@@ -121,6 +131,7 @@ impl MetalBackend {
             hilo: pipe("dit_flash128_hilo"),
             split: pipe("h3_split_half")?,
             col: pipe("h3_col_scale")?,
+            side_gain: pipe("ltx_side_gain")?,
         };
         Some(Box::new(MetalH3 {
             be: self,
@@ -351,10 +362,31 @@ impl H3Session for MetalH3 {
                 };
                 if pair {
                     en.gemm_pair(dn, main_x, at(B::Xl, 0), r, at(B::U, 0), k, false);
+                } else {
+                    en.gemm(dn, main_x, r, at(B::U, 0), k, false);
+                }
+                // The updates' strengths now (a switched adapter's gain).
+                if !l.side_gains.is_empty() {
+                    let mut g = Lsg {
+                        k: k as u32,
+                        n: l.side_gains.len().min(4) as u32,
+                        start: [0; 4],
+                        gain: [1.0; 4],
+                    };
+                    for (i, &(s, v)) in l.side_gains.iter().take(4).enumerate() {
+                        (g.start[i], g.gain[i]) = (s as u32, v);
+                    }
+                    let e = en.e;
+                    e.pipe(p.side_gain);
+                    e.buf(id(B::U), 0, 0);
+                    e.bytes(&g, 1);
+                    e.dispatch((k.div_ceil(256), r), 256);
+                    e.barrier();
+                }
+                if pair {
                     to_pair(en, B::U, k, B::Uh, B::Ul, B::Urs);
                     en.gemm_pair(up, u, at(B::Ul, 0), r, y, ldy, true);
                 } else {
-                    en.gemm(dn, main_x, r, at(B::U, 0), k, false);
                     en.to_half(at(B::U, 0), k, k, r, u);
                     en.gemm(up, u, r, y, ldy, true);
                 }

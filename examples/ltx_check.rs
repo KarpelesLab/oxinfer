@@ -73,6 +73,23 @@ fn main() -> Result<()> {
             let sigma = m["sigma"].as_f64().unwrap_or(1.0) as f32;
             let files = ModelFiles::open_file(file, false)?;
             let mut dit = ltx::dit::Dit::load(&files)?;
+            // LTX_LORA=FILE[:STRENGTH]: a LoRA on the layers (ref_dit_lora.py's REF_LORA);
+            // LTX_LORA_SWITCH=1 attaches it switched, as the distilled LoRA is.
+            if let Ok(l) = std::env::var("LTX_LORA") {
+                let (f, s) = l
+                    .rsplit_once(':')
+                    .and_then(|(f, s)| Some((f, s.parse::<f32>().ok()?)))
+                    .unwrap_or((&l, 1.0));
+                if std::env::var("LTX_LORA_SWITCH").is_ok_and(|v| v == "1") {
+                    let sw = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                    let g = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(s.to_bits()));
+                    ltx::lora::apply_switched(&mut dit, &[(f.into(), 1.0)], Some(&sw), Some(&g))?;
+                    dit.lora_switch = Some(sw);
+                    dit.lora_gain = Some(g);
+                } else {
+                    ltx::lora::apply(&mut dit, &[(f.into(), s)])?;
+                }
+            }
             dit.truncate_blocks(u("blocks"));
             let pos = ltx::video_positions(lt, lh, lw, fps);
             compare("video positions", &pos, &r("vpos")?);
@@ -407,7 +424,9 @@ fn main() -> Result<()> {
             let m = meta(dir)?;
             let u = |k: &str| m[k].as_u64().unwrap_or(0) as usize;
             let files = ModelFiles::open_file(file, false)?;
+            let t0 = std::time::Instant::now();
             let up = ltx::upsample::LatentUpsampler::load(&files)?;
+            println!("load {:.2}s", t0.elapsed().as_secs_f64());
             let vf = ModelFiles::open_file(vae, false)?;
             let (mean, std) = ltx::vae::stats_of(&vf)?;
             let (t, h, w) = (u("t"), u("h"), u("w"));
@@ -418,13 +437,30 @@ fn main() -> Result<()> {
                     row[c] = row[c] * std[c] + mean[c];
                 }
             }
-            let mut y = up.forward(&v);
-            for row in y.data.chunks_mut(128) {
-                for c in 0..128 {
-                    row[c] = (row[c] - mean[c]) / std[c];
+            let norm = |mut y: ltx::vae::Vid| {
+                for row in y.data.chunks_mut(128) {
+                    for c in 0..128 {
+                        row[c] = (row[c] - mean[c]) / std[c];
+                    }
                 }
+                y.to_cthw()
+            };
+            let t0 = std::time::Instant::now();
+            let cpu = norm(up.forward_cpu(&v));
+            println!("CPU {:.2}s", t0.elapsed().as_secs_f64());
+            compare("upsampled", &cpu, &r("out")?);
+            // The whole device pass (twice: the second without the weights' upload).
+            for i in 0..2 {
+                let t0 = std::time::Instant::now();
+                let Some(y) = up.forward_device(&v) else {
+                    println!("no device pass");
+                    break;
+                };
+                println!("device {:.2}s{}", t0.elapsed().as_secs_f64(), if i == 0 { " (first)" } else { "" });
+                let y = norm(y);
+                compare("upsampled (device)", &y, &r("out")?);
+                compare("device against CPU", &y, &cpu);
             }
-            compare("upsampled", &y.to_cthw(), &r("out")?);
         }
         "rows" => {
             // ltx_check rows FILE_A FILE_B MODULE: a layer's first rows as two files store them

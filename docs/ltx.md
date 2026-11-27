@@ -152,7 +152,9 @@ turn; then `clean_response`. "a cat plays piano in a jazz bar" became a 160-word
 sizes, camera push-in, the music's tone) in 2 s with E2B-it on Metal; the video follows it. As
 the reference's `generate(no_repeat_ngram_size=5)`, no 5 tokens appear twice in the sequence, the
 system prompt and the user's prompt included (`ChatConfig::no_repeat_ngram`,
-`sampler::NoRepeatNgram`: transformers' `NoRepeatNGramLogitsProcessor`, for any engine model).
+`sampler::NoRepeatNgram`: transformers' `NoRepeatNGramLogitsProcessor`; for any chat model too:
+`--no-repeat-ngram N`, the request field `no_repeat_ngram_size`, the C API's `no_repeat_ngram`
+setting and the web GUI's chat settings).
 
 ### The dev transformer: guidance
 
@@ -175,8 +177,17 @@ upsampler and the LoRA's 3 unguided steps at the full size, the first stage's so
 (`ti2vid_two_stages`; `--refine-audio` denoises it again); without it, one guided stage at the
 full size (`ti2vid_one_stage`). The dev transformer with the distilled LoRA and `--one-stage`
 runs the distilled schedule instead (the LoRA makes it a distilled model). The distilled LoRA
-is switched per stage: on the GPU its side paths exist only in the second stage's view of the
-layers.
+is switched per stage, read at run time: on the GPU one copy of its side paths (float16, 8.9 GB)
+serves every strength, each update's rank columns scaled by its strength now
+(`gpu::dit::Lin::side_gains`, `ltx_side_gain`), and none run while it is off.
+
+As the release's loader (`LoRAFuser`: `W += strength B A`), a LoRA's updates are not scaled by
+the file's `lora_alpha` metadata: the distilled LoRA's says 450, the rank of its largest updates,
+and its smaller ones (the attention gates' rank 32, the timestep embedders' 256, the patchify
+layers' 128) are applied as they are (a module's own `.alpha` key, kohya's files, still scales
+its update). Before, those were scaled by `450 / rank` (14 times for the gates), and the gates'
+updates were left out on Metal: the dev transformer with the distilled LoRA was 0.23 (CPU) and
+3.1e-2 (Metal) from the reference on two blocks; it is now 2.8e-6 / 8.5e-5 (the table below).
 
 ### Audio to video
 
@@ -232,8 +243,10 @@ truncates: the frames differ by +0.34 of a level on average, which moves the enc
 audio-video cross-attention), with the dev transformer guided on the audio (CFG 7, STG on block
 28, rescale 0.7, no modality guidance) over `LTX2Scheduler`'s schedule; the length from `--frames`
 (`frames` / `seconds` in the server and C API) or the duration head on the audio context alone. The whole decoded soundtrack is
-written (`-o FILE.wav`; the server returns the WAV, the C API writes `out_wav`). The transformer
-runs on the CPU kernels (the Metal session needs both streams): about 1 s a pass for 5 s of audio.
+written (`-o FILE.wav`; the server returns the WAV, the C API writes `out_wav`). On Metal the
+transformer session runs the audio stream alone (the video stream's blocks and the audio-video
+cross-attention left out): 0.1 s a pass for 5 s of audio (1.1 s on the CPU kernels); 2 s of
+audio, 4 guided steps, are 1.3e-3 (latents) and 30 dB (waveform) from the CPU path.
 
 ### The HQ pipeline: res2s
 
@@ -252,8 +265,7 @@ fixed-point iterations while `h < 0.5`, the denoised rows at the midpoint, the s
 replaces the final step to 0. Two transformer evaluations a step. The noise comes from two
 generators seeded -1 and 9999 (in each stage), every draw normalized to zero mean and unit
 variance; the arithmetic is in float64 as the reference's on the CPU. The LoRA's strength is read
-at run time on the CPU; on Metal each strength gets its own side paths (2 x 8.9 GB for the HQ
-pipeline's two).
+at run time, on the CPU and on Metal (one copy of its side paths for both strengths).
 
 
 ### Temporal upscaling: the DFR rounds
@@ -367,8 +379,19 @@ and residuals on the `ltx_*` kernels of `metal_ltx.metal`. The rest, also as who
   plan rotates their inputs (`Op::Fold` with ConvRot's regular Hadamard transform, `dec_fold`'s
   radix-4 butterflies): a 12-token prompt in 0.33 s instead of 3.3 s.
 
-The latent upsamplers, the audio VAE decoder and encoder and the output heads stay on the CPU
-kernels with per-op GPU convolutions and matmuls. `OXINFER_LTX_GPU=0` keeps the transformer on the CPU; the
+- the latent upsamplers (spatial and temporal; [`upsample.rs`](../src/ltx/upsample.rs)) in the VAE's
+  session (`LtxVaeSession::upsample`): its padded layout with zero frames around the clip (the
+  time padding is zeros here), the 3 x 3 x 3 convolutions as its shifted GEMMs (the spatial
+  upsampling's 3 x 3 one a single pass of nine taps), and the group norms (32 groups over every
+  frame and position) in two passes over the rows: per-slice partial sums of the values, the
+  groups' means, then the squared distances to them, and the per-channel scale and shift that
+  the next convolution's input preparation (`lu_prep`, with SiLU) or the residual's end
+  (`lu_res`) applies; the depth-to-space steps are the decoder's `lv_d2s`. A 768x512x121 run's
+  16 x 8 x 12 latents take 0.15 s instead of 1.3 s per op (4 s on the CPU kernels alone)
+  (`OXINFER_LTX_UP_GPU=0`: the CPU path).
+
+The audio VAE decoder and encoder and the output heads stay on the CPU kernels with per-op GPU
+convolutions and matmuls. `OXINFER_LTX_GPU=0` keeps the transformer on the CPU; the
 `device=cpu` option of the server and the C API does the same per model. The NVFP4 transformer
 runs in the same session: its layers (repacked into ggml's NVFP4 blocks at load) go through
 `mma_NVFP4`, which dequantizes the E2M1 codes, the E4M3 scales of 16 values and the tensor-wide
@@ -386,7 +409,7 @@ wall time from start to the written `.mp4`, files mapped (resident set 17 to 22 
 | i2v 768x512 (`--init-image`, a red sports car on a coastal road) | 121 | 81.0 s | the first frame is the image; the car drives off into the sunset, the camera follows |
 | t2v 768x512, no `--frames` (the duration head: 4.32 s) | 97 | 69.8 s | a woman in a kitchen saying the prompt's line; Whisper large-v3-turbo transcribes the soundtrack as "Good morning. Today we are going to bake fresh bread together." |
 | first + last frame 768x512 (`--init-image car.png --last-image` a 1.67x crop of it) | 49 | 47.7 s | the camera pushes in from the first frame to the last one |
-| dev transformer + `--distilled-lora` (1660 layers as side paths), 384x256 one stage | 25 | 56.8 s (19 s of it loading the LoRA; 40 GB resident) | the dog running, softer than the distilled file's |
+| dev transformer + `--distilled-lora` (1660 layers as side paths), 384x256 one stage | 25 | 56.8 s (19 s of it loading the LoRA; 40 GB resident) | the dog running, softer than the distilled file's (the LoRA's gates were 14 times too strong, below) |
 | dev transformer, guided one stage (30 steps x 4 passes), 384x256 | 25 | 73.1 s (stage 64.2 s: 0.53 s a pass) | a red fox trotting through snow under pines |
 | t2v 384x256 two stages, `--temporal-rounds 2` (DFR: 1 then 2 then 4 tiles) | 25 -> 97 (96 fps) | 45.6 s | the dog trotting, smooth, no visible tile borders |
 | t2v 384x256 two stages, `--temporal-upscale`, 49 frames | 49 -> 97 (48 fps) | 63 s (machine shared) | no jump at the tile border (frame 48) |
@@ -400,7 +423,11 @@ wall time from start to the written `.mp4`, files mapped (resident set 17 to 22 
 | audio to video 768x512 (`--audio`: the 4 s line of a generated news anchor) | 89 | 47.1 s | stages 10.9 + 17.6 s; a woman talking to the camera in a kitchen over the kept soundtrack |
 | retake 768x512 of seconds 1 to 2.5 of that clip | 97 | 66.9 s | one stage at the full size: 48.0 s with the whole clip's encoding; frames outside the window kept |
 | text to audio, dev transformer, 30 guided steps (`--audio-only`, rain on a tin roof) | 5 s | 107.6 s | the audio stream on the CPU kernels: 1.1 s a pass |
+| the same with the audio stream alone on the Metal session | 5 s | 10.2 s | stage 7.9 s (90 passes: 0.09 s each); broadband rain-like noise |
 | HQ: dev + `--distilled-lora --hq` 768x512 | 121 | 312.9 s | text 11.7 s, stage 1 187.1 s (15 res2s steps: 93 passes at 384x256x121), stage 2 76.0 s; 65 GB resident (the LoRA's side paths at two strengths) |
+| the same, one copy of the side paths for both strengths (and the LoRA's gates fixed) | 121 | 361.3 s (machine shared: other agents' builds) | text 28.7 s, stage 1 219.7 s, stage 2 69.7 s; 34 GB peak resident set; the fox trotting through the snow between pines, sharp |
+| dev + `--distilled-lora`, 384x256 one stage (the LoRA's gates fixed) | 25 | 60.0 s (machine shared) | 37 GB peak resident set; a sharp dog running in a meadow |
+| t2v 768x512 two stages, the spatial upsampler per op / as a whole Metal pass (back to back, machine shared) | 121 | 66.0 / 56.0 s | stage 2 25.3 / 24.2 s: the upsampler took 1.3 s per op (not 15: the 15 s measured before included its first load from disk), 0.15 s whole; the rest of stage 2 is its three transformer passes |
 
 The whole GPU passes of the connectors, the VAE decoder and the vocoder, measured in one locked
 session against the build before them (same prompt and seed, `| time |` of the CLI):
@@ -449,6 +476,8 @@ are `ref_*.py` beside `examples/ltx_check.rs`'s checks):
 | video VAE decoder (3 x 4 x 6 latents) / encoder | 3.5e-6 / 6.0e-6 | `ConvVideoDecoder` / `VideoEncoder` |
 | audio decoder (20 latents) / vocoder with BWE | 6.3e-7 / 1.0e-5 | `AudioDecoder`, `VocoderWithBWE` |
 | spatial / temporal upsampler | 1.2e-5 / 2.2e-5 | `LatentUpsampler` with the VAE's statistics |
+| the same, whole Metal passes: spatial on 16 x 8 x 12 latents (768x512x121's) / temporal on 7 x 8 x 12 | 4.6e-4 / 6.1e-4 | half GEMM inputs (CPU path: 1.3e-5 / 2.8e-5; `ltx_check upsample`) |
+| dev transformer with the distilled LoRA (strength 1, and 0.25 switched as the pipelines run it), 2 blocks, CPU / Metal | 2.8e-6 / 1.9e-6; 8.5e-5 / 7.5e-5 | the LoRA fused into the weights as `LoRAFuser` does (`ref_dit_lora.py`, `ltx_check dit` with `LTX_LORA`) |
 | the guidance passes, 2 blocks (dev int8; STG: video self-attention skipped in block 1, audio in block 0; modality: no AV cross-attention), CPU / Metal | 2.3e-6 / 1.6e-6, 2.2e-6 / 1.5e-6; 9.7e-5 / 1.1e-4, 8.9e-5 / 7.7e-5 | `LTXModel` with a `BatchedPerturbationConfig` (`ref_dit_ptb.py`) |
 | guidance arithmetic (video / audio params, masked rescale) | 0 (bit-identical) | `MultiModalGuider.calculate` (`ref_guider.py`, `ltx_check guider`) |
 | audio encoder front end: resampling 48 / 44.1 kHz to 16 kHz, log-mel | 6.3e-8, 8.3e-8 / 7.0e-6, 7.6e-6 | `AudioProcessor` (`torchaudio` 2.11's `resample`, `MelSpectrogram`; `ref_audio_enc.py`, `ltx_check audioenc`) |
@@ -481,10 +510,16 @@ transformer passes, sampler, guidance, upsampler, decoders: all of it compared a
 | audio to video (`A2VidPipelineTwoStage`, the distilled transformer, Euler), 384x256, a 1.04 s WAV at 44.1 kHz (25 frames), CPU | 1.3e-6 / 1.0e-6 | 5.1e-5 / 4.7e-5 (the source's latents) | 8.0e-5 | 1.7e-4 / 4.7e-5 | 67.6 dB | the source's samples |
 | retake of 0.4 to 0.8 s (`RetakePipeline`, distilled) of a 384x256, 25-frame H.264 + PCM clip, CPU, the same decoded frames | 4.6e-6 / 1.1e-6 | 4.5e-5 / 2.3e-5 | | | 76.0 dB | 83.1 dB |
 | text to audio (`T2AOneStagePipeline`, dev, 4 guided steps of 3 passes), 49 frames (2 s), CPU | / 4.8e-6 | / 1.4e-5 | | | | 52.0 dB |
+| guided audio to video (`A2VidPipelineTwoStage`, dev: 4 guided steps of 4 passes, then the distilled LoRA's 3 steps), 384x256, 25 frames, CPU | 1.5e-6 / 1.1e-6 | 1.1e-3 / the source's | 2.3e-3 | 4.3e-2 / | 43.5 dB | the source's samples |
+| the same, stage 2 from the reference's upsampled latents (`OXINFER_LTX_LOAD`) | | | | 9.8e-4 / | 76.7 dB | |
+| the same on Metal | 1.0e-4 / 1.2e-3 | 1.9e-2 / | 3.6e-2 | 0.25 / | 29.2 dB | |
 | HQ (`TI2VidTwoStagesHQPipeline` on the distilled transformer, the LoRA at 0: the res2s loop and its guidance), 384x256, 17 frames, 2 steps, CPU | 1.6e-6 / 2.2e-6 | 3.7e-4 / 1.5e-4 | | | | |
 | the same with 4 steps (bong iterations) | | 0.25 / 9.9e-2 | 0.36 | 0.58 / | 17.6 dB | 8.1 dB |
 
-(rel L2 of the latents.) On the CPU the whole pipeline follows the reference's to float rounding,
+(rel L2 of the latents. The pipelines with the distilled LoRA run it as `ref_modes2.py` does: its
+updates as float32 side paths on the int8 layers, `y += strength B (A x)`, as `LoRAFuser` fuses
+them; `OXINFER_LTX_LOAD=DIR` makes oxinfer start a state, such as the upsampled latents, from
+`DIR/{name}.f32`.) On the CPU the whole pipeline follows the reference's to float rounding,
 amplified by the ancestral sampler's steps. On Metal the half-precision GEMM inputs and attention
 (1e-4 a pass) grow over the steps into a different sample of the same video: the same scene,
 motion and sound, details apart (the dog's legs, `side_distilled.png` in the scratch notes).
@@ -496,6 +531,16 @@ Every evaluation of the 4-step run matches the reference's to that sensitivity (
 different samples of the same clip (the same fox in the same snow, placed elsewhere); with 2 steps
 (no bong iterations, 4 evaluations) the first stage stays at 3.7e-4. The midpoints' sigmas are
 float64 in the reference, and so are their timestep sinusoids here (`StreamIn::t64`).
+
+Nothing but that sensitivity is involved: on the 4-step run (384x256, 17 frames, CPU) oxinfer's
+first stage ends 8.0e-2 from the reference (1.6e-2 for the audio), while oxinfer against itself
+with the initial noise changed by 1e-6 (relative, about one float32 rounding) ends 9.7e-2 apart
+(1.4e-2); the upsampled latents 0.13 and 0.17, the second stage 0.66 and 0.44. The reference run
+in float64 (every tensor, `ref_modes2.py` with `REF_F64=1`; its text contexts 6e-6 from the
+float32 run's) ends its first stage 0.40 from its own float32 run, further than oxinfer is. With
+the dev transformer's guided Euler steps the same holds at a smaller scale: in the guided audio
+to video comparison the second stage, 4.3e-2 from the reference, is 9.8e-4 from it when it starts
+from the reference's own upsampled latents.
 
 The other transformer files, on one-block copies (block 0 and connector block 0 of the real files,
 fetched by HTTP ranges) against the reference on bf16 weights: the bf16 file 6.7e-7 / 8.7e-7 on
@@ -516,8 +561,6 @@ precision of the int8 and bf16 sessions; `ltx_check dit` with `LTX_SAVE` and `LT
   EXR / HDR inputs of retakes.
 - oxideav's YUV to RGB conversion rounds where swscale (the reference's PyAV) truncates, which
   moves a retake's source latents by 2 % (above).
-- Text to audio on the GPU: the Metal session needs both streams, so the audio stream alone runs
-  on the CPU kernels.
 - DFR's detailing IC-LoRA second stage and its spatial epilogue (`spatial_upscalings = 2`): the
   LoRA is not part of the release's files.
 - The DiffVAE's tiled decode (the reference's memory-driven tiles and its keyframe-anchored
@@ -525,8 +568,3 @@ precision of the int8 and bf16 sessions; `ltx_check dit` with `LTX_SAVE` and `LT
 - The NVFP4 file is repacked into ggml's blocks at load (3 s, 18.7 GB of anonymous memory beside
   the mapped file: 34 GB resident at 384x256): the kernels do not read ComfyUI's packing (high
   nibble first, scales in cuBLAS's tiled order) in place.
-- The latent upsamplers run per op (their group norms reduce over every frame: no whole pass
-  yet); the spatial one of a 768x512x121 run's latents takes about 15 s with its loading
-  (`ltx_check upsample`), a good part of the second stage's 20.6 s.
-- oxinfer's MP4 muxer writes 24 fps clips with 41 ms frames (1000/41 fps): a retake of one of its
-  own videos runs at 24.39 fps.

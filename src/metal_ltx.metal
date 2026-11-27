@@ -576,3 +576,111 @@ kernel void lb_half(device const float* x [[buffer(0)]], device half* out [[buff
     out[i] = hi;
     lo[i] = half(v - float(hi));
 }
+
+// ---- LTX-2.5's latent upsamplers (metal_ltx_vae.rs, LtxVaeSession::upsample) ----
+// The VAE's padded layout and GEMMs, with zero time padding; the group norms (32 groups over
+// every frame and position) in two passes over the interior rows: partial sums per slice of
+// rows (pass 0: the values, pass 1: their squared distance to the group's mean), then each
+// group's mean (pass 0) or the per-channel scale and shift of the normalization and the affine
+// transform (pass 1).
+struct LUG { LVG g; uint c; uint lo; uint t; uint slices; uint groups; uint pass; float eps; uint _p; };
+kernel void lu_gn_part(device const float* x [[buffer(0)]], device float4* part [[buffer(1)]],
+                       device const float* mean [[buffer(2)]], constant LUG& p [[buffer(3)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    uint c4 = p.c / 4, j = gid.x, s = gid.y;
+    if (j >= c4 || s >= p.slices) return;
+    uint hw = p.g.h * p.g.w, n = p.t * hw, per = (n + p.slices - 1) / p.slices;
+    uint i0 = min(n, s * per), i1 = min(n, i0 + per), gsz = p.c / p.groups;
+    float4 m = float4(0.f);
+    if (p.pass == 1) m = float4(mean[(4 * j) / gsz], mean[(4 * j + 1) / gsz], mean[(4 * j + 2) / gsz], mean[(4 * j + 3) / gsz]);
+    float4 acc = float4(0.f);
+    for (uint i = i0; i < i1; i++) {
+        uint f = i / hw, q = i - f * hw, y = q / p.g.w, xx = q - y * p.g.w;
+        float4 v = ((device const float4*)(x + (ulong)lv_row(p.g, p.lo + f, y, xx) * p.c))[j];
+        if (p.pass == 1) { v -= m; v *= v; }
+        acc += v;
+    }
+    part[(ulong)s * c4 + j] = acc;
+}
+// One threadgroup (256 threads) per group. `ab`: the scale (c values) then the shift (c values).
+kernel void lu_gn_fin(device const float* part [[buffer(0)]], device float* mean [[buffer(1)]],
+                      device float* ab [[buffer(2)]], device const float* w [[buffer(3)]],
+                      device const float* bias [[buffer(4)]], constant LUG& p [[buffer(5)]],
+                      uint g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    uint gsz = p.c / p.groups, k = p.slices * gsz;
+    float acc = 0.f;
+    for (uint e = tid; e < k; e += 256) {
+        uint s = e / gsz, ch = g * gsz + (e - s * gsz);
+        acc += part[(ulong)s * p.c + ch];
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) red[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.f;
+    for (uint i = 0; i < 8; i++) tot += red[i];
+    float cnt = float(p.t * p.g.h * p.g.w) * float(gsz);
+    if (p.pass == 0) {
+        if (tid == 0) mean[g] = tot / cnt;
+        return;
+    }
+    float inv = rsqrt(tot / cnt + p.eps), mu = mean[g];
+    for (uint i = tid; i < gsz; i += 256) {
+        uint ch = g * gsz + i;
+        float a = w[ch] * inv;
+        ab[ch] = a;
+        ab[p.c + ch] = bias[ch] - mu * a;
+    }
+}
+// The half rows a convolution reads: every image of the padded layout, the frames outside lo ..
+// hi zero (the time padding), the frames as they are (mode 0) or normalized by `ab` and SiLU'd
+// (mode 1).
+struct LUP { LVG g; uint c; uint nimg; uint lo; uint hi; uint mode; uint rows; uint _p; };
+kernel void lu_prep(device const float* x [[buffer(0)]], device half* out [[buffer(1)]], device const float* ab [[buffer(2)]],
+                    constant LUP& p [[buffer(3)]], uint tg [[threadgroup_position_in_grid]],
+                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tg * 8 + sg;
+    if (row >= p.rows) return;
+    uint c4 = p.c / 4;
+    device half4* o = (device half4*)(out + (ulong)row * p.c);
+    uint b, y, xx;
+    if (!lv_interior(p.g, p.nimg, row, b, y, xx) || b < p.lo || b >= p.hi) {
+        for (uint j = lane; j < c4; j += 32) o[j] = half4(0.h);
+        return;
+    }
+    device const float4* s = (device const float4*)(x + (ulong)row * p.c);
+    device const float4* a4 = (device const float4*)ab;
+    device const float4* b4 = (device const float4*)(ab + p.c);
+    for (uint j = lane; j < c4; j += 32) {
+        float4 v = s[j];
+        if (p.mode == 1) {
+            v = v * a4[j] + b4[j];
+            v = v / (1.0f + exp(-v));
+        }
+        o[j] = half4(v);
+    }
+}
+// A residual block's end over the interior rows: y = silu(t ab + x) (without x: silu(t ab)).
+struct LUR { LVG g; uint c; uint lo; uint t; uint add; };
+kernel void lu_res(device const float* t [[buffer(0)]], device const float* x [[buffer(1)]], device float* y [[buffer(2)]],
+                   device const float* ab [[buffer(3)]], constant LUR& p [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    uint c4 = p.c / 4, hw = p.g.h * p.g.w, pix = i / c4, j = i - pix * c4;
+    if (pix >= p.t * hw) return;
+    uint f = pix / hw, q = pix - f * hw, yy = q / p.g.w, xx = q - yy * p.g.w;
+    ulong r = (ulong)lv_row(p.g, p.lo + f, yy, xx) * c4 + j;
+    float4 v = ((device const float4*)t)[r] * ((device const float4*)ab)[j] + ((device const float4*)(ab + p.c))[j];
+    if (p.add) v += ((device const float4*)x)[r];
+    ((device float4*)y)[r] = v / (1.0f + exp(-v));
+}
+
+// A LoRA side path's run-time strengths (metal_ltx.rs): the rank columns of `down x` (rows of
+// k) from each start on times its gain.
+struct LSG { uint k; uint n; uint start[4]; float gain[4]; };
+kernel void ltx_side_gain(device float* u [[buffer(0)]], constant LSG& p [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
+    uint j = gid.x;
+    if (j >= p.k) return;
+    float g = 1.0f;
+    for (uint i = 0; i < p.n; i++) if (j >= p.start[i]) g = p.gain[i];
+    u[(ulong)gid.y * p.k + j] *= g;
+}

@@ -1521,7 +1521,8 @@ impl Pipeline {
             let t2 = Instant::now();
             let uf = ModelFiles::open_file(up, false)?;
             let ups = upsample::LatentUpsampler::load(&uf)?;
-            let x = upsample_rows(&ups, &vfiles_stats, &video.x, c, (lt, lh, lw));
+            let mut x = upsample_rows(&ups, &vfiles_stats, &video.x, c, (lt, lh, lw));
+            load_state("upsampled_video", &mut x);
             // The slots' rows upsampled as a clip of their own (`upsampler(stacked_keyframes)`).
             let up_planes = (rounds > 0).then(|| upsample_rows(&ups, &vfiles_stats, &planes, c, (keyframes_at.len(), lh, lw)));
             drop(ups);
@@ -1860,6 +1861,22 @@ fn dump(name: &str, v: &[f32]) {
         let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
         if let Err(e) = std::fs::write(d.join(format!("{name}.f32")), b) {
             eprintln!("[OXINFER_LTX_DUMP: {name}: {e}]");
+        }
+    }
+}
+
+/// `OXINFER_LTX_LOAD=DIR`: a state replaced by `DIR/{name}.f32` when that file holds as many
+/// values (comparisons with the reference: a stage run from the reference's own input).
+fn load_state(name: &str, v: &mut [f32]) {
+    if let Some(d) = std::env::var_os("OXINFER_LTX_LOAD") {
+        let p = PathBuf::from(d).join(format!("{name}.f32"));
+        if let Ok(b) = std::fs::read(&p)
+            && b.len() == v.len() * 4
+        {
+            for (o, c) in v.iter_mut().zip(b.as_chunks::<4>().0) {
+                *o = f32::from_le_bytes(*c);
+            }
+            eprintln!("[OXINFER_LTX_LOAD: {name} from {}]", p.display());
         }
     }
 }

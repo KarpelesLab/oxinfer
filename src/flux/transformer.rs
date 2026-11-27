@@ -840,6 +840,7 @@ pub(crate) fn dit_lin<'a>(d: &'a Dense) -> Option<crate::gpu::dit::Lin<'a>> {
         n_in: d.n_in,
         bias: d.b.as_deref(),
         side: None,
+        side_gains: Vec::new(),
         rot: None,
     })
 }

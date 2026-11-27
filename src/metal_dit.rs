@@ -217,10 +217,14 @@ fn runnable(be: &MetalBackend, l: &Lin) -> bool {
     if l.rot.is_some_and(|g| g != 256 || !l.n_in.is_multiple_of(256)) {
         return false;
     }
-    match &l.side {
-        Some((d, u)) => d.side.is_none() && u.side.is_none() && d.rot.is_none() && u.rot.is_none() && runnable(be, d) && runnable(be, u),
-        None => true,
-    }
+    // (At most 4 gain ranges: `ltx_side_gain`'s.)
+    l.side_gains.len() <= 4
+        && match &l.side {
+            Some((d, u)) => {
+                d.side.is_none() && u.side.is_none() && d.rot.is_none() && u.rot.is_none() && runnable(be, d) && runnable(be, u)
+            }
+            None => true,
+        }
 }
 
 struct Enc<'e, 'f> {

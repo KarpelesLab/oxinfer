@@ -442,6 +442,7 @@ fn dev_lin<'s>(d: &'s DLin) -> Option<crate::gpu::dit::Lin<'s>> {
         n_in: d.n_in,
         bias: d.b.as_deref(),
         side: None,
+        side_gains: Vec::new(),
         rot: None,
     })
 }

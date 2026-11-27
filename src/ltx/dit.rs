@@ -325,12 +325,12 @@ pub struct Dit<'a> {
     /// On the device, 128-wide heads' attention with float32 operands (else half-precision).
     pub exact_attention: bool,
     /// The switch and the strength of the LoRA that changes between stages (the distilled LoRA
-    /// of the two-stage dev pipeline): the device twins are kept for each strength it runs at.
+    /// of the two-stage dev pipeline), read at run time (on the device, by the side paths'
+    /// gains: one copy of the side paths for every strength).
     pub lora_switch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub lora_gain: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
-    /// The device twins by the switched LoRA's strength (`f32` bits; 0 when off), never removed.
-    #[allow(clippy::vec_box)]
-    twins: std::sync::Mutex<Vec<(u32, Box<super::device::Twins<'a>>)>>,
+    /// The device twins, made on the first device pass.
+    twins: std::sync::OnceLock<Box<super::device::Twins<'a>>>,
     session: std::sync::Mutex<Option<Box<dyn crate::gpu::dit::LtxSession>>>,
 }
 
@@ -432,7 +432,7 @@ impl<'a> Dit<'a> {
             exact_attention: false,
             lora_switch: None,
             lora_gain: None,
-            twins: std::sync::Mutex::new(Vec::new()),
+            twins: std::sync::OnceLock::new(),
             session: std::sync::Mutex::new(None),
         })
     }
@@ -484,23 +484,9 @@ impl<'a> Dit<'a> {
         }
     }
 
-    /// The device twins of the layers for the switched LoRA's state now.
+    /// The device twins of the layers (the LoRA side paths' strengths are read per pass).
     fn device_twins(&self) -> &super::device::Twins<'a> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let on = self.lora_switch.as_ref().is_none_or(|s| s.load(Relaxed));
-        let gain = self.lora_gain.as_ref().map_or(1.0, |g| f32::from_bits(g.load(Relaxed)));
-        let key = if on { gain.to_bits() } else { 0 };
-        let mut t = self.twins.lock().unwrap_or_else(|e| e.into_inner());
-        let p: *const super::device::Twins<'a> = match t.iter().find(|(k, _)| *k == key) {
-            Some((_, b)) => &**b,
-            None => {
-                t.push((key, Box::new(super::device::Twins::build(self))));
-                &*t.last().unwrap().1
-            }
-        };
-        // SAFETY: the boxes are never removed or replaced while `self` lives, so the twins stay
-        // where they are after the lock is released.
-        unsafe { &*p }
+        self.twins.get_or_init(|| Box::new(super::device::Twins::build(self)))
     }
 
     /// Whether the transformer has the learned keyframe embedding (generated keyframe slots).
@@ -710,7 +696,7 @@ impl<'a> Dit<'a> {
             }
         }
         let mut ax = self.a_patchify.forward(a.x, na);
-        if nv == 0 || na == 0 || !self.blocks_device(&mut vx, &mut ax, (v, &mv, &vpe, &vcpe), (a, &ma, &ape, &acpe), ptb) {
+        if (nv == 0 && na == 0) || !self.blocks_device(&mut vx, &mut ax, (v, &mv, &vpe, &vcpe), (a, &ma, &ape, &acpe), ptb) {
             for (i, b) in self.blocks.iter().enumerate() {
                 let skip = (ptb.video_self.has(i), ptb.audio_self.has(i), ptb.cross);
                 self.block(

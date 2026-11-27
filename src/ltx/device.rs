@@ -6,7 +6,9 @@
 //! layout: the same int8 bytes (borrowed from the mapped file) with the row scale repeated per
 //! block of 32; the session rotates their inputs (`dit_rot_half`). bf16 layers go as stored.
 //! LoRA updates become side paths (`up (down x)`, float16, the rank padded to 64; `down` in the
-//! rotated basis of a ConvRot layer). NVFP4 layers (ggml's blocks, repacked at load) go as they
+//! rotated basis of a ConvRot layer), made once with every update of the layer: each update's
+//! run-time strength (a switched adapter's on / off and gain) scales its rank columns on the
+//! device (`Lin::side_gains`), so one copy serves every strength. NVFP4 layers (ggml's blocks, repacked at load) go as they
 //! are: the GEMMs dequantize their E2M1 codes, E4M3 scales and tensor-wide factor
 //! (`mma_NVFP4`). FP8 E4M3 layers with one scale for the whole matrix (ComfyUI's "scaled" FP8)
 //! get a twin with that scale repeated over the 128 x 128 blocks the FP8 GEMMs read (the same
@@ -26,13 +28,29 @@ pub(crate) struct Twins<'a> {
     twin: HashMap<usize, crate::model::Lin<'a>>,
     /// By the address of the gate's `DLin`: `[heads, q_dim]` weights and the bias.
     gates: HashMap<usize, (Vec<f32>, Vec<f32>)>,
+    /// By the address of the gate's `DLin`: each LoRA update of a gate as a dense delta (its
+    /// fixed scale in) and its run-time strength.
+    gate_deltas: HashMap<usize, Vec<(Vec<f32>, crate::lora::Strength)>>,
+    /// The gates' weights with their updates at each set of strengths they ran at (by the
+    /// updates' factors, in the order of `gate_deltas`'s sorted keys), never removed.
+    #[allow(clippy::type_complexity)]
+    gate_views: std::sync::Mutex<Vec<(Vec<u32>, Box<HashMap<usize, Vec<f32>>>)>>,
     /// By the address of the layer's `DLin`: its LoRA updates as one side path (down, up).
-    sides: HashMap<usize, (crate::model::Lin<'a>, crate::model::Lin<'a>, usize)>,
+    sides: HashMap<usize, Side<'a>>,
     /// Twins with unit scales, their layers' scales applied to the outputs instead (`[n_out]`
     /// in `out_scales`): the GEMMs then read the int8 / E4M3 values as they are, exact in half,
     /// rather than their products with the scales rounded to half.
     pub(crate) unit_scales: bool,
     out_scales: HashMap<usize, Vec<f32>>,
+}
+
+/// A layer's LoRA updates as one side path: `down` (each update's rank rows at its fixed scale)
+/// and `up`, the padded rank, and where each update's rows start with its run-time strength.
+struct Side<'a> {
+    down: crate::model::Lin<'a>,
+    up: crate::model::Lin<'a>,
+    rank: usize,
+    links: Vec<(usize, crate::lora::Strength)>,
 }
 
 /// An f32 matrix `[n_out, n_in]` as a float16 "GGUF" layer.
@@ -51,12 +69,13 @@ pub(crate) fn f16_lin(w: &[f32], n_out: usize, n_in: usize) -> crate::model::Lin
     })
 }
 
-/// The LoRA updates of `d` (at their strengths now) as one side path, the rank padded to 64,
-/// `down` rotated when the layer's input is (`rot`).
-fn side_of(d: &DLin, rot: Option<usize>) -> Option<(crate::model::Lin<'static>, crate::model::Lin<'static>, usize)> {
+/// The LoRA updates of `d` (all but retired adapters', whatever their strengths now) as one side
+/// path, the rank padded to 64, `down` rotated when the layer's input is (`rot`); each update's
+/// rows at its fixed scale, its run-time factor (on / off, gain) left to [`Twins::lin`].
+fn side_of(d: &DLin, rot: Option<usize>) -> Option<Side<'static>> {
     let delta = d.w.lora_delta()?;
     let (n_in, n_out) = (d.n_in, d.n_out);
-    let links: Vec<_> = delta.links().filter(|l| l.strength() != 0.0).collect();
+    let links: Vec<_> = delta.links().filter(|l| !l.retired() && l.scale() != 0.0).collect();
     let r: usize = links.iter().map(|l| l.factors().2).sum();
     if r == 0 {
         return None;
@@ -65,9 +84,11 @@ fn side_of(d: &DLin, rot: Option<usize>) -> Option<(crate::model::Lin<'static>, 
     let mut down = vec![0f32; rp * n_in];
     let mut up = vec![0f32; n_out * rp];
     let mut k0 = 0;
+    let mut starts = Vec::with_capacity(links.len());
     for l in links {
         let (a, bt, lr) = l.factors();
-        let s = l.strength();
+        let s = l.scale();
+        starts.push((k0, l.strength_handle()));
         for k in 0..lr {
             let row = &mut down[(k0 + k) * n_in..(k0 + k + 1) * n_in];
             row.iter_mut().zip(&a[k * n_in..(k + 1) * n_in]).for_each(|(o, &v)| *o = v * s);
@@ -83,7 +104,12 @@ fn side_of(d: &DLin, rot: Option<usize>) -> Option<(crate::model::Lin<'static>, 
             c.chunks_exact_mut(g).for_each(crate::hadamard::fwht_regular)
         });
     }
-    Some((f16_lin(&down, rp, n_in), f16_lin(&up, n_out, rp), rp))
+    Some(Side {
+        down: f16_lin(&down, rp, n_in),
+        up: f16_lin(&up, n_out, rp),
+        rank: rp,
+        links: starts,
+    })
 }
 
 fn key(d: &DLin) -> usize {
@@ -149,6 +175,28 @@ impl<'a> Twins<'a> {
             let rows: Vec<u32> = (0..d.n_out as u32).collect();
             if d.w.rows(&rows, d.n_in, &mut w) {
                 self.gates.insert(key(d), (w, d.b.clone().unwrap_or_else(|| vec![0.0; d.n_out])));
+                // The LoRA updates (`rows` reads the stored weights alone).
+                let deltas: Vec<_> =
+                    d.w.lora_delta()
+                        .into_iter()
+                        .flat_map(|l| l.links())
+                        .filter(|l| !l.retired() && l.scale() != 0.0)
+                        .map(|l| {
+                            let (a, bt, r) = l.factors();
+                            let mut dw = vec![0f32; d.n_out * d.n_in];
+                            for k in 0..r {
+                                let ak = &a[k * d.n_in..(k + 1) * d.n_in];
+                                for o in 0..d.n_out {
+                                    let b = bt[k * d.n_out + o] * l.scale();
+                                    dw[o * d.n_in..(o + 1) * d.n_in].iter_mut().zip(ak).for_each(|(w, &x)| *w += b * x);
+                                }
+                            }
+                            (dw, l.strength_handle())
+                        })
+                        .collect();
+                if !deltas.is_empty() {
+                    self.gate_deltas.insert(key(d), deltas);
+                }
             }
         } else {
             if let Some((q, s)) = q8_twin(d, self.unit_scales).or_else(|| fp8_twin(d, self.unit_scales)) {
@@ -185,21 +233,41 @@ impl<'a> Twins<'a> {
             // A rotated weight in a format without a twin (NVFP4 ConvRot is not one).
             return None;
         }
+        // Each update's factor now (its adapter's on / off and gain); none on: no side path.
+        let mut side_gains: Vec<(usize, f32)> = Vec::new();
         let side = match self.sides.get(&key(d)) {
-            Some((dn, up, rp)) => {
-                let (rp, n_in, n_out) = (*rp, d.n_in, d.n_out);
-                let plain = |l: &'s crate::model::Lin<'a>, o: usize, i: usize| -> Option<Box<DevLin<'s>>> {
-                    Some(Box::new(DevLin {
-                        w: l.as_ref(),
-                        dev: l.device_weight_unfolded(o, i)?,
-                        n_out: o,
-                        n_in: i,
-                        bias: None,
-                        side: None,
-                        rot: None,
-                    }))
-                };
-                Some((plain(dn, rp, n_in)?, plain(up, n_out, rp)?))
+            Some(sd) => {
+                for (start, st) in &sd.links {
+                    let g = st.factor();
+                    if side_gains.last().is_none_or(|l| l.1 != g) {
+                        side_gains.push((*start, g));
+                    }
+                }
+                if side_gains.iter().all(|g| g.1 == 0.0) {
+                    side_gains.clear();
+                    None
+                } else {
+                    if side_gains.len() > 4 {
+                        return None;
+                    }
+                    if side_gains.iter().all(|g| g.1 == 1.0) {
+                        side_gains.clear();
+                    }
+                    let (rp, n_in, n_out) = (sd.rank, d.n_in, d.n_out);
+                    let plain = |l: &'s crate::model::Lin<'a>, o: usize, i: usize| -> Option<Box<DevLin<'s>>> {
+                        Some(Box::new(DevLin {
+                            w: l.as_ref(),
+                            dev: l.device_weight_unfolded(o, i)?,
+                            n_out: o,
+                            n_in: i,
+                            bias: None,
+                            side: None,
+                            side_gains: Vec::new(),
+                            rot: None,
+                        }))
+                    };
+                    Some((plain(&sd.down, rp, n_in)?, plain(&sd.up, n_out, rp)?))
+                }
             }
             None => None,
         };
@@ -210,13 +278,46 @@ impl<'a> Twins<'a> {
             n_in: d.n_in,
             bias: d.b.as_deref(),
             side,
+            side_gains,
             rot,
         })
     }
 
-    fn attn<'s>(&'s self, a: &'s super::nn::Attn<'a>) -> Option<LtxAttn<'s>> {
+    /// The gates' weights with their LoRA updates at the strengths now (those with updates).
+    fn gate_view(&self) -> &HashMap<usize, Vec<f32>> {
+        let mut keys: Vec<usize> = self.gate_deltas.keys().copied().collect();
+        keys.sort_unstable();
+        let factors: Vec<u32> = keys
+            .iter()
+            .flat_map(|k| self.gate_deltas[k].iter().map(|(_, s)| s.factor().to_bits()))
+            .collect();
+        let mut v = self.gate_views.lock().unwrap_or_else(|e| e.into_inner());
+        let p: *const HashMap<usize, Vec<f32>> = match v.iter().find(|(f, _)| *f == factors) {
+            Some((_, m)) => &**m,
+            None => {
+                let mut m = HashMap::new();
+                for k in keys {
+                    let mut w = self.gates[&k].0.clone();
+                    for (dw, s) in &self.gate_deltas[&k] {
+                        let f = s.factor();
+                        if f != 0.0 {
+                            w.iter_mut().zip(dw).for_each(|(w, &d)| *w += f * d);
+                        }
+                    }
+                    m.insert(k, w);
+                }
+                v.push((factors, Box::new(m)));
+                &*v.last().unwrap().1
+            }
+        };
+        // SAFETY: the boxes are never removed or replaced while `self` lives.
+        unsafe { &*p }
+    }
+
+    fn attn<'s>(&'s self, a: &'s super::nn::Attn<'a>, gv: &'s HashMap<usize, Vec<f32>>) -> Option<LtxAttn<'s>> {
         let g = a.gate.as_ref()?;
         let (gw, gb) = self.gates.get(&key(g))?;
+        let gw = gv.get(&key(g)).unwrap_or(gw);
         Some(LtxAttn {
             q: self.lin(&a.q)?,
             k: self.lin(&a.k)?,
@@ -240,11 +341,12 @@ impl<'a> Twins<'a> {
 
     /// The device's view of a text connector's blocks.
     pub(crate) fn connector<'s>(&'s self, c: &'s super::dit::Connector<'a>) -> Option<Vec<crate::gpu::dit::LtxConnBlock<'s>>> {
+        let gv = self.gate_view();
         c.blocks()
             .iter()
             .map(|(a, f)| {
                 Some(crate::gpu::dit::LtxConnBlock {
-                    attn: self.attn(a)?,
+                    attn: self.attn(a, gv)?,
                     ff: self.ff(f)?,
                 })
             })
@@ -254,20 +356,21 @@ impl<'a> Twins<'a> {
     /// The device's view of `dit`'s blocks.
     pub(crate) fn model<'s>(&'s self, dit: &'s Dit<'a>, half_attention: bool) -> Option<LtxModel<'s>> {
         let mut blocks = Vec::with_capacity(dit.n_blocks());
+        let gv = self.gate_view();
         for i in 0..dit.n_blocks() {
             let (v, a, a2v, v2a) = dit.block_parts(i);
             let stream = |s: (&'s super::nn::Attn<'a>, &'s super::nn::Attn<'a>, &'s super::nn::Ff<'a>)| -> Option<LtxStream<'s>> {
                 Some(LtxStream {
-                    attn1: self.attn(s.0)?,
-                    attn2: self.attn(s.1)?,
+                    attn1: self.attn(s.0, gv)?,
+                    attn2: self.attn(s.1, gv)?,
                     ff: self.ff(s.2)?,
                 })
             };
             blocks.push(LtxBlock {
                 v: stream(v)?,
                 a: stream(a)?,
-                a2v: self.attn(a2v)?,
-                v2a: self.attn(v2a)?,
+                a2v: self.attn(a2v, gv)?,
+                v2a: self.attn(v2a, gv)?,
             });
         }
         Some(LtxModel {

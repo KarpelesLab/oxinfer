@@ -21,6 +21,9 @@ pub struct Lin<'a> {
     pub bias: Option<&'a [f32]>,
     /// A low-rank side path `up (down x)` added to the output (a LoRA), each a layer of its own.
     pub side: Option<(Box<Lin<'a>>, Box<Lin<'a>>)>,
+    /// The side path's gains at run time: `(start, gain)` in increasing `start`, the rank columns
+    /// of `down x` from each `start` on scaled by its `gain` (at most 4; empty: as stored).
+    pub side_gains: Vec<(usize, f32)>,
     /// The weight is stored rotated (ComfyUI's ConvRot): its input goes through the normalized
     /// regular Hadamard transform over consecutive groups of this many values first.
     pub rot: Option<usize>,
@@ -413,6 +416,54 @@ pub trait LtxVaeSession: Send {
     ) -> bool {
         false
     }
+
+    /// The latent upsampler's output (`[t', h', w', m.conv_out.cout]` rows, un-normalized) into
+    /// `out` from un-normalized latents `lat` (`[t, h, w, m.conv_in.cin]` rows); false when
+    /// declined.
+    #[allow(clippy::too_many_arguments)]
+    fn upsample(
+        &mut self,
+        _m: &LtxUpsampler,
+        _lat: &[f32],
+        _t: usize,
+        _h: usize,
+        _w: usize,
+        _out: &mut Vec<f32>,
+        _progress: &mut dyn FnMut(usize, usize),
+    ) -> bool {
+        false
+    }
+}
+
+/// A group norm of LTX-2.5's latent upsamplers: `groups` groups of channels, each over every
+/// frame and position (eps 1e-5), then the per-channel weight and bias.
+pub struct LtxGroupNorm<'a> {
+    pub w: &'a [f32],
+    pub b: &'a [f32],
+    pub groups: usize,
+}
+
+/// A residual block of the latent upsamplers: `silu(x + n2(c2(silu(n1(c1(x))))))`, the
+/// convolutions zero-padded in time.
+pub struct LtxUpRes<'a> {
+    pub c1: LtxVaeConv<'a>,
+    pub n1: LtxGroupNorm<'a>,
+    pub c2: LtxVaeConv<'a>,
+    pub n2: LtxGroupNorm<'a>,
+}
+
+/// LTX-2.5's latent upsampler (`crate::ltx::upsample`) over un-normalized latents: `conv_in`,
+/// `silu(norm_in)`, the `pre` blocks, the upsampling (`spatial`: `up` a 3 x 3 convolution per
+/// frame, its weights `[n_out][ky][kx][cin]`, then 2 x 2 depth-to-space; else a 3 x 3 x 3 one,
+/// then depth-to-space in time with the first frame dropped), the `post` blocks, `conv_out`.
+pub struct LtxUpsampler<'a> {
+    pub conv_in: LtxVaeConv<'a>,
+    pub norm_in: LtxGroupNorm<'a>,
+    pub pre: Vec<LtxUpRes<'a>>,
+    pub up: LtxVaeConv<'a>,
+    pub spatial: bool,
+    pub post: Vec<LtxUpRes<'a>>,
+    pub conv_out: LtxVaeConv<'a>,
 }
 
 /// A step of the VAE encoder after its input convolution.

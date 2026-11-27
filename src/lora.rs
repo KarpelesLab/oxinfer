@@ -89,6 +89,11 @@ impl Strength {
         strength(&self.active, &self.gain, self.scale)
     }
 
+    /// The adapter's factor now: its gain while on, 0 while off (the strength over the scale).
+    pub fn factor(&self) -> f32 {
+        strength(&self.active, &self.gain, 1.0)
+    }
+
     /// Whether `o` always gives the same strength (the same adapter switch, strength and scale).
     pub fn same(&self, o: &Strength) -> bool {
         Arc::ptr_eq(&self.active, &o.active) && Arc::ptr_eq(&self.gain, &o.gain) && self.scale.to_bits() == o.scale.to_bits()
@@ -163,6 +168,11 @@ impl LoraDelta {
     #[inline]
     pub(crate) fn strength(&self) -> f32 {
         strength(&self.active, &self.gain, self.scale)
+    }
+
+    /// This update's fixed scale (its strength is the scale times its adapter's gain while on).
+    pub(crate) fn scale(&self) -> f32 {
+        self.scale
     }
 
     /// Whether this update or one chained after it is switched on (with a nonzero strength).

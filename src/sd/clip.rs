@@ -303,6 +303,7 @@ impl ClipText {
                 n_in: u.n_in,
                 bias: u.bias,
                 side: None,
+                side_gains: Vec::new(),
                 rot: None,
             })
         }

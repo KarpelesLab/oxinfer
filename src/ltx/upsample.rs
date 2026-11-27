@@ -9,6 +9,10 @@
 //! upsampler (spatial: a 3 x 3 convolution per frame to 4x the channels and a 2 x 2 pixel
 //! shuffle; temporal: a 3 x 3 x 3 convolution to 2x and a time shuffle, its first frame dropped),
 //! as many residual blocks again, a convolution back to the latent channels; normalized again.
+//!
+//! With an accelerator's VAE session ([`crate::gpu::dit::LtxVaeSession::upsample`]) the whole
+//! upsampler runs there, the group norms' statistics reduced on the device
+//! (`OXINFER_LTX_UP_GPU=0`: the CPU path).
 
 use super::vae::{Conv3, TPad, Vid, depth_to_space, drop_first_frame};
 use crate::safetensors::ModelFiles;
@@ -89,8 +93,10 @@ impl Res {
 }
 
 enum Upsampler {
-    /// A 3 x 3 convolution per frame to 4x the channels, 2 x 2 pixel shuffle.
-    Spatial(Conv),
+    /// A 3 x 3 convolution per frame to 4x the channels, 2 x 2 pixel shuffle; its kernel also as
+    /// bfloat16 `[n_out][ky][kx][cin]` rows and the bias (`n_out` the outputs rounded up to 64)
+    /// for the device.
+    Spatial(Conv, Vec<u16>, Vec<f32>),
     /// A 3 x 3 x 3 convolution to 2x the channels, time shuffle, first frame dropped.
     Temporal(Conv3),
 }
@@ -138,8 +144,20 @@ impl LatentUpsampler {
                 let [cout, cin, 3, 3] = i.shape[..] else {
                     bail!("{wn}: {:?}", i.shape);
                 };
-                let conv = Conv::from_kernel(&f.f32(wn)?, cout, cin, 3, Some(f.f32("upsampler.0.bias")?))?;
-                (Upsampler::Spatial(conv), [1, 2, 2])
+                let (k, b) = (f.f32(wn)?, f.f32("upsampler.0.bias")?);
+                let rows = cout.next_multiple_of(64);
+                let mut wd = vec![0u16; rows * 9 * cin];
+                for (o, row) in wd.chunks_mut(9 * cin).take(cout).enumerate() {
+                    for c in 0..cin {
+                        for t in 0..9 {
+                            row[t * cin + c] = half::bf16::from_f32(k[(o * cin + c) * 9 + t]).to_bits();
+                        }
+                    }
+                }
+                let mut bd = b.clone();
+                bd.resize(rows, 0.0);
+                let conv = Conv::from_kernel(&k, cout, cin, 3, Some(b))?;
+                (Upsampler::Spatial(conv, wd, bd), [1, 2, 2])
             }
             (false, true) => (Upsampler::Temporal(Conv3::load(f, "upsampler.0")?), [2, 1, 1]),
             _ => bail!("LTX latent upsampler: spatial and temporal at once is not supported"),
@@ -155,15 +173,88 @@ impl LatentUpsampler {
         })
     }
 
-    /// Upsamples un-normalized latents (frames of `[h * w, c]` rows).
+    /// Upsamples un-normalized latents (frames of `[h * w, c]` rows): on the accelerator when
+    /// there is one, else on the CPU.
     pub fn forward(&self, x: &Vid) -> Vid {
+        if std::env::var("OXINFER_LTX_UP_GPU").is_ok_and(|v| v == "0") {
+            return self.forward_cpu(x);
+        }
+        self.forward_device(x).unwrap_or_else(|| self.forward_cpu(x))
+    }
+
+    /// The whole upsampler on the accelerator's VAE session; None when there is none or it
+    /// declined.
+    pub fn forward_device(&self, x: &Vid) -> Option<Vid> {
+        use crate::gpu::dit::{LtxGroupNorm, LtxUpRes, LtxUpsampler, LtxVaeConv};
+        let mut s = crate::gpu::active()?.ltx_vae_session()?;
+        fn conv(c: &Conv3) -> LtxVaeConv<'_> {
+            LtxVaeConv {
+                w: &c.w,
+                bias: &c.bias,
+                cin: c.cin,
+                cout: c.cout,
+            }
+        }
+        fn norm(n: &GroupNorm) -> LtxGroupNorm<'_> {
+            LtxGroupNorm {
+                w: &n.w,
+                b: &n.b,
+                groups: n.groups,
+            }
+        }
+        fn res(rs: &[Res]) -> Vec<LtxUpRes<'_>> {
+            rs.iter()
+                .map(|r| LtxUpRes {
+                    c1: conv(&r.c1),
+                    n1: norm(&r.n1),
+                    c2: conv(&r.c2),
+                    n2: norm(&r.n2),
+                })
+                .collect()
+        }
+        let (up, spatial) = match &self.up {
+            Upsampler::Spatial(c, w, b) => (
+                LtxVaeConv {
+                    w,
+                    bias: b,
+                    cin: c.cin,
+                    cout: c.cout,
+                },
+                true,
+            ),
+            Upsampler::Temporal(c) => (conv(c), false),
+        };
+        let m = LtxUpsampler {
+            conv_in: conv(&self.conv_in),
+            norm_in: norm(&self.norm_in),
+            pre: res(&self.pre),
+            up,
+            spatial,
+            post: res(&self.post),
+            conv_out: conv(&self.conv_out),
+        };
+        let mut out = Vec::new();
+        if !s.upsample(&m, &x.data, x.t, x.h, x.w, &mut out, &mut |_, _| {}) {
+            return None;
+        }
+        let (t, h, w) = if spatial {
+            (x.t, 2 * x.h, 2 * x.w)
+        } else {
+            (2 * x.t - 1, x.h, x.w)
+        };
+        let c = self.conv_out.cout;
+        (out.len() == t * h * w * c).then_some(Vid { t, h, w, c, data: out })
+    }
+
+    /// The upsampler on the CPU kernels.
+    pub fn forward_cpu(&self, x: &Vid) -> Vid {
         let mut h = self.conv_in.forward_pad(x, TPad::Zero);
         self.norm_in.apply(&mut h, true);
         for r in &self.pre {
             h = r.forward(&h);
         }
         h = match &self.up {
-            Upsampler::Spatial(conv) => {
+            Upsampler::Spatial(conv, ..) => {
                 let mut out = Vid::new(h.t, 2 * h.h, 2 * h.w, h.c);
                 let n = out.h * out.w * out.c;
                 for f in 0..h.t {

@@ -2,10 +2,11 @@
 //! (`loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors`, rank 450, for the dev
 //! transformer) and LTX-2.x LoRAs with the same naming (`diffusion_model.<module>.lora_A.weight`
 //! / `.lora_B.weight`, PEFT's `.lora_A.default.weight`, kohya's `.lora_down` / `.lora_up`, an
-//! optional `.alpha`; the file's `lora_alpha` metadata otherwise).
+//! optional `.alpha`; as the release's loader, the file's `lora_alpha` metadata is not applied).
 //!
 //! Every targeted layer keeps its stored weights (mapped bf16, int8 ConvRot, NVFP4) and gains the
-//! float32 side path `y += strength * alpha / rank * B (A x)` ([`crate::lora::LoraDelta`]).
+//! float32 side path `y += strength * B (A x)` (times `alpha / rank` with a module's `.alpha`;
+//! [`crate::lora::LoraDelta`]).
 //! A key that is not a low-rank pair, or a module no layer has, is an error.
 
 use super::dit::Dit;
@@ -41,7 +42,6 @@ pub fn apply_switched(
     let mut total = 0;
     for (path, strength) in loras {
         let st = SafeTensors::open(path, false).with_context(|| format!("open LoRA {}", path.display()))?;
-        let meta_alpha = st.metadata("lora_alpha").and_then(|v| v.parse::<f32>().ok());
         let mut pending: BTreeMap<String, Parts> = BTreeMap::new();
         for name in st.names() {
             let base = PREFIXES.iter().find_map(|p| name.strip_prefix(p)).unwrap_or(name);
@@ -82,9 +82,13 @@ pub fn apply_switched(
                         lin.n_in
                     );
                 }
+                // The release's loader fuses `strength B A` (no alpha): the file's `lora_alpha`
+                // metadata is the rank of its largest updates (450), and the smaller ones (the
+                // gates' rank 32, the patchify layers' 128) are not scaled by it. A module's own
+                // `.alpha` (kohya's files) is applied, as ComfyUI does.
                 let alpha = match &a {
                     Some(n) => tensor_f32(&st, n)?.first().copied().unwrap_or(r as f32),
-                    None => meta_alpha.unwrap_or(r as f32),
+                    None => r as f32,
                 };
                 let s = strength * alpha / r as f32;
                 let down: Vec<f32> = down.iter().map(|v| v * s).collect();
