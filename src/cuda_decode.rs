@@ -1454,7 +1454,11 @@ impl CudaBackend {
                                 && gdn_split != "0"
                             {
                                 gdn_floats = gdn_floats.max(2 * key_dim + 2 * r.nv);
-                                let name = if fast_gemm && gdn_split != "exact" { "dgdn_seqw" } else { "dgdn_seq" };
+                                let name = if fast_gemm && gdn_split != "exact" {
+                                    "dgdn_seqw"
+                                } else {
+                                    "dgdn_seq"
+                                };
                                 self.func(&format!("{name}_{}", r.hdk))?
                             } else {
                                 std::ptr::null_mut()
@@ -2587,7 +2591,11 @@ impl CudaPlan<'_> {
             // One sweep of the weights for up to `MVQT` tokens.
             return (0..t).step_by(super::MVQT as usize).all(|j0| {
                 let nt = (t - j0).min(super::MVQT);
-                let (xq, xd, y) = (xq + (j0 * n_in) as u64, xd + (j0 * (n_in / 32) * 8) as u64, y + 4 * (j0 * ys) as u64);
+                let (xq, xd, y) = (
+                    xq + (j0 * n_in) as u64,
+                    xd + (j0 * (n_in / 32) * 8) as u64,
+                    y + 4 * (j0 * ys) as u64,
+                );
                 match w2 {
                     Some(w2) => be.launch(
                         k.mvqpt,
@@ -2890,7 +2898,9 @@ impl CudaPlan<'_> {
                     let (ga, ua, oa, gs, us, os) = (g.a, u.a, out.a, st(g), st(u), st(out));
                     be.launch(rf.glu, (n.div_ceil(256), bb), 256, &mut args![ga, ua, oa, n, gelu, gs, us, os])
                 }
-                COp::Ew { a, b: eb, out, n, kind, p, .. } if !per_row => {
+                COp::Ew {
+                    a, b: eb, out, n, kind, p, ..
+                } if !per_row => {
                     let (aa, ba, oa, sa, sb, so) = (a.a, eb.a, out.a, st(a), st(eb), st(out));
                     be.launch(
                         rf.ew,
@@ -2912,7 +2922,8 @@ impl CudaPlan<'_> {
                     ..
                 } if !per_row && kv < self.kv.len() => {
                     let kvt = rf.kvt + (kv * self.tokens * 16) as u64;
-                    let (qa, oa, ko, vo, qn, kn, cs, sp, qs, os) = (qkv.a, qo.a, kout.a, vout.a, qn.a, kn.a, cs.a, self.sp, st(qkv), st(qo));
+                    let (qa, oa, ko, vo, qn, kn, cs, sp, qs, os) =
+                        (qkv.a, qo.a, kout.a, vout.a, qn.a, kn.a, cs.a, self.sp, st(qkv), st(qo));
                     be.launch(
                         rf.qk,
                         (p.nh + 2 * p.nkv, bb),
@@ -2997,7 +3008,11 @@ impl CudaPlan<'_> {
             for (i, (m, c)) in ms.kv.iter_mut().zip(r.kv.iter_mut()).enumerate() {
                 let row = self.kv[i].0 * self.kv[i].1;
                 let tr = self.tokens * row;
-                c.push(&kvo[o + j * row..o + (j + 1) * row], &kvo[o + tr + j * row..o + tr + (j + 1) * row], 1);
+                c.push(
+                    &kvo[o + j * row..o + (j + 1) * row],
+                    &kvo[o + tr + j * row..o + tr + (j + 1) * row],
+                    1,
+                );
                 c.kept = c.len;
                 m.synced = r.pos + 1;
                 o += 2 * tr;

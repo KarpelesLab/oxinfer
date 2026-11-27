@@ -205,7 +205,13 @@ impl QwenModel<'_> {
             .collect();
         let mut hidden = crate::kernels::zeros(b * h);
         let mut logits = crate::kernels::zeros(b * v);
-        type Part<'a> = (&'a mut crate::gpu::decode::Slot, Vec<&'a mut LayerCache>, Vec<&'a mut [f32]>, usize, bool);
+        type Part<'a> = (
+            &'a mut crate::gpu::decode::Slot,
+            Vec<&'a mut LayerCache>,
+            Vec<&'a mut [f32]>,
+            usize,
+            bool,
+        );
         let mut parts: Vec<Part> = sess
             .iter_mut()
             .map(|s| {

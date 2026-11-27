@@ -3338,12 +3338,27 @@ mod tests {
             hdv: u32,
         }
         let mut seed = 77;
-        for (nk, nv, hdk, hdv, flags) in [(4usize, 4usize, 128usize, 128usize, 0u32), (2, 4, 128, 128, 1), (4, 4, 128, 96, 0), (4, 4, 64, 128, 0), (2, 4, 64, 96, 1), (2, 6, 32, 64, 2), (3, 3, 128, 256, 3)] {
+        for (nk, nv, hdk, hdv, flags) in [
+            (4usize, 4usize, 128usize, 128usize, 0u32),
+            (2, 4, 128, 128, 1),
+            (4, 4, 128, 96, 0),
+            (4, 4, 64, 128, 0),
+            (2, 4, 64, 96, 1),
+            (2, 6, 32, 64, 2),
+            (3, 3, 128, 256, 3),
+        ] {
             let nt = 37usize;
             let key_dim = nk * hdk;
             let (cn, zn) = (2 * key_dim + nv * hdv, nv * hdv);
             // Rows a few floats apart, as a plan's (64-float aligned) rows are.
-            let (cs, zs, bs, as_, os, ss) = (cn + 16, zn + 16, nv + 16, nv + 32, zn + 48, (2 * key_dim + 2 * nv).next_multiple_of(16));
+            let (cs, zs, bs, as_, os, ss) = (
+                cn + 16,
+                zn + 16,
+                nv + 16,
+                nv + 32,
+                zn + 48,
+                (2 * key_dim + 2 * nv).next_multiple_of(16),
+            );
             let c: Vec<f32> = (0..nt * cs).map(|_| rnd(&mut seed) * 2.0).collect();
             let z: Vec<f32> = (0..nt * zs).map(|_| rnd(&mut seed) * 3.0).collect();
             let b: Vec<f32> = (0..nt * bs).map(|_| rnd(&mut seed) * 4.0).collect();
@@ -3403,11 +3418,21 @@ mod tests {
             let (o0, o1) = (down(do0, nt * os), down(do1, nt * os));
             let (s0, s1) = (down(ds0, st0.len()), down(ds1, st0.len()));
             assert!(o0.iter().any(|&v| v != 0.0) && o0.iter().all(|v| v.is_finite()), "{hdk} x {hdv}");
-            assert!(s0.iter().zip(&s1).all(|(a, b)| a.to_bits() == b.to_bits()), "states differ at {hdk} x {hdv}");
+            assert!(
+                s0.iter().zip(&s1).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "states differ at {hdk} x {hdv}"
+            );
             if hdv.is_power_of_two() {
-                assert!(o0.iter().zip(&o1).all(|(a, b)| a.to_bits() == b.to_bits()), "outputs differ at {hdk} x {hdv}");
+                assert!(
+                    o0.iter().zip(&o1).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "outputs differ at {hdk} x {hdv}"
+                );
             } else {
-                let worst = o0.iter().zip(&o1).map(|(a, b)| (a - b).abs() / a.abs().max(1e-3)).fold(0f32, f32::max);
+                let worst = o0
+                    .iter()
+                    .zip(&o1)
+                    .map(|(a, b)| (a - b).abs() / a.abs().max(1e-3))
+                    .fold(0f32, f32::max);
                 assert!(worst < 1e-6, "outputs differ at {hdk} x {hdv}: {worst:e}");
             }
             assert!(s0.iter().zip(&st0).any(|(a, b)| a != b));
@@ -3826,7 +3851,11 @@ mod tests {
                         assert!(be.htod(dy, &y0));
                         for j0 in (0..t).step_by(MVQT as usize) {
                             let nt = (t - j0).min(MVQT as usize) as u32;
-                            let (xq, xd, dy) = (xq + (j0 * n_in) as u64, xd + (j0 * nb * 8) as u64, dy + (j0 * ysu as usize * 4) as u64);
+                            let (xq, xd, dy) = (
+                                xq + (j0 * n_in) as u64,
+                                xd + (j0 * nb * 8) as u64,
+                                dy + (j0 * ysu as usize * 4) as u64,
+                            );
                             let mut a = [
                                 &w as *const _ as *mut c_void,
                                 &xq as *const _ as *mut c_void,
@@ -3843,8 +3872,16 @@ mod tests {
                         let mut yt = vec![0f32; t * n_out];
                         assert!(be.dtoh(&mut yt, dy));
                         let n = yt.iter().zip(&y).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-                        let worst = yt.iter().zip(&y).map(|(a, b)| (a - b).abs() / b.abs().max(1e-3)).fold(0f32, f32::max);
-                        assert!(n == 0, "{kind} mvqt mode {mode}: {n} of {} values differ from mvq's, by up to {worst:e}", y.len());
+                        let worst = yt
+                            .iter()
+                            .zip(&y)
+                            .map(|(a, b)| (a - b).abs() / b.abs().max(1e-3))
+                            .fold(0f32, f32::max);
+                        assert!(
+                            n == 0,
+                            "{kind} mvqt mode {mode}: {n} of {} values differ from mvq's, by up to {worst:e}",
+                            y.len()
+                        );
                     }
                     // Three at once (`mvq3`: W, W2, W into three outputs): each the same bits as
                     // its own launch (W's), W2's within the same bound of its definition.
@@ -3948,7 +3985,11 @@ mod tests {
                         assert!(be.htod(dy, &y0));
                         for j0 in (0..t).step_by(MVQT as usize) {
                             let nt = (t - j0).min(MVQT as usize) as u32;
-                            let (xq, xd, dy) = (xq + (j0 * n_in) as u64, xd + (j0 * nb * 8) as u64, dy + (j0 * ysu as usize * 4) as u64);
+                            let (xq, xd, dy) = (
+                                xq + (j0 * n_in) as u64,
+                                xd + (j0 * nb * 8) as u64,
+                                dy + (j0 * ysu as usize * 4) as u64,
+                            );
                             let mut a = [
                                 &w as *const _ as *mut c_void,
                                 &wg2 as *const _ as *mut c_void,
@@ -4531,8 +4572,14 @@ mod tests {
                 assert_eq!(b.cache.len, starts[j] + steps);
                 assert!(same(&a.hs, &b.hs), "{what} rows: sequence {j}'s hidden states differ");
                 assert!(same(a.cache.data().0, b.cache.data().0), "{what} rows: sequence {j}'s keys differ");
-                assert!(same(a.cache.data().1, b.cache.data().1), "{what} rows: sequence {j}'s values differ");
-                assert!(same(&a.s0, &b.s0) && same(&a.s1, &b.s1), "{what} rows: sequence {j}'s states differ");
+                assert!(
+                    same(a.cache.data().1, b.cache.data().1),
+                    "{what} rows: sequence {j}'s values differ"
+                );
+                assert!(
+                    same(&a.s0, &b.s0) && same(&a.s1, &b.s1),
+                    "{what} rows: sequence {j}'s states differ"
+                );
             }
         }
         // An input the GEMMs cannot take (here not a number) declines the step and leaves the
