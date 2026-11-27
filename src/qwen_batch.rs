@@ -149,6 +149,9 @@ impl QwenModel<'_> {
     pub fn forward_batch(&self, sess: &mut [&mut QwenSession], tokens: &[u32]) -> Vec<Vec<f32>> {
         let b = tokens.len();
         assert!(b > 0 && sess.len() == b, "one token per session");
+        if self.is_front() {
+            return self.split_batch(sess, tokens);
+        }
         let one_by_one =
             |sess: &mut [&mut QwenSession]| -> Vec<Vec<f32>> { sess.iter_mut().zip(tokens).map(|(s, &t)| self.forward(s, &[t])).collect() };
         if b == 1 {

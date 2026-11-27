@@ -246,8 +246,8 @@ impl TextLm for QwenModel<'_> {
     fn prefill_chunk(&self, chunk: usize) -> usize {
         QwenModel::prefill_chunk(self, chunk)
     }
-    fn prefill_hidden(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])], _last: bool) -> Vec<f32> {
-        QwenModel::prefill_hidden(self, sess, tokens, mm)
+    fn prefill_hidden(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])], last: bool) -> Vec<f32> {
+        QwenModel::prefill_hidden_last(self, sess, tokens, mm, last)
     }
     fn forward(&self, sess: &mut QwenSession, tokens: &[u32]) -> Vec<f32> {
         QwenModel::forward(self, sess, tokens)

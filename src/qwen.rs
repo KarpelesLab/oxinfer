@@ -130,6 +130,9 @@ pub(crate) enum Ffn<'a> {
 
 pub(crate) use crate::moe::NeedExperts;
 
+#[path = "qwen_split.rs"]
+mod split_part;
+pub(crate) use split_part::Part;
 #[path = "qwen_batch.rs"]
 pub(crate) mod batch;
 
@@ -254,6 +257,8 @@ pub struct QwenModel<'a> {
     pub(crate) exp: Option<Box<crate::qwen4exp::Exp<'a>>>,
     /// LoRA modules of the MTP layer, kept until it loads (see [`QwenModel::mtp_loras`]).
     mtp_loras: std::sync::Mutex<Vec<crate::lora::LoraAdapter>>,
+    /// The whole model, or one side of a model split across two machines ([`crate::split`]).
+    pub(crate) part: Part,
 }
 
 /// Attaches `ad`'s modules of a full-attention block at `p` (`layers.N.self_attn.`): `dims` are
@@ -581,6 +586,9 @@ pub struct QwenSession {
     /// Checkpoints of earlier positions, lowest first ([`QwenSession::checkpoint`]; shared by
     /// the session's copies).
     pub(crate) checkpoints: Vec<std::sync::Arc<Checkpoint>>,
+    /// The session's other half on a worker, when the model is the front of a split one
+    /// ([`crate::split`]).
+    pub(crate) split: Option<crate::split::Sess>,
 }
 
 /// What a session with recurrent layers cannot rebuild of an earlier position once it has gone
@@ -711,7 +719,12 @@ impl QwenSession {
     /// (whose state cannot be cut back otherwise), and is not Qwen4-Exp's (n-gram and indexer
     /// state) nor fed explicit positions.
     pub fn checkpointable(&self) -> bool {
-        self.exp.is_none() && self.positions.is_none() && self.gdn.iter().any(Option::is_some)
+        self.exp.is_none() && self.positions.is_none() && (self.gdn.iter().any(Option::is_some) || self.split_recurrent())
+    }
+
+    /// The model is split and some layer of its other half keeps a recurrent state.
+    fn split_recurrent(&self) -> bool {
+        self.split.as_ref().is_some_and(|s| s.recurrent)
     }
 
     /// Takes a [`Checkpoint`] of the current position (none when there is one already, `max` is
@@ -729,6 +742,12 @@ impl QwenSession {
         if std::env::var_os("OXINFER_DEBUG").is_some() {
             let floats: usize = states.iter().map(|(s, c)| s.len() + c.len()).sum();
             eprintln!("[Qwen: checkpoint of position {pos}, {:.1} MB]", floats as f64 * 4e-6);
+        }
+        // The other half of a split model takes its own, of the same position.
+        if let Some(sp) = &self.split
+            && let Err(e) = sp.checkpoint(pos, max)
+        {
+            panic!("split: the worker failed to take a checkpoint: {e:#}");
         }
         let at = self.checkpoints.partition_point(|c| c.pos < pos);
         self.checkpoints.insert(at, std::sync::Arc::new(Checkpoint { pos, states }));
@@ -769,7 +788,7 @@ impl QwenSession {
         if len >= self.pos {
             return Ok(());
         }
-        if self.gdn.iter().all(Option::is_none) && self.exp.is_none() {
+        if self.gdn.iter().all(Option::is_none) && self.exp.is_none() && !self.split_recurrent() {
             return self.rewind(len);
         }
         let Some(cp) = self.checkpoints.iter().find(|c| c.pos == len).cloned() else {
@@ -945,6 +964,28 @@ impl<'a> Loader<'a, '_> {
 
 impl<'a> QwenModel<'a> {
     pub fn load(cfg: QwenConfig, files: &'a ModelFiles, quant: Quant) -> Result<Self> {
+        let all = 0..cfg.num_hidden_layers;
+        Self::load_part(cfg, files, quant, all, None)
+    }
+
+    /// [`Self::load`] of layers `range` only, for one side of a model split across two machines
+    /// ([`crate::split`]): with `front` (the worker that runs the rest) the first layers, which
+    /// end with the residual stream instead of the final norm; without, the last ones (or all
+    /// of them). The model then counts its own layers only (`cfg.num_hidden_layers`).
+    pub(crate) fn load_part(
+        mut cfg: QwenConfig,
+        files: &'a ModelFiles,
+        quant: Quant,
+        range: std::ops::Range<usize>,
+        front: Option<std::sync::Arc<crate::split::Client>>,
+    ) -> Result<Self> {
+        let total = cfg.num_hidden_layers;
+        let whole = range == (0..total);
+        if !whole {
+            split_part::check(&cfg, &range, front.is_some())?;
+        }
+        // Some layer of the whole model keeps a recurrent state.
+        let recurrent = (0..total).any(|l| !cfg.is_full(l));
         let quant = Quant::stored(files).unwrap_or(quant);
         let ld = Loader { files, cfg: &cfg, quant };
         let prefix = if ld.has("model.language_model.embed_tokens.weight") {
@@ -1003,8 +1044,8 @@ impl<'a> QwenModel<'a> {
         let (key_dim, value_dim) = (nk * hdk, nv * hdv);
         let conv_dim = 2 * key_dim + value_dim;
         let kc = cfg.linear_conv_kernel_dim;
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for l in 0..cfg.num_hidden_layers {
+        let mut layers = Vec::with_capacity(range.len());
+        for l in range.clone() {
             let lp = format!("{prefix}layers.{l}.");
             if let Some(lf) = &cfg.lfm3 {
                 let mixer = if cfg.is_conv(l) {
@@ -1146,6 +1187,18 @@ impl<'a> QwenModel<'a> {
                 unclaimed.join(", ")
             );
         }
+        let part = match front {
+            _ if whole => Part::Whole,
+            Some(client) => Part::Front { client, recurrent },
+            None => Part::Tail,
+        };
+        if !whole {
+            // From here on the model is its own layers.
+            if let Some(t) = &mut cfg.layer_types {
+                *t = t[range.clone()].to_vec();
+            }
+            cfg.num_hidden_layers = range.len();
+        }
         Ok(Self {
             cfg,
             quant,
@@ -1160,6 +1213,7 @@ impl<'a> QwenModel<'a> {
             stream_choice: Default::default(),
             exp,
             mtp_loras: Default::default(),
+            part,
         })
     }
 
@@ -1393,6 +1447,10 @@ impl<'a> QwenModel<'a> {
             deepstack: None,
             exp: self.exp.as_ref().map(|e| Box::new(e.new_session(cfg))),
             checkpoints: Vec::new(),
+            split: match &self.part {
+                Part::Front { client, recurrent } => Some(crate::split::Sess::new(client, *recurrent)),
+                _ => None,
+            },
         }
     }
 
@@ -1859,6 +1917,14 @@ impl<'a> QwenModel<'a> {
             steer(&mut g, 2 * li + 2);
             capture(&mut g, li);
         }
+        if self.is_front() {
+            // The first layers of a split model: the pass ends with the residual stream, which
+            // the worker takes from there.
+            g.hidden = x;
+            g.head_from = g.ops.len();
+            g.units.push((g.ops.len(), self.layers.len()));
+            return Some(g);
+        }
         g.ops.push(Op::norm(x, hidden, &self.final_norm, h, eps));
         g.head_from = g.ops.len();
         g.units.push((g.ops.len(), self.layers.len()));
@@ -1921,6 +1987,7 @@ impl<'a> QwenModel<'a> {
         if !crate::gpu::decode_chain_enabled()
             || !self.gpu_decode_on()
             || crate::gpu::decode::check()
+            || self.is_front()
             || self.exp.is_some()
             || self.stream.is_some()
             || sess.iv.active()
@@ -1969,6 +2036,18 @@ impl<'a> QwenModel<'a> {
     /// Runs token `tok` through the GPU decode plan: the final-normed hidden state and, if
     /// wanted, the logits. None (nothing changed) when GPU decoding is off or unavailable.
     fn gpu_step(&self, sess: &mut QwenSession, tok: u32, want_logits: bool) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
+        self.gpu_step_x(sess, tok, None, want_logits)
+    }
+
+    /// [`Self::gpu_step`] with the input row given (`row`: the residual stream the first layer
+    /// takes, instead of `tok`'s embedding; the last layers of a split model).
+    pub(crate) fn gpu_step_x(
+        &self,
+        sess: &mut QwenSession,
+        tok: u32,
+        row: Option<&[f32]>,
+        want_logits: bool,
+    ) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
         if !self.gpu_decode_on() {
             return None;
         }
@@ -1989,11 +2068,14 @@ impl<'a> QwenModel<'a> {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let mut x = vec![0f32; h];
-        self.embed.row(tok as usize, &mut x);
+        match row {
+            Some(r) => x.copy_from_slice(r),
+            None => self.embed.row(tok as usize, &mut x),
+        }
         let (mut cs, sin) = self.rope_cs(&sess.spans, sess.pos, 1);
         cs.extend_from_slice(&sin);
         let mut hidden = vec![0f32; h];
-        let mut logits = want_logits.then(|| vec![0f32; cfg.vocab_size]);
+        let mut logits = (want_logits && !self.is_front()).then(|| vec![0f32; cfg.vocab_size]);
         let kept = sess.gpu_states_kept;
         let mut kv: Vec<&mut LayerCache> = sess.kv.iter_mut().flatten().collect();
         let mut states: Vec<&mut [f32]> = sess
@@ -2423,6 +2505,9 @@ impl<'a> QwenModel<'a> {
     }
 
     pub fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+        if self.is_front() {
+            return self.split_logits(hidden, t);
+        }
         let _unit = crate::stream::enter(&self.stream, self.layers.len());
         let _timer = prof::start(Cat::Head);
         let mut logits = crate::kernels::zeros_from(t * self.cfg.vocab_size, 1 << 16);
@@ -2447,6 +2532,9 @@ impl<'a> QwenModel<'a> {
     /// one is active and the weights do not stream (a draft's head: the drafts may differ from
     /// the CPU's in the last bits, the verification keeps the output exact).
     pub fn logits_device(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+        if self.is_front() {
+            return self.split_logits(hidden, t);
+        }
         if self.stream.is_none() && t <= 4 && self.cfg.granite_scales().is_none() {
             let _timer = prof::start(Cat::Head);
             let (v, h) = (self.cfg.vocab_size, self.cfg.hidden_size);
@@ -2460,6 +2548,11 @@ impl<'a> QwenModel<'a> {
     }
 
     pub fn forward(&self, sess: &mut QwenSession, tokens: &[u32]) -> Vec<f32> {
+        if self.is_front() {
+            return self
+                .split_pass(sess, tokens, &[], crate::split::Entry::Forward, true, crate::split::Rows::None)
+                .logits;
+        }
         let t = tokens.len();
         let t0 = crate::clock::Instant::now();
         let measure = t == 1 && self.choosing_device() && self.stream_choice.measuring();
@@ -2493,6 +2586,11 @@ impl<'a> QwenModel<'a> {
 
     /// Final-normed hidden states `[t, hidden]` for `tokens` appended at `sess.pos`.
     pub fn forward_hidden_mm(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
+        if self.is_front() {
+            return self
+                .split_pass(sess, tokens, mm, crate::split::Entry::Hidden, false, crate::split::Rows::All)
+                .rows;
+        }
         self.forward_impl(sess, tokens, mm, false, true)
     }
 
@@ -2500,10 +2598,14 @@ impl<'a> QwenModel<'a> {
     /// back to any position inside `tokens` (speculative verification): one copy of the Gated
     /// DeltaNet states, and a replay of the kept tokens' delta rule on rewind.
     pub fn forward_hidden_rec(&self, sess: &mut QwenSession, tokens: &[u32]) -> Vec<f32> {
+        // (Nothing rewinds inside a pass of a split model: speculative decoding is off there.)
+        if self.is_front() {
+            return self.forward_hidden_mm(sess, tokens, &[]);
+        }
         self.forward_impl(sess, tokens, &[], true, true)
     }
 
-    fn forward_impl(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])], record: bool, gpu: bool) -> Vec<f32> {
+    pub(crate) fn forward_impl(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])], record: bool, gpu: bool) -> Vec<f32> {
         let t = tokens.len();
         assert!(t > 0);
         sess.gpu_rec = None;
@@ -2687,7 +2789,10 @@ impl<'a> QwenModel<'a> {
                 s.prefetch_parts(l + 1, &m.predict(&x, t, h, &next.ln_post, eps));
             }
         }
-        rmsnorm_f32w_rows(&x.clone(), h, &self.final_norm, eps, &mut x);
+        // (The first layers of a split model end with the residual stream.)
+        if !self.is_front() {
+            rmsnorm_f32w_rows(&x.clone(), h, &self.final_norm, eps, &mut x);
+        }
         sess.rec_span = if record { Some((start, t)) } else { None };
         sess.pos += t;
         x
@@ -3199,6 +3304,22 @@ impl QwenModel<'_> {
     /// [`crate::generate::TextLm::prefill_hidden`]: a chunk of fewer tokens than
     /// [`PREFILL_GPU_MIN`] runs on the prefill plan too (see [`crate::model::small_prompt_gpu`]).
     pub fn prefill_hidden(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
+        self.prefill_hidden_last(sess, tokens, mm, true)
+    }
+
+    /// [`Self::prefill_hidden`]; without `last` nothing reads the chunk's hidden states: the
+    /// front of a split model then does not wait for the worker's half of the chunk, and what is
+    /// returned means nothing.
+    pub fn prefill_hidden_last(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])], last: bool) -> Vec<f32> {
+        if self.is_front() {
+            let want = if last { crate::split::Rows::Last } else { crate::split::Rows::None };
+            return self.split_pass(sess, tokens, mm, crate::split::Entry::Prefill, false, want).rows;
+        }
+        self.prefill_hidden_local(sess, tokens, mm)
+    }
+
+    /// [`Self::prefill_hidden`] of this model's own layers.
+    pub(crate) fn prefill_hidden_local(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
         let t = tokens.len();
         if (2..PREFILL_GPU_MIN).contains(&t)
             && self.exp.is_none()
@@ -3208,7 +3329,7 @@ impl QwenModel<'_> {
         {
             return hs;
         }
-        self.forward_hidden_mm(sess, tokens, mm)
+        self.forward_impl(sess, tokens, mm, false, true)
     }
 }
 
@@ -3344,6 +3465,9 @@ impl crate::snapshot::SessionState for QwenSession {
         if self.exp.is_some() || self.positions.is_some() {
             bail!("session snapshots are not supported for Qwen4-Exp models or explicit positions");
         }
+        if self.split.is_some() {
+            bail!("session snapshots are not supported for a model split across two machines");
+        }
         w.u64s("qwen.pos", &[self.pos as u64])?;
         let spans: Vec<u64> = self.spans.iter().flat_map(|s| [s.start as u64, s.gh as u64, s.gw as u64]).collect();
         w.u64s("qwen.spans", &spans)?;
@@ -3363,6 +3487,9 @@ impl crate::snapshot::SessionState for QwenSession {
     fn read_state(&mut self, r: &mut crate::snapshot::SnapReader) -> Result<()> {
         if self.exp.is_some() {
             bail!("session snapshots are not supported for Qwen4-Exp models");
+        }
+        if self.split.is_some() {
+            bail!("session snapshots are not supported for a model split across two machines");
         }
         let pos = r.u64s_exact("qwen.pos", 1)?[0] as usize;
         let spans = r.u64s("qwen.spans", 3 << 20)?;

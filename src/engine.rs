@@ -354,6 +354,15 @@ pub struct EngineOptions {
     /// not Mistral Large 4, Qwen4-Exp, Core ML, nor the Gemma 4 assistant drafter's state (none:
     /// it keeps no cache).
     pub prompt_cache: Option<PathBuf>,
+    /// Dense Qwen-path models (Qwen3, Qwen3.5 / 3.6 / 3.8, Llama): run the model across two
+    /// machines ([`crate::split`], docs/cluster.md). The value is the `HOST:PORT` of an `oxinfer
+    /// split-worker` that holds the same model and runs its last layers; this side loads the
+    /// layers before those. Plain decoding only: drafts, MTP, prompt lookup, adapters,
+    /// interventions, weight streaming and the prompt cache are refused or off. Key `split`.
+    pub split: Option<String>,
+    /// The worker's key ([`EngineOptions::split`]; default `$OXINFER_SPLIT_KEY`). Key
+    /// `split_key`.
+    pub split_key: Option<String>,
     /// Size cap of the prompt cache in GB (default [`crate::snapshot::DEFAULT_CAP_GB`]). Key
     /// `prompt_cache_gb`.
     pub prompt_cache_gb: Option<f64>,
@@ -545,6 +554,8 @@ impl Default for EngineOptions {
             loras: Vec::new(),
             lora_merge: false,
             interventions: None,
+            split: None,
+            split_key: None,
             lookup: None,
             lookup_tokens: None,
             lookup_min_match: None,
@@ -578,6 +589,42 @@ fn parse_opt_usize(key: &str, v: &str) -> Result<Option<usize>> {
 impl EngineOptions {
     /// The weight streaming in effect ([`EngineOptions::stream_mode`]): None for none, else its
     /// settings. `default` is what the family streams with when left to decide (`auto`).
+    /// These options for the front of a split model ([`EngineOptions::split`]): plain decoding
+    /// of mapped weights. An error names what was asked for that a split model does not do.
+    fn for_split(&self) -> Result<EngineOptions> {
+        let no = |what: &str| -> Result<EngineOptions> { bail!("split: {what} not supported for a model split across two machines") };
+        if self.mtp || self.mtp_from.is_some() {
+            return no("MTP speculative decoding (mtp) is");
+        }
+        if self.draft.as_deref().is_some_and(|d| d != "none") {
+            return no("drafts (draft) are");
+        }
+        if self.lookup == Some(true) {
+            return no("prompt lookup (lookup) is");
+        }
+        if !self.loras.is_empty() {
+            return no("LoRA adapters (lora) are");
+        }
+        if self.decision_from.is_some() {
+            return no("decisions (decision_from) are");
+        }
+        if self.interventions.is_some() {
+            return no("interventions are");
+        }
+        if self.prompt_cache.is_some() {
+            return no("the prompt cache (prompt_cache; none turns it off for this model) is");
+        }
+        if self.stream_mode == StreamMode::On || self.stream.is_some() {
+            return no("weight streaming (stream) is");
+        }
+        let mut o = self.clone();
+        o.draft = Some("none".into());
+        o.lookup = Some(false);
+        o.stream_mode = StreamMode::Off;
+        o.mmap = true;
+        Ok(o)
+    }
+
     pub fn effective_stream(&self, default: Option<crate::stream::StreamOptions>) -> Option<crate::stream::StreamOptions> {
         match self.stream_mode {
             StreamMode::Off => None,
@@ -647,6 +694,8 @@ impl EngineOptions {
         "prompt_cache_gb",
         "prompt_cache_min_tokens",
         "prompt_checkpoints",
+        "split",
+        "split_key",
     ];
 
     /// Sets an option by name (see the field docs for the keys). Unknown keys are errors.
@@ -847,6 +896,8 @@ impl EngineOptions {
                 }
             }
             "prompt_cache_min_tokens" => self.prompt_cache_min_tokens = parse_opt_usize(key, value)?,
+            "split" => self.split = opt_str(value).filter(|v| v != "none" && v != "off"),
+            "split_key" => self.split_key = opt_str(value),
             "prompt_checkpoints" => {
                 self.prompt_checkpoints = match value.trim() {
                     "" | "auto" => None,
@@ -1962,6 +2013,14 @@ impl Engine {
     /// (`org/name`, or `org/name:QUANT` for a GGUF repo) fetched into the cache.
     pub fn load(model: &str, opts: &EngineOptions) -> Result<Engine> {
         let t0 = Instant::now();
+        let split_opts;
+        let opts = match &opts.split {
+            Some(_) => {
+                split_opts = opts.for_split()?;
+                &split_opts
+            }
+            None => opts,
+        };
         let dir = resolve_model_with(model, opts.cache_dir.as_deref(), &opts.mmproj)?;
         let no_mmproj = crate::pixtral::Mmproj::None;
         let side_dir = opts
@@ -2068,6 +2127,9 @@ impl Engine {
                 "{}: the chat template is not Granite 4's (ChatML); Granite 3's chat format is not supported",
                 dir.display()
             );
+        }
+        if opts.split.is_some() && !matches!(family, Family::Qwen | Family::Llama) {
+            bail!("split: running a model across two machines is for dense Qwen, Qwen3.5 / 3.8 and Llama models, not {model_type}");
         }
         if !opts.loras.is_empty()
             && !matches!(
@@ -2246,7 +2308,18 @@ impl Engine {
             }
             // Llama 3 runs on the Qwen3 code path (see `crate::qwen`).
             Family::Qwen | Family::Llama => {
-                let mut model = QwenModel::load(config::QwenConfig::load(&dir)?, files, opts.quant)?;
+                let mut model = match &opts.split {
+                    // The first layers here, the rest on the worker, which says where it starts.
+                    Some(addr) => {
+                        let key = opts
+                            .split_key
+                            .clone()
+                            .or_else(|| std::env::var("OXINFER_SPLIT_KEY").ok())
+                            .unwrap_or_default();
+                        crate::split::load_front(&dir, files, opts.quant, addr, &key)?
+                    }
+                    None => QwenModel::load(config::QwenConfig::load(&dir)?, files, opts.quant)?,
+                };
                 let c = &model.cfg;
                 let base = BaseCheck {
                     hidden_size: c.hidden_size,
@@ -5041,7 +5114,8 @@ mod tests {
                 "prefill_gemm" => "sme",
                 "kv_cache" => "q8",
                 "gpu_kv" => "f16",
-                "mtp_from" | "draft" | "cache_dir" | "decision_from" => "x",
+                "mtp_from" | "draft" | "cache_dir" | "decision_from" | "split_key" => "x",
+                "split" => "127.0.0.1:1",
                 "interventions" => r#"{"neurons":[{"layer":1,"neuron":2,"op":"zero"}]}"#,
                 _ => "1",
             };

@@ -50,6 +50,7 @@ mod qwen_image_cli;
 mod sd3_cli;
 #[cfg(feature = "server")]
 mod server_cli;
+mod split_cli;
 mod step1x_cli;
 #[cfg(feature = "media")]
 mod tts_cli;
@@ -1585,6 +1586,10 @@ fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("web") {
         let rest: Vec<String> = std::env::args().skip(2).filter(|a| !is_global_flag(a)).collect();
         return web_cli::run(&rest, "web", true);
+    }
+    if std::env::args().nth(1).as_deref() == Some("split-worker") {
+        let rest: Vec<String> = std::env::args().skip(2).filter(|a| !is_global_flag(a)).collect();
+        return split_cli::run(&rest);
     }
     if std::env::args().nth(1).as_deref() == Some("depth") {
         let rest: Vec<String> = std::env::args().skip(2).filter(|a| !is_global_flag(a)).collect();
