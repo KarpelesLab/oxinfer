@@ -4,7 +4,8 @@
 examples/longcat_avatar_check.rs.
 
 usage: longcat_avatar_ref.py REF_REPO AVATAR_DIR BASE_DIR OUT_DIR [--int8] [--frames N]
-           [--stages text,audio,vae,dit,e2e,avc] [--f32 text,vae] [--seconds S]
+           [--stages text,audio,vae,dit,e2e,avc,e2e_f32] [--f32 text,vae,dit]
+           [--seconds S]
 
 REF_REPO is a checkout of the reference repository (its `assets/avatar/single` example is the
 input), AVATAR_DIR the release (`base_model/`, `base_model_int8/`, `loraA/`, `loraB/`,
@@ -220,7 +221,7 @@ if "vae" in stages:
     flush()
 
 # ---- transformer ------------------------------------------------------------------------------------
-if stages & {"dit", "e2e", "avc"}:
+if stages & {"dit", "e2e", "avc", "e2e_f32"}:
     t0 = time.time()
     if args.int8:
         dit = load_quantized_dit(args.avatar, subfolder="base_model_int8", cp_split_hw=[1, 1])
@@ -239,6 +240,48 @@ if stages & {"dit", "e2e", "avc"}:
 
     with torch.no_grad():
         cond = pipe.normalize_latents(vae.encode(pixels.unsqueeze(2).to(dev, bf16)).latent_dist.mode().float())
+
+    def lora_reset():
+        dit.disable_all_loras()
+        dit.lora_dict.clear()
+        dit.lora_mix_config = None
+        dit._lora_mix_active = None
+
+    def lora_load():
+        dit.load_lora(os.path.join(args.avatar, "loraA", "lora.safetensors"), "dmd", multiplier=1.0, lora_network_dim=128, lora_network_alpha=64)
+        dit.load_lora(os.path.join(args.avatar, "loraB", "lora.safetensors"), "opsd", multiplier=1.0, lora_network_dim=128, lora_network_alpha=64)
+        dit.enable_lora_mix("dmd", "opsd", 1.0, 4)
+
+    def dit_f32():
+        # Float32 activations on the weights as stored: the LoRAs dropped (enabling them cast their
+        # factors to bfloat16 in place; they are read again when next loaded) and the transformer's
+        # float tensors read again from the files (the loaders cast them to bfloat16).
+        from safetensors.torch import load_file
+
+        lora_reset()
+        dit.float()
+        sub = os.path.join(args.avatar, "base_model_int8" if args.int8 else "base_model")
+        # One file at a time: the bf16 transformer is 63 GB in float32, beside which the whole
+        # state dict and its float32 copy do not fit in a DGX Spark's memory.
+        seen = set()
+        for fn in sorted(os.listdir(sub)):
+            if fn.endswith(".safetensors"):
+                sd = load_file(os.path.join(sub, fn), device="cpu")
+                bad = dit.load_state_dict({k: (v.float() if v.is_floating_point() else v) for k, v in sd.items()}, strict=False)
+                assert not bad.unexpected_keys, bad.unexpected_keys
+                seen.update(sd.keys())
+                del sd
+        missing = set(dit.state_dict().keys()) - seen
+        assert not missing, sorted(missing)[:8]
+
+    def dit_bf16():
+        lora_reset()
+        for n_, p_ in dit.named_parameters():
+            if p_.dtype == torch.float32:
+                p_.data = p_.data.to(bf16)
+        for m_ in dit.modules():
+            if m_.__class__.__name__ == "QuantizedLinear" and m_.bias is not None:
+                m_.bias = m_.bias.to(bf16)
 
 if "dit" in stages:
     DF = args.dit_frames or NF
@@ -269,9 +312,7 @@ if "dit" in stages:
 
     def three(dt):
         one("dit_i2v" + tag, 0.9, dt)
-        dit.load_lora(os.path.join(args.avatar, "loraA", "lora.safetensors"), "dmd", multiplier=1.0, lora_network_dim=128, lora_network_alpha=64)
-        dit.load_lora(os.path.join(args.avatar, "loraB", "lora.safetensors"), "opsd", multiplier=1.0, lora_network_dim=128, lora_network_alpha=64)
-        dit.enable_lora_mix("dmd", "opsd", 1.0, 4)
+        lora_load()
         dit.set_lora_mix_step(0)
         one("dit_lora_a" + tag, 0.9, dt)
         dit.set_lora_mix_step(4)
@@ -280,41 +321,15 @@ if "dit" in stages:
 
     three(bf16)
     if "dit" in f32:
-        # The same three forwards with float32 activations on the weights as stored: the LoRAs read
-        # again (enabling them cast their factors to bfloat16 in place) and the transformer's float
-        # tensors read again from the files (the loaders cast them to bfloat16).
-        from safetensors.torch import load_file  # noqa: E402
-
-        dit.disable_all_loras()
-        dit.lora_dict.clear()
-        dit.lora_mix_config = None
-        dit._lora_mix_active = None
-        dit.float()
-        sub = os.path.join(args.avatar, "base_model_int8" if args.int8 else "base_model")
-        sd = {}
-        for fn in sorted(os.listdir(sub)):
-            if fn.endswith(".safetensors"):
-                sd.update(load_file(os.path.join(sub, fn), device="cpu"))
-        dit.load_state_dict({k: (v.float() if v.is_floating_point() else v) for k, v in sd.items()}, strict=True)
-        del sd
+        # The same three forwards with float32 activations on the weights as stored.
+        dit_f32()
         three(torch.float32)
         # Back to what the demo runs for the stages after this one.
-        dit.disable_all_loras()
-        dit.lora_dict.clear()
-        dit.lora_mix_config = None
-        dit._lora_mix_active = None
-        for n_, p_ in dit.named_parameters():
-            if p_.dtype == torch.float32:
-                p_.data = p_.data.to(bf16)
-        for m_ in dit.modules():
-            if m_.__class__.__name__ == "QuantizedLinear" and m_.bias is not None:
-                m_.bias = m_.bias.to(bf16)
+        dit_bf16()
 
 if stages & {"e2e", "avc"}:
     if not dit.lora_dict:
-        dit.load_lora(os.path.join(args.avatar, "loraA", "lora.safetensors"), "dmd", multiplier=1.0, lora_network_dim=128, lora_network_alpha=64)
-        dit.load_lora(os.path.join(args.avatar, "loraB", "lora.safetensors"), "opsd", multiplier=1.0, lora_network_dim=128, lora_network_alpha=64)
-        dit.enable_lora_mix("dmd", "opsd", 1.0, 4)
+        lora_load()
     pipe.text_encoder = types.SimpleNamespace(dtype=bf16, config=types.SimpleNamespace(d_model=4096))
     # The prompt's rows from the text stage (the 11 GB encoder need not stay beside the transformer).
     pipe.encode_prompt = lambda **kw: (te.to(dev, bf16), tm.to(dev), None, None)
@@ -358,5 +373,30 @@ if stages & {"e2e", "avc"}:
         case["avc_latent" + tag] = save("avc_latent" + tag + ".bin", lat2)
         case["avc_frames" + tag] = save("avc_frames" + tag + ".bin", frames2[0])
         write_frames("avc" + tag, frames2[0])
+    flush()
+
+if "e2e_f32" in stages:
+    # The first clip again from the same noise with float32 activations everywhere: the
+    # transformer and the LoRAs on the weights as stored, the float32 text encoder's rows (the
+    # `--f32 text` case of the text stage), the VAE on the weights its bfloat16 load rounded.
+    dit_f32()
+    lora_load()
+    vae.float()
+    n = case["prompt0_embeds_f32"][0]
+    te32 = te.float().clone()
+    te32[0, 0, :n] = torch.from_numpy(np.fromfile(os.path.join(out, "prompt0_embeds_f32.bin"), dtype=np.float32).reshape(n, -1))
+    pipe.text_encoder = types.SimpleNamespace(dtype=torch.float32, config=types.SimpleNamespace(d_model=4096))
+    pipe.encode_prompt = lambda **kw: (te32.to(dev), tm.to(dev), None, None)
+    tl = 1 + (NF - 1) // 4
+    noise = torch.from_numpy(np.fromfile(os.path.join(out, "e2e_noise" + tag + ".bin"), dtype=np.float32).reshape(1, 16, tl, height // 8, width // 8))
+    t0 = time.time()
+    with torch.no_grad():
+        frames, lat = pipe.generate_ai2v(
+            image=image, prompt=prompt, resolution="480p", num_frames=NF, num_inference_steps=8, use_distill=True, text_guidance_scale=1.0,
+            audio_guidance_scale=1.0, latents=noise.clone().to(dev), output_type="both", audio_emb=clip_audio(0, NF),
+        )
+    print(f"generate_ai2v (float32): {NF} frames in {time.time() - t0:.1f}s")
+    case["e2e_latent" + tag + "_f32"] = save("e2e_latent" + tag + "_f32.bin", lat)
+    case["e2e_frames" + tag + "_f32"] = save("e2e_frames" + tag + "_f32.bin", frames[0])
     flush()
 print("wrote", out)

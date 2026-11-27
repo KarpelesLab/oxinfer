@@ -7,7 +7,9 @@
 //! ```
 //!
 //! Parts (all by default, each skipped when its case is not in `DIR/case.json`): `vae`, `dit`,
-//! `audio`, `text`, `sched`, `e2e`.
+//! `audio`, `text`, `sched`, `e2e`. `--avc-from-ref` starts the continuation of `e2e` from the
+//! reference's first clip instead of from the one computed here, `--no-avc` leaves the continuation
+//! out.
 
 use anyhow::{Context, Result};
 use oxinfer::longcat_avatar::audio::{AudioEncoder, clip_window};
@@ -238,7 +240,10 @@ fn check_sched(case: &Value) {
     cmp("sigmas (distilled, shift 7)", &pipeline::sigmas(8, true, 7.0), &want);
 }
 
-fn check_e2e(dir: &Path, case: &Value, avatar: &Path, base: &Path) -> Result<()> {
+/// `from_ref`: the first clip is not run; the continuation starts from the reference's first
+/// clip (its latents and its 8-bit frames), so that what is compared is one clip's worth of
+/// difference instead of two.
+fn check_e2e(dir: &Path, case: &Value, avatar: &Path, base: &Path, from_ref: bool, avc: bool) -> Result<()> {
     if case["e2e_noise"].is_null() && case["e2e_noise_int8"].is_null() {
         return Ok(());
     }
@@ -280,24 +285,43 @@ fn check_e2e(dir: &Path, case: &Value, avatar: &Path, base: &Path) -> Result<()>
             }
         };
         let noise = read(&dir.join(format!("e2e_noise{tag}.bin")))?;
-        let lat = pipe.first_clip(
-            &p,
-            &text,
-            None,
-            (w, h),
-            Some(&image),
-            &clip_window(&emb, rows, 0, frames, 1, 5),
-            None,
-            noise.clone(),
-            &mut prog,
-        )?;
-        cmp(&format!("e2e_latent{tag}"), &lat, &read(&dir.join(format!("e2e_latent{tag}.bin")))?);
-        let fr = pipe.decode(&lat, shape, 1, &mut prog)?;
-        let got: Vec<f32> = fr.iter().flat_map(|f| f.iter().map(|&v| v as f32 / 255.0)).collect();
+        let want_lat = read(&dir.join(format!("e2e_latent{tag}.bin")))?;
         let want = read(&dir.join(format!("e2e_frames{tag}.bin")))?;
-        let want8: Vec<f32> = want.iter().map(|&v| ((v * 255.0) as u8) as f32 / 255.0).collect();
-        cmp(&format!("e2e_frames{tag} (8-bit)"), &got, &want8);
-        if !case[format!("avc_noise{tag}")].is_null() {
+        let (lat, fr) = if from_ref {
+            let px = w * h * 3;
+            let fr: Vec<Vec<u8>> = want.chunks(px).map(|f| f.iter().map(|&v| (v * 255.0) as u8).collect()).collect();
+            (want_lat, fr)
+        } else {
+            let lat = pipe.first_clip(
+                &p,
+                &text,
+                None,
+                (w, h),
+                Some(&image),
+                &clip_window(&emb, rows, 0, frames, 1, 5),
+                None,
+                noise.clone(),
+                &mut prog,
+            )?;
+            cmp(&format!("e2e_latent{tag}"), &lat, &want_lat);
+            let fr = pipe.decode(&lat, shape, 1, &mut prog)?;
+            (lat, fr)
+        };
+        let tag_avc = if from_ref { " (from the reference's first clip)" } else { "" };
+        if !from_ref {
+            // (The reference's clip with float32 activations, when the case has it.)
+            if let Ok(r) = read(&dir.join(format!("e2e_latent{tag}_f32.bin"))) {
+                cmp(&format!("e2e_latent{tag} (float32 reference)"), &lat, &r);
+            }
+            let got: Vec<f32> = fr.iter().flat_map(|f| f.iter().map(|&v| v as f32 / 255.0)).collect();
+            let want8: Vec<f32> = want.iter().map(|&v| ((v * 255.0) as u8) as f32 / 255.0).collect();
+            cmp(&format!("e2e_frames{tag} (8-bit)"), &got, &want8);
+            if let Ok(r) = read(&dir.join(format!("e2e_frames{tag}_f32.bin"))) {
+                let r8: Vec<f32> = r.iter().map(|&v| ((v * 255.0) as u8) as f32 / 255.0).collect();
+                cmp(&format!("e2e_frames{tag} (8-bit, float32 reference)"), &got, &r8);
+            }
+        }
+        if avc && !case[format!("avc_noise{tag}")].is_null() {
             let n2 = read(&dir.join(format!("avc_noise{tag}.bin")))?;
             let frame = shape.1 * shape.2;
             let reference: Vec<f32> = (0..pipe.dit.cfg.in_channels)
@@ -306,7 +330,7 @@ fn check_e2e(dir: &Path, case: &Value, avatar: &Path, base: &Path) -> Result<()>
             let audio = clip_window(&emb, rows, frames - pipeline::COND_FRAMES, frames, 1, 5);
             let lat2 = pipe.next_clip(&p, &text, None, (w, h), &fr, &reference, &audio, None, n2, 2, &mut prog)?;
             cmp(
-                &format!("avc_latent{tag}"),
+                &format!("avc_latent{tag}{tag_avc}"),
                 &lat2,
                 &read(&dir.join(format!("avc_latent{tag}.bin")))?,
             );
@@ -314,7 +338,7 @@ fn check_e2e(dir: &Path, case: &Value, avatar: &Path, base: &Path) -> Result<()>
             let got: Vec<f32> = fr2.iter().flat_map(|f| f.iter().map(|&v| v as f32 / 255.0)).collect();
             let want = read(&dir.join(format!("avc_frames{tag}.bin")))?;
             let want8: Vec<f32> = want.iter().map(|&v| ((v * 255.0) as u8) as f32 / 255.0).collect();
-            cmp(&format!("avc_frames{tag} (8-bit)"), &got, &want8);
+            cmp(&format!("avc_frames{tag} (8-bit){tag_avc}"), &got, &want8);
         }
         if tag.is_empty() && !case["cfg_latent"].is_null() {
             let neg = pipeline::encode_text(&pipe.text_encoder()?, "blurry", 512)?;
@@ -400,7 +424,8 @@ fn main() -> Result<()> {
         check_text(dir, &case, &base)?;
     }
     if on("e2e") {
-        check_e2e(dir, &case, &avatar, &base)?;
+        let flag = |f: &str| args.iter().any(|a| a == f);
+        check_e2e(dir, &case, &avatar, &base, flag("--avc-from-ref"), !flag("--no-avc"))?;
     }
     Ok(())
 }

@@ -144,25 +144,39 @@ blocks on the device against the CPU in both modes; skipped without an NVIDIA GP
 | umT5 hidden states of the example's prompt (51 tokens; mean \|v\| 0.052) | max 2.2e-1, mean 1.3e-3 (PSNR 58.2 dB) | max 7.5e-6, mean 1.7e-7 (137.1 dB) |
 | token ids of the prompt | equal | |
 | audio features of 4.7 s (118 rows of 5 x 1280; mean \|v\| 0.57; the reference runs Whisper in float32) | | max 1.3e-1, mean 1.1e-4 (90.7 dB) |
-| VAE: the reference image (768x512) encoded (mean \|v\| 0.85) | max 4.4e-2, mean 4.8e-3 (55.9 dB) | max 1.1e-2, mean 1.7e-3 (64.5 dB; cuDNN float32, TF32 off) |
-| VAE: 3 latent frames decoded to 9 frames (mean \|v\| 0.58) | max 8.6e-2, mean 1.7e-3 (53.1 dB) | max 2.1e-2, mean 2.9e-4 (68.3 dB; cuDNN float32, TF32 off) |
+| VAE: the reference image (768x512) encoded (mean \|v\| 0.85) | max 4.2e-2, mean 4.4e-3 (56.8 dB) | max 6.3e-6, mean 7.9e-7 (131.8 dB; the reference on the CPU) |
+| VAE: 3 latent frames decoded to 9 frames (mean \|v\| 0.58) | max 8.7e-2, mean 1.7e-3 (53.2 dB) | max 2.2e-5, mean 2.0e-7 (129.9 dB) on the CPU, max 2.6e-5, mean 4.0e-7 (125.5 dB) on the GB10 |
 | transformer, int8 weights, one forward of 24 latent frames (36,864 tokens) at sigma 0.9, no LoRA (mean \|v\| 0.80) | max 9.6e-2, mean 1.5e-2 (48.9 dB) | max 1.6e-2, mean 2.4e-4 (84.0 dB); split operands: mean 1.9e-4 (85.4 dB) |
 | the same with the DMD LoRA (`loraA`) | max 1.1, mean 3.0e-2 (43.2 dB) | max 5.0e-2, mean 7.8e-4 (73.9 dB); split: mean 4.8e-4 (78.3 dB) |
 | the same with the OPSD LoRA (`loraB`), sigma 0.5 | max 9.4e-1, mean 1.8e-2 (49.2 dB) | max 9.2e-3, mean 2.8e-4 (85.1 dB); split: mean 2.1e-4 (86.8 dB) |
+| transformer, bf16 weights (`base_model/`), the same forward, no LoRA (GB10) | max 8.7e-2, mean 1.5e-2 (49.0 dB) | max 1.1e-2, mean 2.4e-4 (83.9 dB) |
+| the same with the DMD LoRA (GB10) | max 3.8e-1, mean 2.8e-2 (44.3 dB) | max 1.1e-1, mean 7.9e-4 (73.2 dB) |
+| the same with the OPSD LoRA, sigma 0.5 (GB10) | max 6.9e-1, mean 1.8e-2 (49.0 dB) | max 2.9e-2, mean 2.8e-4 (84.9 dB) |
+| the whole clip, int8 weights: image, 3.7 s of audio and the prompt to 93 frames, 8 steps with the LoRA mix, from the reference's noise (GB10): latents (mean \|v\| 0.73) | max 3.9e-1, mean 1.7e-2 (42.2 dB) | max 1.8e-2, mean 4.2e-4 (73.6 dB) |
+| its 93 frames of 768x512, 8 bits | max 85 steps of 255, mean 0.98 (42.6 dB) | max 6 steps, mean 0.032 (63.1 dB) |
+| the whole clip, bf16 weights (GB10): latents, frames | max 1.2, mean 1.8e-2 (41.3 dB); max 93 steps, mean 1.08 (41.7 dB) | not computed |
+| the continuation (93 more frames) from the reference's first clip, its latents and its 8-bit frames (GB10): latents (mean \|v\| 0.74), frames; int8 weights | max 8.9e-1, mean 1.1e-2 (44.7 dB); max 165 steps, mean 0.76 (42.3 dB) | not computed |
+| the same, bf16 weights | max 7.6e-1, mean 1.1e-2 (44.5 dB); max 163 steps, mean 0.73 (41.7 dB) | not computed |
+| the continuation from oxinfer's own first clip, against the reference's from its own; int8, bf16 weights | latents max 1.7, mean 2.9e-2 (37.3 dB), frames 37.4 dB; latents max 1.5, mean 3.6e-2 (34.7 dB), frames 36.2 dB | not computed |
 
-The transformer rows are oxinfer on the RTX 5080 (float16 operands unless "split") against the
-reference's outputs for the same latents, text rows, audio rows and timesteps. The float32
-column is the reference's own modules with float32 activations: the text encoder loaded in
-float32, the transformer's float tensors and the LoRAs read again from the files after
-`.float()`, the VAE with float32 activations on the weights its bfloat16 load had rounded
-(oxinfer rounds the VAE's weights to bfloat16 too, and keeps every other weight as stored). The
-reference's bfloat16 forward is itself about 1.5e-2 away from its float32 one, sixty times what
-separates oxinfer from the latter; the VAE and audio rows are the same numbers on the CPU and on
-CUDA here. The VAE's float32 reference on the CPU (no cuDNN) and the whole clip (the reference
-took 431.6 s for the 93 frames and 431.4 s for the continuation on the Spark; 51 s a step, 43 s
-for a forward without LoRAs) were computed there but not compared: the Spark stopped answering on the network while oxinfer's
-side of that comparison was running, and had not come back when this was written (see
-[not run](#not-run)).
+The transformer rows without "GB10" are oxinfer on the RTX 5080 (float16 operands unless
+"split"); the int8 forwards were run again on the GB10 with the same figures to the digits
+shown. All are against the reference's outputs for the same latents, text rows, audio rows and
+timesteps, the clips from the same noise. The float32 column is the reference's own modules with
+float32 activations: the text encoder loaded in float32, the transformer's float tensors and the
+LoRAs read again from the files after `.float()`, the VAE on the CPU (no cuDNN) with float32
+activations on the weights its bfloat16 load had rounded. oxinfer rounds the VAE's weights to
+bfloat16 too (kernels, biases and norm gains) and keeps every other weight as stored.
+
+The reference's bfloat16 arithmetic is what the first column measures: its own bfloat16 forward
+is 1.5e-2 (mean) away from its float32 one, sixty times what separates oxinfer from the latter,
+and its own bfloat16 clip is max 3.9e-1, mean 1.7e-2 (42.2 dB) away from its float32 clip on the
+latents and 42.5 dB on the 8-bit frames, the same distance as oxinfer's clip from it. The
+float32 clip took the reference 1780.7 s on the GB10 (431.6 s in bfloat16; 51 s a step, 43 s for
+a forward without LoRAs), which is why only the first int8 clip has one; the continuation and
+the bf16 clips are compared with the bfloat16 reference alone, where they sit at the same 41 to
+45 dB. The continuation from oxinfer's own first clip is further off because the two sides then
+start from different frames.
 
 ## Speed and memory
 
@@ -176,7 +190,23 @@ frames (24 latent frames, 36,864 tokens), 8 steps, on a Threadripper 9970X with 
 | `longcat-avatar` (bf16), one clip | 38.3 s | 314.0 s | 251.9 s | 594.7 s | 44.9 GB | 15.0 GB |
 | `longcat-avatar-int8`, split operands, one clip | 62.8 s | 506.6 s | 241.7 s | 779.3 s | | |
 | `longcat-avatar`, split operands, one clip | 67.9 s | 557.6 s | 248.1 s | 835.1 s | 44.3 GB | 15.0 GB |
-| the reference (PyTorch 2.14.1, bfloat16, one GB10 of a DGX Spark, `--use_int8`) | 51 s | | | 431.6 s for the clip | | |
+
+The same example on a DGX Spark (GB10, 20 cores, 121 GB shared by the CPU and the GPU; all 48
+blocks stay on the device, 17.4 GB with their LoRA factors for the int8 weights and 32.2 GB for
+the bf16 ones):
+
+| run | a step | denoising | VAE decode | whole run | peak resident memory | GPU memory of the process | memory taken from the machine |
+|---|---|---|---|---|---|---|---|
+| `longcat-avatar-int8`, two clips (173 frames, 6.9 s) | 101.2 s (101.0 s in the continuation) | 1656.7 s | 706.2 s | 2392.0 s | 31.9 GB | 24.4 GB | 35.4 GB |
+| `longcat-avatar` (bf16), one clip | 78.3 s | 633.3 s | 351.2 s | 1009.7 s | 47.1 GB | 38.1 GB | 50.0 GB |
+| the reference (PyTorch 2.14.1, bfloat16), `--use_int8`, one clip | 51 s | | | 431.6 s for the clip (models loaded) | | | |
+| the reference, `base_model/`, one clip | 52 s a forward with LoRAs | | | 433.9 s for the continuation | | | |
+
+"Memory taken from the machine" is the drop of `MemAvailable` while the run was on it (sampled
+every 2 s; the GPU's memory is the machine's there), "GPU memory of the process" what
+`nvidia-smi` listed for it. oxinfer's engine is half the reference's speed on this machine, and
+the int8 weights are slower than the bf16 ones there, the opposite of the RTX 5080: the engine
+was tuned on the latter, and where the GB10's time goes was not profiled.
 
 "GPU memory in use" is the card's total while the run was on it (sampled every 2 s), about 2 GB
 of which belonged to the desktop. "Whole run" has the text encoder (2 to 4 s for the prompt, the 22.7 GB file mapped), the audio
@@ -202,7 +232,7 @@ the CPU.
 The VAE is the slow part next to that: its convolutions go through the shared accelerator path
 (`gpu::Backend::conv2d`) one frame and one layer at a time from host memory, so a decode is
 bounded by the copies (17 frames of 768x512: 44.2 s on the RTX 5080, 187.5 s on the CPU; encoding
-13 frames: 22.5 s and 78.7 s). A pass that keeps the frames on the device is not written.
+13 frames: 22.5 s and 78.7 s; a clip's 93 frames: 351 s on the GB10). A pass that keeps the frames on the device is not written.
 
 On the CPU alone (`--device cpu`), the transformer runs in float32 on weights dequantized a
 matrix at a time: a 320x192 clip of 13 frames (960 tokens) takes 24.2 s a step and 230 s in all.
@@ -229,16 +259,10 @@ A full-size clip on the CPU was not run.
 
 ## Not run
 
-- The whole clip and its continuation against the reference **on the released weights**: the
-  reference's latents and frames exist on the Spark, the comparison did not finish (above). What
-  stands for the sampling loop is the tiny-checkpoint comparison (same code, 1.3e-6 on the
-  latents after 8 steps) and the per-stage comparisons on the released weights.
-- The bf16 transformer (`base_model/`) against the reference on the released weights: it runs
-  here (table above) and gives the same video as the int8 one up to the quantization (PSNR
-  40.0 dB between the two encoded videos from the same seed; 48.5 dB between float16 and split
-  operands on the int8 weights), but no reference output of it was compared.
-- The DGX Spark's speed with oxinfer's engine (all 48 blocks fit there): the tiny cases ran on
-  its GB10 (table above), the full-size run did not finish.
+- A float32 reference for the continuation and for the bf16 transformer's clips: those are
+  compared with the reference's bfloat16 run only (above), 41 to 45 dB away as the int8 first
+  clip is, whose float32 reference is at 73.6 dB.
+- A profile of the engine on the GB10, where a step takes twice the reference's time.
 - Two speakers, the 720p buckets, `--no-distill` (guidance, 50 steps) and prompts without a
   reference image on the released weights at full size: the two-speaker forward, guidance and
   the text-only forward are checked on the tiny checkpoints only; a text-only clip of 320x192
