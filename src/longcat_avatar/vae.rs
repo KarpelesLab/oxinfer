@@ -568,7 +568,7 @@ impl VideoVae {
         let mut out: Vec<Frame> = Vec::new();
         let (mut lh, mut lw) = (0, 0);
         #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
-        if let Some(e) = self.device.engine.get_or_init(dev::Engine::new)
+        if let Some(e) = self.device.engine.get_or_init(|| dev::Engine::new(dev::OFF))
             && let Some((y, a, b)) = dev::encode(e, self, frames, h, w)
         {
             (out, lh, lw) = (y, a, b);
@@ -616,7 +616,7 @@ impl VideoVae {
             self.post_quant.forward(&fr, h, w, 1).0
         };
         #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
-        if let Some(e) = self.device.engine.get_or_init(dev::Engine::new) {
+        if let Some(e) = self.device.engine.get_or_init(|| dev::Engine::new(dev::OFF)) {
             let x: Vec<Frame> = (0..t).map(latent).collect();
             if let Some(mut out) = dev::decode(e, self, &x, h, w, progress) {
                 for g in &mut out {

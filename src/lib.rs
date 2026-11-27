@@ -61,6 +61,8 @@ pub mod constrain;
 pub mod coreml;
 #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
 pub mod cuda;
+#[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
+pub(crate) mod cuda_vae;
 pub mod decide;
 pub mod deepseek4;
 pub mod depth_pro;

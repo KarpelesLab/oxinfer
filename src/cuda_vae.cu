@@ -1,5 +1,5 @@
-// The video VAE on CUDA (`longcat_avatar/vae/dev.rs`): float32 frames `[pixels][channels]` that
-// stay on the device from one layer to the next.
+// Convolutional VAEs on CUDA (`cuda_vae.rs`): float32 frames `[pixels][channels]` that stay on
+// the device from one layer to the next.
 
 typedef unsigned int u32;
 typedef unsigned long long u64;

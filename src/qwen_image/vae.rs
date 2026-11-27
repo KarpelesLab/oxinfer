@@ -22,6 +22,16 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::Path;
 
+#[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
+mod dev;
+
+/// The device engine of a VAE: decided at the first pass.
+#[derive(Default)]
+struct Device {
+    #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
+    engine: std::sync::OnceLock<Option<dev::Engine>>,
+}
+
 fn d96() -> usize {
     96
 }
@@ -317,6 +327,7 @@ pub struct Vae {
     quant: Option<Conv>,
     dec: Stack,
     post_quant: Conv,
+    device: Device,
 }
 
 impl Vae {
@@ -446,7 +457,20 @@ impl Vae {
             post_quant: conv(&t, "post_quant_conv")?,
             dec,
             cfg,
+            device: Device::default(),
         })
+    }
+
+    /// `s` over an image: on CUDA with the activations kept on the device (`vae/dev.rs`), else
+    /// (and when the device declines) layer by layer.
+    fn run(&self, s: &Stack, x: &[f32], h: usize, w: usize) -> (Vec<f32>, usize, usize) {
+        #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
+        if let Some(e) = self.device.engine.get_or_init(|| dev::Engine::new(dev::OFF))
+            && let Some(y) = dev::forward(e, s, x, h, w)
+        {
+            return y;
+        }
+        s.forward(x, h, w)
     }
 
     /// Spatial compression factor (8).
@@ -481,7 +505,7 @@ impl Vae {
         if px.len() != h * w * enc.conv_in.cin {
             bail!("VAE input: {} values for {w}x{h} with {} channels", px.len(), enc.conv_in.cin);
         }
-        let (y, lh, lw) = enc.forward(px, h, w);
+        let (y, lh, lw) = self.run(enc, px, h, w);
         let (m, _, _) = q.forward(&y, lh, lw, 1);
         let z = self.cfg.z_dim;
         let eps = match eps {
@@ -520,7 +544,7 @@ impl Vae {
             }
         });
         let (x, _, _) = self.post_quant.forward(&x, lh, lw, 1);
-        let (mut y, h, w) = self.dec.forward(&x, lh, lw);
+        let (mut y, h, w) = self.run(&self.dec, &x, lh, lw);
         y.iter_mut().for_each(|v| *v = v.clamp(-1.0, 1.0));
         (y, h, w)
     }
