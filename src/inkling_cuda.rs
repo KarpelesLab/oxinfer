@@ -19,8 +19,16 @@
 //! Decode steps are captured once per session as a CUDA graph (positions are read on the device),
 //! so a token is one graph launch.
 //!
+//! Runtime LoRA updates of the dense projections (the attention's seven, the dynamic
+//! convolutions' `weight_proj`, the message gates' three, the unembedding) run as side paths
+//! ([`LoraSet`], `lora_k`): the weights stay on the device as stored, the updates' factors beside
+//! them, read again when the set of attached adapters changes; a pass launches the updates whose
+//! strength is not 0 then, so an adapter switched off costs nothing and leaves the base model's
+//! bits. The embedding's update is the host's. A pass with an update the engine has no kernel for
+//! switched on (the routed experts', a rank over 256) is declined, that pass only.
+//!
 //! Declined (the CPU path runs): weight kinds without a kernel (the ternary and 1-bit GGUF types,
-//! affine Q4), LoRA adapters, Hadamard-folded weights, streamed weights, head sizes other than
+//! affine Q4), Hadamard-folded weights, streamed weights, head sizes other than
 //! 128, more than 4 query heads per key/value head, and models that do not fit in VRAM
 //! (`OXINFER_GPU_PLAN_DEBUG=1` says why; `OXINFER_INKLING_GPU=0` keeps the CPU path).
 
@@ -33,7 +41,8 @@ use crate::model::{Lin, Weight};
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
 use std::ffi::{CString, c_int, c_void};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 dlsym::library! {
     /// Driver entry points beyond the backend's: streams, async copies and graphs.
@@ -312,8 +321,9 @@ const K_OQ8: u32 = 200;
 const K_OQ4: u32 = 201;
 const K_F8: u32 = 202;
 
+/// (The weight alone: its runtime LoRA updates are side paths, [`LoraSet`].)
 fn host_w<'m>(l: &'m Lin, n_in: usize) -> Option<HostW<'m>> {
-    if l.has_lora() || l.fold.is_some() {
+    if l.fold.is_some() {
         return None;
     }
     Some(match &l.w {
@@ -411,8 +421,8 @@ pub(super) struct DevSess {
     engine: usize,
 }
 /// A captured pass: (tokens, captured steps, the cache capacities it was captured with,
-/// executable, graph).
-type PassGraph = (usize, Vec<usize>, Vec<usize>, F, F);
+/// executable, graph, the LoRA updates it launches as [`LoraPass::sig`]).
+type PassGraph = (usize, Vec<usize>, Vec<usize>, F, F, u64);
 
 // SAFETY: device addresses and driver handles; the driver API is thread-safe and the context is
 // made current before use.
@@ -424,7 +434,7 @@ impl DevSess {
         unsafe { self.x.cuCtxSetCurrent(self.ctx) == 0 }
     }
     fn drop_graph(&mut self) {
-        for (_, _, _, exec, g) in self.graphs.drain(..) {
+        for (_, _, _, exec, g, _) in self.graphs.drain(..) {
             unsafe {
                 self.x.cuGraphExecDestroy(exec);
                 self.x.cuGraphDestroy(g);
@@ -515,6 +525,130 @@ impl DevSession for DevSess {
     fn truncate(&mut self, pos: usize, len: usize) -> bool {
         pos - len <= ROLLBACK
     }
+}
+
+/// A LoRA update of a launch (`LoraJob` in the kernels).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LoraJob {
+    a: u64,
+    bt: u64,
+    st: u64,
+    x: u64,
+    y: u64,
+    n_in: u32,
+    n_out: u32,
+    r: u32,
+    xs: u32,
+    ys: u32,
+    _p: u32,
+}
+
+/// A LoRA update on the device: `A` (`[r, n_in]`), `B` transposed (`[r, n_out]`).
+struct DLora {
+    a: u64,
+    bt: u64,
+    r: usize,
+    n_in: usize,
+    n_out: usize,
+    /// Its strength's place in [`LoraSet::st`].
+    idx: usize,
+}
+
+/// The projections of a layer that take LoRA updates ([`LoraSet::layers`]): the attention's, the
+/// dynamic convolutions' and, from `L_GATES`, down, forget and gain of the query, key, value and
+/// MLP message gates.
+const L_Q: usize = 0;
+const L_K: usize = 1;
+const L_V: usize = 2;
+const L_R: usize = 3;
+const L_GATE: usize = 4;
+const L_SINK: usize = 5;
+const L_O: usize = 6;
+const L_KPROJ: usize = 7;
+const L_VPROJ: usize = 8;
+const L_GATES: usize = 9;
+const L_SITES: usize = L_GATES + 12;
+/// The highest rank `lora_k` takes (its shared `u`).
+const LORA_MAX_RANK: usize = 256;
+
+/// The runtime LoRA updates of the model's weights as the engine runs them, built from the model
+/// at the first pass after the set of attached adapters changed
+/// ([`DevEngine::adapters_changed`]): retired updates are left out.
+#[derive(Default)]
+struct LoraSet {
+    /// Per layer, per projection (`L_*`), its chained updates.
+    layers: Vec<Vec<Vec<DLora>>>,
+    head: Vec<DLora>,
+    /// The strengths (`[handles.len()]` f32), written before each pass that reads one.
+    st: u64,
+    handles: Vec<crate::lora::Strength>,
+    /// The strengths of the updates without a kernel: a pass with one of them on is the CPU's.
+    blocked: Vec<crate::lora::Strength>,
+    /// This set's device allocations.
+    bufs: Vec<u64>,
+    /// Counts the sets built (a captured pass launches one set's buffers).
+    generation: u64,
+}
+
+impl LoraSet {
+    /// The updates to launch in a pass now: those whose strength is not 0.
+    fn pass(&self) -> LoraPass {
+        let st: Vec<f32> = self.handles.iter().map(|h| h.get()).collect();
+        let on: Vec<bool> = st.iter().map(|&v| v != 0.0).collect();
+        let mut sig = 0u64;
+        if on.iter().any(|&b| b) {
+            // (FNV-1a over the generation and the switches; never 0.)
+            sig = 0xcbf2_9ce4_8422_2325 ^ self.generation;
+            for &b in &on {
+                sig = (sig ^ (1 + b as u64)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            sig |= 1;
+        }
+        LoraPass {
+            st_dev: self.st,
+            st,
+            on,
+            sig,
+        }
+    }
+
+    /// Whether an update without a kernel is switched on.
+    fn is_blocked(&self) -> bool {
+        self.blocked.iter().any(|h| h.get() != 0.0)
+    }
+}
+
+/// The LoRA updates of one pass ([`LoraSet::pass`]).
+struct LoraPass {
+    st_dev: u64,
+    st: Vec<f32>,
+    on: Vec<bool>,
+    /// 0 without updates; else the set and the updates launched (a captured pass is replayed
+    /// only for the same ones).
+    sig: u64,
+}
+
+impl LoraPass {
+    /// A pass without updates.
+    #[cfg(test)]
+    fn off() -> LoraPass {
+        LoraPass {
+            st_dev: 0,
+            st: Vec::new(),
+            on: Vec::new(),
+            sig: 0,
+        }
+    }
+
+    fn any(&self, ds: &[Vec<DLora>]) -> bool {
+        ds.iter().flatten().any(|d| self.on[d.idx])
+    }
+}
+
+/// Projection `i` of a layer's updates (`ll` empty: none).
+fn site(ll: &[Vec<DLora>], i: usize) -> &[DLora] {
+    ll.get(i).map_or(&[], |v| &v[..])
 }
 
 struct DLoop {
@@ -655,6 +789,10 @@ pub(super) struct Engine {
     max_heads: usize,
     max_kv_heads: usize,
     rank: usize,
+    /// The LoRA side paths (locked after the arena, for the whole of a pass).
+    lora: Mutex<LoraSet>,
+    /// The adapters attached to the model changed since `lora` was built.
+    lora_stale: AtomicBool,
 }
 // SAFETY: as DevSess; one pass at a time (the arena's lock).
 unsafe impl Send for Engine {}
@@ -683,6 +821,9 @@ impl Drop for Engine {
         unsafe {
             self.x.cuStreamSynchronize(self.stream);
             for &p in self.owned.lock().unwrap().iter() {
+                self.x.cuMemFree_v2(p);
+            }
+            for &p in self.lora.lock().unwrap_or_else(|p| p.into_inner()).bufs.iter() {
                 self.x.cuMemFree_v2(p);
             }
             self.x.cuStreamDestroy_v2(self.stream);
@@ -735,7 +876,7 @@ fn lb_groups(nb: usize) -> usize {
     }
 }
 
-const FIXED: [&str; 40] = [
+const FIXED: [&str; 41] = [
     "attnt_f32_1",
     "attnt_f16_1",
     "attnt_q8_1",
@@ -776,6 +917,7 @@ const FIXED: [&str; 40] = [
     "moe_rows",
     "moe_combine",
     "softcap_k",
+    "lora_k",
 ];
 
 fn ceil(a: usize, b: usize) -> u32 {
@@ -789,6 +931,11 @@ impl Engine {
             return None;
         }
         let be: &'static CudaBackend = crate::gpu::active()?.as_any()?.downcast_ref::<CudaBackend>()?;
+        Self::new_on(be, m)
+    }
+
+    /// [`Self::new`] on the backend `be`.
+    fn new_on(be: &CudaBackend, m: &Inkling2Model) -> Option<Engine> {
         if m.stream.is_some() {
             debug("streamed weights");
             return None;
@@ -852,7 +999,7 @@ impl Engine {
         }
         for l in &lins {
             let Some(hw) = host_w(l, 1) else {
-                debug("a weight kind without a kernel, a LoRA or a folded weight");
+                debug("a weight kind without a kernel or a folded weight");
                 return None;
             };
             if !kinds.contains(&hw.kind) {
@@ -1038,7 +1185,189 @@ impl Engine {
             max_heads: 0,
             max_kv_heads: 0,
             rank: 0,
+            lora: Mutex::new(LoraSet::default()),
+            lora_stale: AtomicBool::new(true),
         })
+    }
+
+    /// The LoRA side paths for the adapters attached to `m` now, read again from the model when
+    /// they changed since the last pass.
+    fn lora_set(&self, m: &Inkling2Model) -> MutexGuard<'_, LoraSet> {
+        let mut ls = self.lora.lock().unwrap_or_else(|p| p.into_inner());
+        if self.lora_stale.swap(false, Ordering::SeqCst) {
+            // (No pass is running: each holds this lock. The stream is idle before the buffers
+            // of the old set go.)
+            assert!(unsafe { self.x.cuCtxSetCurrent(self.ctx) } == 0, "inkling cuda: context");
+            unsafe { self.x.cuStreamSynchronize(self.stream) };
+            for p in ls.bufs.drain(..) {
+                unsafe { self.x.cuMemFree_v2(p) };
+            }
+            let generation = ls.generation + 1;
+            *ls = self.build_lora(m);
+            ls.generation = generation;
+        }
+        ls
+    }
+
+    /// The updates attached to `m` on the device ([`LoraSet`]).
+    fn build_lora(&self, m: &Inkling2Model) -> LoraSet {
+        let mut ls = LoraSet::default();
+        // Why updates stay without a side path, and how many.
+        let mut why: Vec<(&'static str, usize)> = Vec::new();
+        fn block(ls: &mut LoraSet, why: &mut Vec<(&'static str, usize)>, d: &crate::lora::LoraDelta, reason: &'static str) {
+            let h = d.strength_handle();
+            if !ls.blocked.iter().any(|b| b.same(&h)) {
+                ls.blocked.push(h);
+            }
+            match why.iter_mut().find(|w| w.0 == reason) {
+                Some(w) => w.1 += 1,
+                None => why.push((reason, 1)),
+            }
+        }
+        fn live<'l>(l: &'l Lin) -> impl Iterator<Item = &'l crate::lora::LoraDelta> {
+            l.lora_delta().into_iter().flat_map(|d| d.links()).filter(|d| !d.retired())
+        }
+        let up = |ls: &mut LoraSet, v: &[f32]| -> Option<u64> {
+            let mut d = 0u64;
+            if unsafe { self.x.cuMemAlloc_v2(&mut d, (v.len() * 4).max(256)) } != 0 {
+                return None;
+            }
+            ls.bufs.push(d);
+            (unsafe { self.htod(d, v.as_ptr() as *const c_void, v.len() * 4) } == 0).then_some(d)
+        };
+        let add = |ls: &mut LoraSet, why: &mut Vec<(&'static str, usize)>, l: &Lin| -> Vec<DLora> {
+            let mut out = Vec::new();
+            for d in live(l) {
+                let (a, bt, r) = d.factors();
+                let (n_out, n_in) = d.shape();
+                if r == 0 {
+                    continue;
+                }
+                if r > LORA_MAX_RANK {
+                    block(ls, why, d, "a rank over 256");
+                    continue;
+                }
+                if !n_in.is_multiple_of(4) {
+                    block(ls, why, d, "an input width that is not a multiple of 4");
+                    continue;
+                }
+                let (Some(da), Some(db)) = (up(ls, a), up(ls, bt)) else {
+                    block(ls, why, d, "no device memory for the factors");
+                    continue;
+                };
+                out.push(DLora {
+                    a: da,
+                    bt: db,
+                    r,
+                    n_in,
+                    n_out,
+                    idx: ls.handles.len(),
+                });
+                ls.handles.push(d.strength_handle());
+            }
+            out
+        };
+        for l in &m.layers {
+            let a = &l.attn;
+            let mut sites: Vec<Vec<DLora>> = Vec::with_capacity(L_SITES);
+            for lin in [&a.q, &a.k, &a.v, &a.r, &a.gate, &a.sink, &a.o] {
+                sites.push(add(&mut ls, &mut why, lin));
+            }
+            for cv in [&a.k_conv, &a.v_conv] {
+                sites.push(match cv {
+                    KvConv::Dynamic { proj, .. } => add(&mut ls, &mut why, proj),
+                    KvConv::Static(_) => Vec::new(),
+                });
+            }
+            for g in 0..4 {
+                match &l.looped {
+                    Some(lp) => {
+                        let gt = &lp.gates[g];
+                        for lin in [&gt.down, &gt.forget, &gt.gain] {
+                            sites.push(add(&mut ls, &mut why, lin));
+                        }
+                    }
+                    None => sites.extend([Vec::new(), Vec::new(), Vec::new()]),
+                }
+            }
+            debug_assert_eq!(sites.len(), L_SITES);
+            ls.layers.push(sites);
+            for lin in l.experts.lins().into_iter().flatten() {
+                for d in live(lin) {
+                    block(&mut ls, &mut why, d, "the routed experts");
+                }
+            }
+        }
+        ls.head = add(&mut ls, &mut why, &m.lm_head);
+        if !ls.handles.is_empty() {
+            let zeros = vec![0f32; ls.handles.len()];
+            match up(&mut ls, &zeros) {
+                Some(st) => ls.st = st,
+                None => {
+                    // Without the strengths' buffer no side path can run.
+                    let hs = std::mem::take(&mut ls.handles);
+                    ls.blocked.extend(hs);
+                    ls.layers.clear();
+                    ls.head.clear();
+                    why.push(("no device memory for the strengths", 1));
+                }
+            }
+        }
+        debug(&format!(
+            "{} LoRA updates on the device, {} adapter strengths without a GPU path",
+            ls.handles.len(),
+            ls.blocked.len()
+        ));
+        if !why.is_empty() {
+            let list: Vec<String> = why.iter().map(|(r, n)| format!("{n} on {r}")).collect();
+            crate::gpu::warn(format!(
+                "Inkling-2 on CUDA has no side path for some LoRA updates ({}): the passes of requests with such an adapter switched on run on the CPU",
+                list.join(", ")
+            ));
+        }
+        ls
+    }
+
+    /// `y += s B (A x)` over `t` rows for each update that is on in this pass, of each job
+    /// (updates, x, y, their strides in floats): one launch per 8 updates of different outputs.
+    fn lora(&self, lo: &LoraPass, jobs: &[(&[DLora], u64, u64, usize, usize)], t: usize) {
+        let mut p = [LoraJob::default(); 8];
+        let (mut n, mut cols) = (0usize, 0usize);
+        let launch = |p: &[LoraJob; 8], n: usize, cols: usize| {
+            if n > 0 {
+                self.go(self.f("lora_k"), (t as u32, ceil(cols, 2048), n as u32), 512, &mut args![*p]);
+            }
+        };
+        for &(ds, x, y, xs, ys) in jobs {
+            for d in ds.iter().filter(|d| lo.on[d.idx]) {
+                debug_assert!(xs.is_multiple_of(4) && d.n_in.is_multiple_of(4));
+                // (The jobs of a launch run at once: chained updates of one output take turns.)
+                if p[..n].iter().any(|j| j.y == y) {
+                    launch(&p, n, cols);
+                    (n, cols) = (0, 0);
+                }
+                p[n] = LoraJob {
+                    a: d.a,
+                    bt: d.bt,
+                    st: lo.st_dev + (d.idx * 4) as u64,
+                    x,
+                    y,
+                    n_in: d.n_in as u32,
+                    n_out: d.n_out as u32,
+                    r: d.r as u32,
+                    xs: xs as u32,
+                    ys: ys as u32,
+                    _p: 0,
+                };
+                n += 1;
+                cols = cols.max(d.n_out);
+                if n == 8 {
+                    launch(&p, n, cols);
+                    (n, cols) = (0, 0);
+                }
+            }
+        }
+        launch(&p, n, cols);
     }
 
     fn arena_bytes(m: &Inkling2Model) -> usize {
@@ -1660,10 +1989,13 @@ impl Engine {
         self.go(f, (t as u32, 1, 1), threads, &mut args![p]);
     }
 
-    /// A message gate over input `x` and message `msg` into `out`.
-    fn gate(&self, ar: &Arena, g: &(Dw, Dw, Dw), x: u64, msg: u64, out: u64, t: usize) {
+    /// A message gate over input `x` and message `msg` into `out`; `gl`: the LoRA updates of
+    /// its down, forget and gain projections (with one on, the three run as plain projections).
+    #[allow(clippy::too_many_arguments)]
+    fn gate(&self, ar: &Arena, g: &(Dw, Dw, Dw), x: u64, msg: u64, out: u64, t: usize, lo: &LoraPass, gl: &[Vec<DLora>]) {
         let h = self.h;
-        if t <= MV_T && g.1.kind == g.2.kind {
+        let adapted = lo.any(gl);
+        if !adapted && t <= MV_T && g.1.kind == g.2.kind {
             let r = self.rank as u32;
             self.go(
                 g.0.gdown,
@@ -1679,7 +2011,7 @@ impl Engine {
             );
             return;
         }
-        if 2 * h <= 4608 {
+        if !adapted && 2 * h <= 4608 {
             // A block per token (`gate_down_t`'s shared input holds 4608 values).
             let r = self.rank as u32;
             self.go(
@@ -1696,9 +2028,15 @@ impl Engine {
                 &mut args![x, msg, ar.cat, h as u32, self.eps],
             );
             self.lin(&g.0, ar.cat, ar.gd, t, 2 * h, self.rank, false);
+            self.lora(lo, &[(site(gl, 0), ar.cat, ar.gd, 2 * h, self.rank)], t);
         }
         self.lin(&g.1, ar.gd, ar.gf, t, self.rank, h, false);
         self.lin(&g.2, ar.gd, ar.gg, t, self.rank, h, false);
+        self.lora(
+            lo,
+            &[(site(gl, 1), ar.gd, ar.gf, self.rank, h), (site(gl, 2), ar.gd, ar.gg, self.rank, h)],
+            t,
+        );
         let n = (t * h) as u32;
         self.go(
             self.f("gate_mix"),
@@ -1782,7 +2120,7 @@ impl Engine {
 
     /// The attention of layer `l` over the normed inputs into `ar.a`, appending to slot `s`.
     #[allow(clippy::too_many_arguments)]
-    fn attention(&self, ar: &Arena, l: &DLayer, xq: u64, xk: u64, xv: u64, s: &Slot, fmt: u32, t: usize) {
+    fn attention(&self, ar: &Arena, l: &DLayer, xq: u64, xk: u64, xv: u64, s: &Slot, fmt: u32, t: usize, lo: &LoraPass, ll: &[Vec<DLora>]) {
         let (nh, nkv, d, dr, kn) = (l.nh, l.nkv, 128usize, self.d_rel, self.conv_k);
         let (w, kw, h) = (nh * d, nkv * d, self.h);
         let mut jq: Vec<(&Dw, u64, usize)> = vec![(&l.q, ar.q, w), (&l.r, ar.r, nh * dr), (&l.gate, ar.g, w), (&l.sink, ar.sink, nh)];
@@ -1805,6 +2143,21 @@ impl Engine {
             self.lin_many(&jk, xk, h, t);
             self.lin_many(&jv, xv, h, t);
         }
+        // The projections' LoRA updates, each added to its output.
+        self.lora(
+            lo,
+            &[
+                (site(ll, L_Q), xq, ar.q, h, w),
+                (site(ll, L_R), xq, ar.r, h, nh * dr),
+                (site(ll, L_GATE), xq, ar.g, h, w),
+                (site(ll, L_SINK), xq, ar.sink, h, nh),
+                (site(ll, L_K), xk, ar.k, h, kw),
+                (site(ll, L_KPROJ), xk, ar.kd, h, nkv * kn),
+                (site(ll, L_V), xv, ar.v, h, kw),
+                (site(ll, L_VPROJ), xv, ar.vd, h, nkv * kn),
+            ],
+            t,
+        );
         let (dyn_k, dyn_v, norm) = match (&l.kproj, &l.vproj) {
             (Some(_), Some(_)) => (ar.kd, ar.vd, 1.0 / ((2 * kn + 1) as f32).sqrt()),
             _ => (0, 0, 1.0 / ((kn + 1) as f32).sqrt()),
@@ -1893,6 +2246,7 @@ impl Engine {
                 &mut args![ar.part, ar.sink, ar.g, ar.att, nh as u32, ns, nh as u32, w as u32],
             );
             self.lin(&l.o, ar.att, ar.a, t, w, h, false);
+            self.lora(lo, &[(site(ll, L_O), ar.att, ar.a, w, h)], t);
             return;
         }
         self.go(self.attn_f(fmt, nh / nkv), (nkv as u32, t as u32, ns as u32), 128, &mut args![p]);
@@ -1903,6 +2257,7 @@ impl Engine {
             &mut args![ar.part, ar.sink, ar.g, ar.att, nh as u32, ns as u32, nh as u32, w as u32],
         );
         self.lin(&l.o, ar.att, ar.a, t, w, h, false);
+        self.lora(lo, &[(site(ll, L_O), ar.att, ar.a, w, h)], t);
     }
 
     /// The routed experts of `l` over `x` into `y`.
@@ -2031,7 +2386,8 @@ impl Engine {
     /// `ar.out` (final-normed hidden states), as `Inkling2Model::forward_capture`.
     /// `capture`: the steps whose entering stream goes to `ar.cap` (`[capture.len()][t][hidden]`;
     /// `steps().len()` the last layer's output).
-    fn pass(&self, m: &Inkling2Model, ar: &Arena, s: &DevSess, t: usize, capture: &[usize]) {
+    #[allow(clippy::too_many_arguments)]
+    fn pass(&self, m: &Inkling2Model, ar: &Arena, s: &DevSess, t: usize, capture: &[usize], ls: &LoraSet, lo: &LoraPass) {
         let c = &m.cfg;
         let h = self.h;
         let n = t * h;
@@ -2049,6 +2405,9 @@ impl Engine {
         for (si, step) in steps.iter().enumerate() {
             let l = &self.layers[step.layer];
             let slot = &s.slots[step.slot];
+            // (A looped layer's updates are those of its weights: the same in every pass.)
+            let ll: &[Vec<DLora>] = ls.layers.get(step.layer).map_or(&[], |v| &v[..]);
+            let gl = |i: usize| -> &[Vec<DLora>] { ll.get(L_GATES + 3 * i..L_GATES + 3 * i + 3).unwrap_or(&[]) };
             if let Some(lc) = c.loop_cfg
                 && step.layer == lc.start
             {
@@ -2096,7 +2455,7 @@ impl Engine {
                 }
                 (1, Some(lp)) => {
                     for i in 0..3 {
-                        self.gate(ar, &lp.gates[i], input[0], ar.msgs[i], ar.gated[i], t);
+                        self.gate(ar, &lp.gates[i], input[0], ar.msgs[i], ar.gated[i], t, lo, gl(i));
                         self.rms(ar.gated[i], ar.xn[i], l.ln[0], h, self.eps, t);
                     }
                     ar.xn
@@ -2105,7 +2464,7 @@ impl Engine {
                     for i in 0..3 {
                         let src = match mg {
                             Some(lp) => {
-                                self.gate(ar, &lp.gates[i], input[i], ar.msgs[i], ar.gated[i], t);
+                                self.gate(ar, &lp.gates[i], input[i], ar.msgs[i], ar.gated[i], t, lo, gl(i));
                                 ar.gated[i]
                             }
                             None => input[i],
@@ -2115,7 +2474,7 @@ impl Engine {
                     ar.xn
                 }
             };
-            self.attention(ar, l, xs[0], xs[1], xs[2], slot, s.fmt, t);
+            self.attention(ar, l, xs[0], xs[1], xs[2], slot, s.fmt, t, lo, ll);
             self.sconv(ar.a, slot.hist[2], l.attn_taps, 0, h, 1, t, conv_norm, ar.info);
             if l.boundary {
                 let st = free.pop().expect("inkling cuda: block states");
@@ -2133,7 +2492,7 @@ impl Engine {
             let hn = match msgs {
                 Some(lp) => {
                     self.mix(&states, ar.x, l.mlp_query, 1, &[ar.hn], &[], t);
-                    self.gate(ar, &lp.gates[3], ar.hn, ar.msgs[3], ar.hn2, t);
+                    self.gate(ar, &lp.gates[3], ar.hn, ar.msgs[3], ar.hn2, t, lo, gl(3));
                     self.rms(ar.hn2, ar.hn2, l.ln_post, h, self.eps, t);
                     ar.hn2
                 }
@@ -2467,6 +2826,16 @@ impl Engine {
             }
         }
         let ar = self.arena.lock().unwrap();
+        // The LoRA updates of this call: the strengths as they are now, on the device before the
+        // passes that read them.
+        let ls = self.lora_set(m);
+        let lo = ls.pass();
+        if lo.sig != 0 {
+            unsafe {
+                self.x
+                    .cuMemcpyHtoDAsync_v2(lo.st_dev, lo.st.as_ptr() as *const c_void, lo.st.len() * 4, self.stream);
+            }
+        }
         // (A fresh buffer: on a unified-memory device the driver fills pages that are not in the
         // page table yet many times slower, `cuda::touch_before_download`.)
         let mut out = vec![0f32; t * h];
@@ -2490,20 +2859,21 @@ impl Engine {
             if n <= MV_T && graphs() && self.prof.is_none() {
                 // Passes of a few tokens as CUDA graphs, one per token count and captured steps.
                 let caps: Vec<usize> = ds.slots.iter().map(|s| s.cap).collect();
-                if ds.graphs.first().is_some_and(|g| g.2 != caps) {
+                // (And one set of LoRA updates: a session that changes adapter captures again.)
+                if ds.graphs.first().is_some_and(|g| g.2 != caps || g.5 != lo.sig) {
                     ds.drop_graph();
                 }
                 if !ds.graphs.iter().any(|g| g.0 == n && g.1 == capture)
-                    && let Some((e, g)) = self.capture(m, &ar, ds, n, capture)
+                    && let Some((e, g)) = self.capture(m, &ar, ds, n, capture, &ls, &lo)
                 {
-                    ds.graphs.push((n, capture.to_vec(), caps, e, g));
+                    ds.graphs.push((n, capture.to_vec(), caps, e, g, lo.sig));
                 }
                 match ds.graphs.iter().find(|g| g.0 == n && g.1 == capture) {
                     Some(g) => assert!(unsafe { self.x.cuGraphLaunch(g.3, self.stream) } == 0, "inkling cuda: graph launch"),
-                    None => self.pass(m, &ar, ds, n, capture),
+                    None => self.pass(m, &ar, ds, n, capture, &ls, &lo),
                 }
             } else {
-                self.pass(m, &ar, ds, n, capture);
+                self.pass(m, &ar, ds, n, capture, &ls, &lo);
             }
             let mut cap = vec![0f32; if feats.is_some() { nf * n * h } else { 0 }];
             crate::cuda::touch_before_download(&mut cap);
@@ -2533,13 +2903,23 @@ impl Engine {
     }
 
     /// Captures a pass of `t` tokens as a graph.
-    fn capture(&self, m: &Inkling2Model, ar: &Arena, ds: &DevSess, t: usize, capture: &[usize]) -> Option<(F, F)> {
+    #[allow(clippy::too_many_arguments)]
+    fn capture(
+        &self,
+        m: &Inkling2Model,
+        ar: &Arena,
+        ds: &DevSess,
+        t: usize,
+        capture: &[usize],
+        ls: &LoraSet,
+        lo: &LoraPass,
+    ) -> Option<(F, F)> {
         unsafe {
             if self.x.cuStreamBeginCapture_v2(self.stream, 1) != 0 {
                 return None;
             }
         }
-        self.pass(m, ar, ds, t, capture);
+        self.pass(m, ar, ds, t, capture, ls, lo);
         let mut g = std::ptr::null_mut();
         if unsafe { self.x.cuStreamEndCapture(self.stream, &mut g) } != 0 || g.is_null() {
             debug("graph capture failed");
@@ -2554,11 +2934,20 @@ impl Engine {
         Some((exec, g))
     }
 
-    /// The unembedding of `hidden` (`[t, hidden]`), soft-capped when `cap`.
-    fn logits(&self, hidden: &[f32], t: usize, cap: bool) -> Vec<f32> {
+    /// The unembedding of `hidden` (`[t, hidden]`), soft-capped when `cap`, with the LoRA
+    /// updates of `m`'s head.
+    fn logits(&self, m: &Inkling2Model, hidden: &[f32], t: usize, cap: bool) -> Vec<f32> {
         let (h, v, u) = (self.h, self.vocab, self.unpadded);
         assert!(unsafe { self.x.cuCtxSetCurrent(self.ctx) } == 0, "inkling cuda: context");
         let ar = self.arena.lock().unwrap();
+        let ls = self.lora_set(m);
+        let lo = ls.pass();
+        if lo.any(std::slice::from_ref(&ls.head)) {
+            unsafe {
+                self.x
+                    .cuMemcpyHtoDAsync_v2(lo.st_dev, lo.st.as_ptr() as *const c_void, lo.st.len() * 4, self.stream);
+            }
+        }
         let mut out = vec![0f32; t * u];
         crate::cuda::touch_before_download(&mut out);
         let mut done = 0;
@@ -2569,6 +2958,7 @@ impl Engine {
                     .cuMemcpyHtoDAsync_v2(ar.x, hidden[done * h..].as_ptr() as *const c_void, n * h * 4, self.stream);
             }
             self.lin(&self.head, ar.x, ar.head, n, h, v, false);
+            self.lora(&lo, &[(&ls.head, ar.x, ar.head, h, v)], n);
             let tot = (n * u) as u32;
             let cp = if cap { self.softcap } else { 0.0 };
             self.go(
@@ -2624,6 +3014,11 @@ impl DevEngine for Engine {
         if capture.len() > MAX_CAPTURE {
             return false;
         }
+        // An update without a kernel is on: this pass is the CPU's (the session goes back to the
+        // host; the passes of requests without that adapter come back here).
+        if self.lora_set(m).is_blocked() {
+            return false;
+        }
         let Some(hs) = self.run_pass(m, sess, x, t, capture, feats) else {
             // The device cannot hold this session: it stays on the host from now on.
             sess.dev_off = true;
@@ -2631,7 +3026,7 @@ impl DevEngine for Engine {
         };
         if let Some((l, rows)) = want.logits {
             let r = rows.min(t);
-            *l = self.logits(&hs[(t - r) * self.h..], r, true);
+            *l = self.logits(m, &hs[(t - r) * self.h..], r, true);
         }
         if let Some(hv) = want.hidden {
             *hv = hs;
@@ -2642,8 +3037,17 @@ impl DevEngine for Engine {
         self.run_pass(m, sess, x, t, &[], None)
             .expect("inkling cuda: no device memory for the session")
     }
-    fn head(&self, _m: &Inkling2Model, hidden: &[f32], t: usize, cap: bool) -> Option<Vec<f32>> {
-        Some(self.logits(hidden, t, cap))
+    fn head(&self, m: &Inkling2Model, hidden: &[f32], t: usize, cap: bool) -> Option<Vec<f32>> {
+        // (With an update without a kernel on, the pass was the CPU's and so is its head.)
+        if self.lora_set(m).is_blocked() {
+            return None;
+        }
+        Some(self.logits(m, hidden, t, cap))
+    }
+    /// The side paths are read again from the model at the next pass: the engine stays.
+    fn adapters_changed(&self) -> bool {
+        self.lora_stale.store(true, Ordering::SeqCst);
+        true
     }
     fn to_host(&self, m: &Inkling2Model, sess: &mut Inkling2Session) {
         let Some(mut d) = sess.dev.take() else { return };
@@ -2728,6 +3132,166 @@ mod tests {
     /// against the product of the CPU's dequantized rows in f64; the matvecs with a lane per 4
     /// values and with a lane per block (`LANE_BLOCKS`: rows of 16, 72 and 36 or 40 blocks, so
     /// one, four and eight or four row groups a warp).
+    /// Adapters attached to a loaded model as the server attaches a profile's
+    /// (`lora::attach_switched`, on the tiny looped checkpoint in the engine's shapes): switched
+    /// off the device gives the base model's bits, switched on the CPU path's logits with the
+    /// same adapter (prefill, a pass of a few tokens and one-token steps), each token of a pass
+    /// of a few the bits of its one-token pass; two adapters side by side, one retired; an
+    /// adapter on the routed experts sends its own passes to the CPU and no others.
+    #[test]
+    fn lora_side_paths_match_the_cpu_and_switch_per_pass() {
+        use crate::lora::attach_switched;
+        use crate::safetensors::ModelFiles;
+        let Some(be) = backend() else { return };
+        let dir = std::env::temp_dir().join(format!("oxinfer-ink-cuda-lora-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (model, a1, a2, a3) = (dir.join("model"), dir.join("a1"), dir.join("a2"), dir.join("a3"));
+        super::super::tiny::write_tiny_metal(&model, 4).unwrap();
+        let mut dense = vec![
+            "attn.wq_du".to_string(),
+            "attn.wk_dv".into(),
+            "attn.wv_dv".into(),
+            "attn.wr_du".into(),
+            "attn.gate_attn".into(),
+            "attn.attn_sink_proj".into(),
+            "attn.wo_ud".into(),
+            "attn.k_sconv.weight_proj".into(),
+            "attn.v_sconv.weight_proj".into(),
+            "lm_head".into(),
+        ];
+        for kind in ["attn", "k", "v", "mlp"] {
+            for w in ["down_weight", "forget_weight", "gain_weight"] {
+                dense.push(format!("controllers.{kind}.{w}"));
+            }
+        }
+        let dense: Vec<&str> = dense.iter().map(|s| s.as_str()).collect();
+        super::super::tiny::write_adapter_metal(&a1, 21, 0.25, &dense).unwrap();
+        super::super::tiny::write_adapter_metal(&a2, 22, 0.25, &["attn.wo_ud"]).unwrap();
+        super::super::tiny::write_adapter_metal(&a3, 23, 0.25, &["attn.wo_ud", "mlp.experts"]).unwrap();
+        let files = ModelFiles::open(&model, true).unwrap();
+        let load = |device: bool| {
+            let cfg = super::super::Inkling2Config::load(&model).unwrap();
+            let m = Inkling2Model::load(cfg, &files, crate::model::Quant::Bf16).unwrap();
+            let dev = device.then(|| Box::new(Engine::new_on(be, &m).expect("no engine for the tiny model")) as Box<dyn DevEngine>);
+            let _ = m.device.set(dev);
+            m
+        };
+        let (mut mc, mut md) = (load(false), load(true));
+        let toks: Vec<u32> = (0..70u32).map(|i| (i * 29 + 3) % 250).collect();
+        // Every position's logits: a prefill pass (the GEMMs), a pass of 7 (the decode kernels),
+        // then one-token steps; and whether the session ended on the device.
+        let run = |m: &Inkling2Model| -> (Vec<f32>, bool) {
+            let mut s = m.new_session();
+            let mut out = Vec::new();
+            for c in [&toks[..40], &toks[40..47]].into_iter().chain(toks[47..].chunks(1)) {
+                let hs = m.forward_hidden(&mut s, c);
+                out.extend(m.logits(&hs, c.len()));
+            }
+            (out, s.dev.is_some())
+        };
+        let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+        let (base_c, _) = run(&mc);
+        let (base_d, on_dev) = run(&md);
+        assert!(on_dev, "the base model did not run on the device");
+        let d0 = diff(&base_c, &base_d);
+        let tol = (4.0 * d0).max(2e-3);
+        eprintln!("[base model, device against CPU: max logit diff {d0:.3e}]");
+        assert!(d0 < 2e-2, "base model: {d0}");
+        let attach = |mc: &mut Inkling2Model, md: &mut Inkling2Model, p: &std::path::Path| {
+            (
+                attach_switched(mc, p, &model, 1.0).unwrap(),
+                attach_switched(md, p, &model, 1.0).unwrap(),
+            )
+        };
+        let (s1c, s1d) = attach(&mut mc, &mut md, &a1);
+        let (s2c, s2d) = attach(&mut mc, &mut md, &a2);
+        // Attached and off: the base model's bits, on the device.
+        let (off, on_dev) = run(&md);
+        assert!(on_dev);
+        assert!(bits(&off) == bits(&base_d), "an adapter switched off changes the device's logits");
+        let mut seen: Vec<Vec<f32>> = vec![base_d.clone()];
+        let mut check = |name: &str, mc: &Inkling2Model, md: &Inkling2Model| {
+            let (c, _) = run(mc);
+            let (d, on_dev) = run(md);
+            assert!(on_dev, "{name}: not on the device");
+            let (e, moved) = (diff(&c, &d), diff(&d, &base_d));
+            eprintln!("[{name}: device against CPU {e:.3e}; the adapter moves the logits by {moved:.3e}]");
+            assert!(e < tol, "{name}: device against CPU {e} (base {d0})");
+            assert!(moved > 20.0 * tol, "{name}: the adapter moves the logits by {moved} only");
+            assert!(
+                seen.iter().all(|s| diff(s, &d) > 20.0 * tol),
+                "{name}: the logits of another set of adapters"
+            );
+            seen.push(d);
+        };
+        for (name, on1, on2) in [("every dense module", true, false), ("wo_ud", false, true), ("both", true, true)] {
+            s1c.set(on1);
+            s1d.set(on1);
+            s2c.set(on2);
+            s2d.set(on2);
+            check(name, &mc, &md);
+        }
+        // A token of a pass of several is its one-token pass, with the updates on.
+        {
+            let mut s = md.new_session();
+            md.forward_hidden(&mut s, &toks[..40]);
+            let mut t = s.clone();
+            let hs = md.forward_hidden(&mut s, &toks[40..53]);
+            let many = md.logits(&hs, 13);
+            let mut single = Vec::new();
+            for &tk in &toks[40..53] {
+                let hs = md.forward_hidden(&mut t, &[tk]);
+                single.extend(md.logits(&hs, 1));
+            }
+            assert!(
+                bits(&many) == bits(&single),
+                "a pass of 13 differs from 13 one-token passes with adapters on"
+            );
+        }
+        // Off again: the base bits; then the first adapter retired, the second on: the model
+        // that only has the second.
+        s1d.set(false);
+        s2d.set(false);
+        assert!(bits(&run(&md).0) == bits(&base_d), "switched off after being on");
+        s2c.set(true);
+        s2d.set(true);
+        let (only2, _) = run(&md);
+        s1c.retire();
+        s1d.retire();
+        mc.reset_device();
+        md.reset_device();
+        let (after, on_dev) = run(&md);
+        assert!(on_dev);
+        assert!(bits(&after) == bits(&only2), "retiring another adapter changes the logits");
+        // An adapter on the routed experts: its passes are the CPU's, the others stay.
+        let (s3c, s3d) = attach(&mut mc, &mut md, &a3);
+        let (still, on_dev) = run(&md);
+        assert!(on_dev, "an adapter on the experts, switched off, takes the model off the device");
+        assert!(bits(&still) == bits(&only2));
+        s2c.set(false);
+        s2d.set(false);
+        s3c.set(true);
+        s3d.set(true);
+        let (c, _) = run(&mc);
+        let (d, on_dev) = run(&md);
+        assert!(!on_dev, "expert updates have no kernel: the pass should have been the CPU's");
+        let e = diff(&c, &d);
+        assert!(e < tol, "expert adapter on the CPU path: {e}");
+        assert!(diff(&d, &base_d) > 20.0 * tol);
+        assert!(
+            crate::gpu::warnings().iter().any(|w| w.contains("the routed experts")),
+            "no warning recorded"
+        );
+        s3c.set(false);
+        s3d.set(false);
+        let (back, on_dev) = run(&md);
+        assert!(on_dev);
+        assert!(bits(&back) == bits(&base_d), "the base model after an expert adapter's request");
+        drop((mc, md));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn matvecs_and_gemms_match_definition() {
         let Some(be) = backend() else { return };
@@ -3361,7 +3925,7 @@ mod tests {
         let x = rnds(t * h, &mut seed, 2.0);
         let m = rnds(t * h, &mut seed, 2.0);
         let (px, pm, po) = (e.upf(&x).unwrap(), e.upf(&m).unwrap(), zeros(&e, t * h));
-        e.gate(&ar, &g, px, pm, po, t);
+        e.gate(&ar, &g, px, pm, po, t, &LoraPass::off(), &[]);
         let got = down(&e, po, t * h);
         for tok in 0..t {
             let mut cat = [&x[tok * h..(tok + 1) * h], &m[tok * h..(tok + 1) * h]].concat();

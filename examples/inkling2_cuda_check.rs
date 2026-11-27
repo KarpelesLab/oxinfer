@@ -15,6 +15,10 @@
 //!
 //! `--seed N` picks another pseudo-random prompt.
 //!
+//! `--lora DIR` attaches an adapter as the server attaches a profile's (behind a switch, turned
+//! on; repeatable), `--lora-off` leaves the switches off. Each run tells whether its session
+//! ended on the device.
+//!
 //! `--rollback R` (device only): after the decode steps, goes back R positions and feeds the same
 //! tokens again, one at a time and then as one pass, comparing the logits with the first time
 //! (a session's caches and convolution rings by position: they must match exactly).
@@ -67,6 +71,7 @@ fn main() -> Result<()> {
     let mut keep = usize::MAX;
     let mut seed = 0x2545_F491_4F6C_DD1Du64;
     let mut rollback = 0usize;
+    let (mut loras, mut lora_on) = (Vec::<String>::new(), true);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--prompt-len" => plen = args.next().context("N")?.parse()?,
@@ -82,6 +87,8 @@ fn main() -> Result<()> {
             "--keep" => keep = args.next().context("N")?.parse()?,
             "--rollback" => rollback = args.next().context("R")?.parse()?,
             "--seed" => seed ^= args.next().context("N")?.parse::<u64>()?.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            "--lora" => loras.push(args.next().context("DIR")?),
+            "--lora-off" => lora_on = false,
             o => anyhow::bail!("unknown argument {o}"),
         }
     }
@@ -95,6 +102,20 @@ fn main() -> Result<()> {
     let files = ModelFiles::open(&dir, true)?;
     let mut m = Inkling2Model::load(Inkling2Config::load(&dir)?, &files, oxinfer::model::Quant::Bf16)?;
     m.kv = kv;
+    // Attached as the server attaches a profile's adapter: behind a switch, on or off.
+    let mut switches = Vec::new();
+    for l in &loras {
+        let sw = oxinfer::lora::attach_switched(&mut m, std::path::Path::new(l), &dir, 1.0)?;
+        sw.set(lora_on);
+        println!(
+            "adapter {l}: rank {}, {} modules, switched {}",
+            sw.adapter.rank,
+            sw.adapter.modules,
+            if lora_on { "on" } else { "off" }
+        );
+        switches.push(sw);
+    }
+    let on_device = std::cell::Cell::new(false);
     let mut s = seed;
     let tokens: Vec<u32> = (0..plen + depth)
         .map(|_| {
@@ -143,6 +164,7 @@ fn main() -> Result<()> {
             toks.push(argmax(&lg) as u32);
             out.push(lg);
         }
+        on_device.set(sess.on_device());
         Run {
             logits: out,
             tokens: toks,
@@ -152,10 +174,11 @@ fn main() -> Result<()> {
     };
     let report = |name: &str, r: &Run| {
         println!(
-            "{name}: prefill {plen} tokens at depth {depth} in {:.2}s ({:.0} tok/s), {steps} decode steps {:.1} tok/s; tokens {:?}",
+            "{name}: prefill {plen} tokens at depth {depth} in {:.2}s ({:.0} tok/s), {steps} decode steps {:.1} tok/s; session on the device: {}; tokens {:?}",
             r.prefill,
             plen as f64 / r.prefill,
             steps as f64 / r.decode,
+            on_device.get(),
             &r.tokens[..r.tokens.len().min(12)]
         );
     };

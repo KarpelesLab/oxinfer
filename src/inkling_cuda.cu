@@ -3394,4 +3394,69 @@ extern "C" __global__ void softcap_k(const float* l, float* out, u32 v, u32 u, u
     float x = l[tok * v + c];
     out[i] = cap > 0.f ? cap * tanh_acc(x / cap) : x;
 }
+
+// LoRA updates beside projections: y[tok] += st[0] * B (A x[tok]) for each job, `a` [r, n_in],
+// `bt` B transposed [r, n_out], r <= 256, n_in a multiple of 4; `st` the update's strength,
+// written by the host before each pass; the jobs of a launch have different outputs. A block
+// per (token, 2048 columns of y, job) of whole warps: warp w takes the ranks w, w + nw, ..., its
+// lanes four elements in every 128 of A[k] . x; then every thread adds four columns of B^T u.
+// The sums are the same whatever the pass's token count, so a token of a pass of several is the
+// token of a pass of its own.
+struct LoraJob {
+    const float* a;
+    const float* bt;
+    const float* st;
+    const float* x;
+    float* y;
+    u32 n_in, n_out, r, xs, ys, pad;
+};
+struct LoraJobs {
+    LoraJob j[8];
+};
+extern "C" __global__ void __launch_bounds__(512) lora_k(LoraJobs p) {
+    __shared__ float u[256];
+    const LoraJob& q = p.j[blockIdx.z];
+    u32 c0 = blockIdx.y * 2048u;
+    if (c0 >= q.n_out) return;
+    u32 tok = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    const float* xr = q.x + (u64)tok * q.xs;
+    float s = q.st[0];
+    for (u32 k = warp; k < q.r; k += nw) {
+        const float* ak = q.a + (u64)k * q.n_in;
+        float acc = 0.f;
+#pragma unroll 4
+        for (u32 i = 4 * lane; i < q.n_in; i += 128) {
+            float4 av = *(const float4*)(ak + i), xv = *(const float4*)(xr + i);
+            acc += av.x * xv.x + av.y * xv.y + av.z * xv.z + av.w * xv.w;
+        }
+        acc = warp_sum(acc);
+        if (lane == 0) u[k] = acc * s;
+    }
+    __syncthreads();
+    float* yr = q.y + (u64)tok * q.ys;
+    u32 c1 = min(q.n_out, c0 + 2048u);
+    if (((q.n_out | q.ys) & 3) == 0) {
+        u32 o = c0 + 4 * threadIdx.x;
+        if (o < c1) {
+            float4 acc = *(float4*)(yr + o);
+#pragma unroll 8
+            for (u32 k = 0; k < q.r; k++) {
+                float4 b = *(const float4*)(q.bt + (u64)k * q.n_out + o);
+                float uk = u[k];
+                acc.x += uk * b.x;
+                acc.y += uk * b.y;
+                acc.z += uk * b.z;
+                acc.w += uk * b.w;
+            }
+            *(float4*)(yr + o) = acc;
+        }
+    } else {
+        // (Rows that are not whole float4s: a column at a time.)
+        for (u32 o = c0 + threadIdx.x; o < c1; o += blockDim.x) {
+            float acc = 0.f;
+            for (u32 k = 0; k < q.r; k++) acc += u[k] * q.bt[(u64)k * q.n_out + o];
+            yr[o] += acc;
+        }
+    }
+}
 #endif // GGML_ONLY

@@ -164,17 +164,63 @@ pub fn write_tiny(dir: &Path, seed: u64) -> Result<()> {
 /// (`adapter_config.json`, `adapter_model.safetensors`): rank 4, alpha 8, on the attention output
 /// projection (`wo_ud`) of every layer, `A` and `B` noise of width `scale` from `seed`.
 pub fn write_adapter(dir: &Path, seed: u64, scale: f32) -> Result<()> {
+    write_adapter_with(dir, seed, scale, &TINY, &["attn.wo_ud"])
+}
+
+/// [`write_adapter`] for [`write_tiny_metal`]'s model, on the modules `targets` of every layer
+/// that has them: the attention's projections (`attn.wq_du`, `attn.wk_dv`, `attn.wv_dv`,
+/// `attn.wr_du`, `attn.gate_attn`, `attn.attn_sink_proj`, `attn.wo_ud`), the dynamic
+/// convolutions' (`attn.k_sconv.weight_proj`, `attn.v_sconv.weight_proj`: the full layers), the
+/// message gates' (`controllers.KIND.down_weight` / `forget_weight` / `gain_weight`, `KIND` one
+/// of `attn`, `k`, `v`, `mlp`: the looped layers), the experts' down projections
+/// (`mlp.experts`), and `lm_head`.
+pub fn write_adapter_metal(dir: &Path, seed: u64, scale: f32, targets: &[&str]) -> Result<()> {
+    write_adapter_with(dir, seed, scale, &METAL, targets)
+}
+
+fn write_adapter_with(dir: &Path, seed: u64, scale: f32, d: &Dims, targets: &[&str]) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
     let r = 4usize;
+    let h = d.h;
     let mut t = Tensors {
         list: Vec::new(),
         rng: Rng(seed),
     };
+    let pair = |t: &mut Tensors, p: &str, n_out: usize, n_in: usize| {
+        t.raw(&format!("{p}.lora_A.weight"), &[r, n_in], scale, 0.0);
+        t.raw(&format!("{p}.lora_B.weight"), &[n_out, r], scale, 0.0);
+    };
     for l in 0..LAYERS {
-        let (heads, _, d) = if (l + 1).is_multiple_of(BLOCK) { FULL } else { SWA };
-        let p = format!("base_model.model.model.llm.layers.{l}.attn.wo_ud");
-        t.raw(&format!("{p}.lora_A.weight"), &[r, heads * d], scale, 0.0);
-        t.raw(&format!("{p}.lora_B.weight"), &[H, r], scale, 0.0);
+        let full = (l + 1).is_multiple_of(BLOCK);
+        let (heads, kv, hd) = if full { d.full } else { d.swa };
+        let looped = (LOOP.0..LOOP.1).contains(&l);
+        for &name in targets {
+            let p = format!("base_model.model.model.llm.layers.{l}.{name}");
+            let (n_out, n_in) = match name {
+                "attn.wq_du" | "attn.gate_attn" => (heads * hd, h),
+                "attn.wk_dv" | "attn.wv_dv" => (kv * hd, h),
+                "attn.wr_du" => (heads * d.d_rel, h),
+                "attn.attn_sink_proj" => (heads, h),
+                "attn.wo_ud" => (h, heads * hd),
+                "attn.k_sconv.weight_proj" | "attn.v_sconv.weight_proj" if full => (kv * KERNEL, h),
+                "mlp.experts" => {
+                    // (PEFT's layout for stacked experts: `lora_A` [experts * r, in], `lora_B`
+                    // [out, r * experts].)
+                    t.raw(&format!("{p}.lora_A.weight"), &[d.experts * r, d.inter], scale, 0.0);
+                    t.raw(&format!("{p}.lora_B.weight"), &[h, r * d.experts], scale, 0.0);
+                    continue;
+                }
+                n if n.starts_with("controllers.") && looped => match n.rsplit('.').next() {
+                    Some("down_weight") => (d.rank, 2 * h),
+                    _ => (h, d.rank),
+                },
+                _ => continue,
+            };
+            pair(&mut t, &p, n_out, n_in);
+        }
+    }
+    if targets.contains(&"lm_head") {
+        pair(&mut t, "base_model.model.model.llm.lm_head", VOCAB, h);
     }
     t.write(&dir.join("adapter_model.safetensors"))?;
     let config = json!({"peft_type": "LORA", "r": r, "lora_alpha": 2 * r, "target_modules": ["wo_ud"]});
@@ -185,18 +231,19 @@ pub fn write_adapter(dir: &Path, seed: u64, scale: f32) -> Result<()> {
 /// [`write_tiny`] in the shapes the Metal engine takes (heads of 128 channels, 256 wide, a
 /// relative bias of 16), for tests of the GPU passes.
 pub fn write_tiny_metal(dir: &Path, seed: u64) -> Result<()> {
-    let d = Dims {
-        h: 256,
-        full: (4, 2, 128),
-        swa: (4, 2, 128),
-        d_rel: 16,
-        extent: 24,
-        inter: 128,
-        experts: 8,
-        rank: 64,
-    };
-    write_tiny_with(dir, seed, false, &d)
+    write_tiny_with(dir, seed, false, &METAL)
 }
+
+const METAL: Dims = Dims {
+    h: 256,
+    full: (4, 2, 128),
+    swa: (4, 2, 128),
+    d_rel: 16,
+    extent: 24,
+    inter: 128,
+    experts: 8,
+    rank: 64,
+};
 
 /// The text model's widths: hidden size, (heads, key / value heads, head size) of the full and
 /// of the sliding layers, relative bias rank and extent, expert width and count.

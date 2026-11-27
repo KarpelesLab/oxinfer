@@ -1129,6 +1129,12 @@ pub(crate) trait DevEngine: Send + Sync {
     fn head(&self, m: &Inkling2Model, hidden: &[f32], t: usize, cap: bool) -> Option<Vec<f32>>;
     /// Moves the device state of `sess`, if any, back into its host caches.
     fn to_host(&self, m: &Inkling2Model, sess: &mut Inkling2Session);
+    /// The set of adapters attached to the model's weights changed (attached, replaced or
+    /// retired; no pass is running): true when the engine reads them again from the model at its
+    /// next pass and stays the model's, false when it has to be built again for them.
+    fn adapters_changed(&self) -> bool {
+        false
+    }
     /// Greedy decoding on the device ([`Inkling2Model::decode_greedy`]): one-token passes from
     /// `first`, each pass's input the argmax of the one before, at most `max` of them; `on` gets
     /// each kept pass's argmax in order ([`crate::generate::Chain`]). The passes run (the session
@@ -1388,6 +1394,11 @@ pub(crate) struct DevWant<'w> {
 }
 
 impl Inkling2Session {
+    /// Whether the session's state is on the accelerator: its last pass ran there.
+    pub fn on_device(&self) -> bool {
+        self.dev.is_some()
+    }
+
     /// Bytes of memory its caches hold: the attention caches on the host and on the device, and
     /// its checkpoints.
     pub fn cache_bytes(&self) -> usize {
@@ -1543,7 +1554,7 @@ pub struct Inkling2Model<'a> {
     stream: Option<crate::stream::StreamHook>,
     /// Whole passes on the GPU, decided at the first pass ([`DevEngine`]).
     device: std::sync::OnceLock<Option<Box<dyn DevEngine>>>,
-    /// Engines replaced since (see `attach_lora`).
+    /// Engines replaced since ([`Self::reset_device`]).
     retired: Vec<Box<dyn DevEngine>>,
     /// Bytes of weights a GPU engine may keep mapped (None: no limit): above it the passes stay
     /// on the CPU (a phone's GPU working set or app limit, `crate::stream::DeviceMemory`).
@@ -2056,11 +2067,15 @@ impl<'a> Inkling2Model<'a> {
         Ok(m)
     }
 
-    /// Forgets the GPU engine, which is built for the weights' adapters (Metal runs them as side
-    /// paths, CUDA leaves adapted models to the CPU): decided again at the next pass, after the
-    /// set of attached adapters changed. The engine it replaces stays to bring the sessions that
-    /// ran on it back to the host caches.
+    /// Tells the GPU engine that the set of attached adapters changes (before or after the
+    /// change, with no pass running). The CUDA engine keeps the weights it holds and reads its
+    /// side paths again at the next pass ([`DevEngine::adapters_changed`]); one built for the
+    /// weights' adapters (Metal) is forgotten and decided again at the next pass, and stays
+    /// to bring the sessions that ran on it back to the host caches.
     pub(crate) fn reset_device(&mut self) {
+        if self.device.get().and_then(|d| d.as_deref()).is_some_and(|e| e.adapters_changed()) {
+            return;
+        }
         if let Some(Some(e)) = std::mem::take(&mut self.device).into_inner() {
             self.retired.push(e);
         }
