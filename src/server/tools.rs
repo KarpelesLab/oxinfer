@@ -1,8 +1,9 @@
-//! Endpoints of the non-generative models: voice isolation (`POST /v1/audio/isolations`) and
-//! depth estimation (`POST /v1/images/depth`).
+//! Endpoints of the non-generative models: voice isolation (`POST /v1/audio/isolations`), depth
+//! estimation (`POST /v1/images/depth`) and OCR (`POST /v1/ocr`).
 //!
 //! Each takes `multipart/form-data` (the input as the `file` part, the other fields as form
-//! fields) or a JSON object (the input base64-encoded in `file`, optionally as a `data:` URL).
+//! fields) or a JSON object (the input base64-encoded in `file`, optionally as a `data:` URL;
+//! the image endpoints also take `image`).
 
 use super::media::{Part, TempFiles, extension, multipart};
 use super::registry::{Kind, Loaded};
@@ -282,6 +283,63 @@ pub(super) fn depth(api: &Arc<Api>, req: &ApiRequest) -> ApiResult<Output> {
     })
 }
 
+/// `POST /v1/ocr`: the text of an image (PNG, JPEG, WebP, GIF, BMP) with OCRia-nano-1. Fields:
+/// `model`, `file` (or `image`), `response_format` (`json`, the default: the page with its
+/// lines, boxes, text and confidences; `text`: the text alone), and the page options
+/// ([`crate::ocria::OcrRunOptions::KEYS`]: `plain`, `det_long_side`, `det_thresh`, the switches).
+pub(super) fn ocr(api: &Arc<Api>, req: &ApiRequest) -> ApiResult<Output> {
+    let f = Fields::parse(req, "image")?;
+    let model = f
+        .get("model")
+        .ok_or_else(|| ApiError::bad("model is required").param("model"))?
+        .to_string();
+    let file = f
+        .file
+        .as_ref()
+        .ok_or_else(|| ApiError::bad("file (or image) is required").param("file"))?;
+    let format = f.get("response_format").unwrap_or("json").to_string();
+    if !["json", "text"].contains(&format.as_str()) {
+        return Err(ApiError::bad(format!("response_format {format:?}: expected json or text")).param("response_format"));
+    }
+    let mut o = crate::ocria::OcrRunOptions::default();
+    // `plain` first: it resets the others.
+    if let Some(v) = f.get("plain") {
+        o.set("plain", v).map_err(|e| ApiError::bad(format!("{e:#}")).param("plain"))?;
+    }
+    for k in crate::ocria::OcrRunOptions::KEYS.iter().filter(|k| **k != "plain") {
+        if let Some(v) = f.get(k) {
+            o.set(k, v).map_err(|e| ApiError::bad(format!("{e:#}")).param(k))?;
+        }
+    }
+    api.models.check(&model, Kind::Ocr)?;
+    let img = crate::mm::decode_images(std::slice::from_ref(&file.data)).map_err(|e| ApiError::bad(format!("decode image: {e:#}")))?;
+    let img = &img[0];
+    let mut lease = api.models.acquire(&model, Kind::Ocr)?;
+    let Loaded::Ocr(m) = lease.model() else { unreachable!() };
+    let page = m
+        .ocr_rgb(&img.data, img.width, img.height, &o)
+        .map_err(|e| ApiError::new(500, format!("{e:#}")))?;
+    drop(lease);
+    let body = |ct: &str, b: Vec<u8>| {
+        Output::Full(ApiResponse {
+            status: 200,
+            content_type: ct.into(),
+            body: b,
+        })
+    };
+    Ok(match format.as_str() {
+        "text" => body("text/plain; charset=utf-8", page.text.into_bytes()),
+        _ => {
+            let mut v = serde_json::to_value(&page).unwrap_or_default();
+            if let Value::Object(m) = &mut v {
+                m.insert("object".into(), json!("ocr.page"));
+                m.insert("model".into(), json!(model));
+            }
+            body("application/json", serde_json::to_vec(&v).unwrap_or_default())
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +404,49 @@ mod tests {
             panic!()
         };
         assert_eq!((r.status, r.content_type.as_str()), (200, "image/png"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ocr_endpoint() {
+        let dir = crate::ocria::tests::tiny("srv");
+        let mut opts = ServerOptions::default();
+        opts.set("model", &format!("ocr={},scripts=latin", dir.display())).unwrap();
+        let api = Api::new(opts).unwrap();
+        let (w, h) = (320, 160);
+        let png = crate::png::encode_rgb(
+            w,
+            h,
+            &crate::ocria::tests::page_with(w, h, &[(40, 30, 260, 50), (40, 100, 280, 120)]),
+        );
+        let body = json!({ "model": "ocr", "image": crate::b64::encode(&png), "plain": true });
+        let Output::Full(r) = api.handle(&ApiRequest::post_json("/v1/ocr", &body.to_string())) else {
+            panic!("a full response")
+        };
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["object"], "ocr.page");
+        assert_eq!(v["text"], "x\nx");
+        assert_eq!(v["lines"].as_array().unwrap().len(), 2);
+        assert_eq!(v["lines"][0]["script"], "latin");
+        // Text out, a bad option, a wrong kind of model.
+        let body = json!({ "model": "ocr", "file": crate::b64::encode(&png), "response_format": "text" });
+        let Output::Full(r) = api.handle(&ApiRequest::post_json("/v1/ocr", &body.to_string())) else {
+            panic!()
+        };
+        assert_eq!(
+            (r.status, r.content_type.as_str(), r.body.as_slice()),
+            (200, "text/plain; charset=utf-8", &b"x\nx"[..])
+        );
+        let body = json!({ "model": "ocr", "file": crate::b64::encode(&png), "gutter": "maybe" });
+        let Output::Full(r) = api.handle(&ApiRequest::post_json("/v1/ocr", &body.to_string())) else {
+            panic!()
+        };
+        assert_eq!(r.status, 400);
+        let Output::Full(r) = api.handle(&ApiRequest::post_json("/v1/ocr", &json!({ "model": "ocr" }).to_string())) else {
+            panic!()
+        };
+        assert_eq!(r.status, 400);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

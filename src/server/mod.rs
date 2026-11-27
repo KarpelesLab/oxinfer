@@ -1,7 +1,7 @@
 //! An OpenAI-compatible API over the models oxinfer runs (feature `server`): chat completions
 //! (text, images, video and audio input, tools, thinking, streaming), legacy completions,
 //! embeddings, image generation and editing, speech to text (Whisper), text to speech
-//! (Orpheus), voice isolation and depth estimation.
+//! (Orpheus), voice isolation, depth estimation and OCR.
 //!
 //! [`Api`] is the request handling without any transport: an HTTP-like request in
 //! ([`ApiRequest`]: method, path, content type, body), a response out ([`Output`]: a complete body,
@@ -73,8 +73,8 @@ pub struct ModelSpec {
 impl ModelSpec {
     /// Server-side keys of a model, besides those of its loader (for chat models,
     /// [`crate::engine::EngineOptions::KEYS`]):
-    /// - `kind`: `chat`, `embedding`, `image`, `transcription`, `speech`, `video`, `isolation` or `depth`
-    ///   (default: detected);
+    /// - `kind`: `chat`, `embedding`, `image`, `transcription`, `speech`, `video`, `isolation`,
+    ///   `depth` or `ocr` (default: detected);
     /// - `system`: the system prompt when a request has none (default none; `default` for the
     ///   CLI's prompt with the local date and time);
     /// - `think`: thinking by default (`1` / `0`; requests override it);
@@ -210,7 +210,7 @@ impl ModelSpec {
         if let Some(k) = self.option("kind") {
             Kind::parse(k).with_context(|| {
                 format!(
-                    "{}: unknown kind {k:?} (chat, embedding, image, transcription, speech, video)",
+                    "{}: unknown kind {k:?} (chat, embedding, image, transcription, speech, video, isolation, ocr)",
                     self.id
                 )
             })?;
@@ -1031,6 +1031,7 @@ impl Api {
             "/v1/audio/voices" if get => speech::voices(self, req),
             "/v1/audio/isolations" if post => tools::isolations(self, req),
             "/v1/images/depth" if post => tools::depth(self, req),
+            "/v1/ocr" if post => tools::ocr(self, req),
             "/v1/videos" | "/v1/videos/generations" if post => video::create(self, req),
             "/v1/videos" if get => video::list(self, req),
             p if p.starts_with("/v1/videos/") && p != "/v1/videos/generations" => video::route(self, req, &p["/v1/videos/".len()..]),
@@ -1048,6 +1049,7 @@ impl Api {
             | "/v1/audio/voices"
             | "/v1/audio/isolations"
             | "/v1/images/depth"
+            | "/v1/ocr"
             | "/v1/videos"
             | "/v1/videos/generations" => Err(wrong_method()),
             _ => Err(ApiError::new(404, format!("unknown endpoint {}", req.path))),

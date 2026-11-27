@@ -971,6 +971,7 @@ fn catalog(api: &Arc<Api>, w: &WebState) -> Value {
                 crate::advisor::Kind::Video => Some("video"),
                 crate::advisor::Kind::Audio => Some("isolation"),
                 crate::advisor::Kind::Depth => Some("depth"),
+                crate::advisor::Kind::Ocr => Some("ocr"),
             });
         }
     }

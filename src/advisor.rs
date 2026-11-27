@@ -38,6 +38,8 @@ pub enum Kind {
     Audio,
     /// Image in, a depth map out.
     Depth,
+    /// Images in, text out (OCR).
+    Ocr,
 }
 
 impl Kind {
@@ -51,6 +53,7 @@ impl Kind {
             Kind::Video => "video",
             Kind::Audio => "audio",
             Kind::Depth => "depth",
+            Kind::Ocr => "ocr",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -63,6 +66,7 @@ impl Kind {
             "video" | "videos" => Kind::Video,
             "audio" | "isolation" | "voice-isolation" => Kind::Audio,
             "depth" | "depth-estimation" => Kind::Depth,
+            "ocr" => Kind::Ocr,
             _ => return None,
         })
     }
@@ -182,10 +186,12 @@ pub enum Cap {
     VoiceIsolation,
     /// Metric depth of an image (and the focal length).
     DepthEstimation,
+    /// The text of an image, line by line with boxes.
+    Ocr,
 }
 
 impl Cap {
-    pub const ALL: [Cap; 21] = [
+    pub const ALL: [Cap; 22] = [
         Cap::Text,
         Cap::ImageInput,
         Cap::VideoInput,
@@ -207,6 +213,7 @@ impl Cap {
         Cap::ImageToVideo,
         Cap::VoiceIsolation,
         Cap::DepthEstimation,
+        Cap::Ocr,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
@@ -231,6 +238,7 @@ impl Cap {
             Cap::ImageToVideo => "image-to-video",
             Cap::VoiceIsolation => "voice-isolation",
             Cap::DepthEstimation => "depth-estimation",
+            Cap::Ocr => "ocr",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -954,6 +962,11 @@ pub const CATALOG: &[Model] = &[
     Model::new("apple/DepthPro2-L", Kind::Depth, 0.36, 1.43, &[DepthEstimation]).note("with apple/DepthPro2-focal; research-only license"),
     Model::new("apple/DepthPro2-H", Kind::Depth, 0.9, 3.6, &[DepthEstimation])
         .note("DINOv3 ViT-H+ (SwiGLU), with apple/DepthPro2-focal; research-only license; not run against the reference"),
+    Model::new("llamaindex/OCRia-nano-1", Kind::Ocr, 0.0039, 0.014, &[Ocr]).note(
+        "OCR (oxinfer ocr, /v1/ocr): LiteParse's line detector, script router and Latin / CJK / right-to-left / world \
+         recognizers (ONNX, 3.9M parameters, 14 MB) on oxinfer's own ONNX interpreter, the CPU; 72 ms for a 2000 x 2600 \
+         page of 70 lines on an M5 Max, 316 ms on one core",
+    ),
 ];
 
 /// A curated stack: a base model of the catalog with LoRA files at set strengths, a trigger word
@@ -1662,7 +1675,7 @@ fn path_of(m: &Model) -> EnginePath {
         Kind::Speech => EnginePath::Matmuls,
         Kind::Tts if has(&["orpheus"]) => EnginePath::Graph,
         Kind::Video if has(&["ltx-2"]) => EnginePath::Pipeline,
-        Kind::Tts | Kind::Video | Kind::Audio => EnginePath::Cpu,
+        Kind::Tts | Kind::Video | Kind::Audio | Kind::Ocr => EnginePath::Cpu,
         Kind::Image | Kind::Embedding | Kind::Depth => EnginePath::Pipeline,
     }
 }
@@ -2213,6 +2226,7 @@ mod tests {
                     Kind::Video => has(Cap::TextToVideo),
                     Kind::Audio => has(Cap::VoiceIsolation),
                     Kind::Depth => has(Cap::DepthEstimation),
+                    Kind::Ocr => has(Cap::Ocr),
                     Kind::Image => has(Cap::TextToImage) || has(Cap::ImageEdit) || has(Cap::Inpainting),
                 },
                 "{}",

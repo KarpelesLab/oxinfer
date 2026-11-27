@@ -3429,6 +3429,123 @@ pub unsafe extern "C" fn oxi_depth_file(
     })
 }
 
+// ---- OCR (OCRia-nano-1) ----------------------------------------------------------------------
+
+/// Loaded OCRia-nano-1 models.
+pub struct OxiOcria(crate::ocria::Ocria);
+
+unsafe fn ocria<'a>(o: *const OxiOcria) -> Result<&'a crate::ocria::Ocria> {
+    Ok(&unsafe { o.as_ref() }.context("ocr handle is NULL")?.0)
+}
+
+fn ocr_run_options(options_json: *const c_char) -> Result<crate::ocria::OcrRunOptions> {
+    Ok(match unsafe { opt_str_arg(options_json, "options_json") }?.map(str::trim) {
+        Some(s) if !s.is_empty() => serde_json::from_str(s).context("options_json")?,
+        _ => Default::default(),
+    })
+}
+
+/// Loads OCRia-nano-1: the repo id `llamaindex/OCRia-nano-1` or a folder of its files; `key=value`
+/// options (`scripts=latin,cjk,rtl,world`, `det_long_side`, `threads`, `cache_dir`, `device`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_ocria_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiOcria {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let mut o = crate::ocria::OcrOptions::default();
+        for item in unsafe { opt_str_arg(options, "options") }?.unwrap_or("").split(['\n', ';']) {
+            let item = item.trim();
+            if item.is_empty() || item.starts_with('#') {
+                continue;
+            }
+            let (k, v) = item.split_once('=').with_context(|| format!("option {item:?} is not key=value"))?;
+            o.set(k.trim(), v.trim())?;
+        }
+        let m = with_progress(progress, user, || crate::ocria::Ocria::load(model, &o))?;
+        Ok(Box::into_raw(Box::new(OxiOcria(m))))
+    })
+}
+
+/// Frees the models (NULL is ignored). No call on them may be running.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_ocria_free(o: *mut OxiOcria) {
+    if !o.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(o) });
+            Ok(())
+        })
+    }
+}
+
+/// What was loaded, as JSON (free with `oxi_string_free`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_ocria_info_json(o: *const OxiOcria) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        Ok(out_string(serde_json::to_string(unsafe { ocria(o) }?.info())?))
+    })
+}
+
+/// OCR of an RGB (`channels` 3) or grey (1) image, row-major with `stride` bytes per row (0:
+/// `width * channels`). Returns the page as JSON (free with `oxi_string_free`), NULL on error.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn oxi_ocria_rgb(
+    o: *const OxiOcria,
+    pixels: *const u8,
+    width: usize,
+    height: usize,
+    channels: c_int,
+    stride: usize,
+    options_json: *const c_char,
+) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let o = unsafe { ocria(o) }?;
+        if pixels.is_null() {
+            bail!("pixels is NULL");
+        }
+        let ch = match channels {
+            1 => 1usize,
+            3 => 3,
+            c => bail!("channels must be 1 or 3, got {c}"),
+        };
+        let row = width.checked_mul(ch).context("image too large")?;
+        let stride = if stride == 0 { row } else { stride };
+        if stride < row {
+            bail!("stride {stride} is under width x channels ({row})");
+        }
+        let len = stride
+            .checked_mul(height.saturating_sub(1))
+            .and_then(|v| v.checked_add(row))
+            .context("image too large")?;
+        let src = unsafe { std::slice::from_raw_parts(pixels, len) };
+        let data: Vec<u8> = if stride == row {
+            src[..row * height].to_vec()
+        } else {
+            (0..height)
+                .flat_map(|y| src[y * stride..y * stride + row].iter().copied())
+                .collect()
+        };
+        let page = o.ocr_rgb(&data, width, height, &ocr_run_options(options_json)?)?;
+        Ok(out_string(serde_json::to_string(&page)?))
+    })
+}
+
+/// OCR of an image file (PNG, JPEG, WebP, GIF, BMP). Returns the page as JSON (free with
+/// `oxi_string_free`), NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_ocria_file(o: *const OxiOcria, path: *const c_char, options_json: *const c_char) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let o = unsafe { ocria(o) }?;
+        let path = unsafe { str_arg(path, "path") }?;
+        let page = o.ocr_file(std::path::Path::new(path), &ocr_run_options(options_json)?)?;
+        Ok(out_string(serde_json::to_string(&page)?))
+    })
+}
+
 // ---- OpenAI-compatible server ---------------------------------------------------------------
 
 /// Receives bytes of a response body (`len` bytes at `data`); return non-zero to stop a streamed

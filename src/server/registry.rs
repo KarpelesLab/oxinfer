@@ -30,6 +30,8 @@ pub enum Kind {
     Isolation,
     /// Monocular depth (Depth Pro 2): `/v1/images/depth`.
     Depth,
+    /// OCR (OCRia-nano-1): `/v1/ocr`.
+    Ocr,
 }
 
 impl Kind {
@@ -43,6 +45,7 @@ impl Kind {
             "video" | "videos" => Kind::Video,
             "isolation" | "voice-isolation" | "denoise" | "denoising" => Kind::Isolation,
             "depth" | "depth-estimation" => Kind::Depth,
+            "ocr" => Kind::Ocr,
             _ => return None,
         })
     }
@@ -56,6 +59,7 @@ impl Kind {
             Kind::Video => "video",
             Kind::Isolation => "isolation",
             Kind::Depth => "depth",
+            Kind::Ocr => "ocr",
         }
     }
 }
@@ -128,6 +132,7 @@ pub(crate) enum Loaded {
     Video(Box<VideoModel>),
     Isolation(Box<crate::voice_isolator::VoiceIsolator>),
     Depth(Box<crate::depth_pro::DepthPro>),
+    Ocr(Box<crate::ocria::Ocria>),
 }
 
 impl Loaded {
@@ -183,6 +188,7 @@ impl Loaded {
             Loaded::Video(_) => Kind::Video,
             Loaded::Isolation(_) => Kind::Isolation,
             Loaded::Depth(_) => Kind::Depth,
+            Loaded::Ocr(_) => Kind::Ocr,
         }
     }
 }
@@ -252,6 +258,7 @@ impl Entry {
                         (crate::zonos::is_zonos(p) || crate::fish::is_drama(p))
                             .then_some((Kind::Speech, None))
                             .or_else(|| crate::voice_isolator::is_repo_id(&spec.source).then_some((Kind::Isolation, None)))
+                            .or_else(|| crate::ocria::is_repo_id(&spec.source).then_some((Kind::Ocr, None)))
                     })
                     .and_then(|d| match spec.option("kind").and_then(Kind::parse) {
                         Some(k) if k != d.0 => None,
@@ -1089,6 +1096,7 @@ impl Registry {
             _ if crate::ltx::is_repo(&e.spec.source) => (Kind::Video, None),
             _ if !Path::new(&e.spec.source).exists() && crate::fish::is_drama(Path::new(&e.spec.source)) => (Kind::Speech, None),
             _ if !Path::new(&e.spec.source).exists() && crate::voice_isolator::is_repo_id(&e.spec.source) => (Kind::Isolation, None),
+            _ if !Path::new(&e.spec.source).exists() && crate::ocria::is_repo_id(&e.spec.source) => (Kind::Ocr, None),
             _ => {
                 let path = self.probe_path(&e.spec)?;
                 let (k, img) = detect_path(&path, &e.spec.source);
@@ -1293,6 +1301,16 @@ impl Registry {
                     o.set(k, v)?;
                 }
                 Loaded::Depth(Box::new(crate::depth_pro::DepthPro::load(src, &o)?))
+            }
+            Kind::Ocr => {
+                let mut o = crate::ocria::OcrOptions {
+                    cache_dir: self.cache_dir.clone(),
+                    ..Default::default()
+                };
+                for (k, v) in &opts {
+                    o.set(k, v)?;
+                }
+                Loaded::Ocr(Box::new(crate::ocria::Ocria::load(src, &o)?))
             }
         };
         // Repo ids are resolved now: count what is on disk.
@@ -1506,6 +1524,9 @@ pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>
     if crate::depth_pro::is_depth_pro(path) {
         return (Kind::Depth, None);
     }
+    if crate::ocria::is_ocria(path) {
+        return (Kind::Ocr, None);
+    }
     if crate::gguf::is_gguf(path) {
         if crate::flux::is_flux_gguf(path) {
             return img(ImageKind::Flux);
@@ -1662,6 +1683,7 @@ mod tests {
             Kind::Video,
             Kind::Isolation,
             Kind::Depth,
+            Kind::Ocr,
         ] {
             assert_eq!(Kind::parse(k.as_str()), Some(k));
         }

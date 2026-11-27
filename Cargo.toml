@@ -182,8 +182,9 @@ oxideav-av1 = { version = "0.1.21", optional = true }
 oxideav-mpeg4video = { version = "0.1.8", optional = true }
 anyhow = "1.0.104"
 half = "2.7.1"
-# Unicode tables of the tokenizer: general categories, normalization forms, grapheme clusters.
-intl = { version = "0.6.4", default-features = false, features = ["full", "normalization", "segmentation"] }
+# Unicode tables of the tokenizer: general categories, normalization forms, grapheme clusters; and
+# the bidirectional algorithm (OCRia's right-to-left recognizer writes visual order).
+intl = { version = "0.6.4", default-features = false, features = ["full", "normalization", "segmentation", "alloc", "bidi"] }
 # CLIP tokenizer pre-tokenization (Unicode letter / number classes).
 regex = { version = "1.12", default-features = false, features = ["std", "unicode"] }
 regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode"] }

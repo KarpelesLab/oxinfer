@@ -53,6 +53,7 @@ img = client.images.generate(model="sd", prompt="a lighthouse at dusk", size="51
 | `POST /v1/audio/speech` | Orpheus, LFM3-Omni (its text to speech, [below](#spoken-replies-lfm3-omni-haru)), ZONOS3-Mini (44.1 kHz, the audio sent once generated; its fields in [ZONOS3-Mini](zonos.md)), Fish Audio Drama 3 (44.1 kHz, the audio sent per chunk of text; `voice` a speaker tag 0 to 15, its fields in [Drama 3](fish-drama.md)), Audio8 TTS (44.1 kHz, streamed as it is generated; `voice` a clip of its voices folder; its fields in [Audio8 TTS](audio8-tts.md)) | `input`, `voice` (the model's voices; OpenAI's names take the default one), `response_format` wav or pcm (16-bit 24 kHz mono, streamed as it is generated), `stream_format` sse; extensions `seed`, `temperature`, `top_p`, `repetition_penalty`; an array as `input` (1 to 64 texts, `voice` one name or an array) is generated as one batch and answered as JSON, `data[i].audio` the base64 WAV (or PCM) of `input[i]` |
 | `POST /v1/audio/isolations` | isolation (Inworld Voice Isolator) | `file` (multipart, or base64 in a JSON body), `response_format` wav (float32, the default) / wav16 / pcm / json (base64 voice and background), `output` voice / background, `output_sample_rate` (default 48000, 0 the input's), `lookahead_frames`, `window_frames`, `crossfade_frames`, `block_frames`, `cache_frames`, `chunk_seconds`, `overlap_seconds`, `offline_passes`: see [Voice isolation](voice-isolation.md) |
 | `POST /v1/images/depth` | depth (Depth Pro 2) | `file` or `image` (multipart, or base64 in a JSON body), `focal_px`, `exif`, `response_format` json (focal length, fields of view, depth range, base64 `png` / `png16`, `depth` with `include_depth`) / png / png16 / f32: see [Depth estimation](depth.md) |
+| `POST /v1/ocr` | ocr (OCRia-nano-1) | the image as `file` or `image` (multipart, or base64 in a JSON body), `response_format` json (the page: `lines` with `text`, `confidence`, `box`, `bbox`, `script`, `words`; `text`, `script`, `upside_down`, `sideways`; the default) / text, `plain`, `det_long_side`, `det_thresh`, `det_merge`, `adaptive`, `gutter`, `orient`, `rescue`, `junk`, `faint`, `clean`, `bidi`, `layout`: see [OCR with OCRia-nano-1](ocr-nano.md) |
 | `GET /v1/audio/voices?model=ID` | speech models, LFM3-Omni | the model's voices up front (it is loaded first when needed): `data` (`id`, `name`, and `label` / `language` for ZONOS3), `default`, `aliases` (OpenAI's names, which take the default), `accepts_any`; `/v1/models/{id}` also has `voices` once the model is loaded |
 | `POST /v1/videos` (also `/v1/videos/generations`), `GET /v1/videos`, `GET /v1/videos/{id}`, `GET /v1/videos/{id}/content`, `POST /v1/videos/{id}/cancel`, `DELETE /v1/videos/{id}` | video (MiniMax-H3) | asynchronous jobs in the shape of OpenAI's videos API: see [below](#video-generation) |
 
@@ -255,7 +256,7 @@ Errors have OpenAI's shape (`{"error": {"message", "type", "param", "code"}}`) a
 404 for an unknown model (`model_not_found`) or endpoint, 405, 413 over the body limit, 500 when
 loading or running fails, 507 when a model named on request does not fit on the disk or in memory. The paths also work without `/v1`.
 
-The kind of each model (chat, embedding, image, transcription, speech) comes from its files
+The kind of each model (chat, embedding, image, transcription, speech, video, isolation, ocr) comes from its files
 (fetching only the small configuration files of a repo id that is not in the cache yet), or the
 `kind` option. Models load on their first request, or all at start with `--preload`. A chat
 model runs up to `--parallel` requests at once (default 4, see [Concurrent
@@ -514,7 +515,7 @@ of the loader for the other kinds (Whisper `encoder` / `decoder` precision, Orph
 
 | Key | Meaning |
 |---|---|
-| `kind` | `chat`, `embedding`, `image`, `transcription`, `speech` or `video` (default: detected) |
+| `kind` | `chat`, `embedding`, `image`, `transcription`, `speech`, `video`, `isolation` or `ocr` (default: detected) |
 | `system` | system prompt when a request has none (default none; `default` for the CLI's prompt with the date and time) |
 | `think` | thinking by default (`1`); requests override it |
 | `max_tokens` | reply length when a request sets none (default 4096) |

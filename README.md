@@ -155,6 +155,7 @@ optional.
 | [Haru-4B](docs/haru.md) | full-duplex speech to speech at 24 kHz: a recording of the user in, what the model says meanwhile out |
 | [Depth Pro 2](docs/depth.md) | metric depth of a photo at full resolution, focal length estimation (`oxinfer depth`) |
 | [Voice Isolator](docs/voice-isolation.md) | 48 kHz voice isolation (denoising), offline and as a live stream with 63 ms latency (`oxinfer isolate`) |
+| [OCRia-nano-1](docs/ocr-nano.md) | OCR of images on the CPU with LiteParse's 4M-parameter ONNX models (line detector, script router, Latin / CJK / right-to-left / world recognizers) on oxinfer's own ONNX interpreter (`oxinfer ocr`, `/v1/ocr`) |
 | [Fish Audio Drama 3](docs/fish-drama.md) | text to speech at 44.1 kHz with a 35B MoE, several speakers per text, cloning from a clip and its transcript |
 
 **Under the hood**

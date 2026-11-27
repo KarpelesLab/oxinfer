@@ -43,6 +43,7 @@ mod minimax_h3_video_cli;
 mod models_cli;
 mod moss_image_cli;
 mod nemotron_image_cli;
+mod ocria_cli;
 mod omnigen2_cli;
 mod qwen_image_cli;
 mod sd3_cli;
@@ -1552,6 +1553,10 @@ fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("isolate") {
         let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
         return voice_isolator_cli::run(&rest);
+    }
+    if std::env::args().nth(1).as_deref() == Some("ocr") {
+        let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
+        return ocria_cli::run(&rest);
     }
     if std::env::args().nth(1).as_deref() == Some("models") {
         let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();

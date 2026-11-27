@@ -1241,6 +1241,31 @@ char *oxi_depth_rgb(const OxiDepth *d, const uint8_t *rgb, int width, int height
  * depth: meters = png16_meters_numerator / value) and -depth.f32 (meters, float32). `options_json`:
  * {"focal_px", "exif"}. Returns the figures with "files" as JSON, or NULL on error. */
 char *oxi_depth_file(const OxiDepth *d, const char *path, const char *options_json, const char *out_prefix);
+/* ---- OCR (OCRia-nano-1, llamaindex/OCRia-nano-1) ---------------------------------------------- */
+
+typedef struct OxiOcria OxiOcria;
+
+/* Loads OCRia-nano-1 (line detector, script router, Latin / CJK / right-to-left / world line
+ * recognizers): the repo id llamaindex/OCRia-nano-1 or a folder of its files. `options`: key=value
+ * lines or ;-separated pairs: scripts (latin,cjk,rtl,world or all; default all), det_long_side
+ * (default 1600), threads, cache_dir. NULL on error. */
+OxiOcria *oxi_ocria_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
+void oxi_ocria_free(OxiOcria *o);
+/* {"name", "path", "scripts", "det_thresh", "det_merge", "det_long_side", "params", "device",
+ *  "load_secs"}; free with oxi_string_free. */
+char *oxi_ocria_info_json(const OxiOcria *o);
+
+/* OCR of one image: `channels` 3 (RGB) or 1 (grey) bytes per pixel, rows `stride` bytes apart (0:
+ * width x channels). Returns the page as JSON: {"width", "height", "lines": [{"text", "confidence",
+ * "box" (4 corners in reading order), "bbox" [x0, y0, x1, y1], "script", "words": [{"text", "bbox"}],
+ * "faint"}], "text" (the lines in reading order), "script", "upside_down", "sideways", "seconds"};
+ * free with oxi_string_free; NULL on error. `options_json` (NULL for defaults): {"det_long_side",
+ * "det_thresh", "det_merge", and the switches "adaptive", "gutter", "orient", "rescue", "junk",
+ * "faint", "clean", "bidi", "layout" (all true by default)}. */
+char *oxi_ocria_rgb(const OxiOcria *o, const uint8_t *pixels, size_t width, size_t height, int channels, size_t stride,
+                    const char *options_json);
+/* The same for an image file (PNG, JPEG, WebP, GIF, BMP). */
+char *oxi_ocria_file(const OxiOcria *o, const char *path, const char *options_json);
 
 /* ---- OpenAI-compatible server (cargo features `capi` + `server`) -----------------------------
  * The OpenAI API (GET /v1/models; POST /v1/chat/completions, /v1/completions, /v1/embeddings,
