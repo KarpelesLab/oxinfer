@@ -84,7 +84,8 @@ oxinfer's layout and sampling for sources (the defaults; `source_layout`, `sourc
 (the chat template's rendering of a past reply; `source_layout=inline` puts the blocks at the
 start of the user turn instead), and classifier-free guidance on the instruction: logits
 `u + 2 (c - u)`, `u` from the same prompt with an empty instruction, which shares the prompt's
-prefix (one prefill of it, then two sequences: about half the tokens per second).
+prefix (one prefill of it, then two sequences, which take each token together in one GPU step
+that reads the weights once: 101 tok/s against 141-147 for one sequence on the M5 Max).
 
 What was checked (Q4_0 GGUF, M5 Max), and why edits are still not clean:
 
@@ -188,13 +189,13 @@ CPU (`tools/bench/with-lock.sh` held for the GPU):
 | 2 x 1024x1024, Metal (`--num-images 2`, both images in each GPU step) | 8,350 | 47.3 s (176 tok/s) | 50.4 s |
 | 4 x 1024x1024, Metal (`--num-images 4`) | 16,700 | 70-76 s (219-238 tok/s) | 74-80 s |
 | 1024x1024, CPU (`--device cpu`) | 4,175 | 102 s (41 tok/s) | 107 s |
-| edit of a 1184x880 image (4,230 prompt tokens), guidance 2, Metal | 4,139 | 54.7 s (76 tok/s) | 68 s, prefill 12 s |
-| edit of a 1024x1024 image (4,275 prompt tokens), guidance 2, Metal | 4,175 | 63 to 66 s (63 to 66 tok/s) | 78 to 82 s |
+| edit of a 1184x880 image (4,230 prompt tokens), guidance 2, Metal | 4,139 | 41.1 s (101 tok/s) | 46 s, prefill 3.7 s |
 | 1024x1024, the float32 release with `--quant q4`, CPU | 4,175 | 173 s (24 tok/s) | 3.1 min, after 3.9 min of loading |
 
-Before the batched steps and the experts fix below (the first Metal plan): 1024x1024 in 33.7 s
-(130 tok/s), 1184x880 in 32.0 s, 880x1184 in 30.0 s, 2 x 1024x1024 one after the other in 59.7
-s. A step of one image is 6.2 ms of GPU time out of 6.8 ms (`OXINFER_METAL_TRACE`): it reads
+Before the batched steps, the prefill plan and the experts fix below (the first Metal plan):
+1024x1024 in 33.7 s (130 tok/s), 1184x880 in 32.0 s, 880x1184 in 30.0 s, 2 x 1024x1024 one after
+the other in 59.7 s; the 1184x880 edit in 68 s (76 tok/s, prefill 12 s), a 1024x1024 edit in 78
+to 82 s. A step of one image is 6.2 ms of GPU time out of 6.8 ms (`OXINFER_METAL_TRACE`): it reads
 about 2.6 GB of weights (the visual rows of the head 0.56 GB of it), close to the memory's
 bandwidth, so one image goes no faster; several images share the weight reads of every step but
 their routed experts' (each token picks its own 6 of 128). A step of 4 images at 512x512 is
