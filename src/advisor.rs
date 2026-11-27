@@ -863,7 +863,8 @@ pub const CATALOG: &[Model] = &[
             "22B audio-video DiT + Gemma 4 12B text encoder, the distilled two-stage pipeline (8 + 3 forwards) with a 48 kHz \
              stereo soundtrack; image to video, the duration head, the spatial / temporal upsamplers, LoRAs (the distilled \
              LoRA on the dev transformer); fetched from the public mirror comfyicu/LTX-2.5 (the release is gated); the \
-             transformer in whole passes on Metal (384x256, 25 frames, one stage: 0.55 s a forward, 13.7 s in all on an M5; 7.8 s a forward on the CPU) (docs/ltx.md)",
+             transformer in whole passes on Metal: 768x512, 121 frames (two stages) in 88 s on an M5 Max, \
+             22 GB resident; 7.8 s a forward on the CPU at 384x256x25 (docs/ltx.md)",
         ),
 ];
 

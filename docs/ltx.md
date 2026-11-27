@@ -43,13 +43,15 @@ files (the other parts from the folder above it).
 | `--fps F` | the frame rate (default 24): the positions the transformer sees and the soundtrack's length |
 | `--seed N` | the noise seed (`--noise torch`: PyTorch's CPU generator; the reference draws on its device, so a seed does not reproduce its videos) |
 | `--init-image FILE` | the first frame (`--strength F`, default 1: kept as is) |
-| `--image FILE@FRAME[:STRENGTH]` | an image for the latent frame `FRAME` falls in (repeatable) |
+| `--last-image FILE` | the last frame (a guide image, below) |
+| `--image FILE@FRAME[:STRENGTH]` | an image for pixel frame `FRAME` (repeatable; 0 is the first frame) |
 | `--one-stage` | the distilled schedule at the full size, no upsampler |
 | `--temporal-upscale` | twice the frames and the rate after the last stage (fetches the temporal upsampler, 0.26 GB) |
 | `--no-audio` | no soundtrack decoded (the audio stream is denoised anyway: the model is joint) |
 | `--transformer int8\|bf16\|nvfp4\|dev\|dev-bf16\|FILE` | the transformer file (default the distilled int8 one) |
 | `--distilled-lora` | the release's distilled LoRA (rank 450, 8.9 GB) on the dev transformer |
 | `--lora FILE[:SCALE]` | an LTX-2.x LoRA (repeatable) |
+| `--exact-attention` | the video self-attention in float32 on Metal (slower; default half operands) |
 | `--text-bf16` | fetch the bf16 text encoder (26.3 GB) instead of the int8 one |
 | `--text-encoder FILE`, `--vae FILE`, `--audio-vae FILE`, `--upsampler FILE`, `--temporal-upsampler FILE`, `--duration-head FILE` | parts from elsewhere |
 | `--sigmas a,b,..,0`, `--stage2-sigmas a,..,0` | other schedules than the distilled ones |
@@ -114,6 +116,23 @@ matmuls on the GPU's per-op path). `OXINFER_LTX_GPU=0` keeps the transformer on 
 `device=cpu` option of the server and the C API does the same per model. NVFP4 weights have no
 Metal kernels here: that transformer runs on the CPU.
 
+## Runs and speed
+
+Apple M5 Max (128 GB), `--profile ci` build, each run alone on the machine
+(`tools/bench/with-lock.sh`), the default files (distilled int8 transformer, int8 text encoder),
+wall time from start to the written `.mp4`, files mapped (resident set 17 to 22 GB):
+
+| run | frames | time | |
+|---|---|---|---|
+| t2v 768x512, two stages (8 forwards at 384x256, 3 at 768x512) | 121 | 87.8 s | a golden retriever running through a meadow: sharp frames, coherent motion |
+| i2v 768x512 (`--init-image`, a red sports car on a coastal road) | 121 | 81.0 s | the first frame is the image; the car drives off into the sunset, the camera follows |
+| t2v 768x512, no `--frames` (the duration head: 4.32 s) | 97 | 69.8 s | a woman in a kitchen saying the prompt's line; Whisper large-v3-turbo transcribes the soundtrack as "Good morning. Today we are going to bake fresh bread together." |
+| first + last frame 768x512 (`--init-image car.png --last-image` a 1.67x crop of it) | 49 | 47.7 s | the camera pushes in from the first frame to the last one |
+| dev transformer + `--distilled-lora` (1660 layers as side paths), 384x256 one stage | 25 | 56.8 s (19 s of it loading the LoRA; 40 GB resident) | the dog running, softer than the distilled file's |
+| t2v 384x256 one stage, `--temporal-upscale` | 25 -> 49 (48 fps) | 22.4 s | smooth doubled motion |
+| t2v 384x256 one stage | 25 | 13.7 s | text 3.3 s, 8 forwards 4.4 s (0.55 s each), VAE 2.1 s, audio 1.3 s |
+| the same on the CPU (`--device cpu`, release build) | 25 | 79 s | 7.8 s a forward: the frames look the same as the GPU's |
+
 ## Library, C API, server
 
 `oxinfer::ltx::Pipeline::load(Paths)` and `generate(&Params, progress)` (a
@@ -145,4 +164,21 @@ are `ref_*.py` beside `examples/ltx_check.rs`'s checks):
 
 Positions (video and audio) are bit-identical to the reference's. The whole pipeline was not
 compared with the reference's output (its noise comes from its device's generator); runs are
-checked by looking at their frames and listening to their soundtracks (below).
+checked by looking at their frames and transcribing their soundtracks ([Runs and speed](#runs-and-speed)).
+
+The other transformer files, on one-block copies (block 0 and connector block 0 of the real files,
+fetched by HTTP ranges) against the reference on bf16 weights: the bf16 file 6.7e-7 / 8.7e-7 on
+the CPU, 5.1e-5 / 1.0e-4 on Metal; the int8 file is 7e-4 / 1.2e-3 from the bf16 reference (its
+quantization) and the NVFP4 file 2.7e-2 / 1.6e-2 (its rows correlate 0.9956 with the bf16 ones).
+
+## Not done
+
+- Guidance for the dev transformer (the release's CFG / STG / modality guidance of
+  `ti2vid_two_stages`): the dev file runs only with the distilled LoRA or its own schedule
+  without guidance.
+- The H.264 CRF 33 re-compression of conditioning images (encoded as they are).
+- The temporal upscaler's DFR rounds (tiled, with keyframes): a single refinement pass instead.
+- NVFP4 on the GPU (CPU only), the DiffVAE decoder, the prompt enhancer, audio-to-video and
+  video-to-video (IC-LoRA) pipelines.
+- The text encoder, connectors, VAEs and vocoder run on the CPU kernels with per-op GPU matmuls
+  and convolutions, not as whole GPU passes.
