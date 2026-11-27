@@ -37,6 +37,7 @@ mod intervene_cli;
 mod janus_cli;
 mod lfm3_omni_cli;
 mod longcat_avatar_cli;
+mod lora_train_cli;
 mod ltx_cli;
 mod minimax_h3_cli;
 mod minimax_h3_video_cli;
@@ -1563,6 +1564,10 @@ fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("ocr") {
         let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
         return ocria_cli::run(&rest);
+    }
+    if std::env::args().nth(1).as_deref() == Some("lora-train") {
+        let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
+        return lora_train_cli::run(&rest);
     }
     if std::env::args().nth(1).as_deref() == Some("models") {
         let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
