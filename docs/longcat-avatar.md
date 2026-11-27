@@ -133,7 +133,11 @@ The CUDA column was measured with split operands (`OXINFER_AVATAR_GPU_EXACT=1`: 
 activations as two halves); the LoRA factors are float16 either way (after a power of two), which
 is where the 2e-5 comes from. With the default float16 operands the same cases are within 2e-2
 of the mean magnitude (`cargo test --lib longcat_avatar::cuda`, which runs the tiny release's
-blocks on the device against the CPU in both modes; skipped without an NVIDIA GPU).
+blocks on the device against the CPU with split operands and on the default path, with its
+outputs fused into the GEMMs and not; skipped without an NVIDIA GPU). The VAE's device passes
+([below](#the-vae)) are checked the same way: 9 frames encoded and 3 latent frames decoded on
+the tiny VAE within 1e-4 of the host's (`cargo test --lib longcat_avatar::vae`); the CUDA
+column's VAE figures are those of the per-layer path they replaced.
 
 **The released weights**, against the reference on a DGX Spark (GB10, torch 2.14.1+cu130,
 `tools/longcat_avatar_ref.py`: the modules in bfloat16 as the demo loads them, the repository's
@@ -178,6 +182,27 @@ the bf16 clips are compared with the bfloat16 reference alone, where they sit at
 45 dB. The continuation from oxinfer's own first clip is further off because the two sides then
 start from different frames.
 
+**After the speed work** ([Speed and memory](#speed-and-memory): the default path's kernels and
+the VAE's device passes) the figures above were not measured again: the reference's outputs
+are not on the machines it was done on. Each stage was compared with itself before instead,
+on the same inputs:
+
+| stage | against the same stage before |
+|---|---|
+| transformer, int8 weights, one forward of 36,864 tokens with the OPSD LoRA on made-up inputs (RTX 5080; mean \|v\| 0.71) | max 1.8e-2, mean 6.8e-5 (93.2 dB) |
+| the same against split operands (`OXINFER_AVATAR_GPU_EXACT=1`, whose kernels did not change) | mean 1.13e-4 (88.9 dB); before: 1.10e-4 (90.3 dB) |
+| transformer, bf16 weights, the same forward (GB10; mean \|v\| 0.71) | max 1.1e-2, mean 6.8e-5 (93.7 dB); without a LoRA mean 7.8e-5 (91.3 dB) |
+| VAE: 5 latent frames decoded to 17 frames of 768x512, made-up latents (both machines) | max 7.6e-6, mean 3.9e-7 (125.9 dB); with float32 products max 4.2e-6, mean 2.3e-7 (130.6 dB) |
+| VAE: 13 of those frames encoded | max 1.2e-5, mean 1.4e-6 (120.2 dB); with float32 products 125.0 dB |
+| the whole clip, bf16 weights, same seed (GB10): 93 frames of 8 bits | max 5 steps of 255, mean 0.022 (64.6 dB) |
+| a clip of 13 frames, int8 weights (GB10) | max 2 steps, mean 0.015 (66.5 dB) |
+
+The clip moved by what a different rounding moves it: 64.6 dB, where 63.1 dB separated it
+from the float32 reference. The kernels' changes that are not bit-identical are in the
+attention (the scores accumulated by the tensor cores, the device's approximate `2^x` for the
+probabilities); the larger GEMM tiles, the fused outputs and the fused norms gave the same bits
+as the kernels before them on both machines.
+
 ## Speed and memory
 
 Measured on the repository's `single` example at 768x512 (the bucket of `man.png`), clips of 93
@@ -186,53 +211,141 @@ frames (24 latent frames, 36,864 tokens), 8 steps, on a Threadripper 9970X with 
 
 | run | a step | denoising | VAE decode | whole run | peak resident memory | GPU memory in use |
 |---|---|---|---|---|---|---|
-| `longcat-avatar-int8`, two clips (173 frames, 6.9 s) | 31.5 s (30.5 s in the continuation) | 522.7 s | 484.7 s | 1041.1 s | 30.5 GB | 14.8 GB |
-| `longcat-avatar` (bf16), one clip | 38.3 s | 314.0 s | 251.9 s | 594.7 s | 44.9 GB | 15.0 GB |
-| `longcat-avatar-int8`, split operands, one clip | 62.8 s | 506.6 s | 241.7 s | 779.3 s | | |
-| `longcat-avatar`, split operands, one clip | 67.9 s | 557.6 s | 248.1 s | 835.1 s | 44.3 GB | 15.0 GB |
+| `longcat-avatar-int8`, two clips (173 frames, 6.9 s) | 25.9 s (25.3 s in the continuation) | 413.5 s | 23.2 s | 453.9 s | 26.4 GB | 15.3 GB |
+| `longcat-avatar` (bf16), one clip | 27.4 s | 225.4 s | 11.4 s | 251.5 s | 41.6 GB | 15.3 GB |
 
 The same example on a DGX Spark (GB10, 20 cores, 121 GB shared by the CPU and the GPU; all 48
 blocks stay on the device, 17.4 GB with their LoRA factors for the int8 weights and 32.2 GB for
-the bf16 ones):
+the bf16 ones), a release build, the files named as folders (`--model DIR --avatar-base DIR`):
 
 | run | a step | denoising | VAE decode | whole run | peak resident memory | GPU memory of the process | memory taken from the machine |
 |---|---|---|---|---|---|---|---|
-| `longcat-avatar-int8`, two clips (173 frames, 6.9 s) | 101.2 s (101.0 s in the continuation) | 1656.7 s | 706.2 s | 2392.0 s | 31.9 GB | 24.4 GB | 35.4 GB |
-| `longcat-avatar` (bf16), one clip | 78.3 s | 633.3 s | 351.2 s | 1009.7 s | 47.1 GB | 38.1 GB | 50.0 GB |
+| `longcat-avatar-int8`, two clips (173 frames, 6.9 s) | 42.9 s (42.0 s in the continuation) | 685.4 s | 60.1 s | 757.7 s | 26.2 GB | 29.2 GB | 38.7 GB |
+| `longcat-avatar` (bf16), one clip | 46.5 s | 375.8 s | 38.2 s | 425.8 s | 41.5 GB | 42.9 GB | 51.9 GB |
 | the reference (PyTorch 2.14.1, bfloat16), `--use_int8`, one clip | 51 s | | | 431.6 s for the clip (models loaded) | | | |
 | the reference, `base_model/`, one clip | 52 s a forward with LoRAs | | | 433.9 s for the continuation | | | |
 
 "Memory taken from the machine" is the drop of `MemAvailable` while the run was on it (sampled
 every 2 s; the GPU's memory is the machine's there), "GPU memory of the process" what
-`nvidia-smi` listed for it. oxinfer's engine is half the reference's speed on this machine, and
-the int8 weights are slower than the bf16 ones there, the opposite of the RTX 5080: the engine
-was tuned on the latter, and where the GB10's time goes was not profiled.
+`nvidia-smi` listed for it. "GPU memory in use" is the RTX 5080's total while the run was on it
+(sampled every 2 s), about 2 GB of which belonged to the desktop. "Whole run" has the text
+encoder (2 to 4 s for the prompt, the 22.7 GB file mapped), the audio encoder (4 s for 4.7 s of
+speech) and the frames written as PNGs in it. The first step of a run also reads the
+transformer from disk and fills the blocks that stay on the device. The reference's lines are
+its own timings on the other DGX Spark, measured when the model was ported.
 
-"GPU memory in use" is the card's total while the run was on it (sampled every 2 s), about 2 GB
-of which belonged to the desktop. "Whole run" has the text encoder (2 to 4 s for the prompt, the 22.7 GB file mapped), the audio
-encoder (4 s for 4.7 s of speech) and the H.264 / AAC file (14 s) in it. The first step of a run
-also reads the transformer from disk and fills the blocks that stay on the card.
+Before the changes of this section the same runs took 31.5 s a step and 1041.1 s in all (int8,
+two clips) and 38.3 s and 594.7 s (bf16) on the RTX 5080, 101.2 s a step and 2392.0 s (int8, two
+clips) and 78.3 s and 1009.7 s (bf16) on the GB10; the bf16 clip was run again on this GB10
+with the binary of before: 78.4 s a step, denoising 638.7 s, VAE decode 336.3 s. With split
+operands (`OXINFER_AVATAR_GPU_EXACT=1`: the kernels of before in the transformer), measured
+before the VAE's device passes existed: 62.8 s a step with the int8 weights and 67.9 s with
+the bf16 ones on the RTX 5080.
 
-Where a step goes on the RTX 5080 (`OXINFER_AVATAR_GPU_PROF=1`), int8 weights, in seconds:
+### Where a step goes
 
-| | self-attention | feed-forward | `qkv` and query / key preparation | text cross-attention | audio cross-attention | attention output | block copies |
-|---|---|---|---|---|---|---|---|
-| float16 operands (default) | 15.8 | 6.3 | 3.0 | 1.9 | 1.7 | 0.9 | 1.5 |
-| split operands (`OXINFER_AVATAR_GPU_EXACT=1`) | 35.7 | 11.9 | 5.0 | 3.5 | 3.0 | 1.6 | 1.5 |
+`OXINFER_AVATAR_GPU_PROF=1` prints the stages of each forward (a stream synchronization after
+each; the host's part of a forward, patch embedding and final layer, is the 0.6 s the sum
+leaves). One forward of 24 latent frames of 64x96 with a reference frame
+and the OPSD LoRA, on made-up inputs (`examples/longcat_avatar_check DIR bench-dit --lora=b
+--device=cuda --avatar=... --base=...`, `--int8` for the int8 weights), in seconds:
 
-The self-attention is the 36,864 x 36,864 scores of 32 heads, 48 times a step.
+| | RTX 5080, int8 | GB10, bf16 | GB10, int8 |
+|---|---|---|---|
+| copies: the tokens, the rotary and AdaLN tables (on the RTX 5080 also the blocks that do not stay on the card) | 1.67 | 0.88 | 1.51 |
+| first layer norm (with the row split on the GB10) | 0.07 | 0.19 | 0.19 |
+| `qkv` | 2.09 | 4.20 | 3.81 |
+| query, key and value planes | 0.65 | 1.63 | 1.63 |
+| self-attention | 11.55 | 16.40 | 16.46 |
+| attention output | 0.84 | 1.82 | 1.66 |
+| text: norm, queries | 0.83 | 1.74 | 1.64 |
+| text: keys, values, attention | 0.22 | 0.41 | 0.42 |
+| text: output | 0.68 | 1.40 | 1.23 |
+| audio: norm, queries | 0.70 | 1.38 | 1.24 |
+| audio: keys, values, attention | 0.07 | 0.32 | 0.32 |
+| audio: output, its norm | 0.75 | 1.60 | 1.44 |
+| feed-forward: norm, `w1`, `w3`, SwiGLU | 3.99 | 8.64 | 7.51 |
+| feed-forward: `w2` | 2.00 | 5.23 | 4.53 |
+| the forward | 26.7 | 46.5 | 44.3 |
 
-The device engine (`cuda.rs`) keeps the sequence on the card (5.8 GB of activations for 36,864
-tokens) and as many blocks as fit beside it: 14 of the 48 int8 blocks (0.36 GB each with their
-LoRA factors), 7 of the bf16 ones (0.67 GB each, converted to float16 as they are copied). The
-others go through one of two slots while the block before them runs.
-`OXINFER_GPU_PLAN_DEBUG=1` prints the placement, `OXINFER_AVATAR_GPU=0` keeps the transformer on
-the CPU.
+The self-attention is the 36,864 x 36,864 scores of 32 heads, 48 times a step: 1.07e15
+floating-point operations, at 93 TFLOPS on the RTX 5080 and 65 on the GB10; the GEMMs are
+0.95e15 a step.
 
-The VAE is the slow part next to that: its convolutions go through the shared accelerator path
-(`gpu::Backend::conv2d`) one frame and one layer at a time from host memory, so a decode is
-bounded by the copies (17 frames of 768x512: 44.2 s on the RTX 5080, 187.5 s on the CPU; encoding
-13 frames: 22.5 s and 78.7 s; a clip's 93 frames: 351 s on the GB10). A pass that keeps the frames on the device is not written.
+What the GB10 taught (the engine was written on the RTX 5080, and first ran there at half the
+reference's speed, the int8 weights slower than the bf16 ones):
+
+- A register-only loop of `mma.sync.m16n8k16` (16 accumulators per warp) runs at 98 TFLOPS on
+  the GB10 and 111 on the RTX 5080, while a float32 FMA kernel (the VAE's convolutions) is 2.2
+  times slower there (39.7 s against 18.1 s): the GB10's tensor cores nearly match the
+  discrete card's, the rest of it is about half (`nvidia-smi` showed 2.4 GHz and 35 to 97 W
+  under these loads).
+- So the kernels were not waiting on their products. With the products edited out of the GEMM
+  a forward lost 2.5 s of 48 s, with the reads of its operands from the device's memory (once
+  per 32-wide K step, the rest of the kernel unchanged) 9.4 s. The first profile had the GEMMs
+  at 29 TFLOPS and the attention at 38.
+- What the default path does about it: GEMMs in tiles of 128 x 128 instead of 64 x 64 (half the
+  reads per product), attention in blocks of 128 queries (each read of a step's keys and values
+  serves twice the queries), the approximate `2^x` of the device instead of `expf` for the
+  probabilities, no planes for the operands' second halves.
+- The weights of a GEMM stay in the GPU's cache in smaller groups of outputs: 12 MB there (8 and
+  6 MB within 2%), where the RTX 5080 takes 16 MB and a matrix of up to 48 MB whole. With one
+  32 MB group the attention's output projection took 3.1 s a forward, in 12 MB groups 2.0 s;
+  with 64 MB groups a forward took 110 s instead of 75 s.
+- Every pass over the activations (0.6 GB per 4096-wide tensor at this size) costs what it
+  reads and writes, at about 230 GB/s (the first layer norm: 0.6 GB read and 0.6 GB written,
+  48 times in 0.25 s). On a GPU that shares the machine's memory what follows a matrix is
+  therefore part of its GEMM's output: the LoRA side paths (further K steps of the main
+  product instead of a read-modify-write of the output), the gated residual, SwiGLU's product;
+  and the norms write the float16 operands of the GEMM after them (that last part: 47.6 s to
+  46.1 s a forward). The RTX 5080 runs the separate passes as fast (26.8 s a forward
+  separate, 27.1 s fused) and keeps them.
+- The int8 weights were slower than the bf16 ones because their bytes become float16 in the
+  kernel, per tile and K step: twice the tile is half of that per product too. They are the faster ones there now, as on
+  the RTX 5080: 42.9 s a step against 46.5 s.
+
+What did not help: 128 x 128 tiles on 128 threads (warps of 64 x 64: slower on the RTX 5080,
+no faster on the GB10), fresh float32 sums per K step in the default GEMM (no closer to split
+operands), accumulating the attention's output over all key steps in the tensor cores (twice as
+far from split operands: their additions truncate).
+
+### Memory on the device
+
+The device engine (`cuda.rs`) keeps the sequence on the card (4.7 GB of activations for 36,864
+tokens on the default path, 5.8 GB with split operands) and as many blocks as fit beside it: 23
+of the 48 int8 blocks on the 16 GB card (0.36 GB each with their LoRA factors), fewer of the
+bf16 ones (0.67 GB each, converted to float16 as they are copied). The others go through one
+of two slots while the block before them runs. Between two clips the engine gives its memory
+back only when the VAE would not have room otherwise (a 16 GB card; the GB10 keeps the
+blocks, and its process then holds them and the VAE's buffers together: the 29.2 and 42.9 GB
+of the table, where it held 24.4 and 38.1 GB). `OXINFER_GPU_PLAN_DEBUG=1` prints the placement, `OXINFER_AVATAR_GPU=0` keeps the
+transformer on the CPU.
+
+### The VAE
+
+On CUDA the VAE's encode and decode run with the frames kept on the device (`src/cuda_vae.rs`,
+walked by `vae/dev.rs`): one launch per causal convolution (its three input frames read where
+they are, the 2x upsampling part of its input addressing, bias and residual part of its
+output), one per RMS norm; the mid block's attention (one head over the pixels of a latent
+frame) goes through the host. The convolutions run on the tensor cores with float16 weights
+(exact for the bf16-rounded kernels: the upload checks) and each activation as two halves
+`hi + lo 2^-11` after a power of two per frame; `OXINFER_VAE_GPU_F32=1` runs them as float32
+FMAs. Before, each convolution was a round trip through host memory
+(`gpu::Backend::conv2d`) with the norms on the CPU; `OXINFER_AVATAR_VAE_GPU=0` still does that,
+and it is the fallback when the device cannot hold a pass (8.2 GB of buffers to decode a clip
+of 768x512, 7.0 GB to encode 13 frames; the 720p buckets were not run).
+
+| 768x512 | RTX 5080 | GB10 |
+|---|---|---|
+| decode a clip's 24 latent frames (93 frames) | 251.9 s -> 12.2 s | 351 s -> 34.9 s (37.4 s in a later run) |
+| decode 5 latent frames (17 frames) | 48.9 s -> 2.5 s | 64.1 s -> 6.0 s |
+| encode 13 frames | 24.6 s -> 1.5 s | 30.5 s -> 3.3 s |
+| the same in float32 FMAs: 93 frames, 17 frames, encode | 18.1 s, 3.4 s, 1.8 s | 39.7 s, 7.3 s, 3.7 s |
+
+(`examples/longcat_avatar_check DIR bench-vae --device=cuda --base=... [--frames=24]`, made-up
+latents; the clip's "before" figures are the runs above.) The GB10 gains less from the tensor
+cores here than the discrete card: the passes over the frames (151 MB each at the last level)
+are a larger part of its time.
 
 On the CPU alone (`--device cpu`), the transformer runs in float32 on weights dequantized a
 matrix at a time: a 320x192 clip of 13 frames (960 tokens) takes 24.2 s a step and 230 s in all.
@@ -262,7 +375,9 @@ A full-size clip on the CPU was not run.
 - A float32 reference for the continuation and for the bf16 transformer's clips: those are
   compared with the reference's bfloat16 run only (above), 41 to 45 dB away as the int8 first
   clip is, whose float32 reference is at 73.6 dB.
-- A profile of the engine on the GB10, where a step takes twice the reference's time.
+- The reference's outputs against the engine as it is after the speed work (see the table of
+  each stage against itself before), and split operands' timings since then.
+- The VAE's device passes at the 720p buckets (they need more than the 8.2 GB of 768x512).
 - Two speakers, the 720p buckets, `--no-distill` (guidance, 50 steps) and prompts without a
   reference image on the released weights at full size: the two-speaker forward, guidance and
   the text-only forward are checked on the tiny checkpoints only; a text-only clip of 320x192

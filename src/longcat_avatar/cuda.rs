@@ -19,9 +19,11 @@
 //! (half the reads per product of `gemm_body`'s 64 x 64), attention in blocks of 128 queries
 //! (each read of a step's keys and values serves twice the queries), the weights of a GEMM in
 //! groups of outputs that stay in the cache (12 MB on a GPU sharing the machine's memory), no
-//! planes for the operands' second halves, and what follows a matrix as part of its GEMM's
-//! output instead of a pass of its own over the activations: the LoRAs' side paths, the gated
-//! residual, SwiGLU's product.
+//! planes for the operands' second halves. On a GPU sharing the machine's memory, where a pass
+//! over the activations costs what it reads and writes, the path is also fused: what follows a
+//! matrix is part of its GEMM's output (the LoRAs' side paths, the gated residual, SwiGLU's
+//! product) and the layer norms write the next GEMM's operands; a discrete card runs those as
+//! passes of their own, which cost it nothing more (docs/longcat-avatar.md has the numbers).
 //!
 //! Weights: `base_model_int8/` goes to the device byte for byte (0.33 GB a block); the bf16
 //! `base_model/` as float16 (exact but for values under 2^-14; 0.66 GB a block). The LoRAs are

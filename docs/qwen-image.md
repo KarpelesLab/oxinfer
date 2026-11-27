@@ -204,7 +204,13 @@ and Qwen-Image-Layered were checked on the tiny models only (their weights were 
 | bf16, 512x512 output (5300 tokens) | CPU, 18 threads | 185 s | 13 min | | |
 
 The text encoder takes 1-2 s, the VAE 3 s to encode and 5 s to decode at 1024x1024; two input
-images double the reference tokens (37 s per pass). Qwen-Image-2512 text to image (GGUF Q4_0 +
+images double the reference tokens (37 s per pass). On CUDA the VAE of Qwen-Image runs with its
+activations kept on the device (`src/cuda_vae.rs`, the passes written for
+[LongCat-Video-Avatar](longcat-avatar.md#the-vae)): on an RTX 5080, made-up latents, 0.7 s to
+decode and 0.6 s to encode 1024x1024 (5.8 s and 4.0 s one convolution at a time through host
+memory, which `OXINFER_QWEN_VAE_GPU=0` still does), 0.25 s and 0.21 s at 768x768 (3.1 s and
+2.1 s); 129 dB (decode) and 127 dB (encode) from the per-layer result. Qwen-Image-2.1's VAE
+(residual groups) keeps the per-layer path. Qwen-Image-2512 text to image (GGUF Q4_0 +
 Lightning, 1024x1024): 58 s, 9.4 GB.
 
 **Sample edits** (Edit-2511 bf16 + Lightning 4 steps, from a 512x512 fox photo and a bookshop that
