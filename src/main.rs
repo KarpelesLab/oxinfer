@@ -1389,8 +1389,13 @@ fn run_update(args: &Args) -> Result<()> {
                 (None, None) => "no binary is published for this platform".to_string(),
             };
             println!("oxinfer {CURRENT}: {} is available ({}): {binary}", rel.version(), rel.html_url);
-        } else {
+        } else if rel.pending.is_none() {
             println!("oxinfer {CURRENT} is the latest release");
+        } else {
+            println!("oxinfer {CURRENT} is the latest release with a binary for this platform");
+        }
+        if let Some(tag) = &rel.pending {
+            println!("({tag} is published, without a binary for this platform yet)");
         }
         return Ok(());
     }

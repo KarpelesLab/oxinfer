@@ -5,6 +5,10 @@
 //! (the names `release-binaries.yml` gives them), unpacked in memory (gzip with `compcol`, the
 //! tar or zip container with `fstool`), and the running executable replaced by the new one.
 //!
+//! When the latest release has no archive for this platform yet (the binaries are built and
+//! attached after the release is published, some platforms later than others), the newest
+//! release that has one is taken in its place ([`latest_from`]).
+//!
 //! What vouches for the download is GitHub over TLS and the size the API lists: the releases
 //! are not signed, and the asset's SHA-256 digest is not checked.
 
@@ -56,6 +60,14 @@ pub struct Release {
     pub html_url: String,
     #[serde(default)]
     pub assets: Vec<Asset>,
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
+    pub prerelease: bool,
+    /// Set by [`latest_from`] when this is not the latest release but the newest one with a
+    /// binary for this platform: the tag of the latest, whose binary is not attached (yet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<String>,
 }
 
 impl Release {
@@ -105,8 +117,24 @@ pub fn newer(a: &str, b: &str) -> bool {
 /// tests and mirrors.
 pub const FEED_ENV: &str = "OXINFER_UPDATE_FEED";
 
-/// The latest published release (`GET /repos/<repo>/releases/latest`, unauthenticated: GitHub
-/// allows 60 such requests an hour per address), or what `$OXINFER_UPDATE_FEED` names.
+/// The releases looked at for a binary when the latest has none for this platform.
+const HISTORY: usize = 15;
+
+/// The release to install when `latest` has no binary for this platform: the first of `list`
+/// (newest first, as GitHub lists them) that is published, has one, is older than `latest` and
+/// not older than `current` (an update never goes back). Its `pending` names `latest`.
+fn fallback(latest: &Release, list: Vec<Release>, current: &str) -> Option<Release> {
+    let mut rel = list.into_iter().find(|r| {
+        !r.draft && !r.prerelease && r.asset().is_some() && newer(latest.version(), r.version()) && !newer(current, r.version())
+    })?;
+    rel.pending = Some(latest.tag_name.clone());
+    Some(rel)
+}
+
+/// The latest published release that has a binary for this platform (`GET
+/// /repos/<repo>/releases/latest`, then the list of releases when that one has none yet;
+/// unauthenticated: GitHub allows 60 such requests an hour per address), or what
+/// `$OXINFER_UPDATE_FEED` names.
 pub fn latest() -> Result<Release> {
     latest_from(None)
 }
@@ -114,6 +142,12 @@ pub fn latest() -> Result<Release> {
 /// [`latest`] from `feed` (a JSON file or an `http(s)://` URL, see [`FEED_ENV`]) when given,
 /// else `$OXINFER_UPDATE_FEED`, else the GitHub API. The request is an anonymous GET: no token,
 /// no cookie, nothing about this machine but what any HTTP request shows.
+///
+/// A release is published before its binaries are attached. When the latest has no archive for
+/// this platform, the newest earlier release that has one is returned in its place, its
+/// [`Release::pending`] naming the latest; when there is none (or it would be older than this
+/// binary), the latest is returned as it is. A feed may be a JSON array of releases, newest
+/// first, to the same effect.
 pub fn latest_from(feed: Option<&str>) -> Result<Release> {
     let env = std::env::var(FEED_ENV).ok().filter(|f| !f.is_empty());
     let (url, body) = match feed.filter(|f| !f.is_empty()).or(env.as_deref()) {
@@ -131,7 +165,31 @@ pub fn latest_from(feed: Option<&str>) -> Result<Release> {
             (url, body)
         }
     };
-    serde_json::from_slice(&body).with_context(|| format!("parse {url}"))
+    let value: serde_json::Value = serde_json::from_slice(&body).with_context(|| format!("parse {url}"))?;
+    let (rel, list) = if value.is_array() {
+        let list: Vec<Release> = serde_json::from_value(value).with_context(|| format!("parse {url}"))?;
+        let first = list.iter().find(|r| !r.draft && !r.prerelease).cloned();
+        (first.with_context(|| format!("{url}: no published release"))?, Some(list))
+    } else {
+        (serde_json::from_value(value).with_context(|| format!("parse {url}"))?, None)
+    };
+    if platform_suffix().is_none() || rel.asset().is_some() {
+        return Ok(rel);
+    }
+    // No binary for this platform in the latest: the releases before it. A failure here leaves
+    // the latest, reported as having no binary.
+    let list = match list {
+        Some(l) => l,
+        None if url.starts_with(&format!("https://api.github.com/repos/{REPO}/")) => {
+            let url = format!("https://api.github.com/repos/{REPO}/releases?per_page={HISTORY}");
+            crate::hf::http_get(&url)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+    Ok(fallback(&rel, list, CURRENT).unwrap_or(rel))
 }
 
 /// The `oxinfer` executable inside a release archive (`name`: the asset's file name).
@@ -403,6 +461,59 @@ mod tests {
             let a = rel.asset().unwrap();
             assert!(a.name.starts_with(&format!("oxinfer-v9.0.0-{s}.")), "{}", a.name);
         }
+    }
+
+    #[test]
+    fn falls_back_to_the_newest_release_with_a_binary() {
+        let Some(s) = platform_suffix() else { return };
+        let rel = |tag: &str, binary: bool, flags: &str| -> Release {
+            let assets = if binary {
+                format!(r#"{{"name":"oxinfer-{tag}-{s}.tar.gz","browser_download_url":"u","size":3}}"#)
+            } else {
+                // Another platform's archive only.
+                format!(r#"{{"name":"oxinfer-{tag}-other.tar.gz","browser_download_url":"u","size":3}}"#)
+            };
+            serde_json::from_str(&format!(r#"{{"tag_name":"{tag}","assets":[{assets}]{flags}}}"#)).unwrap()
+        };
+        let latest = rel("v9.0.3", false, "");
+        let list = || {
+            vec![
+                rel("v9.0.3", false, ""),
+                rel("v9.0.2", true, r#","prerelease":true"#),
+                rel("v9.0.2-draft", true, r#","draft":true"#),
+                rel("v9.0.1", false, ""),
+                rel("v9.0.0", true, ""),
+                rel("v8.9.9", true, ""),
+            ]
+        };
+        let got = fallback(&latest, list(), "8.0.0").unwrap();
+        assert_eq!((got.version(), got.pending.as_deref()), ("9.0.0", Some("v9.0.3")));
+        assert!(got.asset().is_some());
+        // The running binary is that release: still returned (up to date), never an older one.
+        assert_eq!(fallback(&latest, list(), "9.0.0").unwrap().version(), "9.0.0");
+        assert!(fallback(&latest, list(), "9.0.1").is_none());
+        assert!(fallback(&latest, vec![], "8.0.0").is_none());
+
+        // Through a feed: an array, newest first; and a lone release without a binary stays.
+        let dir = std::env::temp_dir().join(format!("oxinfer-update-feed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let feed = dir.join("releases.json");
+        // Tags far above any real version, so the fallback is not older than this binary.
+        let many = [rel("v9999.0.3", false, ""), rel("v9999.0.2", true, "")];
+        std::fs::write(&feed, serde_json::to_vec(&many).unwrap()).unwrap();
+        let got = latest_from(Some(feed.to_str().unwrap())).unwrap();
+        assert_eq!((got.version(), got.pending.as_deref()), ("9999.0.2", Some("v9999.0.3")));
+        assert!(got.is_newer() && cannot_install_binary(&got).is_none());
+        std::fs::write(&feed, serde_json::to_vec(&many[0]).unwrap()).unwrap();
+        let got = latest_from(Some(feed.to_str().unwrap())).unwrap();
+        assert_eq!((got.version(), got.pending.as_deref()), ("9999.0.3", None));
+        assert!(got.asset().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Why `rel` has no binary to install here (None: it has one).
+    fn cannot_install_binary(rel: &Release) -> Option<&'static str> {
+        rel.asset().is_none().then_some("no binary")
     }
 
     /// A ustar archive holding one file.

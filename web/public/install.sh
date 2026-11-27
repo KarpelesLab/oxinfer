@@ -4,6 +4,8 @@
 #   curl -fsSL https://karpeleslab.github.io/oxinfer/install.sh | sh
 #
 # Downloads the latest release's binary from GitHub into ~/.local/bin (or $OXINFER_INSTALL_DIR).
+# A release is published before its binaries are attached: when the latest has none for this
+# platform yet, the newest release that has one is installed.
 # Options, after `sh -s --`:
 #   --dir DIR        install into DIR
 #   --version TAG    install release TAG (e.g. v0.0.12) instead of the latest
@@ -35,9 +37,13 @@ die() { say "oxinfer installer: $*"; exit 1; }
 
 if command -v curl >/dev/null 2>&1; then
     fetch() { curl -fL --proto '=https' --tlsv1.2 --progress-bar -o "$2" "$1"; }
+    exists() { curl -fsSLI --proto '=https' -o /dev/null "$1" 2>/dev/null; }
+    text() { curl -fsSL --proto '=https' "$1"; }
     final_url() { curl -fsSLI --proto '=https' -o /dev/null -w '%{url_effective}' "$1"; }
 elif command -v wget >/dev/null 2>&1; then
     fetch() { wget -q --show-progress -O "$2" "$1"; }
+    exists() { wget -q --spider "$1" 2>/dev/null; }
+    text() { wget -q -O - "$1"; }
     final_url() { wget -q --spider -S "$1" 2>&1 | sed -n 's/^ *[Ll]ocation: *//p' | tail -n 1 | tr -d '\r'; }
 else
     die "needs curl or wget"
@@ -70,6 +76,16 @@ if [ -z "$TAG" ]; then
     url="$(final_url "https://github.com/$REPO/releases/latest")"
     TAG="${url##*/tag/}"
     case "$TAG" in v*) ;; *) die "could not find the latest release (got $url)" ;; esac
+    if ! exists "https://github.com/$REPO/releases/download/$TAG/oxinfer-$TAG-$target.tar.gz"; then
+        # Its binary for this platform is not attached (yet): the newest release that has one,
+        # from the API's list of releases (newest first).
+        say "oxinfer $TAG has no $target binary yet; looking at the releases before it"
+        found="$(text "https://api.github.com/repos/$REPO/releases?per_page=15" \
+            | grep -o "/releases/download/v[^/\"]*/oxinfer-v[^/\"]*-$target\.tar\.gz" | head -n 1)" || found=""
+        prev="${found#/releases/download/}"
+        prev="${prev%%/*}"
+        case "$prev" in v*) TAG="$prev" ;; *) die "no release has a $target binary; build from source: cargo install oxinfer" ;; esac
+    fi
 fi
 
 archive="oxinfer-$TAG-$target.tar.gz"

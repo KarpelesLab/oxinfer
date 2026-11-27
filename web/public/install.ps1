@@ -4,7 +4,9 @@
 #
 # Downloads the latest release's oxinfer.exe from GitHub into %LOCALAPPDATA%\oxinfer\bin (or
 # $env:OXINFER_INSTALL_DIR) and adds that folder to the user's PATH. $env:OXINFER_VERSION picks a
-# release (e.g. v0.0.12) instead of the latest.
+# release (e.g. v0.0.12) instead of the latest. A release is published before its binaries are
+# attached: when the latest has none for this platform yet, the newest release that has one is
+# installed.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -30,6 +32,22 @@ if (-not $tag) {
     $resp.Close()
     $tag = ($loc -split '/tag/')[-1]
     if ($tag -notlike 'v*') { throw "oxinfer installer: could not find the latest release (got $loc)" }
+    $has = $true
+    try {
+        Invoke-WebRequest -UseBasicParsing -Method Head -Uri "https://github.com/$repo/releases/download/$tag/oxinfer-$tag-$target.zip" | Out-Null
+    } catch { $has = $false }
+    if (-not $has) {
+        # Its binary for this platform is not attached (yet): the newest release that has one,
+        # from the API's list of releases (newest first).
+        Write-Host "oxinfer $tag has no $target binary yet; looking at the releases before it"
+        $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=15" -Headers @{ 'User-Agent' = 'oxinfer-installer' }
+        $prev = $releases | Where-Object {
+            $t = $_.tag_name
+            -not $_.draft -and -not $_.prerelease -and ($_.assets | Where-Object { $_.name -eq "oxinfer-$t-$target.zip" })
+        } | Select-Object -First 1
+        if (-not $prev) { throw "oxinfer installer: no release has a $target binary" }
+        $tag = $prev.tag_name
+    }
 }
 
 $archive = "oxinfer-$tag-$target.zip"

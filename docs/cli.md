@@ -75,6 +75,8 @@ irm https://karpeleslab.github.io/oxinfer/install.ps1 | iex
   - `--web`: start `oxinfer web` once installed.
 - **`install.ps1`** puts `oxinfer.exe` in `%LOCALAPPDATA%\oxinfer\bin`, or `$env:OXINFER_INSTALL_DIR`, and adds that folder to the user's `PATH`. `$env:OXINFER_VERSION` picks a release instead of the latest.
 
+A release is published before its binaries are attached (they take about 20 minutes to build). When the latest release has no binary for the platform yet, both scripts install the newest release that has one, and so does `oxinfer --update` (below).
+
 Both scripts live in `web/public/` and are published with the browser demo on GitHub Pages. Later updates use `oxinfer --update` (below).
 
 Each GitHub release carries the `oxinfer` binary (`.github/workflows/release-binaries.yml`,
@@ -108,7 +110,10 @@ it in memory (gzip with [compcol](https://crates.io/crates/compcol), the tar or 
 with [fstool](https://crates.io/crates/fstool)), writes the new executable beside the running
 one and swaps them by renames. Windows cannot delete a program that is running: there the
 previous one is renamed to `oxinfer.exe.old` and marked hidden, and the next start of oxinfer
-deletes it. `--force` reinstalls the latest release. What vouches for the download is GitHub over TLS
+deletes it. `--force` reinstalls the latest release. When the latest release has no archive for
+the platform yet, the newest earlier release that has one is taken in its place (from the list
+of the last 15 releases; never one older than the running binary), and `--check-update` says
+which release is waiting for its binary. What vouches for the download is GitHub over TLS
 and the size the API lists: the releases are not signed and no digest is checked. A binary built
 from source for a platform without an archive (Android, the BSDs, musl) reports that instead.
 
