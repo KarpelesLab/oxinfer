@@ -840,7 +840,10 @@ impl AvatarPipeline {
         let reference: Vec<f32> = (0..self.dit.cfg.in_channels)
             .flat_map(|ch| lat[ch * shape.0 * frame..ch * shape.0 * frame + frame].to_vec())
             .collect();
-        self.dit.release_device();
+        // The VAE's device pass takes 8.2 GB of buffers and 0.3 GB of weights to decode 768x512
+        // (22 KB a pixel); a card the transformer fills gives its memory back for it.
+        let vae_room = width * height * (24 << 10);
+        self.dit.make_device_room(vae_room);
         secs[2] += t0.elapsed().as_secs_f64();
         t0 = Instant::now();
         let mut frames = self.decode(&lat, shape, 1, progress)?;
@@ -862,7 +865,7 @@ impl AvatarPipeline {
                 seg + 1,
                 progress,
             )?;
-            self.dit.release_device();
+            self.dit.make_device_room(vae_room);
             secs[2] += t0.elapsed().as_secs_f64();
             t0 = Instant::now();
             last = self.decode(&lat, shape, seg + 1, progress)?;

@@ -590,7 +590,14 @@ impl Dit {
 
     /// Frees the device copy of the weights (the next forward brings it back).
     pub fn release_device(&self) {
-        self.device.release();
+        self.device.release(0);
+    }
+
+    /// [`Dit::release_device`] unless the device still has `bytes` free without it: what a stage
+    /// that wants the device between two clips (the VAE) calls, so that a device with room for
+    /// both keeps the weights where they are.
+    pub fn make_device_room(&self, bytes: usize) {
+        self.device.release(bytes.max(1));
     }
 
     /// The audio tokens of each latent frame: `[humans, frames, context_tokens, output_dim]`.

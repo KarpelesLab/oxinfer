@@ -175,6 +175,8 @@ impl Drop for Engine {
 struct Pool {
     free: RefCell<Vec<(usize, u64)>>,
     all: RefCell<Vec<u64>>,
+    /// Bytes allocated.
+    bytes: std::cell::Cell<usize>,
 }
 
 struct Buf<'p> {
@@ -332,6 +334,7 @@ impl Engine {
         for p in pool.all.borrow_mut().drain(..) {
             unsafe { self.x.cuMemFree_v2(p) };
         }
+        debug(&format!("a pass took {:.2} GB of buffers", pool.bytes.get() as f64 / 1e9));
         if !crate::cuda::integrated() || out.is_err() {
             self.free_weights(&mut st);
         }
@@ -363,6 +366,7 @@ impl<'p> Pass<'p, '_> {
                     bail!("out of device memory for the frames");
                 }
                 self.pool.all.borrow_mut().push(d);
+                self.pool.bytes.set(self.pool.bytes.get() + bytes);
                 d
             }
         };

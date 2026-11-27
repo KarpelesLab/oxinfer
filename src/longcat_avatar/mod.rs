@@ -168,10 +168,13 @@ impl Device {
         false
     }
 
-    pub(crate) fn release(&self) {
+    /// Frees the engine's device memory, unless the device still has `keep` bytes free (0:
+    /// in any case).
+    pub(crate) fn release(&self, keep: usize) {
         #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
         if let Some(Some(e)) = self.engine.get() {
-            e.release();
+            e.release(keep);
         }
+        let _ = keep;
     }
 }

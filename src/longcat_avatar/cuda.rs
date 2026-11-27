@@ -1580,6 +1580,7 @@ impl Engine {
                 self.mark(&mut tm, 12);
                 self.split(act, ffn, ffn, rn, bf.xs, bf.rs);
                 lin(10, rows, h, rn);
+                self.mark(&mut tm, 13);
             }
             if !self.fuse {
                 self.go(
@@ -1618,10 +1619,14 @@ impl Engine {
         got
     }
 
-    /// Frees the device memory (weights and activations); the next forward brings them back.
-    pub(super) fn release(&self) {
+    /// Frees the device memory (weights and activations) unless the device still has `keep`
+    /// bytes free (0: frees in any case); the next forward brings them back.
+    pub(super) fn release(&self, keep: usize) {
         let mut st = self.state.lock().unwrap();
         if unsafe { self.x.cuCtxSetCurrent(self.ctx) } != 0 {
+            return;
+        }
+        if keep > 0 && self.free_mem() >= keep + RESERVE {
             return;
         }
         self.release_blocks(&mut st);
