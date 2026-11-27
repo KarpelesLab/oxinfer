@@ -1063,6 +1063,7 @@ impl Api {
             "/v1/audio/isolations" if post => tools::isolations(self, req),
             "/v1/images/depth" if post => tools::depth(self, req),
             "/v1/ocr" if post => tools::ocr(self, req),
+            "/v1/videos/depth" if post => tools::depth_video(self, req),
             "/v1/videos" | "/v1/videos/generations" if post => video::create(self, req),
             "/v1/videos" if get => video::list(self, req),
             p if p.starts_with("/v1/videos/") && p != "/v1/videos/generations" => video::route(self, req, &p["/v1/videos/".len()..]),
@@ -1082,6 +1083,7 @@ impl Api {
             | "/v1/images/depth"
             | "/v1/ocr"
             | "/v1/videos"
+            | "/v1/videos/depth"
             | "/v1/videos/generations" => Err(wrong_method()),
             _ => Err(ApiError::new(404, format!("unknown endpoint {}", req.path))),
         }

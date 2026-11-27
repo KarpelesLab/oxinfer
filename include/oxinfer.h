@@ -1246,6 +1246,24 @@ char *oxi_depth_rgb(const OxiDepth *d, const uint8_t *rgb, int width, int height
  * depth: meters = png16_meters_numerator / value) and -depth.f32 (meters, float32). `options_json`:
  * {"focal_px", "exif"}. Returns the figures with "files" as JSON, or NULL on error. */
 char *oxi_depth_file(const OxiDepth *d, const char *path, const char *options_json, const char *out_prefix);
+
+/* Video (Depth Pro 2's buffered / unbuffered modes). options_json: {"mode": "buffered" |
+ * "unbuffered", "window" (default 16), "overlap" (default 4, buffered), "focal_px" (default:
+ * estimated), "frames_fps" (oxi_depth_video_file, a folder of frames)}. */
+typedef struct OxiDepthStream OxiDepthStream;
+/* A session over one video; the model must outlive it. */
+OxiDepthStream *oxi_depth_stream_new(const OxiDepth *d, const char *options_json);
+/* Adds the next RGB8 frame; returns the number of finished predictions waiting, or -1. */
+int oxi_depth_stream_push(OxiDepthStream *s, const uint8_t *rgb, int width, int height);
+/* Ends the video; returns the number of finished predictions waiting, or -1. */
+int oxi_depth_stream_flush(OxiDepthStream *s);
+/* The next finished prediction in frame order: figures as JSON (as oxi_depth_rgb's), buffers
+ * when not NULL (free with oxi_audio_free(p, width * height)); NULL when none is waiting. */
+char *oxi_depth_stream_next(OxiDepthStream *s, float **depth_out, float **inverse_out);
+void oxi_depth_stream_free(OxiDepthStream *s);
+/* Every frame of a video file or folder of frames: writes out_prefix + "-depth.mp4",
+ * "-depth16/" and "-depth/" (meters, float32 per frame); returns JSON or NULL. */
+char *oxi_depth_video_file(const OxiDepth *d, const char *path, const char *options_json, const char *out_prefix);
 /* ---- OCR (OCRia-nano-1, llamaindex/OCRia-nano-1) ---------------------------------------------- */
 
 typedef struct OxiOcria OxiOcria;

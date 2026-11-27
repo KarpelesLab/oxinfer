@@ -1,5 +1,5 @@
 //! Endpoints of the non-generative models: voice isolation (`POST /v1/audio/isolations`), depth
-//! estimation (`POST /v1/images/depth`) and OCR (`POST /v1/ocr`).
+//! estimation (`POST /v1/images/depth`, `POST /v1/videos/depth`) and OCR (`POST /v1/ocr`).
 //!
 //! Each takes `multipart/form-data` (the input as the `file` part, the other fields as form
 //! fields) or a JSON object (the input base64-encoded in `file`, optionally as a `data:` URL;
@@ -283,6 +283,128 @@ pub(super) fn depth(api: &Arc<Api>, req: &ApiRequest) -> ApiResult<Output> {
     })
 }
 
+/// `POST /v1/videos/depth`: the metric depth of every frame of a video (a file oxideav decodes:
+/// MP4, MOV, Matroska / WebM, AVI; the `media` feature). Fields: `model`, `file` (also `video`),
+/// `mode` (`buffered`, the default, or `unbuffered`), `window` (16), `overlap` (4), `focal_px`
+/// (default: estimated over the first window), `response_format` (`json`, the default: the
+/// figures of each frame, with `include_depth` the float32 depth of every frame, little-endian,
+/// frame after frame, base64; `mp4`: the color preview; `f32`: the depth of every frame).
+pub(super) fn depth_video(api: &Arc<Api>, req: &ApiRequest) -> ApiResult<Output> {
+    let f = Fields::parse(req, "video")?;
+    let model = f
+        .get("model")
+        .ok_or_else(|| ApiError::bad("model is required").param("model"))?
+        .to_string();
+    let file = f
+        .file
+        .as_ref()
+        .ok_or_else(|| ApiError::bad("file (or video) is required").param("file"))?;
+    let format = f.get("response_format").unwrap_or("json").to_string();
+    if !["json", "mp4", "f32"].contains(&format.as_str()) {
+        return Err(ApiError::bad(format!("response_format {format:?}: expected json, mp4 or f32")).param("response_format"));
+    }
+    let mut vo = crate::depth_pro::VideoOptions::default();
+    for k in crate::depth_pro::VideoOptions::KEYS {
+        if let Some(v) = f.get(k) {
+            vo.set(k, v).map_err(|e| ApiError::bad(format!("{e:#}")).param(k))?;
+        }
+    }
+    vo.check().map_err(|e| ApiError::bad(format!("{e:#}")))?;
+    let flag = |k: &str| f.get(k).map(|v| matches!(v, "1" | "true" | "yes" | "on"));
+    api.models.check(&model, Kind::Depth)?;
+    #[cfg(feature = "media")]
+    {
+        let ext = file
+            .filename
+            .as_deref()
+            .and_then(|n| std::path::Path::new(n).extension())
+            .and_then(|e| e.to_str())
+            .filter(|e| crate::depth_pro::VIDEO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+            .unwrap_or("mp4")
+            .to_string();
+        let tmp = std::env::temp_dir().join(format!(
+            "oxinfer-depth-{}-{:x}.{ext}",
+            std::process::id(),
+            crate::clock::unix_time().as_nanos()
+        ));
+        std::fs::write(&tmp, &file.data).map_err(|e| ApiError::new(500, format!("temporary file: {e}")))?;
+        let clip = crate::depth_pro::load_video(&tmp, None);
+        let _ = std::fs::remove_file(&tmp);
+        let clip = clip.map_err(|e| ApiError::bad(format!("decode video: {e:#}")))?;
+        let t0 = std::time::Instant::now();
+        let mut lease = api.models.acquire(&model, Kind::Depth)?;
+        let Loaded::Depth(net) = lease.model() else { unreachable!() };
+        let frames: Vec<&[u8]> = clip.frames.iter().map(|f| &f[..]).collect();
+        let maps = net
+            .infer_video(&frames, clip.width, clip.height, &vo)
+            .map_err(|e| ApiError::new(500, format!("{e:#}")))?;
+        drop(lease);
+        let secs = t0.elapsed().as_secs_f64();
+        let body = |ct: &str, b: Vec<u8>| {
+            Output::Full(ApiResponse {
+                status: 200,
+                content_type: ct.into(),
+                body: b,
+            })
+        };
+        let all_depth = || -> ApiResult<Vec<u8>> {
+            let mut out = Vec::with_capacity(maps.len() * clip.width * clip.height * 4);
+            for m in &maps {
+                let d = m
+                    .depth()
+                    .ok_or_else(|| ApiError::bad("no focal length (give focal_px or load the estimator)"))?;
+                out.extend(d.iter().flat_map(|x| x.to_le_bytes()));
+            }
+            Ok(out)
+        };
+        Ok(match format.as_str() {
+            "mp4" => body(
+                "video/mp4",
+                crate::depth_pro::preview_mp4(&maps, clip.fps).map_err(|e| ApiError::new(500, format!("{e:#}")))?,
+            ),
+            "f32" => body("application/octet-stream", all_depth()?),
+            _ => {
+                let first = maps.first().map(|m| m.scale());
+                let mut v = json!({
+                    "object": "video.depth",
+                    "model": model,
+                    "frames": maps.len(),
+                    "width": clip.width,
+                    "height": clip.height,
+                    "fps": clip.fps,
+                    "mode": vo.mode.as_str(),
+                    "window": vo.window,
+                    "overlap": vo.overlap,
+                    "focal_px": maps.last().and_then(|m| m.focal_px),
+                    "focal_source": maps.last().and_then(|m| m.focal_px).map(|_| if vo.focal_px.is_some() { "given" } else { "estimated" }),
+                    "png16_meters_numerator": first.filter(|_| maps[0].focal_px.is_some()).map(|s| 65535.0 / s),
+                    "seconds": secs,
+                    "per_frame": maps.iter().enumerate().map(|(i, m)| {
+                        let r = m.depth_range();
+                        json!({
+                            "index": i,
+                            "depth_p05": r.map(|r| r.0).filter(|v| v.is_finite()),
+                            "depth_p95": r.map(|r| r.1).filter(|v| v.is_finite()),
+                            "far_fraction": r.map(|r| r.2),
+                        })
+                    }).collect::<Vec<_>>(),
+                });
+                if flag("include_depth").unwrap_or(false) {
+                    v["depth"] = json!(crate::b64::encode(&all_depth()?));
+                }
+                body("application/json", serde_json::to_vec(&v).unwrap_or_default())
+            }
+        })
+    }
+    #[cfg(not(feature = "media"))]
+    {
+        let _ = (file, format, vo, flag);
+        Err(ApiError::bad(
+            "video input needs the `media` feature (this server was built without it)",
+        ))
+    }
+}
+
 /// `POST /v1/ocr`: the text of an image (PNG, JPEG, WebP, GIF, BMP) with OCRia-nano-1. Fields:
 /// `model`, `file` (or `image`), `response_format` (`json`, the default: the page with its
 /// lines, boxes, text and confidences; `text`: the text alone), and the page options
@@ -404,6 +526,46 @@ mod tests {
             panic!()
         };
         assert_eq!((r.status, r.content_type.as_str()), (200, "image/png"));
+        // A video: its frames' depth (an MP4 made from depth previews of the tiny model).
+        #[cfg(feature = "media")]
+        {
+            let (w, h) = (48, 32);
+            let net = crate::depth_pro::DepthPro::load(
+                &dir.to_string_lossy(),
+                &crate::depth_pro::DepthOptions {
+                    focal: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let maps: Vec<_> = (0..3u8)
+                .map(|k| {
+                    let img: Vec<u8> = crate::depth_pro::tests::image(w, h)
+                        .iter()
+                        .map(|v| v.wrapping_add(40 * k))
+                        .collect();
+                    net.infer_rgb(&img, w, h, Some(40.0)).unwrap()
+                })
+                .collect();
+            let mp4 = crate::depth_pro::preview_mp4(&maps, 10.0).unwrap();
+            let body = json!({ "model": "d", "video": crate::b64::encode(&mp4), "mode": "unbuffered", "window": 2, "include_depth": true });
+            let Output::Full(r) = api.handle(&ApiRequest::post_json("/v1/videos/depth", &body.to_string())) else {
+                panic!()
+            };
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let v: Value = serde_json::from_slice(&r.body).unwrap();
+            assert_eq!(
+                (v["object"].as_str(), v["frames"].as_u64(), v["mode"].as_str()),
+                (Some("video.depth"), Some(3), Some("unbuffered"))
+            );
+            assert_eq!(v["per_frame"].as_array().unwrap().len(), 3);
+            assert_eq!(crate::b64::decode(v["depth"].as_str().unwrap()).unwrap().len(), 3 * w * h * 4);
+            let body = json!({ "model": "d", "video": crate::b64::encode(&mp4), "overlap": 16 });
+            let Output::Full(r) = api.handle(&ApiRequest::post_json("/v1/videos/depth", &body.to_string())) else {
+                panic!()
+            };
+            assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

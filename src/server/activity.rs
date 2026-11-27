@@ -465,7 +465,7 @@ pub(crate) fn kind_of(path: &str) -> Option<&'static str> {
         "/v1/audio/transcriptions" | "/v1/audio/translations" => "transcription",
         "/v1/audio/speech" => "speech",
         "/v1/audio/isolations" => "isolation",
-        "/v1/images/depth" => "depth",
+        "/v1/images/depth" | "/v1/videos/depth" => "depth",
         "/v1/ocr" => "ocr",
         _ => return None,
     })

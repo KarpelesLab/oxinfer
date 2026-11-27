@@ -3429,6 +3429,175 @@ pub unsafe extern "C" fn oxi_depth_file(
     })
 }
 
+/// `options_json` of the video functions: {"mode": "buffered" | "unbuffered", "window",
+/// "overlap", "focal_px"}.
+fn video_options(options_json: *const c_char) -> Result<crate::depth_pro::VideoOptions> {
+    let mut vo = crate::depth_pro::VideoOptions::default();
+    if let Some(s) = unsafe { opt_str_arg(options_json, "options_json") }?
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let o: serde_json::Value = serde_json::from_str(s).context("options_json")?;
+        if let Some(m) = o.as_object() {
+            for (k, v) in m {
+                if v.is_null() || k == "frames_fps" {
+                    continue;
+                }
+                let v = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    v => v.to_string(),
+                };
+                vo.set(k, &v)?;
+            }
+        }
+    }
+    Ok(vo)
+}
+
+/// A video session over a depth model ([`crate::depth_pro::DepthStream`]) and its finished
+/// predictions not yet taken.
+pub struct OxiDepthStream {
+    s: crate::depth_pro::DepthStream<'static>,
+    ready: std::collections::VecDeque<crate::depth_pro::DepthMap>,
+}
+
+/// Opens a session over one video (`options_json` as `oxi_depth_video_file`'s: `mode`, `window`,
+/// `overlap`, `focal_px`). The model must outlive the stream. Free with `oxi_depth_stream_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_depth_stream_new(d: *const OxiDepth, options_json: *const c_char) -> *mut OxiDepthStream {
+    guard(std::ptr::null_mut(), || {
+        let d = unsafe { depth_model(d) }?;
+        let vo = video_options(options_json)?;
+        // SAFETY: the caller keeps the model alive while the stream lives (documented).
+        let net: &'static crate::depth_pro::DepthPro = unsafe { &*(&d.0 as *const crate::depth_pro::DepthPro) };
+        Ok(Box::into_raw(Box::new(OxiDepthStream {
+            s: net.stream(&vo)?,
+            ready: Default::default(),
+        })))
+    })
+}
+
+/// Adds the next frame (RGB8, `width * height * 3` bytes, the first frame's size). Returns the
+/// number of finished predictions waiting (`oxi_depth_stream_next` takes them), or -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_depth_stream_push(s: *mut OxiDepthStream, rgb: *const u8, width: c_int, height: c_int) -> c_int {
+    guard(-1, || {
+        let s = unsafe { s.as_mut() }.context("stream is NULL")?;
+        let (w, h) = (usize::try_from(width)?, usize::try_from(height)?);
+        if rgb.is_null() {
+            bail!("rgb is NULL");
+        }
+        let px = unsafe { std::slice::from_raw_parts(rgb, w * h * 3) };
+        let v = s.s.step(px, w, h)?;
+        s.ready.extend(v);
+        Ok(s.ready.len() as c_int)
+    })
+}
+
+/// Ends the video. Returns the number of finished predictions waiting, or -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_depth_stream_flush(s: *mut OxiDepthStream) -> c_int {
+    guard(-1, || {
+        let s = unsafe { s.as_mut() }.context("stream is NULL")?;
+        let v = s.s.flush()?;
+        s.ready.extend(v);
+        Ok(s.ready.len() as c_int)
+    })
+}
+
+/// Takes the next finished prediction, in frame order: its figures as JSON (as
+/// `oxi_depth_rgb`'s), the buffers to `depth_out` / `inverse_out` when not NULL (free each with
+/// `oxi_audio_free(p, width * height)`). NULL when none is waiting (or on error).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_depth_stream_next(
+    s: *mut OxiDepthStream,
+    depth_out: *mut *mut f32,
+    inverse_out: *mut *mut f32,
+) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let s = unsafe { s.as_mut() }.context("stream is NULL")?;
+        let Some(m) = s.ready.pop_front() else {
+            return Ok(std::ptr::null_mut());
+        };
+        unsafe {
+            if let Some(p) = depth_out.as_mut() {
+                let v = m.depth().context("no focal length: give focal_px or load the estimator")?;
+                *p = Box::into_raw(v.into_boxed_slice()) as *mut f32;
+            }
+            if let Some(p) = inverse_out.as_mut() {
+                *p = Box::into_raw(m.inverse_depth.clone().into_boxed_slice()) as *mut f32;
+            }
+        }
+        Ok(out_string(depth_json(&m)))
+    })
+}
+
+/// Frees a video session (NULL is ignored).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_depth_stream_free(s: *mut OxiDepthStream) {
+    if !s.is_null() {
+        drop(unsafe { Box::from_raw(s) });
+    }
+}
+
+/// Predicts depth for every frame of a video file (or a folder of frames; needs the `media`
+/// feature) and writes, as the CLI does, `out_prefix` + `-depth.mp4` (color preview),
+/// `-depth16/` (16-bit PNGs) and `-depth/` (meters, float32, a file per frame). `options_json`:
+/// {"mode", "window", "overlap", "focal_px", "frames_fps"}. Returns JSON (`frames`, `width`,
+/// `height`, `fps`, `focal_px`, `focal_estimated`, `files`, `png16_meters_numerator`, the last
+/// frame's figures as `last`), or NULL on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_depth_video_file(
+    d: *const OxiDepth,
+    path: *const c_char,
+    options_json: *const c_char,
+    out_prefix: *const c_char,
+) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let d = unsafe { depth_model(d) }?;
+        let path = std::path::Path::new(unsafe { str_arg(path, "path") }?);
+        let prefix = std::path::PathBuf::from(unsafe { str_arg(out_prefix, "out_prefix") }?);
+        let vo = video_options(options_json)?;
+        #[cfg(feature = "media")]
+        {
+            let fps_opt = match unsafe { opt_str_arg(options_json, "options_json") }?
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(s) => serde_json::from_str::<serde_json::Value>(s)?["frames_fps"].as_f64(),
+                None => None,
+            };
+            let clip = crate::depth_pro::load_video(path, fps_opt)?;
+            let frames: Vec<&[u8]> = clip.frames.iter().map(|f| &f[..]).collect();
+            let maps = d.0.infer_video(&frames, clip.width, clip.height, &vo)?;
+            let dir = prefix.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            let stem = prefix
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "video".into());
+            let (files, k) = crate::depth_pro::write_video(&maps, &dir, &stem, clip.fps, true, true)?;
+            let last = maps.last().context("no frames decoded")?;
+            let v = serde_json::json!({
+                "frames": maps.len(),
+                "width": clip.width,
+                "height": clip.height,
+                "fps": clip.fps,
+                "focal_px": last.focal_px,
+                "focal_estimated": last.focal_estimated,
+                "files": files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "png16_meters_numerator": k,
+                "last": serde_json::from_str::<serde_json::Value>(&depth_json(last))?,
+            });
+            Ok(out_string(v.to_string()))
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            let _ = (d, prefix, vo);
+            bail!("{}: video input needs the `media` feature", path.display())
+        }
+    })
+}
+
 // ---- OCR (OCRia-nano-1) ----------------------------------------------------------------------
 
 /// Loaded OCRia-nano-1 models.

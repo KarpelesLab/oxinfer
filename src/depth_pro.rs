@@ -8,7 +8,9 @@
 //!   right and bottom;
 //! - a DINOv3 ViT (S/16, B/16, L/16 or H+/16; a class and four register tokens, 2D rotary
 //!   positions on the patch tokens normalized by the longer side, layer scale) runs over the
-//!   16-pixel patches; for one frame the "cross-frame" blocks are plain blocks;
+//!   16-pixel patches; the "cross-frame" blocks attend over every frame of a video clip (one
+//!   sequence of the frames' mean class and register tokens and all their patches; unbuffered,
+//!   the cached patch keys and values of the last frames), each frame keeping its own prefix;
 //! - four blocks' patch tokens are reassembled into a pyramid at 1/4, 1/8, 1/16 and 1/32 (a 1x1
 //!   conv, then a 4x4 / 2x2 transposed conv, nothing, or a strided 3x3 conv);
 //! - a DPT decoder fuses it from coarse to fine (3x3 convs, residual units, 2x2 transposed
@@ -171,11 +173,21 @@ impl DepthMap {
         if high > 0.0 { high * 1.2 } else { 1.0 }
     }
 
+    /// The reference CLI's color scale of this map: its largest metric inverse depth (or
+    /// focal-normalized one without a focal length) plus 20% headroom.
+    pub fn scale(&self) -> f32 {
+        Self::color_scale(&self.inverse_metric().unwrap_or_else(|| self.inverse_depth.clone()))
+    }
+
     /// The reference CLI's preview: metric inverse depth (or the focal-normalized one without a
     /// focal length) through the turbo color map, from 0 (infinitely far) to the scale. RGB8.
     pub fn colorize(&self) -> Vec<u8> {
+        self.colorize_on(self.scale())
+    }
+
+    /// [`Self::colorize`] on a given scale (a video's: its first frame's).
+    pub fn colorize_on(&self, scale: f32) -> Vec<u8> {
         let inv = self.inverse_metric().unwrap_or_else(|| self.inverse_depth.clone());
-        let scale = Self::color_scale(&inv);
         let mut out = Vec::with_capacity(inv.len() * 3);
         for &v in &inv {
             let i = (v * (256.0 / scale)).clamp(0.0, 255.0) as usize;
@@ -187,8 +199,12 @@ impl DepthMap {
     /// The reference CLI's 16-bit PNG values: inverse depth over the color scale times 65535
     /// (0 is infinitely far), and the factor `k`: depth in meters = `k / value`.
     pub fn gray16(&self) -> (Vec<u16>, f32) {
+        self.gray16_on(self.scale())
+    }
+
+    /// [`Self::gray16`] on a given scale.
+    pub fn gray16_on(&self, scale: f32) -> (Vec<u16>, f32) {
         let inv = self.inverse_metric().unwrap_or_else(|| self.inverse_depth.clone());
-        let scale = Self::color_scale(&inv);
         let v = inv
             .iter()
             .map(|&d| ((d / scale).clamp(0.0, 1.0) * 65535.0).round() as u16)
@@ -465,6 +481,15 @@ impl VitBlock {
     /// One block over `x` (`[n, dim]`), rotary positions `rope` on the tokens from `prefix` on.
     fn fwd(&self, x: &mut [f32], n: usize, heads: usize, prefix: usize, rope: Option<&Rope>) {
         let dim = self.norm1.w.len();
+        let (q, k, v) = self.qkv(x, n, heads, prefix, rope);
+        let o = crate::sd::ops::attention(&q, &k, &v, n, n, heads, dim / heads, false);
+        self.finish(x, &o, n);
+    }
+
+    /// The queries, keys and values of `x` (`[n, dim]`): `qkv(norm1(x))`, the rotary positions
+    /// `rope` applied from row `prefix` on.
+    fn qkv(&self, x: &[f32], n: usize, heads: usize, prefix: usize, rope: Option<&Rope>) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let dim = self.norm1.w.len();
         let hd = dim / heads;
         let h = self.norm1.fwd(x);
         let qkv = self.qkv.fwd(&h, n);
@@ -480,8 +505,13 @@ impl VitBlock {
             r.apply(&mut q[prefix * dim..], heads, hd);
             r.apply(&mut k[prefix * dim..], heads, hd);
         }
-        let o = crate::sd::ops::attention(&q, &k, &v, n, n, heads, hd, false);
-        let mut a = self.proj.fwd(&o, n);
+        (q, k, v)
+    }
+
+    /// The rest of the block from its attention output `o` (`eva_finish`): `x += gamma1
+    /// proj(o)`, then `x += gamma2 mlp(norm2(x))`.
+    fn finish(&self, x: &mut [f32], o: &[f32], n: usize) {
+        let mut a = self.proj.fwd(o, n);
         if let Some(g) = &self.gamma1 {
             scale_rows(&mut a, g);
         }
@@ -529,6 +559,8 @@ struct Rope {
     sin: Vec<f32>,
     cos: Vec<f32>,
     half: usize,
+    /// Patches of a frame: the rows of several frames' patches take the angles of row `% patches`.
+    patches: usize,
 }
 
 impl Rope {
@@ -552,7 +584,12 @@ impl Rope {
                 }
             }
         }
-        Self { sin, cos, half }
+        Self {
+            sin,
+            cos,
+            half,
+            patches: gh * gw,
+        }
     }
 
     /// Rotates the patch rows `x` (`[patches, heads * head_dim]`).
@@ -561,7 +598,7 @@ impl Rope {
         let dim = heads * hd;
         for_chunks(x, dim * 16, x.len() > dim * 64, |b, blk| {
             for (j, row) in blk.chunks_mut(dim).enumerate() {
-                let p = b * 16 + j;
+                let p = (b * 16 + j) % self.patches;
                 let (s, c) = (&self.sin[p * half..(p + 1) * half], &self.cos[p * half..(p + 1) * half]);
                 for h in 0..heads {
                     let v = &mut row[h * hd..(h + 1) * hd];
@@ -892,41 +929,95 @@ impl DepthPro {
 
     /// Focal-normalized inverse depth `[h][w]` of a normalized image `[3][h][w]`.
     fn inverse_depth(&self, img: &[f32], h: usize, w: usize) -> Vec<f32> {
+        self.inverse_depth_clip(&[img], h, w, None).pop().unwrap()
+    }
+
+    /// Focal-normalized inverse depth `[h][w]` of each frame of a clip (normalized images
+    /// `[3][h][w]`, `predict_inverse_depth`): the cross-frame blocks attend over the patches of
+    /// every frame with the frames' mean class and register tokens (each frame keeps its own);
+    /// with `cache`, one frame attends to the cached frames' patches too (unbuffered video).
+    fn inverse_depth_clip(&self, frames: &[&[f32]], h: usize, w: usize, mut cache: Option<&mut FrameCache>) -> Vec<Vec<f32>> {
         let (hp, wp) = (h.next_multiple_of(INPUT_MULTIPLE), w.next_multiple_of(INPUT_MULTIPLE));
-        let padded;
-        let x = if (hp, wp) != (h, w) {
-            padded = pad_replicate(img, h, w, hp, wp);
-            &padded[..]
-        } else {
-            img
-        };
         let (gh, gw) = (hp / PATCH, wp / PATCH);
         let vit = &self.vit;
-        let dim = vit.shape.dim;
+        let (dim, heads) = (vit.shape.dim, vit.shape.heads);
         let np = vit.prefix();
-        let mut tokens = vit.embed(x, hp, wp);
-        let n = np + gh * gw;
-        let rope = Rope::new(gh, gw, dim / vit.shape.heads);
-        let mut taps = Vec::new();
+        let patches = gh * gw;
+        let n = np + patches;
+        let nfr = frames.len();
+        let mut tokens: Vec<Vec<f32>> = frames
+            .iter()
+            .map(|img| {
+                if (hp, wp) != (h, w) {
+                    vit.embed(&pad_replicate(img, h, w, hp, wp), hp, wp)
+                } else {
+                    vit.embed(img, hp, wp)
+                }
+            })
+            .collect();
+        let rope = Rope::new(gh, gw, dim / heads);
+        let mut taps: Vec<Vec<Vec<f32>>> = vec![Vec::new(); nfr];
         let pv = crate::prof::phase(8, "depth backbone");
         for (i, b) in vit.blocks.iter().enumerate() {
-            // A cross-frame block attends over every frame's patches with the frames' mean class
-            // and register tokens, and hands each frame its own prefix back: for one frame, the
-            // block with its prefix tokens left as they came in.
-            let prefix = self.cfg.cross_frame_blocks.contains(&i).then(|| tokens[..np * dim].to_vec());
-            b.fwd(&mut tokens, n, vit.shape.heads, np, Some(&rope));
-            if let Some(p) = prefix {
-                tokens[..np * dim].copy_from_slice(&p);
+            if !self.cfg.cross_frame_blocks.contains(&i) {
+                for t in tokens.iter_mut() {
+                    b.fwd(t, n, heads, np, Some(&rope));
+                }
+            } else if let Some(c) = cache.as_deref_mut() {
+                // `cached_cross_frame_attention`: the frame's patches attend to the pooled prefix
+                // of the cached frames and to every cached frame's patches.
+                let t = &mut tokens[0];
+                let (q, k, v) = b.qkv(&t[np * dim..], patches, heads, 0, Some(&rope));
+                let cc = c.block(i, np, patches, dim);
+                let pooled = cc.push_prefix(&t[..np * dim]);
+                let (_, pk, pv) = b.qkv(&pooled, np, heads, np, None);
+                let live = cc.push(&k, &v, &pk, &pv);
+                let o = crate::sd::ops::attention(
+                    &q,
+                    &cc.k[..live * dim],
+                    &cc.v[..live * dim],
+                    patches,
+                    live,
+                    heads,
+                    dim / heads,
+                    false,
+                );
+                b.finish(&mut t[np * dim..], &o, patches);
+            } else if nfr == 1 {
+                // One frame: the block over its own tokens, its prefix tokens left as they came.
+                let t = &mut tokens[0];
+                let prefix = t[..np * dim].to_vec();
+                b.fwd(t, n, heads, np, Some(&rope));
+                t[..np * dim].copy_from_slice(&prefix);
+            } else {
+                // `cross_frame_attention`: one sequence of the frames' mean prefix and every
+                // frame's patches; each frame keeps its own prefix.
+                let mut x = Vec::with_capacity((np + nfr * patches) * dim);
+                x.extend(mean_rows(&tokens.iter().map(|t| &t[..np * dim]).collect::<Vec<_>>()));
+                for t in &tokens {
+                    x.extend_from_slice(&t[np * dim..]);
+                }
+                b.fwd(&mut x, np + nfr * patches, heads, np, Some(&rope));
+                for (f, t) in tokens.iter_mut().enumerate() {
+                    t[np * dim..].copy_from_slice(&x[(np + f * patches) * dim..(np + (f + 1) * patches) * dim]);
+                }
             }
             if self.cfg.reassembled_blocks.contains(&i) {
-                taps.push(tokens[np * dim..].to_vec());
+                for (f, t) in tokens.iter().enumerate() {
+                    taps[f].push(t[np * dim..].to_vec());
+                }
             }
         }
         drop(pv);
+        taps.iter().map(|t| self.decode(t, gh, gw, h, w)).collect()
+    }
+
+    /// One frame's inverse depth `[h][w]` from its tapped patch tokens (`decode_frame`).
+    fn decode(&self, taps: &[Vec<f32>], gh: usize, gw: usize, h: usize, w: usize) -> Vec<f32> {
         let _pd = crate::prof::phase(9, "depth decoder");
         // The pyramid, HWC: 1/4, 1/8, 1/16, 1/32.
         let mut levels: Vec<(Vec<f32>, usize, usize)> = Vec::new();
-        for (r, f) in self.reassemble.iter().zip(&taps) {
+        for (r, f) in self.reassemble.iter().zip(taps) {
             levels.push(match r {
                 Reassemble::Up(a, d) => {
                     let y = a.fwd(f, gh * gw);
@@ -958,13 +1049,517 @@ impl DepthPro {
         relu_inplace(&mut y);
         let mut y = c4.fwd(&y, oh * ow);
         relu_inplace(&mut y);
-        debug_assert_eq!((oh, ow), (hp, wp));
+        debug_assert_eq!((oh, ow), (h.next_multiple_of(INPUT_MULTIPLE), w.next_multiple_of(INPUT_MULTIPLE)));
         let mut out = Vec::with_capacity(h * w);
         for r in 0..h {
             out.extend_from_slice(&y[r * ow..r * ow + w]);
         }
         out
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Video.
+
+/// How a video's frames see each other (`VideoMode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoMode {
+    /// Clips of `window` frames overlapping by `overlap`, attended jointly; the overlaps
+    /// cross-faded. A frame also sees later frames and is returned once its clip is done.
+    Buffered,
+    /// Each frame predicted as it arrives, from itself and the `window - 1` frames before it
+    /// (their patch keys and values cached).
+    Unbuffered,
+}
+
+impl VideoMode {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s {
+            "buffered" => Self::Buffered,
+            "unbuffered" | "live" => Self::Unbuffered,
+            _ => bail!("video mode must be buffered or unbuffered, got {s:?}"),
+        })
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Buffered => "buffered",
+            Self::Unbuffered => "unbuffered",
+        }
+    }
+}
+
+/// The reference's default clip length / cache size and overlap.
+pub const DEFAULT_WINDOW: usize = 16;
+pub const DEFAULT_OVERLAP: usize = 4;
+
+/// Video options. Keys for [`VideoOptions::set`]: `mode`, `window`, `overlap`, `focal_px`.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct VideoOptions {
+    pub mode: VideoMode,
+    /// Frames attended together: the clip length (buffered) or the cache size, the current
+    /// frame included (unbuffered).
+    pub window: usize,
+    /// Frames shared by consecutive clips (buffered), fewer than `window`.
+    pub overlap: usize,
+    /// The focal length in pixels of the frames; None: estimated (the median over the first
+    /// window's frames for a whole video, the running median until a window is in for a stream).
+    pub focal_px: Option<f32>,
+}
+
+impl Default for VideoOptions {
+    fn default() -> Self {
+        Self {
+            mode: VideoMode::Buffered,
+            window: DEFAULT_WINDOW,
+            overlap: DEFAULT_OVERLAP,
+            focal_px: None,
+        }
+    }
+}
+
+impl VideoOptions {
+    pub const KEYS: &'static [&'static str] = &["mode", "window", "overlap", "focal_px"];
+
+    pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        match key {
+            "mode" | "video_mode" => self.mode = VideoMode::parse(value)?,
+            "window" => self.window = value.parse().with_context(|| format!("window: {value:?}"))?,
+            "overlap" => self.overlap = value.parse().with_context(|| format!("overlap: {value:?}"))?,
+            "focal_px" | "f_px" => {
+                self.focal_px = match value {
+                    "" | "none" | "auto" => None,
+                    v => Some(v.parse().with_context(|| format!("focal_px: {v:?}"))?),
+                }
+            }
+            _ => bail!("unknown video option {key:?} (known: {})", Self::KEYS.join(", ")),
+        }
+        Ok(())
+    }
+
+    /// Errors on an empty window, an overlap not below it, a focal length not positive.
+    pub fn check(&self) -> Result<()> {
+        if self.window < 1 {
+            bail!("window must be at least 1, got {}", self.window);
+        }
+        if self.mode == VideoMode::Buffered && self.overlap >= self.window {
+            bail!("overlap must be from 0 to window - 1 = {}, got {}", self.window - 1, self.overlap);
+        }
+        if self.focal_px.is_some_and(|f| !(f.is_finite() && f > 0.0)) {
+            bail!("focal_px must be a positive number");
+        }
+        Ok(())
+    }
+}
+
+/// The element-wise mean of equally long rows (`mean(dim=0)`: summed in order, then divided).
+fn mean_rows(rows: &[&[f32]]) -> Vec<f32> {
+    let mut m = rows[0].to_vec();
+    for r in &rows[1..] {
+        for (a, &b) in m.iter_mut().zip(r.iter()) {
+            *a += b;
+        }
+    }
+    let n = rows.len() as f32;
+    m.iter_mut().for_each(|v| *v /= n);
+    m
+}
+
+/// Unbuffered video's cache (`KVCache`): per cross-frame block, a ring of the last `window`
+/// frames' class and register tokens, and the keys and values of their mean ahead of a ring of
+/// the frames' patch keys and values.
+struct FrameCache {
+    window: usize,
+    blocks: Vec<(usize, CrossCache)>,
+}
+
+struct CrossCache {
+    /// `[window][prefix * dim]`.
+    prefix: Vec<f32>,
+    /// `[prefix + window * patches][dim]`: the pooled prefix's keys / values, then the slots.
+    k: Vec<f32>,
+    v: Vec<f32>,
+    seen: usize,
+    np: usize,
+    patches: usize,
+    dim: usize,
+    window: usize,
+}
+
+impl FrameCache {
+    fn new(window: usize) -> Self {
+        Self {
+            window,
+            blocks: Vec::new(),
+        }
+    }
+
+    /// Block `idx`'s cache (made on its first frame).
+    fn block(&mut self, idx: usize, np: usize, patches: usize, dim: usize) -> &mut CrossCache {
+        let at = match self.blocks.iter().position(|b| b.0 == idx) {
+            Some(i) => i,
+            None => {
+                let len = (np + self.window * patches) * dim;
+                self.blocks.push((
+                    idx,
+                    CrossCache {
+                        prefix: vec![0f32; self.window * np * dim],
+                        k: vec![0f32; len],
+                        v: vec![0f32; len],
+                        seen: 0,
+                        np,
+                        patches,
+                        dim,
+                        window: self.window,
+                    },
+                ));
+                self.blocks.len() - 1
+            }
+        };
+        &mut self.blocks[at].1
+    }
+}
+
+impl CrossCache {
+    /// `update_prefix`: stores a frame's prefix tokens; their mean over the visible frames.
+    fn push_prefix(&mut self, prefix: &[f32]) -> Vec<f32> {
+        let n = self.np * self.dim;
+        let slot = self.seen % self.window;
+        self.prefix[slot * n..(slot + 1) * n].copy_from_slice(prefix);
+        let live = (self.seen + 1).min(self.window);
+        let rows: Vec<&[f32]> = (0..live).map(|s| &self.prefix[s * n..(s + 1) * n]).collect();
+        mean_rows(&rows)
+    }
+
+    /// `update`: stores a frame's patch keys and values and the pooled prefix's; the rows to
+    /// attend to (the pooled prefix, then the visible frames' slots).
+    fn push(&mut self, k: &[f32], v: &[f32], pk: &[f32], pv: &[f32]) -> usize {
+        let (d, np, p) = (self.dim, self.np, self.patches);
+        let slot = self.seen % self.window;
+        let at = (np + slot * p) * d;
+        self.k[at..at + p * d].copy_from_slice(k);
+        self.v[at..at + p * d].copy_from_slice(v);
+        self.k[..np * d].copy_from_slice(pk);
+        self.v[..np * d].copy_from_slice(pv);
+        let live = np + (self.seen + 1).min(self.window) * p;
+        self.seen += 1;
+        live
+    }
+}
+
+/// torch.linspace(1, 0, n + 2)[1:-1] (float32): the cross-fade weights of the earlier clip.
+fn blend_ramp(n: usize) -> Vec<f32> {
+    let steps = n + 2;
+    let step = (0f32 - 1f32) / (steps - 1) as f32;
+    let half = steps / 2;
+    (1..=n)
+        .map(|i| {
+            if i < half {
+                1.0 + step * i as f32
+            } else {
+                0.0 - step * (steps - i - 1) as f32
+            }
+        })
+        .collect()
+}
+
+/// The focal length at the lower median of fields of view (`median_focal_length_px`).
+fn median_focal(fovs: &[[f32; 2]], h: usize, w: usize) -> f32 {
+    let med = |c: usize| {
+        let mut v: Vec<f32> = fovs.iter().map(|f| f[c]).collect();
+        v.sort_by(f32::total_cmp);
+        v[(v.len() - 1) / 2]
+    };
+    focal_from_fov([med(0), med(1)], h, w)
+}
+
+/// A session over one video (`DepthStream`): [`DepthStream::step`] takes each frame (RGB8 of
+/// one size) and returns the predictions it finishes, in order, never revised;
+/// [`DepthStream::flush`] ends the video. Its recent frames and focal length carry over a flush.
+pub struct DepthStream<'a> {
+    net: &'a DepthPro,
+    window: usize,
+    f_px: Option<f32>,
+    estimated: bool,
+    fovs: Vec<[f32; 2]>,
+    cache: Option<FrameCache>,
+    clip: usize,
+    overlap: usize,
+    size: Option<(usize, usize)>,
+    /// Normalized frames, the last `clip`.
+    frames: std::collections::VecDeque<Vec<f32>>,
+    /// Predicted, not yet returned.
+    held: Vec<Vec<f32>>,
+    new: usize,
+}
+
+impl DepthPro {
+    /// Opens a session over one video (`DepthPro2.stream`).
+    pub fn stream(&self, opts: &VideoOptions) -> Result<DepthStream<'_>> {
+        opts.check()?;
+        let unbuffered = opts.mode == VideoMode::Unbuffered;
+        Ok(DepthStream {
+            net: self,
+            window: opts.window,
+            f_px: opts.focal_px,
+            estimated: opts.focal_px.is_none(),
+            fovs: Vec::new(),
+            cache: unbuffered.then(|| FrameCache::new(opts.window)),
+            clip: if unbuffered { 1 } else { opts.window },
+            overlap: if unbuffered { 0 } else { opts.overlap },
+            size: None,
+            frames: std::collections::VecDeque::new(),
+            held: Vec::new(),
+            new: 0,
+        })
+    }
+
+    /// Depth for every frame of a video (RGB8 frames of one size), in order (`infer_video`):
+    /// without a focal length, the median estimate over the first window's frames serves them
+    /// all.
+    pub fn infer_video(&self, frames: &[&[u8]], width: usize, height: usize, opts: &VideoOptions) -> Result<Vec<DepthMap>> {
+        opts.check()?;
+        let mut o = opts.clone();
+        if o.focal_px.is_none()
+            && let Some(fov) = &self.fov
+        {
+            let head = &frames[..frames.len().min(o.window)];
+            if head.is_empty() {
+                return Ok(Vec::new());
+            }
+            let _p = crate::prof::phase(10, "depth focal");
+            let fovs = head
+                .iter()
+                .map(|f| {
+                    check_rgb(f, width, height)?;
+                    Ok(fov.fov_deg(&normalize(f, width, height), height, width))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            o.focal_px = Some(median_focal(&fovs, height, width));
+        }
+        let mut s = self.stream(&o)?;
+        s.estimated = opts.focal_px.is_none();
+        let mut out = Vec::with_capacity(frames.len());
+        for f in frames {
+            out.extend(s.step(f, width, height)?);
+        }
+        out.extend(s.flush()?);
+        Ok(out)
+    }
+}
+
+fn check_rgb(rgb: &[u8], width: usize, height: usize) -> Result<()> {
+    if rgb.len() != width * height * 3 || width == 0 || height == 0 {
+        bail!("RGB image of {} bytes for {width} x {height}", rgb.len());
+    }
+    Ok(())
+}
+
+impl DepthStream<'_> {
+    /// Adds the next frame (RGB8, `width * height * 3` bytes, the size of the first); returns
+    /// the predictions it finishes.
+    pub fn step(&mut self, rgb: &[u8], width: usize, height: usize) -> Result<Vec<DepthMap>> {
+        check_rgb(rgb, width, height)?;
+        if let Some(s) = self.size
+            && s != (width, height)
+        {
+            bail!("a stream takes frames of one size: {width}x{height} after {}x{}", s.0, s.1);
+        }
+        self.size = Some((width, height));
+        if self.frames.len() == self.clip {
+            self.frames.pop_front();
+        }
+        self.frames.push_back(normalize(rgb, width, height));
+        self.new += 1;
+        if self.held.len() + self.new < self.clip {
+            return Ok(Vec::new());
+        }
+        Ok(self.predict(self.frames.len(), self.overlap))
+    }
+
+    /// Ends the video: the predictions not yet returned.
+    pub fn flush(&mut self) -> Result<Vec<DepthMap>> {
+        if self.new == 0 {
+            let f = self.f_px;
+            return Ok(self.emit(self.held.len(), f));
+        }
+        let length = if self.overlap > 0 { self.frames.len() } else { self.new };
+        Ok(self.predict(length, 0))
+    }
+
+    /// Predicts the last `length` frames; returns those finished, all but the last `keep`.
+    fn predict(&mut self, length: usize, keep: usize) -> Vec<DepthMap> {
+        let (w, h) = self.size.unwrap();
+        let start = self.frames.len() - length;
+        let frames: Vec<&[f32]> = self.frames.iter().skip(start).map(|f| &f[..]).collect();
+        let inv = self.net.inverse_depth_clip(&frames, h, w, self.cache.as_mut());
+        let f_px = self.focal(start, h, w);
+        let mut inv = inv.into_iter().skip(length - self.held.len() - self.new);
+        let held = self.held.len();
+        self.new = 0;
+        if held > 0 {
+            // Cross-fade, with no scale fit (its error would accumulate over a long video).
+            let ramp = blend_ramp(held);
+            for (prev, r) in self.held.iter_mut().zip(ramp) {
+                let next = inv.next().unwrap();
+                for (a, &b) in prev.iter_mut().zip(&next) {
+                    *a = r * *a + (1.0 - r) * b;
+                }
+            }
+        }
+        self.held.extend(inv);
+        self.emit(self.held.len() - keep, f_px)
+    }
+
+    /// The focal length given, else the median estimate so far over the frames from `start`
+    /// (kept once a window is in).
+    fn focal(&mut self, start: usize, h: usize, w: usize) -> Option<f32> {
+        let net = self.net;
+        let (None, Some(fov)) = (self.f_px, &net.fov) else {
+            return self.f_px;
+        };
+        let _p = crate::prof::phase(10, "depth focal");
+        for f in self.frames.iter().skip(start) {
+            self.fovs.push(fov.fov_deg(f, h, w));
+        }
+        let f = median_focal(&self.fovs, h, w);
+        if self.fovs.len() >= self.window {
+            self.f_px = Some(f);
+        }
+        Some(f)
+    }
+
+    /// The first `count` predictions held, with depth from `f_px`.
+    fn emit(&mut self, count: usize, f_px: Option<f32>) -> Vec<DepthMap> {
+        let (width, height) = self.size.unwrap_or((0, 0));
+        self.held
+            .drain(..count)
+            .map(|inverse_depth| DepthMap {
+                width,
+                height,
+                inverse_depth,
+                focal_px: f_px,
+                focal_estimated: self.estimated && f_px.is_some(),
+                fov_deg: None,
+            })
+            .collect()
+    }
+}
+
+/// File extensions read as videos (a folder is read as a sequence of image frames).
+pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "mkv", "webm", "avi"];
+
+/// Whether `path` is a video for [`load_video`]: a folder, or a file with a video extension.
+pub fn is_video_path(path: &Path) -> bool {
+    path.is_dir()
+        || path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// Every frame (RGB8) of a video file oxideav decodes, or of a folder of images sorted by name
+/// (`frames_fps` frames per second, default 24), with the frame rate.
+#[cfg(feature = "media")]
+pub fn load_video(path: &Path, frames_fps: Option<f64>) -> Result<crate::video::Clip> {
+    let media = crate::media::Media::new();
+    crate::video::load_clip(&media, path, &|n, _| (0..n).collect(), frames_fps)
+}
+
+/// The color preview of a video's predictions as an MP4 (H.264): metric inverse depth through
+/// the turbo color map on the first frame's scale, the frames edge-padded to a multiple of 16,
+/// `fps` rounded.
+#[cfg(feature = "media")]
+pub fn preview_mp4(maps: &[DepthMap], fps: f64) -> Result<Vec<u8>> {
+    use crate::minimax_h3::video::{Video, VideoFormat};
+    let first = maps.first().context("no frames")?;
+    let scale = first.scale();
+    let (w, h) = (first.width, first.height);
+    let (wp, hp) = (w.next_multiple_of(16), h.next_multiple_of(16));
+    let frames = maps
+        .iter()
+        .map(|m| {
+            let c = m.colorize_on(scale);
+            let mut p = Vec::with_capacity(wp * hp * 3);
+            for y in 0..hp {
+                let row = &c[y.min(h - 1) * w * 3..][..w * 3];
+                p.extend_from_slice(row);
+                for _ in w..wp {
+                    p.extend_from_slice(&row[(w - 1) * 3..]);
+                }
+            }
+            p
+        })
+        .collect();
+    let v = Video {
+        width: wp,
+        height: hp,
+        frames,
+        fps: (fps.round() as usize).max(1),
+        audio: None,
+    };
+    crate::minimax_h3::encode::mp4_or_webm(&v, VideoFormat::Mp4)
+}
+
+/// Writes a video's predictions as the reference CLI does, in `dir`: `{stem}-depth.mp4` (the
+/// turbo preview on the first frame's scale; H.264 with the `media` feature, the frames
+/// edge-padded to a multiple of 16; without it `{stem}-depth/NNNNNN.png`), with `png16`
+/// `{stem}-depth16/{stem}-depth16.NNNNNN.png` (16-bit inverse depth on the same scale), with
+/// `raw` `{stem}-depth/NNNNNN.f32` (meters, float32). Returns the paths written and the 16-bit
+/// PNGs' factor `k` (meters = `k / value`) when there is a focal length.
+pub fn write_video(maps: &[DepthMap], dir: &Path, stem: &str, fps: f64, png16: bool, raw: bool) -> Result<(Vec<PathBuf>, Option<f32>)> {
+    let first = maps.first().context("no frames")?;
+    let scale = first.scale();
+    let mut written = Vec::new();
+    let sub = |name: &str| -> Result<PathBuf> {
+        let d = dir.join(name);
+        std::fs::create_dir_all(&d).with_context(|| format!("create {}", d.display()))?;
+        Ok(d)
+    };
+    #[cfg(feature = "media")]
+    {
+        let p = dir.join(format!("{stem}-depth.mp4"));
+        std::fs::write(&p, preview_mp4(maps, fps)?).with_context(|| format!("write {}", p.display()))?;
+        written.push(p);
+    }
+    #[cfg(not(feature = "media"))]
+    {
+        let _ = fps;
+        let d = sub(&format!("{stem}-depth"))?;
+        for (i, m) in maps.iter().enumerate() {
+            let p = d.join(format!("{i:06}.png"));
+            std::fs::write(&p, crate::png::encode_rgb(m.width, m.height, &m.colorize_on(scale)))?;
+        }
+        written.push(d);
+    }
+    let mut k = None;
+    if png16 {
+        let d = sub(&format!("{stem}-depth16"))?;
+        for (i, m) in maps.iter().enumerate() {
+            let (g, kk) = m.gray16_on(scale);
+            k = m.focal_px.map(|_| kk);
+            std::fs::write(
+                d.join(format!("{stem}-depth16.{i:06}.png")),
+                crate::png::encode_gray16(m.width, m.height, &g),
+            )?;
+        }
+        written.push(d);
+    }
+    if raw {
+        let d = sub(&format!("{stem}-depth"))?;
+        for (i, m) in maps.iter().enumerate() {
+            if let Some(depth) = m.depth() {
+                std::fs::write(
+                    d.join(format!("{i:06}.f32")),
+                    depth.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+                )?;
+            }
+        }
+        if !written.contains(&d) {
+            written.push(d);
+        }
+    }
+    Ok((written, k))
 }
 
 /// An RGB8 image ImageNet-normalized, `[3][h][w]`.
@@ -1615,6 +2210,68 @@ pub(crate) mod tests {
         assert_eq!(px.len(), w * h);
         assert!(k > 0.0);
         assert_eq!(g.colorize().len(), w * h * 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tiny_model_video_modes() {
+        let (dir, fdir) = tiny("video");
+        let o = DepthOptions {
+            focal: Some(fdir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let m = DepthPro::load(&dir.to_string_lossy(), &o).unwrap();
+        let (w, h) = (40, 36);
+        let frames: Vec<Vec<u8>> = (0..7)
+            .map(|k| image(w, h).iter().map(|&v| v.wrapping_add(13 * k)).collect())
+            .collect();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| &f[..]).collect();
+        let single: Vec<Vec<f32>> = frames
+            .iter()
+            .map(|f| m.infer_rgb(f, w, h, Some(50.0)).unwrap().inverse_depth)
+            .collect();
+        let vo = |mode, window, overlap| VideoOptions {
+            mode,
+            window,
+            overlap,
+            focal_px: Some(50.0),
+        };
+        // A window of one frame is the image model, in either mode.
+        for mode in [VideoMode::Buffered, VideoMode::Unbuffered] {
+            let v = m.infer_video(&refs, w, h, &vo(mode, 1, 0)).unwrap();
+            assert_eq!(v.len(), 7);
+            for (a, b) in v.iter().zip(&single) {
+                let d = a.inverse_depth.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+                assert!(d < 1e-5, "{mode:?}: {d}");
+                assert_eq!(a.focal_px, Some(50.0));
+            }
+        }
+        // Frames attending to each other: every frame returned once, in order, the same however
+        // the stream is fed; the estimated focal length shared by every frame.
+        for (mode, window, overlap) in [(VideoMode::Buffered, 3, 1), (VideoMode::Unbuffered, 3, 0)] {
+            let mut o = vo(mode, window, overlap);
+            o.focal_px = None;
+            let v = m.infer_video(&refs, w, h, &o).unwrap();
+            assert_eq!(v.len(), 7);
+            let f = v[0].focal_px.unwrap();
+            assert!(v.iter().all(|d| d.focal_px == Some(f) && d.focal_estimated));
+            assert!(v.iter().all(|d| d.inverse_depth.iter().all(|x| x.is_finite() && *x >= 0.0)));
+            let mut o = vo(mode, window, overlap);
+            o.focal_px = Some(f);
+            let mut s = m.stream(&o).unwrap();
+            let mut got = Vec::new();
+            for fr in &refs {
+                got.extend(s.step(fr, w, h).unwrap());
+            }
+            got.extend(s.flush().unwrap());
+            assert_eq!(got.len(), 7);
+            for (a, b) in got.iter().zip(&v) {
+                assert_eq!(a.inverse_depth, b.inverse_depth);
+            }
+            // The cross-frame blocks make the frames depend on each other.
+            assert!(v.iter().zip(&single).any(|(a, b)| a.inverse_depth != *b));
+        }
+        assert!(m.stream(&vo(VideoMode::Buffered, 2, 2)).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 
