@@ -1655,6 +1655,7 @@ impl NemotronModel<'_> {
                 x2: &[],
                 kv,
                 states: st,
+                states_kept: false,
             })
             .collect();
         let ok = plan.step_rows(&mut brows, &mut hidden, logits.as_deref_mut());

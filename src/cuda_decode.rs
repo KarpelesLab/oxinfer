@@ -2638,9 +2638,222 @@ impl CudaPlan<'_> {
     }
 }
 
+impl CudaPlan<'_> {
+    /// Before op `i` of a step over `ops[..end]` launches: the rounded / converted rows of x kept
+    /// from the matvec before it hold only across consecutive matvecs.
+    fn before_op(&self, i: usize, end: usize) {
+        if !matches!(self.ops[i], COp::Gmv { .. } | COp::Gmv3 { .. }) {
+            self.q8_last.set(Default::default());
+            self.xh_last.set(Default::default());
+        }
+        self.xh_next.set(match self.ops[..end].get(i + 1) {
+            Some(&COp::Gmv { x, n_in, w2: None, .. }) => (x.a, n_in),
+            _ => Default::default(),
+        });
+    }
+
+    /// After `op` launched over `t` tokens: a matvec writing into the rounded / converted x's rows
+    /// makes them stale.
+    fn after_op(&self, op: &COp, t: usize) {
+        let outs: [(P, u32); 3] = match *op {
+            COp::Gmv { y, n_out, .. } => [(y, n_out), Default::default(), Default::default()],
+            COp::Gmv3 { y, n, .. } => [(y[0], n[0]), (y[1], n[1]), (y[2], n[2])],
+            _ => Default::default(),
+        };
+        for (y, n_out) in outs.into_iter().filter(|o| o.1 > 0) {
+            let y1 = y.a + (t as u64 - 1) * y.ts + 4 * n_out as u64;
+            for c in [&self.q8_last, &self.xh_last] {
+                let (x0, xs, n, tt) = c.get();
+                let x1 = x0 + 4 * ((tt.max(1) as u64 - 1) * xs as u64 + n as u64);
+                if y.a < x1 && x0 < y1 {
+                    c.set(Default::default());
+                }
+            }
+        }
+    }
+
+    /// [`DecodePlan::step_rows`]: a multi-token step's launches over `rows.len()` tokens, but for
+    /// the ops that touch a KV cache (the attention inputs and the attention) or a recurrent
+    /// state, which run per row with the one-token kernels on the row's own device copies at its
+    /// own position, as a one-token step of its session would.
+    fn step_rows_impl(&self, rows: &mut [crate::gpu::decode::Row], hidden: &mut [f32], logits: Option<&mut [f32]>) -> bool {
+        let be = self.be;
+        let b = rows.len();
+        let halves: usize = self.rope_halves.iter().sum();
+        if b == 0
+            || b > self.tokens
+            || self.tokens < 2
+            || self.pf.is_some()
+            || hidden.len() < b * self.hidden.1
+            || logits.as_ref().is_some_and(|l| self.logits.is_none_or(|(_, n, _)| l.len() < b * n))
+            || rows.iter().any(|r| {
+                r.kv.len() != self.kv.len()
+                    || r.rope_cs.len() != 2 * halves
+                    || r.x.len() != self.input.1
+                    || self.input2.is_some_and(|(_, n, _)| r.x2.len() != n)
+                    || r.states.len() != self.states.len()
+                    || r.states.iter().zip(&self.states).any(|(a, &n)| a.len() != n)
+            })
+            // Ops tying a step's tokens together (a draft block's attention): not batched.
+            || self.ops.iter().any(|op| matches!(op, COp::Attn { p, .. } if p.block != 0))
+            || !be.bind()
+        {
+            debug("step_rows: the rows do not match the plan");
+            return false;
+        }
+        let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        // The rows' device slots (distinct sessions): caches brought up to date, states up.
+        let mut mss: Vec<*mut CudaSlot> = Vec::with_capacity(b);
+        for r in rows.iter_mut() {
+            let Some(ms) = self.slot(r.slot) else { return false };
+            let ms: *mut CudaSlot = ms;
+            if mss.contains(&ms) {
+                return false;
+            }
+            // SAFETY: each pointer is a distinct slot, borrowed from its row for this call.
+            let ms_ref = unsafe { &mut *ms };
+            if !self.sync_kv(ms_ref, r.kv, r.pos, 1) {
+                debug("step_rows: KV caches could not be synced (VRAM?)");
+                return false;
+            }
+            if !(r.states_kept && ms_ref.states_valid) {
+                for (&(p, _), st) in ms_ref.states.iter().zip(r.states.iter()) {
+                    if !be.htod(p, st) {
+                        return false;
+                    }
+                }
+            }
+            ms_ref.states_valid = false;
+            // No replay of a multi-token step's recurrent inputs past this step.
+            ms_ref.last = (0, 0);
+            mss.push(ms);
+        }
+        // Inputs: rows `ts` floats apart; each row its own position, a step of one token.
+        let spread = |n: usize, ts: usize, src: &dyn Fn(usize) -> *const f32| -> Vec<f32> {
+            let mut v = vec![0f32; (b - 1) * ts + n];
+            for j in 0..b {
+                // SAFETY: `src(j)` is row j's `n` floats (checked above).
+                v[j * ts..j * ts + n].copy_from_slice(unsafe { std::slice::from_raw_parts(src(j), n) });
+            }
+            v
+        };
+        let sp: Vec<u32> = rows.iter().flat_map(|r| [r.pos as u32, r.pos as u32, 1, 0]).collect();
+        if !be.htod(self.input.0, &spread(self.input.1, self.input.2, &|j| rows[j].x.as_ptr()))
+            || self
+                .input2
+                .is_some_and(|(p, n, ts)| !be.htod(p, &spread(n, ts, &|j| rows[j].x2.as_ptr())))
+            || !be.htod(self.sp, &sp)
+        {
+            return false;
+        }
+        let (mut src, mut dst) = (0, self.cs);
+        for &half in &self.rope_halves {
+            let n = 2 * half;
+            if n > 0 {
+                let v: Vec<f32> = rows.iter().flat_map(|r| r.rope_cs[src..src + n].iter().copied()).collect();
+                if !be.htod(dst, &v) {
+                    return false;
+                }
+            }
+            src += n;
+            dst += (self.tokens * n * 4) as u64;
+        }
+        if !self.strengths.1.is_empty() {
+            let v: Vec<f32> = self.strengths.1.iter().map(|s| s.get()).collect();
+            if !be.htod(self.strengths.0, &v) {
+                return false;
+            }
+        }
+        let want_logits = logits.is_some() && self.logits.is_some();
+        let end = if want_logits { self.ops.len() } else { self.head_from };
+        let tr = trace();
+        let t0 = std::time::Instant::now();
+        self.q8_last.set(Default::default());
+        self.xh_last.set(Default::default());
+        for (i, op) in self.ops[..end].iter().enumerate() {
+            self.before_op(i, end);
+            let ok = match op {
+                COp::QkRope { .. } | COp::Attn { .. } | COp::GdnConv { .. } | COp::GdnRule { .. } => {
+                    // SAFETY: as above; the slots are only read here.
+                    (0..b).all(|j| self.launch_op(op, unsafe { &*mss[j] }, j))
+                }
+                _ => self.launch_tokens(op, unsafe { &*mss[0] }, b),
+            };
+            if !ok {
+                debug(&format!("step of {b} row(s): op {i} of {} did not launch", self.ops.len()));
+                return false;
+            }
+            self.after_op(op, b);
+        }
+        // Results down (each copy waits for the kernels before it on the stream).
+        let dtoh = |dst: &mut [f32], src: u64| unsafe { be.cu.cuMemcpyDtoH_v2(dst.as_mut_ptr() as *mut c_void, src, dst.len() * 4) == 0 };
+        let down = |dst: &mut [f32], (p, n, ts): (u64, usize, usize)| -> bool {
+            if ts == n {
+                return dtoh(&mut dst[..b * n], p);
+            }
+            let mut v = vec![0f32; (b - 1) * ts + n];
+            if !dtoh(&mut v, p) {
+                return false;
+            }
+            for j in 0..b {
+                dst[j * n..(j + 1) * n].copy_from_slice(&v[j * ts..j * ts + n]);
+            }
+            true
+        };
+        if !down(hidden, self.hidden) {
+            return false;
+        }
+        let t1 = std::time::Instant::now();
+        if let (Some(l), Some(lg)) = (logits, self.logits)
+            && want_logits
+            && !down(l, lg)
+        {
+            return false;
+        }
+        // Each row's recurrent states, then its new keys and values, back to its session.
+        for (j, r) in rows.iter_mut().enumerate() {
+            // SAFETY: as above.
+            let ms = unsafe { &mut *mss[j] };
+            if !self.states_down(&ms.states, r.states, false) {
+                return false;
+            }
+            ms.states_valid = true;
+        }
+        let mut kvo = vec![0f32; self.kvout.1];
+        if !kvo.is_empty() && !dtoh(&mut kvo, self.kvout.0) {
+            return false;
+        }
+        for (j, r) in rows.iter_mut().enumerate() {
+            // SAFETY: as above.
+            let ms = unsafe { &mut *mss[j] };
+            let mut o = 0;
+            for (i, (m, c)) in ms.kv.iter_mut().zip(r.kv.iter_mut()).enumerate() {
+                let row = self.kv[i].0 * self.kv[i].1;
+                let tr = self.tokens * row;
+                c.push(&kvo[o + j * row..o + (j + 1) * row], &kvo[o + tr + j * row..o + tr + (j + 1) * row], 1);
+                c.kept = c.len;
+                m.synced = r.pos + 1;
+                o += 2 * tr;
+            }
+        }
+        if tr {
+            eprintln!(
+                "[cuda decode step of {b} rows: ops {:.0} us, the head's rows, states and caches {:.0} us]",
+                (t1 - t0).as_secs_f64() * 1e6,
+                t1.elapsed().as_secs_f64() * 1e6
+            );
+        }
+        true
+    }
+}
+
 impl DecodePlan for CudaPlan<'_> {
     fn tokens(&self) -> usize {
         self.tokens
+    }
+
+    fn step_rows(&self, rows: &mut [crate::gpu::decode::Row], hidden: &mut [f32], logits: Option<&mut [f32]>) -> bool {
+        self.step_rows_impl(rows, hidden, logits)
     }
 
     fn step(&self, slot: &mut Slot, s: Step) -> bool {
@@ -2790,14 +3003,7 @@ impl DecodePlan for CudaPlan<'_> {
                 break;
             }
             let ts = std::time::Instant::now();
-            if !matches!(op, COp::Gmv { .. } | COp::Gmv3 { .. }) {
-                self.q8_last.set(Default::default());
-                self.xh_last.set(Default::default());
-            }
-            self.xh_next.set(match self.ops[..end].get(i + 1) {
-                Some(&COp::Gmv { x, n_in, w2: None, .. }) => (x.a, n_in),
-                _ => Default::default(),
-            });
+            self.before_op(i, end);
             if !self.launch_tokens(op, ms, t) {
                 debug(&format!("step of {t} token(s): op {i} of {} did not launch", self.ops.len()));
                 if recording {
@@ -2809,22 +3015,7 @@ impl DecodePlan for CudaPlan<'_> {
                 }
                 return false;
             }
-            // A matvec writing into the rounded / converted x's rows makes them stale.
-            let outs: [(P, u32); 3] = match *op {
-                COp::Gmv { y, n_out, .. } => [(y, n_out), Default::default(), Default::default()],
-                COp::Gmv3 { y, n, .. } => [(y[0], n[0]), (y[1], n[1]), (y[2], n[2])],
-                _ => Default::default(),
-            };
-            for (y, n_out) in outs.into_iter().filter(|o| o.1 > 0) {
-                let y1 = y.a + (t as u64 - 1) * y.ts + 4 * n_out as u64;
-                for c in [&self.q8_last, &self.xh_last] {
-                    let (x0, xs, n, tt) = c.get();
-                    let x1 = x0 + 4 * ((tt.max(1) as u64 - 1) * xs as u64 + n as u64);
-                    if y.a < x1 && x0 < y1 {
-                        c.set(Default::default());
-                    }
-                }
-            }
+            self.after_op(op, t);
             if per_op {
                 unsafe { be.cu.cuCtxSynchronize() };
                 let k = match op {

@@ -205,21 +205,28 @@ impl QwenModel<'_> {
             .collect();
         let mut hidden = crate::kernels::zeros(b * h);
         let mut logits = crate::kernels::zeros(b * v);
-        type Part<'a> = (&'a mut crate::gpu::decode::Slot, Vec<&'a mut LayerCache>, Vec<&'a mut [f32]>, usize);
+        type Part<'a> = (&'a mut crate::gpu::decode::Slot, Vec<&'a mut LayerCache>, Vec<&'a mut [f32]>, usize, bool);
         let mut parts: Vec<Part> = sess
             .iter_mut()
             .map(|s| {
-                let QwenSession { kv, gdn, gpu, pos, .. } = &mut **s;
+                let QwenSession {
+                    kv,
+                    gdn,
+                    gpu,
+                    pos,
+                    gpu_states_kept,
+                    ..
+                } = &mut **s;
                 // The recurrent states in the plan's order, as a one-token step passes them.
                 let states = gdn.iter_mut().flatten().flat_map(|g| [&mut g.s[..], &mut g.conv[..]]).collect();
-                (gpu, kv.iter_mut().flatten().collect(), states, *pos)
+                (gpu, kv.iter_mut().flatten().collect(), states, *pos, *gpu_states_kept)
             })
             .collect();
         let mut rows: Vec<crate::gpu::decode::Row> = parts
             .iter_mut()
             .zip(&cs)
             .zip(x.chunks(h))
-            .map(|(((slot, kv, states, pos), cs), x)| crate::gpu::decode::Row {
+            .map(|(((slot, kv, states, pos, kept), cs), x)| crate::gpu::decode::Row {
                 slot,
                 pos: *pos,
                 rope_cs: cs,
@@ -227,6 +234,7 @@ impl QwenModel<'_> {
                 x2: &[],
                 kv: &mut kv[..],
                 states: &mut states[..],
+                states_kept: *kept,
             })
             .collect();
         let ok = plan.step_rows(&mut rows, &mut hidden, Some(&mut logits));

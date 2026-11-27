@@ -4332,6 +4332,109 @@ mod tests {
                 "fast prefill plan: {what} differ by {worst:.2e} (largest value {scale:.2e})"
             );
         }
+        // Batched rows (`step_rows`, the server's concurrent requests): three sequences at
+        // different positions, a token of each per step, give each sequence's one-token steps'
+        // bits (hidden states, keys, values, recurrent states), with the f32 and int8 matvecs.
+        for (what, one, multi) in [("f32", &one, &multi), ("int8", &one_q, &multi_q)] {
+            use crate::gpu::decode::Row;
+            let (starts, steps) = ([0usize, 5, 11], 19usize);
+            // Sequence j's token i: input row (3 i + j) % n at position i.
+            let tok = |j: usize, i: usize| (3 * i + j) % n;
+            struct Seq {
+                slot: Slot,
+                cache: LayerCache,
+                s0: Vec<f32>,
+                s1: Vec<f32>,
+                hs: Vec<f32>,
+            }
+            let fresh = || Seq {
+                slot: Slot(None),
+                cache: LayerCache::new(nkv, hd),
+                s0: vec![0f32; nv * hdk * hdv],
+                s1: vec![0f32; (kc - 1) * conv_dim],
+                hs: Vec::new(),
+            };
+            let single = |q: &mut Seq, j: usize, i: usize, kept: bool| {
+                let mut hid = vec![0f32; h];
+                let mut kv = [&mut q.cache];
+                let mut states: [&mut [f32]; 2] = [&mut q.s0, &mut q.s1];
+                let r = tok(j, i);
+                assert!(one.step(
+                    &mut q.slot,
+                    Step {
+                        pos: i,
+                        t: 1,
+                        rope_cs: &cs[i * hd..(i + 1) * hd],
+                        x: &xin[r * h..(r + 1) * h],
+                        x2: &[],
+                        kv: &mut kv,
+                        states: &mut states,
+                        hidden: &mut hid,
+                        logits: None,
+                        params: None,
+                        capture: None,
+                        scratch: false,
+                        states_kept: kept,
+                    },
+                ));
+                q.hs.extend_from_slice(&hid);
+            };
+            let mut alone: Vec<Seq> = (0..3).map(|_| fresh()).collect();
+            let mut batch: Vec<Seq> = (0..3).map(|_| fresh()).collect();
+            for j in 0..3 {
+                for i in 0..starts[j] + steps {
+                    single(&mut alone[j], j, i, i > 0);
+                }
+                for i in 0..starts[j] {
+                    single(&mut batch[j], j, i, i > 0);
+                }
+            }
+            for st in 0..steps {
+                // The last steps as one-token steps again: a slot goes from rows back to steps.
+                if st + 2 >= steps {
+                    for (j, q) in batch.iter_mut().enumerate() {
+                        single(q, j, starts[j] + st, true);
+                    }
+                    continue;
+                }
+                let mut hid = vec![0f32; 3 * h];
+                let mut parts: Vec<(&mut Slot, [&mut LayerCache; 1], [&mut [f32]; 2])> = batch
+                    .iter_mut()
+                    .map(|q| (&mut q.slot, [&mut q.cache], [&mut q.s0[..], &mut q.s1[..]]))
+                    .collect();
+                let mut rows: Vec<Row> = parts
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(j, (slot, kv, states))| {
+                        let (i, r) = (starts[j] + st, tok(j, starts[j] + st));
+                        Row {
+                            slot,
+                            pos: i,
+                            rope_cs: &cs[i * hd..(i + 1) * hd],
+                            x: &xin[r * h..(r + 1) * h],
+                            x2: &[],
+                            kv: &mut kv[..],
+                            states: &mut states[..],
+                            states_kept: st > 0,
+                        }
+                    })
+                    .collect();
+                assert!(multi.step_rows(&mut rows, &mut hid, None), "{what}: step_rows declined");
+                drop(rows);
+                drop(parts);
+                for (j, q) in batch.iter_mut().enumerate() {
+                    q.hs.extend_from_slice(&hid[j * h..(j + 1) * h]);
+                }
+            }
+            for (j, (a, b)) in alone.iter().zip(&batch).enumerate() {
+                let same = |x: &[f32], y: &[f32]| x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits());
+                assert_eq!(b.cache.len, starts[j] + steps);
+                assert!(same(&a.hs, &b.hs), "{what} rows: sequence {j}'s hidden states differ");
+                assert!(same(a.cache.data().0, b.cache.data().0), "{what} rows: sequence {j}'s keys differ");
+                assert!(same(a.cache.data().1, b.cache.data().1), "{what} rows: sequence {j}'s values differ");
+                assert!(same(&a.s0, &b.s0) && same(&a.s1, &b.s1), "{what} rows: sequence {j}'s states differ");
+            }
+        }
         // An input the GEMMs cannot take (here not a number) declines the step and leaves the
         // host's caches and states alone.
         {

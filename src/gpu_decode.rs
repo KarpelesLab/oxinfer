@@ -876,6 +876,8 @@ pub struct Row<'s, 'c> {
     /// The session's recurrent states, as [`Step::states`] (each row its own; empty for plans
     /// without recurrent layers).
     pub states: &'s mut [&'c mut [f32]],
+    /// As [`Step::states_kept`], for this row's slot.
+    pub states_kept: bool,
 }
 
 /// Greedy decoding chained on the device ([`DecodePlan::greedy`]).
