@@ -5500,6 +5500,21 @@ tools/bench/bench.py --model M.gguf --sidecar FastMTP.gguf --llama-bin ~/llama.c
 tools/bench/summarize.py results.jsonl          # medians, acceptance, greedy agreement
 ```
 
+### Nemotron-H prompts (Mamba-2's chunked scan)
+
+NVIDIA Nemotron 3.5 Lightning 30B-A3B, ggml-org's Q4_0 GGUF, M5 Max, one session under the
+benchmark lock (`pf_ab`: plans built, best of 5; `llama-bench` de30697, 3 repetitions):
+
+| | 511 tokens | 2,047 | 3,055 |
+|---|---|---|---|
+| oxinfer, Mamba-2 scan chunked (`pf_ssd_*`) | 3,575 tok/s | 3,748 | 3,984 |
+| oxinfer, token by token (`OXINFER_PF_SSD=0`) | 2,723 | 2,773 | 3,000 |
+| llama.cpp (pp512 / pp2048) | 2,990 | 2,378 | |
+
+The scan went from about 200 to 37 ms of GPU time per 2,048-token chunk
+([Nemotron](nemotron.md#on-metal)). The CLI's one-shot prompt (3,056 tokens, 1,690-1,810 tok/s)
+also builds the plans, 1.1-1.5 s of it the routed experts' tiled copies.
+
 ## Image generation against stable-diffusion.cpp and mflux
 
 November 2026, M5 Max, same files where the engines read them (GGUF transformers, the same

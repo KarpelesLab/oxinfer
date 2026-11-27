@@ -146,7 +146,8 @@ up to 64 rows runs as 32-row tiles rather than one padded tile (513 tokens: 544 
 GPU runs the later layers (a pass is 8 command buffers; MoE passes are cut at every MoE layer
 anyway, for the routing). Interventions, captured layers,
 streamed weights, M-RoPE position lists and Gemma image prompts keep the op-by-op path
-(`OXINFER_PREFILL_GPU=0` forces it, `OXINFER_PF_FLASH=0` the per-token attention kernels). The
+(`OXINFER_PREFILL_GPU=0` forces it, `OXINFER_PF_FLASH=0` the per-token attention kernels,
+`OXINFER_PF_SSD=0` the token-by-token Mamba-2 scan). The
 last-token distribution is as close to the CPU path's as before or closer (Qwen3-8B Q8_0, 2.5k
 tokens: KL 2.2e-5 -> 6.4e-6; Gemma 4 12B Q8_0: 1.0e-4 -> 5.5e-5; Llama-3.2-1B Q4_K_M 2.5e-5 ->
 2.3e-5), and greedy output is unchanged on the models checked (Llama 1B, Orpheus, Qwen3-8B / 14B,

@@ -71,10 +71,10 @@ One-token steps run as a whole on Metal (the decode plan of
 [Nemotron-Labs-Image](nemotron-image.md#speed): Mamba-2, sigmoid routing and squared-ReLU
 experts in one submission), and prompts of 32 tokens and more on its prefill plan (chunks of
 2048 tokens, `OXINFER_PREFILL_TOKENS`, with the activations on the device for the whole chunk:
-matrix-unit GEMMs, the routed experts as grouped GEMMs over each expert's tokens, a SIMD-group
-per Mamba-2 state row that keeps its row in registers across the chunk's tokens, the
-convolution's tokens in parallel). `--gpu-decode off` keeps both on the CPU (an accelerator
-taking the prompt's matmuls), `OXINFER_PREFILL_GPU=0` the prompts alone.
+matrix-unit GEMMs, the routed experts as grouped GEMMs over each expert's tokens, Mamba-2's scan
+chunked as matrix products (below), the convolution's tokens in parallel). `--gpu-decode off`
+keeps both on the CPU (an accelerator taking the prompt's matmuls), `OXINFER_PREFILL_GPU=0` the
+prompts alone.
 
 ggml-org's Q4_0 GGUF of Lightning on the M5 Max (greedy, the machine shared with other jobs,
 `tools/bench/with-lock.sh` held):
@@ -83,16 +83,30 @@ ggml-org's Q4_0 GGUF of Lightning on the M5 Max (greedy, the machine shared with
 |---|---|---|
 | decoding, 34-token prompt | 153 tok/s (before the prefill plan and the experts fix below: 93) | 104 tok/s (`llama-cli`), `llama-bench` tg128 115 |
 | decoding after a 3,056-token prompt | 136 tok/s (70) | |
-| prefill | 1,990-2,030 tok/s at 3,056 tokens in chunks of 2,048 (1,910-1,990 in the CLI's former chunks of 1,024; 596 with the matmuls alone on the GPU) | `llama-bench` pp512 3,390, pp2048 2,761 |
+| prefill, warm (`pf_ab`: the plans built, best of 5) | 3,575 tok/s at 511 tokens, 3,748 at 2,047, 3,984 at 3,055 (token by token scan: 2,723 / 2,773 / 3,000) | `llama-bench` pp512 2,990, pp2048 2,378 (same session; 3,390 / 2,761 on a quieter machine) |
+| prefill, one-shot CLI (3,056 tokens, plan built in the run) | 1,690-1,810 tok/s: 1.1-1.5 s of it is building the plans; with `OXINFER_GPU_EXPERT_TILES=0` 0.08 s and 4,040-4,270 tok/s | |
 
-Decoding is ahead of llama.cpp; prompts run at about 0.7x its pp2048. Where a chunk's
-GPU time goes (`OXINFER_PF_PROFILE=1` prints each prefill chunk's by kind of op, every op in a
-command buffer of its own): of 266 ms for 1,024 tokens, the Mamba-2 scan 88 ms (a third: each
-layer's tokens one after the other, a SIMD-group per state row), the routed experts' grouped
-GEMMs 84 ms, the Mamba-2 input projections 27 ms, the rest under 17 ms each. Giving each
-SIMD-group 8 rows (B and C loaded once for them, the next token's inputs loaded ahead) was 2.2x
-slower and one row with the inputs loaded ahead 1.1x slower (fewer SIMD-groups in flight); a
-chunked scan as matrix products (Mamba-2's SSD form) is what is left to try.
+Decoding and prompts are ahead of llama.cpp (prompts 1.2x its pp512, 1.6x its pp2048). A
+one-shot run pays for the prefill plan once: almost all of it is the routed experts' tiled
+copies (`tiled_experts`, 46 matrices of 342 MB at 14 to 31 ms each, the time of filling fresh
+private GPU memory rather than of the copy kernel: one reading whole rows into threadgroup
+memory was no faster), which make warm prompts 5 to 8% faster and stay for the process's later
+prompts and its decoding.
+
+**The scan.** Mamba-2's recurrence `S_t = exp(dt_t a) S_{t-1} + dt_t x_t B_t^T`, `y_t = S_t C_t`
+ran token after token, a SIMD-group per state row (`dec_mamba2_t`): of 266 ms of GPU time for
+1,024 tokens (`OXINFER_PF_PROFILE=1`, every op in a command buffer of its own) it took 88 ms, a
+third. Prefill plans now run it in chunks of 64 tokens as products of 8x8 float32 SIMD-group
+matrices (Mamba-2's SSD form, `src/metal_ssd.metal`): `pf_ssd_chunk`, a threadgroup per chunk
+and head, computes `C B^T` masked by the decays `exp(cs_t - cs_s) dt_s` (cs the running sum of
+`dt a`) times `X` (the chunk's own term) and the chunk's part of the state; `pf_ssd_state`, a
+threadgroup per head and 16 state rows, walks the chunks in order, adds `exp(cs_t) C S_prev`,
+the `D` skip and the gate, and carries the state. Per 2,048-token chunk the scan went from about
+200 ms to 37 ms; the routed experts' grouped GEMMs (159 ms) and the Mamba-2 input projections
+(63 ms) are now the largest. Heads of 64 and states of up to 256 take it (every Nemotron-H
+release); `OXINFER_PF_SSD=0` keeps the token-by-token kernel. Earlier attempts at the
+recurrence (8 rows per SIMD-group with B and C loaded once, inputs loaded ahead) were 1.1 to
+2.2x slower.
 
 The squared-ReLU experts had run on the pair kernels with the up matrix in both slots, reading
 it twice; they now skip the second matrix (mode 9 of `mvx_*_pair` / `mvxt_*_pair`), the same
@@ -100,7 +114,10 @@ bits for half the work. Agreement (`OXINFER_GPU_DECODE_CHECK=1`, each step again
 the same state, 100 greedy steps after the CPU's prefill): mean KL 3.4e-3 (4.1e-3 before),
 the same top token at every step; the CPU rounds the activations to int8 for the quantized
 blocks. The prefill plan against the CPU's logits after the 3,056-token prompt: KL 1.5e-3, the
-host path (GPU matmuls) 2.2e-3, the two 3.1e-4 apart, the same top token; the two paths'
+host path (GPU matmuls) 2.2e-3, the two 3.1e-4 apart, the same top token; with the chunked scan
+2.5e-3, and on three other prompts of 2,263 to 2,860 tokens 1.6e-2 / 4.4e-3 / 1.0e-2 against the
+token-by-token scan's 1.8e-2 / 4.0e-3 / 1.1e-2 (the two scans 2.7e-4 to 8.8e-4 apart; the scan
+alone agrees with the recurrence to 4.8e-7 relative, `mamba2_chunked_scan_matches_recurrence`); the two paths'
 greedy continuations stay on the same summary of the prompt, worded differently after a few
 dozen tokens.
 

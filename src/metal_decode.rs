@@ -566,6 +566,7 @@ pub(crate) fn shader_src() -> String {
         }
     }
     s.push_str(PFF_SRC);
+    s.push_str(SSD_SRC);
     s
 }
 
@@ -600,6 +601,22 @@ impl MetalBackend {
 const FV_SRC: &str = include_str!("metal_fastv.metal");
 /// Prefill attention on the SIMD-group matrices (`pff_<head dim>`, `MOp::PfFlash`).
 const PFF_SRC: &str = include_str!("metal_pfflash.metal");
+/// Mamba-2's chunked scan for prefill plans (`pf_ssd_chunk`, `pf_ssd_state`; `MOp::Mamba2::ssd`).
+const SSD_SRC: &str = include_str!("metal_ssd.metal");
+/// Tokens per chunk of `pf_ssd_*` (`SSD_L`), rows of state per threadgroup of `pf_ssd_state`.
+const SSD_L: usize = 64;
+const SSD_RB: usize = 16;
+/// Whether prefill plans run Mamba-2's scan chunked on the SIMD-group matrices (`pf_ssd_*`;
+/// `OXINFER_PF_SSD=0`: `dec_mamba2_t`, token by token).
+fn pf_ssd() -> bool {
+    // (Read as each plan is built, so that `pf_ab` can compare.)
+    std::env::var("OXINFER_PF_SSD").map_or(true, |v| v != "0")
+}
+/// Whether `pf_ssd_*` take a Mamba-2 of this shape: heads of 64, state rows a multiple of 64 up
+/// to 256.
+fn ssd_shape(m: &crate::gpu::decode::Mamba2) -> bool {
+    m.hd == 64 && m.ns.is_multiple_of(64) && m.ns <= 256
+}
 /// Prefill attention on the matrix units (`pfm_*`), compiled with the matrix-unit GEMMs.
 pub(crate) const PFM_SRC: &str = include_str!("metal_pfmma.metal");
 
@@ -2672,6 +2689,9 @@ enum MOp {
         /// Multi-token plans: `dec_mamba2_t` and its `ts` (the tokens set per step; the xbc, z / dt
         /// and out strides).
         t: Option<(Id, [u32; 4])>,
+        /// Prefill plans: the chunked scan's pipelines (`pf_ssd_chunk`, `pf_ssd_state`) and the
+        /// arena offset of the chunks' states.
+        ssd: Option<(Id, Id, usize)>,
     },
     GdnRule {
         pipe: Id,
@@ -3533,6 +3553,24 @@ impl MetalBackend {
                 .unwrap_or(0);
             pf_rt = total;
             total += (tokens * ne * 4).next_multiple_of(256);
+        }
+        // Prefill plans: the chunked Mamba-2 scan's per-chunk states (`MOp::Mamba2::ssd`), one
+        // layer's at a time.
+        let mut pf_ssd_off = None;
+        if pf && pf_ssd() {
+            let n = g
+                .ops
+                .iter()
+                .map(|op| match op {
+                    Op::Mamba2(m) if ssd_shape(m) => m.nh * m.hd * m.ns,
+                    _ => 0,
+                })
+                .max()
+                .unwrap_or(0);
+            if n > 0 {
+                pf_ssd_off = Some(total);
+                total += (tokens.div_ceil(SSD_L) * n * 4).next_multiple_of(256);
+            }
         }
         // The view whose half rows the scratch holds, and the routed experts.
         // Matrix-unit attention (`pfm_*`): a cache written by one QkRope of the plan and read by
@@ -5047,6 +5085,12 @@ impl MetalBackend {
                         } else {
                             None
                         },
+                        ssd: match pf_ssd_off {
+                            Some(off) if pf && ssd_shape(m) => {
+                                Some((self.named_pipeline("pf_ssd_chunk")?, self.named_pipeline("pf_ssd_state")?, off))
+                            }
+                            _ => None,
+                        },
                     });
                     let inner = m.nh * m.hd;
                     (
@@ -6551,10 +6595,37 @@ impl MetalPlan<'_> {
                 cst,
                 p,
                 t: tk,
+                ssd,
                 ..
             } => {
                 let (pipe, mut ts) = tk.expect("multi-token mamba2");
                 ts[0] = t as u32;
+                if let Some((chunk, scan, off)) = *ssd {
+                    // Each chunk's own terms in parallel, then the chunks in order per block of
+                    // state rows.
+                    e.pipe(chunk);
+                    e.buf(arena, *xbc, 0);
+                    e.buf(arena, *dt, 1);
+                    e.buf(arena, *out, 2);
+                    e.buf(arena, off, 3);
+                    e.buf(consts, *cst, 4);
+                    e.bytes(p, 5);
+                    e.bytes(&ts, 6);
+                    e.dispatch((t.div_ceil(SSD_L), p.nh as usize), 128);
+                    e.barrier();
+                    e.pipe(scan);
+                    e.buf(arena, *xbc, 0);
+                    e.buf(arena, *z, 1);
+                    e.buf(arena, *out, 2);
+                    e.buf(arena, off, 3);
+                    e.buf(consts, *cst, 4);
+                    e.bytes(p, 5);
+                    e.bytes(&ts, 6);
+                    e.buf(stb[*state].0, stb[*state].1, 7);
+                    e.buf(arena, *dt, 8);
+                    e.dispatch((p.nh as usize, p.hd as usize / SSD_RB), 128);
+                    return;
+                }
                 e.pipe(pipe);
                 e.buf(arena, *xbc, 0);
                 e.buf(arena, *z, 1);
@@ -9188,6 +9259,7 @@ impl MetalPlan<'_> {
                 cst,
                 p,
                 t: tk,
+                ..
             } => {
                 let [_, sx, sz, so] = tk.expect("multi-token mamba2").1;
                 let (sx, sz, so) = (j * sx as usize * 4, j * sz as usize * 4, j * so as usize * 4);
@@ -10800,6 +10872,110 @@ mod tests {
                 }
             }
         }
+        unsafe { (f.void)(arena, f.s_release) };
+    }
+
+    /// Mamba-2's chunked scan (`pf_ssd_chunk` + `pf_ssd_state`) against the token-by-token
+    /// `dec_mamba2_t`: outputs and final states agree to float32 rounding (sums in another order),
+    /// over two whole chunks and a partial one.
+    #[test]
+    fn mamba2_chunked_scan_matches_recurrence() {
+        let Ok(be) = MetalBackend::new() else { return };
+        let (Some(chunk), Some(scan)) = (be.named_pipeline("pf_ssd_chunk"), be.named_pipeline("pf_ssd_state")) else {
+            return;
+        };
+        let f = Fns::new(&be);
+        let new_len: MsgNewBufLen = be.o.msg_send();
+        let (nh, hd, ng, ns, t) = (4usize, 64usize, 2usize, 128usize, 150usize);
+        let inner = nh * hd;
+        let (sx, sz) = (inner + 2 * ng * ns + 64, inner + nh + 60);
+        let rows = t.next_multiple_of(SSD_L);
+        let o_x = 0;
+        let o_z = o_x + rows * sx;
+        let o_y1 = o_z + rows * sz;
+        let o_y2 = o_y1 + rows * inner;
+        let o_s1 = o_y2 + rows * inner;
+        let o_s2 = o_s1 + nh * hd * ns;
+        let o_c = o_s2 + nh * hd * ns;
+        let o_d = (o_c + 3 * nh).next_multiple_of(64);
+        let n_all = o_d + rows.div_ceil(SSD_L) * nh * hd * ns;
+        let arena = unsafe { new_len(be.device, be.sels.new_buffer_len, n_all * 4, 0) };
+        assert!(!arena.is_null());
+        let a = unsafe { std::slice::from_raw_parts_mut(f.contents(arena) as *mut f32, n_all) };
+        let mut seed = 5u64;
+        for v in a[..o_y1].iter_mut() {
+            *v = lcg(&mut seed);
+        }
+        for i in 0..nh * hd * ns {
+            let v = lcg(&mut seed);
+            a[o_s1 + i] = v;
+            a[o_s2 + i] = v;
+        }
+        for h in 0..nh {
+            a[o_c + h] = -(0.5 + 4.0 * lcg(&mut seed).abs());
+            a[o_c + nh + h] = lcg(&mut seed);
+            a[o_c + 2 * nh + h] = lcg(&mut seed) - 1.0;
+        }
+        let p = Mamba2Params {
+            nh: nh as u32,
+            hd: hd as u32,
+            ng: ng as u32,
+            ns: ns as u32,
+            dt_min: 0.0,
+            dt_max: f32::INFINITY,
+            _p0: 0,
+            _p1: 0,
+        };
+        let ts = [t as u32, sx as u32, sz as u32, inner as u32];
+        let multi = be.named_pipeline("dec_mamba2_t").unwrap();
+        let (ok, _) = run_concurrent(&be, &f, std::slice::from_ref(&(0..1)), |e, _| {
+            e.pipe(multi);
+            e.buf(arena, o_x * 4, 0);
+            e.buf(arena, o_z * 4, 1);
+            e.buf(arena, (o_z + inner) * 4, 2);
+            e.buf(arena, o_y1 * 4, 3);
+            e.buf(arena, o_s1 * 4, 4);
+            e.buf(arena, o_c * 4, 5);
+            e.bytes(&p, 6);
+            e.bytes(&ts, 7);
+            e.dispatch((nh, hd.div_ceil(8)), 256);
+            e.barrier();
+            e.pipe(chunk);
+            e.buf(arena, o_x * 4, 0);
+            e.buf(arena, (o_z + inner) * 4, 1);
+            e.buf(arena, o_y2 * 4, 2);
+            e.buf(arena, o_d * 4, 3);
+            e.buf(arena, o_c * 4, 4);
+            e.bytes(&p, 5);
+            e.bytes(&ts, 6);
+            e.dispatch((t.div_ceil(SSD_L), nh), 128);
+            e.barrier();
+            e.pipe(scan);
+            e.buf(arena, o_x * 4, 0);
+            e.buf(arena, o_z * 4, 1);
+            e.buf(arena, o_y2 * 4, 2);
+            e.buf(arena, o_d * 4, 3);
+            e.buf(arena, o_c * 4, 4);
+            e.bytes(&p, 5);
+            e.bytes(&ts, 6);
+            e.buf(arena, o_s2 * 4, 7);
+            e.buf(arena, (o_z + inner) * 4, 8);
+            e.dispatch((nh, hd / SSD_RB), 128);
+        });
+        assert!(ok);
+        let rel = |o1: usize, o2: usize, n: usize| {
+            let (mut d, mut m) = (0f64, 0f64);
+            for i in 0..n {
+                let (x, y) = (a[o1 + i] as f64, a[o2 + i] as f64);
+                assert!(y.is_finite());
+                d += (x - y) * (x - y);
+                m += x * x;
+            }
+            (d / m).sqrt()
+        };
+        let ry = rel(o_y1, o_y2, t * inner);
+        let rs = rel(o_s1, o_s2, nh * hd * ns);
+        assert!(ry < 1e-5 && rs < 1e-5, "chunked scan: outputs {ry:e}, states {rs:e}");
         unsafe { (f.void)(arena, f.s_release) };
     }
 
