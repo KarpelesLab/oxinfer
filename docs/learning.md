@@ -8,7 +8,8 @@ profile with the LoRA adapter trained from its records:
    the tokens it wrote, under the response's `id`;
 2. a later request reports the **outcome** of that response (`POST /v1/episodes/{id}/outcome`);
 3. an offline trainer turns the profile's episodes and outcomes into a LoRA adapter, written
-   into the profile's directory. It is not part of the server and is not described here;
+   into the profile's directory. It is not part of the server: `oxinfer lora-train`
+   ([Training a LoRA from episodes](#training-a-lora-from-episodes));
 4. the server attaches that adapter to the loaded model for the profile's following requests,
    picks up a newer one when the trainer writes it, and drops it when it is deleted.
 
@@ -218,3 +219,163 @@ the delete, the base text again.
 
 Not checked: any other model family, Metal, profile requests with attachments, and many
 profiles or long logs (the index of episodes is held in memory, one small record per episode).
+
+## Training a LoRA from episodes
+
+`oxinfer lora-train` is the offline step: it reads a profile's two logs, trains a LoRA adapter on
+the episodes that have an outcome, and writes `adapter/` only when the adapter does better than
+what the profile runs now on episodes it did not train on. It is a separate process: the server
+keeps answering and picks the new folder up at the profile's next request.
+
+```sh
+oxinfer lora-train --model Qwen/Qwen3-0.6B --profile ~/.cache/oxinfer/learn/qwen/myrepo
+oxinfer lora-train --model M --profile DIR --rank 16 --targets q_proj,k_proj,v_proj,o_proj \
+  --kind-weight tests=1,user_rejected=0.3 --steps 200
+```
+
+`--model` is the base model the profile's model id stands for, loaded as the server loads it
+(the same checkpoint and `--quant`: the loss is computed on those weights). The report goes to
+standard output as JSON (the losses, the gate's verdict, seconds per step), the progress to
+standard error.
+
+### What trains
+
+The dense full-attention models of the Qwen path: **Qwen3** (per-head query / key norms) and
+**Llama 3** (none), from safetensors or GGUF, float or quantized. Every other model is refused
+with a message saying what is in the way: Qwen3.5 / 3.8 (Gated DeltaNet layers, gated
+attention), Qwen2 (attention biases), MoE models, Granite, LFM3, MiniMax; Gemma and Inkling-2
+are other model classes the trainer does not load. The server attaches adapters to more models
+than this trains.
+
+There is no autograd in oxinfer: `src/lora_train.rs` keeps what the backward needs of a forward
+pass and has the backward written out by hand (LM head, final norm, and per layer the SiLU MLP,
+the norms, causal attention with RoPE and grouped key / value heads). Only the adapter's
+matrices get gradients, in PEFT's convention `W x + (alpha / r) B A x` with `A` uniform in
+`+-1 / sqrt(n_in)` and `B` zero at the start. `--targets` picks among `q_proj`, `k_proj`,
+`v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj` (default `q_proj,v_proj`), `--layers`
+the layers (default all; the backward stops at the lowest one).
+
+Precision: f32 on the CPU, no GPU. The forward runs the frozen matmuls through the inference
+kernels on the weights as loaded, so the loss is the served model's. The backward needs
+`W^T g`, which no kernel computes, so every frozen weight from the lowest adapted layer up is
+transposed once at start: bf16 weights as bf16 (the same values), every quantized format as the
+f32 values it stores. For bf16 checkpoints the gradient is that of the loss. For quantized ones
+it is a straight-through estimate: the forward kernels also round activations to int8, the
+backward treats each matmul as the linear map of its dequantized weights.
+
+Memory: the model, plus the transposes (2 bytes a weight for bf16 checkpoints, 4 for the others,
+embedding excluded, LM head included), plus the activations of one episode at a time (per
+adapted layer and token about `8 hidden + 3 intermediate + 3 heads x head_dim` floats). The
+attention backward computes the scores again instead of keeping them. An episode is one
+sequence; `--batch` episodes are run one after the other and their gradients summed.
+`--max-tokens` (default 2048) leaves longer episodes out.
+
+### The objective
+
+An episode's weight is its last outcome's `reward` (clamped to -1..1) times the weight of the
+outcome's `kind` (`--kind-weight tests=1,user_praise=0.3`; 1 for kinds not listed and for no
+kind). Episodes without an outcome, with weight 0 or without completion tokens are left out.
+The loss is over the completion tokens only, each given the prompt and the completion before it,
+with `p` the model's probability of the logged token:
+
+- weight > 0: `-ln p`, the usual likelihood (imitate what worked);
+- weight < 0: `-ln(1 - p)`, which pushes the token down and vanishes, with its gradient, once
+  the token is unlikely. Its gradient is that of `ln p` times the odds `p / (1 - p)`, unbounded
+  for a token the model is sure of, so past odds of `--neg-clip` (default 4, `p` = 0.8) the loss
+  continues along its tangent in `ln p`: the factor stays at the cap.
+
+An episode's loss is the mean over its tokens; a batch's is `sum |w| loss / sum |w|`. Minimizing
+`+ln p` for penalized episodes was not used because it has no floor (it keeps pushing tokens
+that are already at zero), and a ratio against the logged `logprobs` was not used because they
+are usually absent and belong to whatever adapter was attached then (`adapters`), not to the
+model being trained. Every token of a penalized reply is pushed down alike, those that were fine
+included: the outcome says nothing about which tokens were at fault.
+
+The optimizer is AdamW as PyTorch's (`--lr` 2e-4, `--weight-decay` 0, betas 0.9 / 0.999) with
+gradient-norm clipping (`--clip` 1), for `--steps` steps or `--epochs` (3) passes over the
+training episodes, `--batch` (4) episodes a step, in an order shuffled from `--seed`.
+
+### The gate, and updating an adapter
+
+`--holdout` (default 0.2) of the episodes are held out: those whose id hashes into the first
+fifth of the range, so an episode held out once stays held out as the log grows, and an adapter
+trained earlier never saw what a later run measures it on (when none hashes there, the one of
+lowest hash is held out; with a single episode there is none and nothing is written without
+`--force`). After training, the held-out loss is computed for the base model, for the existing
+adapter if there is one, and for the new adapter. The new one is written only when its loss is
+lower than the existing adapter's, or than the base model's when the profile has none.
+`--force` writes it anyway.
+
+With an `adapter/` already there, training starts from its matrices when it has the rank, alpha,
+targets and layers asked for; otherwise from a new adapter (the report's `existing_note` says
+why; `--fresh` asks for that), still compared with the existing one. An existing adapter the
+trainer cannot read (other modules, rsLoRA, DoRA) is only replaced with `--force`.
+
+Writing: the new folder is written as `adapter.tmp-PID` in the profile directory, the existing
+`adapter/` is renamed to `adapter.prev/` (replacing an older one), and the new folder is renamed
+to `adapter/`. Between the two renames there is no `adapter/`: a request of the profile arriving
+then is answered by the base model. To go back, rename `adapter.prev` to `adapter`.
+
+`--episodes DIR --out DIR` instead of `--profile` reads the two logs from one directory and
+keeps the adapter in another.
+
+### What was checked of the trainer
+
+On tiny random checkpoints (3 layers of 64, 4 heads over 2 key / value heads), Qwen3 and Llama 3
+each, x86-64 CPU, `cargo test --lib lora_train`:
+
+- the trainer's forward without an adapter gives the model's logits (maximum difference 0);
+- gradients against PyTorch autograd (`tools/ref_lora_train.py` with torch 2.15.0, peft 0.22.0
+  and transformers 5.24.1 builds the checkpoint, a peft LoRA on all seven targets, one rewarded
+  and two penalized episodes with tokens on both sides of the cap; the ignored test
+  `lora_train::tests::reference` compares): losses equal to 7 digits; the 42 matrices' gradients
+  within 6.5e-7 (Qwen3) and 4.8e-7 (Llama) relative L2 error, the worst matrix 9.9e-7; after
+  three clipped AdamW steps with weight decay the parameters differ from peft's by 5e-6 and 6e-5
+  of the distance they moved;
+- gradients against finite differences (a fourth-order stencil along a random direction per
+  matrix, 42 directions, cap on and off): relative error on average 8e-5 (Llama) to 5e-4
+  (Qwen3), 2e-2 at worst, which is the resolution of an f32 loss for the smallest derivatives;
+- end to end: 24 episodes (12 prompts, each with a rewarded fixed completion and the base
+  model's own greedy completion penalized), 40 steps at lr 2e-3, rank 8 on `q_proj` / `v_proj`:
+  the adapter is written, loads through the path `--lora` takes (`lora::attach_specs`), and the
+  model with it gives the trainer's logits (maximum difference 0); the mean log-probability per
+  token of the rewarded completions rose for 12 of 12 (+3.06 Qwen3, +2.40 Llama) and fell for 12
+  and 11 of 12 of the penalized ones (-2.27, -3.36), 5 of the 24 episodes being held out;
+  held-out loss 4.05 to 2.97 and 4.09 to 3.00. A second run starts from the adapter and is
+  compared with it; a run with a negative learning rate is rejected by the gate and leaves the
+  folder as it was; another rank starts a new adapter.
+
+On real weights, `bartowski/Llama-3.2-1B-Instruct-GGUF` (16 layers of 2048), 64-thread x86-64
+CPU, rank 8 on `q_proj` / `v_proj` (851,968 parameters), a synthetic profile of 40 episodes (20
+questions; the model's own answer with reward -1, a short answer in a fixed style with reward 1;
+46 to 85 tokens each), `--lr 1e-3 --steps 30`:
+
+| | Q8_0 | Q4_K_M |
+|---|---|---|
+| transposes (f32) | 4.92 GB, built in 1.2 s | 4.92 GB, 1.4 s |
+| 30 steps of 4 episodes | 0.96 s a step | 0.99 s a step |
+| peak resident memory | 6.5 GB | 6.0 GB |
+| training loss (29 episodes) | 5.70 to 0.07 | 4.51 to 0.02 |
+| held-out loss (11 episodes), base to adapter | 7.53 to 0.45 | 6.65 to 0.28 |
+
+(The Q8_0 run had `--kind-weight user_rejected=0.5`.) One episode of 1,023 tokens (Q8_0): 3.3 s
+a step, peak 8.9 GB. The Q8_0 adapter then loaded with `oxinfer --model ...Q8_0.gguf --lora
+DIR/adapter` (CUDA backend active) and two questions that were not in the profile were answered
+in the rewarded style, one of them wrongly. With the adapter attached on the CPU the model's
+logits were within 8.7e-5 of the trainer's (logits up to 22, moved by up to 40 by the adapter).
+The straight-through gradient of the Q8_0 model against a finite difference of its loss along
+the gradient: 1e-4 to 2e-4 for one episode, 9e-3 to 4e-2 depending on the step for another
+(`lora_train::tests::real_weights`, ignored).
+
+With the server, by hand: `oxinfer serve --model llama=...Q8_0.gguf --learn-dir DIR`, eight
+chat requests for `llama@demo` with outcomes alternately good and bad (`kind` `tests`), then
+`oxinfer lora-train --profile DIR/llama/demo` beside the running server. The trainer read the
+server's logs (7 training episodes, 1 held out); the gate refused the adapter (held-out loss
+0.0003 for the base model, 0.025 with the adapter) and wrote nothing; with `--force` the folder
+was written, and the profile's next request was answered with it attached (the server's
+`adapter attached` line, the episode's `adapters` naming it).
+
+Not checked: whether an adapter trained this way makes a model better at anything (the numbers
+above are losses on synthetic episodes); Qwen3 real weights (none were at hand; only the tiny
+checkpoint); `--quant q8` / `q4` of a safetensors checkpoint; aarch64; episodes longer than
+1,023 tokens; training while the server reads the folder.

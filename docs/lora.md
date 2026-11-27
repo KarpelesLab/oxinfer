@@ -36,6 +36,7 @@ adapter.
 | Lower level | `oxinfer::lora::attach_specs(&mut model, &specs, model_path, merge)` on a `QwenModel`, Gemma `Model` or `Inkling2Model` (the `Adaptable` trait); `LoraAdapter::open` / `load` / `load_gguf` |
 | C API | `lora=FILE[:SCALE]` lines (repeatable) and `lora_merge=1` in the options of `oxi_engine_load`; `oxi_engine_loras_json`, `oxi_engine_set_lora_strength(engine, index, strength)` |
 | Server, per request | `MODEL@PROFILE` runs with the profile's adapter ([learning from outcomes](learning.md)) |
+| Training | `oxinfer lora-train --model M --profile DIR` writes a PEFT folder trained from a profile's episodes and outcomes (dense Qwen3 and Llama 3, CPU; [training a LoRA from episodes](learning.md#training-a-lora-from-episodes)) |
 | Server | the same model options: `qwen=Qwen/Qwen3-8B,lora=./adapter:0.5,lora=./other`; in a JSON config, `"options": {"lora": ["./a", "./b:0.5"]}` (an array) or one string |
 
 The prompt cache keys snapshots by the adapters and their strengths, so a cached conversation of
