@@ -2182,8 +2182,11 @@ pub(crate) mod tests {
     #[test]
     fn tiny_model_runs() {
         let (dir, fdir) = tiny("run");
+        // (On the CPU: the backend is the process's, and a test that started the GPU would
+        // leave the tests that ask for `device=cpu` an error.)
         let o = DepthOptions {
             focal: Some(fdir.to_string_lossy().into_owned()),
+            device: DevicePref::Cpu,
             ..Default::default()
         };
         let m = DepthPro::load(&dir.to_string_lossy(), &o).unwrap();
@@ -2216,8 +2219,11 @@ pub(crate) mod tests {
     #[test]
     fn tiny_model_video_modes() {
         let (dir, fdir) = tiny("video");
+        // (On the CPU: the backend is the process's, and a test that started the GPU would
+        // leave the tests that ask for `device=cpu` an error.)
         let o = DepthOptions {
             focal: Some(fdir.to_string_lossy().into_owned()),
+            device: DevicePref::Cpu,
             ..Default::default()
         };
         let m = DepthPro::load(&dir.to_string_lossy(), &o).unwrap();

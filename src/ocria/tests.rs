@@ -94,9 +94,12 @@ pub(crate) fn page_with(w: usize, h: usize, bars: &[(usize, usize, usize, usize)
     img
 }
 
+/// (On the CPU: the backend is the process's, and a test that started the GPU would leave the
+/// tests that ask for `device=cpu` an error.)
 fn latin_only() -> OcrOptions {
     OcrOptions {
         scripts: parse_scripts("latin").unwrap(),
+        device: crate::platform::DevicePref::Cpu,
         ..Default::default()
     }
 }
@@ -140,7 +143,11 @@ fn pipeline_on_tiny_models() {
     );
     assert!(o.ocr_rgb(&img[..10], w, h, &OcrRunOptions::default()).is_err());
     // A missing recognizer is an error unless the scripts leave it out.
-    assert!(Ocria::load(dir.to_str().unwrap(), &OcrOptions::default()).is_err());
+    let every = OcrOptions {
+        device: crate::platform::DevicePref::Cpu,
+        ..Default::default()
+    };
+    assert!(Ocria::load(dir.to_str().unwrap(), &every).is_err());
     let _ = std::fs::remove_dir_all(dir);
 }
 
