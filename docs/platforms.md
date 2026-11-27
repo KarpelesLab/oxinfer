@@ -554,6 +554,256 @@ PRO 6000 Blackwell against llama.cpp's CUDA backend (built from source, `llama-b
 
 Prefill of 2048 tokens after 32k of context: 2333 tok/s against llama.cpp's 1094 (Q8_0).
 
+### The int8 prefill GEMM
+
+A round on the prompt GEMMs of GGUF block formats (November 28), on an RTX 5080 (84 SMs, shared
+with other jobs, load averages 30 to 130) and a DGX Spark's GB10 (48 SMs). It started from
+`f94c13f`, where a prefill plan's GEMMs were 14.5 of the 18.7 ms of a 512-token Llama-3.2-1B
+step on the 5080 and 24.6 of 32.6 on the GB10 (`OXINFER_CUDA_DECODE_TRACE=2`), and llama.cpp
+processed prompts at 1.6 and 1.5 times the rate.
+
+**What llama.cpp does** (its `ggml-cuda/mmq.cu` and `mmq.cuh` at `2a8bf0f`). For every block
+format, on a card with int8 tensor cores (`turing_mma_available`) and at any batch size,
+`ggml_cuda_should_use_mmq` takes `mul_mat_q`: the activations are rounded once per matmul to
+int8 with a scale and a partial sum per 32 values, the weights go to shared memory as the
+integers the file stores (for Q4_K a mask and a shift per word), a 32-wide step is one
+`mma.m16n8k32` on int8 per 16 x 8 outputs, and each step's integer sums are scaled in f32
+(`sum += dA * dB * C + mA * sB`). Tiles of 128 weight rows by up to 128 tokens, 256 values of K
+per iteration, one 256-thread block per SM, stream-K with a second kernel for the tiles two
+blocks share, and for Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS and NVFP4 the gate / up pair with its
+activation in one launch (up and gate rows alternate in the weight tile). It keeps no f16 or f32
+copy of the weights, so it costs no memory; cuBLAS is its path for float weights only.
+
+**What an f16 copy would give.** `ggml_bench` (the plan's GEMM kernels on one matrix; here
+512 rows, best of 7 rounds of 5 launches) over the same shapes as ggml F16, the format an f16
+copy would be: on the 5080 8192 x 2048 takes 227 us against Q4_K's 205, 2048 x 8192 212 against
+193, 2048 x 2048 71 against 65; on the GB10 489 against 321, 518 against 276, 127 against 111.
+Weights already in f16 are not faster to multiply: the copy (2 bytes a weight, 3.6 times
+Q4_K's 4.5 bits) was not built.
+
+**Where the f16 GEMM's time is.** With the kernel's parts taken out in turn (5080, Q4_K 2048 x
+8192, the 256 x 128 stream-K tile: 193 us): without the activations' loads 181, without the
+weights' loads and unpacking 176, without either 165, also without the barriers 161; with the
+loads and no MMAs 87. A loop of the same MMAs on registers alone takes 155: the f16 kernel is
+bound by its tensor-core products, at three quarters of what they give. Those ceilings
+(register-only loops in the kernel's place, 8192 x 8192 at 512 rows, TFLOP/s on the 5080 / the
+GB10): `mma.m16n8k16` on f16 summing in f32 in place 118 / 105; the same from zero with the
+four sums added after 203 / 149 (in the real kernel that form gained nothing: 193 -> 200 us);
+f16 accumulators 228 / 104; `mma.m16n8k32` on int8 summing in place 392 / 185; from zero with
+a conversion, a multiplication and a fused multiply-add per output and step, the scaling a
+block format needs, 277 / 124. So int8 products with their scaling have 2.3 times the f16
+ceiling on the 5080 and 1.2 times on the GB10.
+
+**The kernels** (`src/cuda_gemmq.cu`, `gemmq*_K` and `gemmqp*_K`, compiled with each format's
+module; `gemmq_launch` in `cuda.rs`). The step's rows are rounded to int8 per block of 32 by
+the decode plans' kernel (`dq8_t`: `dq8_x` with a flag for values that are not finite), once
+for the GEMMs that share an input. A 256-thread block holds a tile of activations and weight
+rows in shared memory, the weights as their stored integers (Q4_K and Q5_K a mask and a shift a
+word, Q6_K and Q3_K the two bit planes, Q8_0 as stored, IQ4 through a 16-entry table held in
+four words and `__byte_perm`, IQ3 through the grids with the signs applied a word at a time),
+and each warp runs the MMAs of 64 x 64 or 32 x 32 outputs and scales the sums. Three tiles:
+
+- 256 rows x 128 weight rows, a 32-wide step at a time on two stages of shared memory (the
+  next step's activations by `cp.async` and its weight bytes into registers before the current
+  step's MMAs): where a block's share is 64 steps and more.
+- 128 x 128, the same loop: where shares are shorter (most blocks then leave a part of a tile
+  in the scratch, and the smaller tile is less to write and read back).
+- 64 x 128 over groups of 8 steps (a 256-wide superblock), up to 64 rows: every load of a
+  group is issued at once, then its 8 steps run back to back, and the next group's weight bytes
+  are prefetched. A step of so few MMAs waits for its loads: on the 5080 the 64 steps of a
+  2048-wide matrix took 23 to 26 us at 64 rows as at 128, with the f16 kernel's plain tiles as
+  with this one a step at a time, and on the GB10 a matrix of 128 to 1024 outputs by 2048
+  inputs took 26 to 27 us (f16) and 31 to 36 (int8, a step at a time) at 64 rows whatever its
+  outputs, against 7 and 11 to 17 with 256 inputs.
+
+Stream-K always, without the f16 kernel's second pass (`gemmhk_fix`: on the GB10 11 to 24 us
+of a GEMM, 57 -> 46 us on Q4_K 512 x 2048 with the pass empty, 111 -> 91 on 2048 x 2048 and
+275 -> 253 on 2048 x 8192; a GEMM of one tile took 30 us by stream-K, 17 with the pass empty
+and 7 as a plain tile launch): a block that takes a tile from a later step on leaves its sums in
+the scratch and then writes the launch's number to its word; the block that began the tile
+waits for those words and adds the parts in the blocks' order, so the results do not depend
+on timing, and whatever follows the sums can be applied by the block that owns the tile. The
+blocks of a launch are at most one per SM, all resident; one that has polled 2^24 times sets
+the step's flag and the host declines the step (the CPU runs it), which no run here did. The
+scratch's round trip costs a block about what 8 groups of steps do (GB10, Q4_K 2048 x 2048 on
+a 64 x 256 tile at 64 rows: 35 to 38 us, 17 without the parts' writes and the wait), so the
+groups' kernel gives each block whole tiles unless shares of the tiles' groups over every SM
+are shorter by more than that. `OXINFER_CUDA_GEMMQ_TILE=256x128`, `128x128` or `64x128g` takes
+one tile always, `OXINFER_CUDA_GEMMQ_STEPS=N` sets the least steps (or that margin in groups) of
+a block.
+
+A gate / up pair of one format is one launch (`gemmqp_K`; `OXINFER_CUDA_GEMM_PAIR=0` gives the
+two GEMMs and the pass over their outputs back): half of a warp's weight rows are the gate's and
+half the same rows of the up matrix, so the activations' tile is read once for both products
+and the thread that holds both sums writes act(gate) * up.
+
+**On the shapes** (`ggml_bench`, 512 rows unless said, us; f16 is the 256 x 128 stream-K
+launch with its second pass, which is what the plans took):
+
+| | f16, 5080 | int8, 5080 | f16, GB10 | int8, GB10 |
+|---|---:|---:|---:|---:|
+| Q4_K 8192 x 2048 | 205 | 140 | 320 | 331 |
+| Q4_K 2048 x 8192 | 193 | 142 | 276 | 279 |
+| Q4_K 2048 x 2048 | 65 | 46 | 111 | 97 |
+| Q4_K 512 x 2048 | 34 | 26 | 58 | 39 |
+| Q4_K 8192 x 2048, 64 rows | 63 | 31 | 88 | 59 |
+| Q4_K 2048 x 2048, 64 rows | 25 | 14 | 27 | 25 |
+| Q6_K 8192 x 2048 | 220 | 178 | 383 | 426 |
+| Q8_0 8192 x 2048 | 238 | 133 | 424 | 409 |
+| Q5_K 17408 x 5120 | 1150 | 711 | 1745 | 1706 |
+| IQ4_XS 17408 x 5120 | 1039 | 663 | 1483 | 1468 |
+| IQ4_XS 5120 x 17408 | 1032 | 621 | 1578 | 2010 |
+| IQ3_S 17408 x 5120 | 1114 | 703 | 1622 | 1630 |
+| IQ3_XXS 17408 x 5120 | 1095 | 690 | 1624 | 1623 |
+| Q3_K 17408 x 5120 | 1216 | 936 | 1817 | 2009 |
+| Q6_K 17408 x 5120 | 1049 | 911 | 1537 | 2117 |
+
+(The 64-row f16 figures are the faster of its plain tiles and stream-K; the GB10's Q6_K 17408 x
+5120 f16 figure is its 512 x 64 tile.) One matrix run 35 times stays in the GPU's cache; a
+step reads each matrix once. With matrices of 75 MB (Q4_K 65536 x 2048 and 16384 x 8192) the
+5080 takes 1452 and 1410 us at 512 rows on f16 and 973 and 940 on int8, the GB10 2190 and
+2543 against 2345 and 2347; at 64 rows the 5080 takes 392 and 380 against 255 and 244, and 186
+and 182 with the next group's weight bytes prefetched (at 512 rows a prefetch 8 or 16 steps
+ahead gained nothing: 976 -> 1000 us), the GB10 700 to 770 with every kernel: 75 MB in 0.7 ms
+is what its memory gives.
+
+So on the 5080 every format gains, 1.15 times (Q6_K) to 1.8 (Q8_0). On the GB10 the int8 GEMM
+is level with the f16 one at 512 rows on the formats with a scale per 32 and behind on those
+with a scale per 16 (Q6_K, Q3_K: two 16-wide MMAs and twice the scaling a step); it is ahead
+on small matrices and short steps, where the second pass and the loads' latency weighed, and
+with the pair in one launch. A unified-memory device therefore keeps the f16 GEMM for Q6_K and
+Q3_K (`GgKernels::i8`); `OXINFER_CUDA_GEMM_I8=1` takes the int8 one for them too (Llama-3.2-1B
+Q4_K_M on the GB10: 16658 tok/s at 512 tokens by default, 16127 with it; Orpheus 3B 6469 and
+6282), `=0` never takes it.
+
+**What the rounding moves.** The int8 GEMM gives the exact GEMM's sums over the rows it rounds x
+to, to the order of the f32 additions:
+`cuda::tests::ggml_int8_gemm_matches_exact_over_rounded_rows` checks every format on each of the
+three tiles over four shapes, the pair against two GEMMs and the activation on the host, within
+2e-5 of the largest output. The rounding itself is the decode plans' (their int8 matvecs) and
+the CPU's default prompt GEMM's; a prompt on the GPU had f16 operands instead. `pf_check` (raw
+corpus text, 32 greedy tokens, the first step's log-probabilities over the top 20 against the
+CPU's `prefill_gemm=exact`):
+
+| GB10 | prompt tokens | f16 GEMM | int8 GEMM | `gpu_exact=1` | the CPU's default (its int8 GEMM) |
+|---|---:|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | 64 | 0.038 (7) | 0.109 (32) | 0.032 (7) | a token out of the top 20 (7) |
+| | 512 | 0.020 (32) | 0.063 (32) | 0.016 (32) | a token out of the top 20 (32) |
+| | 1500 | 0.037 (14) | 0.100 (5) | 0.035 (5) | a token out of the top 20 (5) |
+| Orpheus 3B Q4_K_M | 64 | 0.035 | 0.056 | 0.034 | 0.068 |
+| | 512 | 0.042 | 0.112 | 0.039 | 0.093 |
+| | 1500 | 0.049 | 0.068 | 0.050 | 0.099 |
+| Qwen3.8-27B UD-Q3_K_XL | 512 | 0.025 (32) | a token out of the top 20 (32) | 0.026 (32) | a token out of the top 20 (27) |
+
+(In brackets, how many of the 32 greedy tokens are the CPU's exact ones; Orpheus, a speech
+model, ends a text prompt's continuation within 2 to 23 tokens. The KL divergence over the top
+20 is below 4e-3 in magnitude in every cell.) The int8 GEMM moves the first step by 0.06 to 0.11,
+or changes which token is twentieth, where the f16 one moves it by 0.02 to 0.05 and the exact
+plans by 0.02 to 0.05 as well (what the attention and the other ops differ by): the CPU's
+default class.
+
+The f16 GEMM is unchanged (`OXINFER_CUDA_GEMM_I8=0`: the base build's log-probabilities to the
+last digit on the seven prompts of the table), and so is `gpu_exact=1`. `prefill_gemm=exact` (or
+`f32`, `sme`), the CPU's opt-out of the int8 rounding of a prompt, now also keeps a fast prefill
+plan on the f16 GEMM.
+
+**Prompts**, tok/s at 64 / 512 / 2048 / 8192 tokens (`parity_bench` with `device=cuda lookup=0
+draft=none mtp=0`, a warm-up per size, median of 5 on the 5080 and of 3 on the GB10; the builds
+of a row group run in turn, each run under the machine's lock; llama.cpp `llama-bench -ngl 99
+-p 64,512,2048,8192 -n 0 -r 3`, `2a8bf0f` on the 5080 and `6d8a888` built on the Spark):
+
+| RTX 5080 | | pp64 | pp512 | pp2048 | pp8192 |
+|---|---|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | before (`f94c13f`) | 9895-10433 | 27036-27411 | 27033-28262 | 23422-23632 |
+| | the int8 GEMM, single GEMMs (`OXINFER_CUDA_GEMM_PAIR=0`) | 12135-12316 | 32569-33940 | 31964-33687 | 26189-27577 |
+| | with the pair in one launch | 12582-13149 | 34267-35349 | 32994-35580 | 29159-29704 |
+| | llama.cpp | 16788-16889 | 44524-44749 | 42834-44686 | 40204-40951 |
+| Orpheus 3B Q4_K_M | before | 4520-4655 | 11228-11534 | 10933-11278 | 8951-9141 |
+| | single GEMMs | 6710-7287 | 11149-13925 | 12591-13644 | 10374-10637 |
+| | with the pair | 7435-7614 | 14316-14719 | 14108-14435 | 10942-11191 |
+| | llama.cpp | 7890-8412 | 13260-15304 | 16742-17830 | 14868-15268 |
+| Qwen3.8-27B UD-Q3_K_XL | before | 478-501 | 1279-1318 | 1305-1331 | |
+| | Q4_K, Q5_K, Q6_K, Q8_0 and the pair | 484-502 | 1289-1313 | 1330-1375 | |
+| | with Q3_K, IQ4 and IQ3 | 715-766 | 1725-1776 | 1776-1857 | |
+| | llama.cpp (one run) | 697 | 1815 | 2232 | |
+
+| GB10 | | pp64 | pp512 | pp2048 | pp8192 |
+|---|---|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | before | 4751-4874 | 13512-13719 | 15011-15060 | 13954-14054 |
+| | single GEMMs | 6149-6173 | 13807-13964 | 14765-15039 | 13774-13812 |
+| | with the pair | 6215-6416 | 15636-15839 | 16853-17211 | 15603-15680 |
+| | llama.cpp | 8438 | 19404 | 21708 | 19491 |
+| Orpheus 3B Q4_K_M | before | 1969-2020 | 5897-6015 | 5895-5989 | 5522-5580 |
+| | single GEMMs | 2572-2650 | 5758-5803 | 5889-5892 | 5501-5507 |
+| | with the pair | 2640-2648 | 6225-6240 | 6417-6437 | 5985-5989 |
+| | llama.cpp | 3469 | 8234 | 8352 | 7270 |
+| Qwen3.8-27B UD-Q3_K_XL | before | 282-283 | 826-829 | 841-842 | 770-803 |
+| | Q4_K, Q5_K, Q8_0 and the pair | 288-290 | 819-825 | 836-838 | |
+| | with IQ4 and IQ3, single GEMMs | 417-418 | 788-790 | 803-804 | 784-786 |
+| | with the pair | 425-427 | 810-825 | 836-838 | 803-807 |
+| | llama.cpp | 558 | 974 | 983 | 968 |
+| Qwen3.8-27B UD-Q4_K_M | before | 316 | 810-822 | 829-838 | 746-814 |
+| | Q4_K, Q5_K, Q8_0 and the pair (one round) | 384 | 807 | 824 | |
+| | with IQ4 and IQ3, single GEMMs | 442-444 | 784-791 | 800-802 | 768-781 |
+| | with the pair | 454-458 | 817-822 | 834-836 | 813-815 |
+| | llama.cpp | 551-556 | 996-999 | 1007-1012 | 993 |
+
+(Ranges are over the rounds: three on the 5080 for the two small models, at load averages of 40
+to 95 and with another job on the GPU outside the lock in some of them, whose rounds are left
+out where a build fell to a third of its other rounds; two on the GB10. llama.cpp's 512-token
+figure for Orpheus spread over +-1600 to +-3700 in these rounds; the round of November 27 had
+18428.) The f16 GEMM of the new build (`OXINFER_CUDA_GEMM_I8=0`) runs at the "before" rates:
+Llama-3.2-1B 9871-10237 / 26518-27238 / 26332-27647 / 21987-23742 on the 5080 and 4740-4936 /
+13395-13459 / 14878-15006 / 13865-14018 on the GB10.
+
+Against llama.cpp that is 0.76 / 0.78 / 0.78 / 0.73 on Llama-3.2-1B on the 5080 (0.60 / 0.61 /
+0.63 / 0.58 before), 0.92 / 0.79 (against the 18428) / 0.83 / 0.73 on Orpheus (0.56 / 0.62 /
+0.64 / 0.60) and 1.06 / 0.96 / 0.81 on the 27B (0.70 / 0.72 / 0.59); on the GB10 0.75 / 0.81 /
+0.78 / 0.80 on Llama-3.2-1B (0.57 / 0.70 / 0.69 / 0.72), 0.76 / 0.76 / 0.77 / 0.82 on Orpheus
+(0.57 / 0.72 / 0.71 / 0.76), 0.76 / 0.84 / 0.85 / 0.83 on the 27B's UD-Q3_K_XL (0.51 / 0.85 /
+0.86 / 0.81) and 0.82 / 0.82 / 0.83 / 0.82 on its UD-Q4_K_M (0.57 / 0.82 / 0.83 / 0.79), taking
+the middle of each range.
+
+**A 512-token Llama-3.2-1B step now** (ms per kind of op, each op synchronized): on the 5080 the
+GEMMs with the activation 10.9 to 11.5 (before: 14.3 to 15.0, and 0.35 to 0.40 for the
+activation's pass), attention 1.2 to 1.3, the norms 0.5 to 0.6, RoPE 0.4, the step 14.9 to 16.2
+(18.6 to 19.8); a 64-token step 5.2, of which 4.3 the GEMMs (6.6 to 6.8, of which 5.5). On the
+GB10 the GEMMs 22.8 to 24.3 (23.5 to 24.6, and 3.6 for the activation's pass), attention 0.8,
+the norms 0.9, RoPE 0.8 to 0.9, the step 27.3 to 28.8 (31.8 to 33.2); a 64-token step 8.2, of
+which 7.3 the GEMMs (10.9, of which 9.8).
+
+**Measured and not kept.** An f16 copy of the weights (above). The f16 MMAs from zero with their
+sums added after, in the f16 kernel (193 -> 200 us). Tiles of 512 x 128 and 256 x 256 on
+512-thread blocks, which leave a thread 128 registers, as many as the tile's sums (2322 and 2550
+us on Q4_K 2048 x 8192 where 256 x 128 takes 283, GB10); 512 x 64 (415 against 283 on the GB10,
+197 against 142 on the 5080); 64 x 256 a step at a time for short steps (the groups replaced it:
+34 -> 31 and 26 -> 14 us on the 5080 at 64 rows). Groups of 8 steps at 512 rows, on 128 x 128 or
+64 x 128 tiles, and groups of 4 on 256 x 128: one stage of shared memory, so no load overlaps
+the MMAs (GB10 356 to 481 us against 283 on 2048 x 8192, 5080 179 to 207 against 142). A
+prefetch of the next group in the cache-resident runs on the GB10 (356 -> 387 us at 512 rows on
+the 128 x 128 groups; kept for the 64-row tile, where the 5080 gains a quarter on matrices that
+are not in its cache).
+
+**What is left.**
+
+- *The int8 kernel against its own ceiling.* On a cache-resident Q4_K 2048 x 8192 it runs at 120
+  TFLOP/s on the 5080, where the register-only loop with the scaling gives 277, and at 60 on the
+  GB10, where it gives 124. With its parts taken out in turn on the 5080 (a prototype of the 256
+  x 128 loop, Q4_K 8192 x 8192, 501 us): without the activations' loads 400, without the
+  weights' 434, without either 327, also without the barriers 296; without the minimum's term of
+  the scaling 447.
+- *Short prompts.* A 64-token Llama-3.2-1B prompt takes 5.0 ms on the 5080 where llama.cpp's
+  takes 3.8, and 10.1 against 7.6 on the GB10. Each GEMM input is rounded by a launch of its own
+  (64 a step), and the weights of a step come from memory whatever its length: the GB10 gave 75
+  MB in 0.7 ms.
+- *The GB10 from 512 tokens on.* The int8 GEMM is level with the f16 one there (the "single
+  GEMMs" rows: 3% ahead on Llama-3.2-1B, 3 to 5% behind on Orpheus and the 27B), so what those
+  prompts gain is the pair's launch, and Q6_K and Q3_K keep the f16 GEMM.
+- *The f16 GEMM* keeps its second pass, for the formats without the int8 kernels (the IQ2 and
+  IQ1 formats, Q2_K, Q4_0 to Q5_1, MXFP4, bf16 and f16, `--quant` weights) and under
+  `prefill_gemm=exact`.
+- *The other ops of a step*: attention is 1.2 to 1.3 of the 5080's 14.9 to 16.2 ms.
+
 ## Vulkan
 
 `--device vulkan` runs the prefill-sized matmuls (bf16, Q8, Q4 and affine Q4 weights, `t >= 16`
@@ -1116,7 +1366,9 @@ measured ahead.
   shape (`ggml_bench`: 2048 x 2048 40.6, 8192 x 2048 56.2, 2048 x 8192 64.3, 17408 x 5120 69.2;
   the 512 x 2048 key and value projections 25.4). llama.cpp takes 24.3 ms for all of a
   512-token Llama-3.2-1B prompt, these GEMMs alone 24 ms. That kernel is the same on a
-  discrete card and was not changed here.
+  discrete card and was not changed here. (The round after took it up, with the short prompts
+  and the activations' pass of the two points below: [The int8 prefill
+  GEMM](#the-int8-prefill-gemm).)
 - *Short prompts.* A 64-token step reads and unpacks every weight as a 512-token one does:
   Llama-3.2-1B 9.5 of its 10.7 ms in the GEMMs (0.6 of llama.cpp at 64 tokens), and Inkling-2
   Mini 0.26 s for 64 tokens against 0.61 s for 512, its experts' `gemmi_12` 86 ms of a 64-token

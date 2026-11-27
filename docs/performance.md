@@ -5111,7 +5111,7 @@ kept on).
   GEMMs (`OXINFER_CUDA_DECODE_TRACE=2`), which unpack the weights to f16 once per 256-row
   tile; llama.cpp's whole pass takes 11.5 and 27.8 ms (512 tokens at its rate). At 64 tokens
   the unpacking is paid for a quarter of a tile's rows (5.3 ms of kernels a pass; llama.cpp's
-  pass 3.7).
+  pass 3.7). Taken up the day after: the round below.
 - **Inkling-2-Mini prompts** (0.43-0.56x; 0.26x at 64 tokens): its own engine, not looked at
   here beyond the measurement.
 - **Recurrent states on the device.** A Gated DeltaNet model's states come down to the host
@@ -5132,6 +5132,34 @@ kept on).
 - **Long contexts**: attention reads f32 keys and values (8.4 of a 512-token Llama-3.2-1B
   step's 25 ms after 7680 positions; pp8192 is 0.58x llama.cpp's where pp2048 is 0.60x).
 
+**The prompt GEMMs on int8 (November 28).** A round on `f94c13f` moved the prefill plans' GEMMs
+over the GGUF block formats from f16 operands to int8 tensor-core products: the step's rows
+rounded to int8 per block of 32 (the decode kernels' rounding, the CPU's default prompt GEMM's
+and llama.cpp's), the weights as the integers the file stores, stream-K in one launch, and a
+gate / up pair with its activation in one launch. An f16 copy of the weights on the device was
+measured first and is not faster than Q4_K (227 us against 205 on 8192 x 2048 at 512 rows), so
+no memory is traded. The kernels, what was measured on the way, what the rounding moves and the
+same on the GB10: [The int8 prefill GEMM](platforms.md#the-int8-prefill-gemm). tok/s as above
+(`parity_bench`, medians of 5; ranges over the rounds, at load averages of 40 to 95 and with
+another job on the GPU in some rounds; llama.cpp `2a8bf0f`, `-n 0`):
+
+| model | | pp64 | pp512 | pp2048 | pp8192 |
+|---|---|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | before | 9895-10433 | 27036-27411 | 27033-28262 | 23422-23632 |
+| | after | 12582-13149 | 34267-35349 | 32994-35580 | 29159-29704 |
+| | llama.cpp | 16788-16889 | 44524-44749 | 42834-44686 | 40204-40951 |
+| Orpheus 3B Q4_K_M | before | 4520-4655 | 11228-11534 | 10933-11278 | 8951-9141 |
+| | after | 7435-7614 | 14316-14719 | 14108-14435 | 10942-11191 |
+| | llama.cpp (pp512: 18428 in the table above) | 7890-8412 | 13260-15304 | 16742-17830 | 14868-15268 |
+| Qwen3.8-27B UD-Q3_K_XL (13.1 GB) | before | 478-501 | 1279-1318 | 1305-1331 | |
+| | after | 715-766 | 1725-1776 | 1776-1857 | |
+| | llama.cpp (one run) | 697 | 1815 | 2232 | |
+
+Decoding does not take these kernels (Llama-3.2-1B tg128 669-679 before, 672-678 after). The
+first step's log-probabilities after a prompt now differ from the CPU's exact prompt by 0.06 to
+0.11 over the top 20, where the f16 GEMM's differed by 0.02 to 0.05 (`pf_check`, on the GB10):
+`prefill_gemm=exact` or `OXINFER_CUDA_GEMM_I8=0` keeps the f16 GEMM, bit for bit what it was.
+
 #### DGX Spark, CUDA (November 2026)
 
 On a DGX Spark (GB10, 121 GB shared between the CPU and the GPU) against llama.cpp's CUDA backend
@@ -5142,7 +5170,11 @@ Llama-3.2-1B Q4_K_M 5173-5243 / 4137-4188 / 177-179 (pp512 / pp2048 / decode) ag
 994-1001 / 995 / 15.3-15.9. What the device's shared memory changes (the driver's free-memory
 figure, weights held twice, copies of pages not yet mapped, memory the GPU reads in place), what
 was measured and kept or not, and where the remaining time goes:
-[DGX Spark](platforms.md#cuda-speed-and-memory-on-the-gb10).
+[DGX Spark](platforms.md#cuda-speed-and-memory-on-the-gb10). After the later rounds
+([Prompts on the GB10](platforms.md#prompts-on-the-gb10), then
+[The int8 prefill GEMM](platforms.md#the-int8-prefill-gemm), November 28, on a second Spark
+against llama.cpp `6d8a888`): Llama-3.2-1B Q4_K_M 15636-15839 / 16853-17211 at 512 / 2048
+prompt tokens against 19404 / 21708, Qwen3.8-27B UD-Q3_K_XL 810-825 / 836-838 against 974 / 983.
 
 #### DGX Spark CPU (November 2026)
 
