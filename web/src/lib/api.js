@@ -208,11 +208,12 @@ export class HttpApi {
   opencode() {
     return this.get('api/web/opencode');
   }
-  opencodeAdd(model) {
-    return this.post('api/web/opencode/add', { model });
+  /// `profile`: the model's entry as MODEL@PROFILE (adding one also installs the outcome plugin).
+  opencodeAdd(model, profile) {
+    return this.post('api/web/opencode/add', profile ? { model, profile } : { model });
   }
-  opencodeRemove(model) {
-    return this.post('api/web/opencode/remove', { model });
+  opencodeRemove(model, profile) {
+    return this.post('api/web/opencode/remove', profile ? { model, profile } : { model });
   }
 
   /// Follows a download job until it ends: `onUpdate(job)` for each report.

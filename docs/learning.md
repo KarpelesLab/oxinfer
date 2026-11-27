@@ -6,7 +6,8 @@ profile with the LoRA adapter trained from its records:
 
 1. a chat request for `MODEL@PROFILE` is logged as an **episode**: the tokens the model read and
    the tokens it wrote, under the response's `id`;
-2. a later request reports the **outcome** of that response (`POST /v1/episodes/{id}/outcome`);
+2. a later request reports the **outcome** of that response (`POST /v1/episodes/{id}/outcome`),
+   or of a conversation's responses since its last outcome (`POST /v1/outcomes` with `session`);
 3. an offline trainer turns the profile's episodes and outcomes into a LoRA adapter, written
    into the profile's directory. It is not part of the server: `oxinfer lora-train`
    ([Training a LoRA from episodes](#training-a-lora-from-episodes));
@@ -64,7 +65,7 @@ writing).
 ### `episodes.jsonl`
 
 ```json
-{"id":"chatcmpl-1a21c98f7fe0001","time":1795774391,"model":"qwen","profile":"myrepo","adapters":[],"prompt_tokens":[248045,846,...],"completion_tokens":[760,5642,...],"finish_reason":"stop"}
+{"id":"chatcmpl-1a21c98f7fe0001","time":1795774391,"model":"qwen","profile":"myrepo","session":"ses_de197b012ffetVhAiCG3Em4a7l","adapters":[],"prompt_tokens":[248045,846,...],"completion_tokens":[760,5642,...],"finish_reason":"stop"}
 ```
 
 | Field | |
@@ -72,6 +73,7 @@ writing).
 | `id` | the response's `id` (`chatcmpl-...`, `msg_...`), as the client received it; with `n` > 1, the first choice's is the `id` and the others' are `id.1`, `id.2`, ... |
 | `time` | Unix seconds when the reply ended |
 | `model`, `profile` | the model's id and the profile |
+| `session` | only when the request named its conversation: the `X-Session-Id` header (else `X-Opencode-Session-Id`), 1 to 128 printable ASCII characters without spaces (another value is ignored). Absent otherwise. It is the client's name for the conversation, nothing the server checks: what an outcome with `session` selects by |
 | `adapters` | the adapter the reply was sampled with: `[]` for the base model, else `[{"path": ".../adapter", "strength": 1.0, "version": "..."}]`. `version` identifies the adapter's files (see below): two episodes with the same `version` were sampled with the same adapter |
 | `prompt_tokens` | the token ids the model read before the reply: the whole rendered chat template (system prompt, tools, every earlier turn), the part taken from a cache included |
 | `completion_tokens` | the token ids the model wrote, in order: thinking, tool calls and the stop token that ended the reply included |
@@ -138,7 +140,7 @@ each adapter version apart.
 |---|---|
 | `POST /v1/episodes/{id}/outcome` | reports the outcome of response `id` |
 | `POST /v1/outcomes` | reports one outcome for several responses, or a batch of outcomes |
-| `GET /v1/episodes` | the episodes: `id`, `time`, `model`, `profile`, `adapter` (sampled with one), `prompt_tokens` and `completion_tokens` (counts), `finish_reason`, `outcomes` (how many) and `outcome` (the last: `time`, `reward`, `kind`, `note`). Newest first; `order=asc`, `limit` (default 50, up to 1000), `after=ID`, `model=`, `profile=`. `has_more` and `last_id` page through them |
+| `GET /v1/episodes` | the episodes: `id`, `time`, `model`, `profile`, `session` (null without one), `adapter` (sampled with one), `prompt_tokens` and `completion_tokens` (counts), `finish_reason`, `outcomes` (how many) and `outcome` (the last: `time`, `reward`, `kind`, `note`). Newest first; `order=asc`, `limit` (default 50, up to 1000), `after=ID`, `model=`, `profile=`, `session=`. `has_more` and `last_id` page through them |
 | `GET /v1/episodes/{id}` | one of them |
 | `GET /v1/models/{id}/profiles` | the model's profiles: `id` (`MODEL@PROFILE`), `path` (the profile directory), `episodes`, `outcomes`, `adapter` (`{"version"}` or null) |
 | `DELETE /v1/models/{id}/profiles/{profile}/adapter` | removes the profile's adapter folder |
@@ -149,9 +151,16 @@ are served: a loopback listener or one with a key).
 An outcome is a JSON object with `reward` (a number from -1 to 1) or `result` (`"good"`: 1,
 `"bad"`: -1), and optionally `kind` (what judged it: `tests`, `build`, `lint`, `user_accepted`,
 `user_rejected`, any string) and `note` (free text). `POST /v1/outcomes` also takes the
-responses it is about: `id`, `ids` (an array), or both. Its body is one such object, or
-`{"outcomes": [...]}` with several. The reply lists what was recorded (`recorded`, `data`). An
-id that is not an episode is a 404 (`episode_not_found`) and nothing of the request is recorded.
+responses it is about: `id`, `ids` (an array), `session`, or several of them. Its body is one
+such object, or `{"outcomes": [...]}` with several. The reply lists what was recorded
+(`recorded`, `data`). An id that is not an episode is a 404 (`episode_not_found`) and nothing of
+the request is recorded.
+
+`"session": NAME` stands for the episodes logged with that `session` after the last one of them
+that has an outcome (any outcome, however it was reported): "the replies of this conversation
+since the previous verdict", for a harness that cannot see response ids. That may be none: the
+request is then answered with `"recorded": 0`, as it is for a session the server never saw (no
+404). In a batch, a session's episodes are judged by the first outcome that names it.
 Ids stay valid across restarts: the server reads the logs under the learn directory at its first
 use of them after a start.
 
@@ -162,9 +171,11 @@ is set, a loopback `Host` on a loopback listener; changes (`POST`, `DELETE`) tak
 
 ## For agent harnesses
 
-A harness (opencode, a custom loop) only has to keep the `id` of each response and say later how
-things went. The id is in every chat completion (`id`), in every chunk of a streamed one, and in
-`message_start` (`message.id`) of a streamed `/v1/messages` reply.
+A harness (a custom loop) only has to keep the `id` of each response and say later how things
+went. The id is in every chat completion (`id`), in every chunk of a streamed one, and in
+`message_start` (`message.id`) of a streamed `/v1/messages` reply. A harness that cannot keep
+ids sends the same `X-Session-Id` header with every request of a conversation and reports with
+`"session"` ([opencode](#opencode) is one).
 
 ```sh
 # 1. Talk to MODEL@PROFILE instead of MODEL. Keep the ids.
@@ -197,9 +208,117 @@ What to report:
 
 What not to report: the model's own opinion of its reply, an outcome for responses the check did
 not cover, or a guess when the check did not run. An episode without an outcome is simply
-unjudged.
+unjudged. (A `report_outcome` tool the model calls is for passing on what something else
+judged, such as the user's verdict.)
+
+## opencode
+
+opencode (1.19.6 is what was looked at) gives a plugin no response id: the hooks of its plugin
+API (`chat.params`, `chat.headers`, `tool.execute.before` / `.after`, `event`, ...) and the
+events it publishes (`message.updated`, `message.part.updated`, `session.*`, `permission.*`)
+were logged during a run against this server, and none of them held a `chatcmpl-...` id. It
+does send the session's id with every request to an OpenAI-compatible provider, plugin or not
+(`X-Session-Id`, `x-opencode-session-id` and `x-session-affinity`, as a listener that logs
+headers received them, with `"model": "qwen@e2e"` as configured), which is what `session`
+above is for.
+
+So the opencode side is two things, both written by the server (**with a profile…** beside
+**Add to opencode** in the GUI, or the API: [docs/server.md](server.md#opencode)):
+
+```sh
+curl -s -X POST -H 'Content-Type: application/json' -d '{"model": "qwen", "profile": "myrepo"}' \
+  localhost:8080/api/web/opencode/add
+opencode run -m oxinfer/qwen@myrepo "make the tests pass"     # or pick it with /models
+```
+
+1. the model's entry under `qwen@myrepo` in opencode's configuration: opencode sends the id as
+   it is, so the session's requests are episodes of profile `myrepo`;
+2. the plugin `~/.config/opencode/plugins/oxinfer-outcomes.js` (the file is
+   `src/opencode/oxinfer-outcomes.js` of this repository: copying it there by hand does the
+   same). In a session whose model is `MODEL@PROFILE` of the `oxinfer` provider, and in no
+   other:
+   - when opencode's `bash` tool finishes a command it recognises as a test, build or lint run,
+     it posts `{"session", "result", "kind", "note"}` to the provider's `baseURL` + `/outcomes`
+     with the provider's `apiKey`: `good` for exit status 0, `bad` otherwise, `kind` `tests`,
+     `build` or `lint`, `note` the status and the command;
+   - the model gets a `report_outcome` tool (`result`, `kind`, `note`) for a result no pattern
+     recognises: a check run by other means, the user saying the change is right or wrong. Its
+     description tells the model not to report its own opinion; nothing enforces that.
+
+The API writes the configuration of the machine the server runs on only. With opencode on
+another machine, do the two by hand there: copy the model's entry in `opencode.json` under the
+key `ID@PROFILE`, and copy the plugin's file into `~/.config/opencode/plugins/` (it imports
+`@opencode-ai/plugin`, which opencode installs in its configuration directory). The server
+needs an API key then (profiles are not served without one off loopback), which the plugin
+takes from the provider's `options.apiKey`. This by-hand path was not run.
+
+What counts as a check is deliberately narrow, since a wrong verdict trains the wrong way:
+
+- the command must start with a known test, build or lint command (`cargo test`, `go test`,
+  `pytest`, `npm test`, `make test`, `cargo build`, `make`, `tsc`, `cargo clippy`, `eslint`, ...:
+  the lists are at the top of the file), after environment assignments and `timeout N`;
+- a command with a pipe, `;`, `||`, `&`, `$(...)`, backticks or several lines is ignored (its
+  exit status is not the check's: `cargo test | tail` always succeeds); `2>&1` and `> file` are
+  fine; so are `--help`, `--no-run`, `--list`, `--collect-only`, `--dry-run` ignored;
+- `a && b`: status 0 is `good` (every part passed); a failure is reported only when the check is
+  the one part beside `cd` / `export` (`which make && make test` failing says nothing);
+- no exit status (a timeout), 126, 127 (not found) and 128 or more (killed) report nothing;
+- the same command with the same status as the session's previous check, with no other tool
+  call in between, reports nothing: a model that runs its tests in a loop is not rewarded once
+  per run;
+- the replies opencode asks for on the side (the session's title, summaries: its `title`,
+  `summary` and `compaction` agents) are sent under another session name (`SESSION.title`) and
+  so are never judged.
+
+Settings, all optional, in `~/.config/opencode/oxinfer-outcomes.json`:
+
+```json
+{ "providers": ["oxinfer"], "tool": true,
+  "patterns": { "tests": ["\\./run-tests\\.sh", "cargo test"], "e2e": ["make e2e"], "lint": [] },
+  "skip": ["--help"] }
+```
+
+`providers`: the provider ids whose `MODEL@PROFILE` sessions report; `tool`: false leaves the
+`report_outcome` tool out; `patterns`: per kind, regular expressions matched at the start of a
+command (a kind listed replaces its defaults, `[]` turns it off, a new name is a new `kind`);
+`skip`: commands matching one are ignored. The tool is offered in every opencode session once
+the plugin is installed, whatever the model (in another session it answers that nothing was
+recorded); `"tool": false` is the way to keep it out of them.
+
+Limits of this path: a verdict is for every reply of the session since the last one, the one
+that asked for the command included, whether or not the command exercised what they wrote; a
+subagent (opencode's `task` tool) is another session, which a verdict in the parent does not
+reach; and a reply cut off by the user is judged with the rest.
+
+What was checked, with opencode 1.19.6 on Linux against `oxinfer serve` with an API key,
+Qwen3.5-0.8B, the configuration, data and state of opencode in temporary directories
+(`XDG_*`), `opencode run -m oxinfer/qwen@PROFILE`:
+
+- the entry and the plugin as the API writes them were loaded by opencode, and the requests
+  arrived as `qwen@PROFILE` with the session's id: every episode has its `session`, the title
+  request the `.title` one (and no outcome);
+- `make test` exiting 0: one outcome line per episode since the last, `"kind":"tests"`,
+  `"reward":1.0`, `"note":"exit 0: make test"`, in the profile's `outcomes.jsonl`; the model then
+  ran the same command again and again and no further outcome was recorded until it had run
+  something else (before that rule, a first run of 713 replies had 713 good outcomes);
+- a failing target: the model handed the work to a subagent, whose `cd DIR && make test`
+  exited 2: `"reward":-1.0`, `"kind":"tests"`, `"note":"exit 2: cd DIR && make test"` for the
+  10 replies of the subagent's session until then, none for the parent session's;
+- the model calling `report_outcome` (`good`, `user_accepted`, a note): one outcome line for
+  the reply since the last verdict.
+
+The classification of commands and exit statuses is tested on its own
+(`node tools/opencode-oxinfer/test.mjs`). Not checked with opencode: the settings file, a provider
+without an API key, opencode's TUI and desktop app (only `opencode run`), older opencode
+versions (the plugin sets `X-Session-Id` itself for those that do not send it), and opencode 2,
+whose plugin API is another one (`Plugin.define`; its documentation says a 1.x plugin does not
+run there): the plugin is not ported to it. Nothing was trained from episodes logged this way.
 
 ## What was checked
+
+`tests/server.rs` (`outcomes_for_a_session`), tiny random Qwen3.5 checkpoint, CPU: the `session`
+of episodes from both APIs, streamed or not, under either header; an outcome for a session
+(its unjudged replies, then none, then the later ones), in a batch, and the listing by session.
 
 `tests/server.rs` (`profiles_log_episodes_take_outcomes_and_switch_adapters`), on the tiny
 random Qwen3.5 checkpoint, CPU: the episodes of both APIs, streamed or not, with the ids the

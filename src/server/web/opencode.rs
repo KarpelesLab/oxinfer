@@ -1,6 +1,7 @@
-//! `GET /api/web/opencode`, `POST /api/web/opencode/add` and `/remove`: the server's chat models
-//! in opencode's global configuration ([`crate::opencode`]), as models of an `oxinfer` provider
-//! pointed at this server.
+//! `GET /api/web/opencode`, `POST /api/web/opencode/add`, `/remove` and `/plugin`: the server's
+//! chat models in opencode's global configuration ([`crate::opencode`]), as models of an `oxinfer`
+//! provider pointed at this server, plain or under a profile (`MODEL@PROFILE`), and the plugin
+//! that reports a profile session's outcomes.
 //!
 //! Only for requests from this machine (a loopback listener, or a loopback client): the file
 //! written is in the home directory of the user running the server.
@@ -152,6 +153,39 @@ pub(super) fn capabilities(api: &Api, s: &EntryStatus) -> (Capabilities, &'stati
     )
 }
 
+/// The opencode entry of model `s`, under `profile` when given: its capabilities with the
+/// context capped at [`crate::server::ServerOptions::opencode_context`] unless the model has a
+/// `max_context` option (the user's choice stands).
+fn entry(api: &Api, s: &EntryStatus, profile: Option<&str>) -> (Model, Capabilities, &'static str) {
+    let (caps, source) = capabilities(api, s);
+    let chosen = s
+        .spec
+        .option("max_context")
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|n| n > 0);
+    let cap = if chosen { None } else { api.opts.opencode_context };
+    let id = match profile {
+        Some(p) => crate::opencode::profile_id(&s.spec.id, p),
+        None => s.spec.id.clone(),
+    };
+    (Model::capped(&id, &caps, cap), caps, source)
+}
+
+/// Whether requests for `MODEL@PROFILE` are served (as `learn::resolve` decides).
+fn profiles_served(api: &Api) -> bool {
+    api.opts.learn_dir.is_some() && api.admin()
+}
+
+fn plugin_json(cfg: &Config) -> Value {
+    let state = cfg.plugin_state();
+    json!({
+        "path": cfg.plugin_path(),
+        "state": state,
+        "installed": state != EntryState::Absent,
+        "up_to_date": state == EntryState::Current,
+    })
+}
+
 /// `GET /api/web/opencode`.
 pub(super) fn status(api: &Api, w: &WebState, req: &ApiRequest) -> Value {
     if !local(w, req) {
@@ -168,16 +202,40 @@ pub(super) fn status(api: &Api, w: &WebState, req: &ApiRequest) -> Value {
         Err(e) => (json!({}), Some(format!("{e:#}"))),
     };
     let mut listed = Vec::new();
-    let models: Vec<Value> = api
-        .models
-        .status()
+    let entries: Vec<String> = value["provider"][crate::opencode::PROVIDER]["models"]
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    let status = api.models.status();
+    let ids: Vec<&str> = status.iter().map(|s| s.spec.id.as_str()).collect();
+    let models: Vec<Value> = status
         .iter()
         .filter(|s| is_chat(s))
         .map(|s| {
-            let (caps, source) = capabilities(api, s);
-            let m = Model::new(&s.spec.id, &caps);
+            let (m, caps, source) = entry(api, s, None);
             let state = crate::opencode::entry_state(&value, &prov, &m);
             listed.push(s.spec.id.clone());
+            // Its entries under a profile (`ID@PROFILE`; a listed id is itself).
+            let profiles: Vec<Value> = entries
+                .iter()
+                .filter(|k| !ids.contains(&k.as_str()))
+                .filter_map(|k| {
+                    let p = k.strip_prefix(s.spec.id.as_str())?.strip_prefix(crate::server::learn::SEPARATOR)?;
+                    crate::server::learn::valid_profile(p).then_some((k, p))
+                })
+                .map(|(k, p)| {
+                    let (m, _, _) = entry(api, s, Some(p));
+                    let state = crate::opencode::entry_state(&value, &prov, &m);
+                    listed.push(k.clone());
+                    json!({
+                        "id": k,
+                        "profile": p,
+                        "state": state,
+                        "up_to_date": state == EntryState::Current,
+                        "entry": m.to_json(),
+                    })
+                })
+                .collect();
             json!({
                 "id": s.spec.id,
                 "state": state,
@@ -186,13 +244,11 @@ pub(super) fn status(api: &Api, w: &WebState, req: &ApiRequest) -> Value {
                 "capabilities": caps,
                 "source": source,
                 "entry": m.to_json(),
+                "profiles": profiles,
             })
         })
         .collect();
-    let other: Vec<&String> = value["provider"][crate::opencode::PROVIDER]["models"]
-        .as_object()
-        .map(|o| o.keys().filter(|k| !listed.contains(k)).collect())
-        .unwrap_or_default();
+    let other: Vec<&String> = entries.iter().filter(|k| !listed.contains(k)).collect();
     json!({
         "available": true,
         "detected": true,
@@ -204,6 +260,9 @@ pub(super) fn status(api: &Api, w: &WebState, req: &ApiRequest) -> Value {
         "provider": value["provider"][crate::opencode::PROVIDER].is_object(),
         "base_url": prov.base_url,
         "default_model": value.get("model"),
+        "context_cap": api.opts.opencode_context,
+        "profiles": profiles_served(api),
+        "plugin": plugin_json(&cfg),
         "models": models,
         "other": other,
     })
@@ -245,12 +304,54 @@ fn change_json(id: &str, c: &crate::opencode::Change, added: bool) -> Value {
     v
 }
 
-/// `POST /api/web/opencode/add` and `/remove`: `{"model"}`.
+/// `POST /api/web/opencode/plugin`: `{"install": true}` (the default) writes the outcome plugin
+/// to opencode's `plugins` directory, `{"install": false}` deletes it.
+pub(super) fn plugin(api: &Api, w: &WebState, req: &ApiRequest, b: &Value) -> ApiResult<Output> {
+    if !local(w, req) {
+        return Err(ApiError::new(403, NOT_LOCAL).code("opencode_local_only"));
+    }
+    let install = match b.get("install") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(i)) => *i,
+        Some(_) => return Err(ApiError::bad("install must be true or false").param("install")),
+    };
+    let cfg = detected()?;
+    let c = if install { cfg.install_plugin() } else { cfg.remove_plugin() }
+        .map_err(|e| ApiError::new(409, format!("opencode's plugin: {e:#}")).code("opencode_config"))?;
+    if api.opts.log && c.changed {
+        eprintln!("[opencode: {} {}]", if install { "wrote" } else { "removed" }, c.path.display());
+    }
+    let message = match (install, c.changed) {
+        (true, true) => format!("written to {} (opencode loads it at its next start)", c.path.display()),
+        (true, false) => format!("{} is already this version", c.path.display()),
+        (false, true) => format!("{} removed", c.path.display()),
+        (false, false) => format!("{} was not there", c.path.display()),
+    };
+    json_ok(json!({"path": c.path, "changed": c.changed, "installed": install, "message": message}))
+}
+
+/// `POST /api/web/opencode/add` and `/remove`: `{"model"}`, with `"profile"` for the model's
+/// entry under that profile (`MODEL@PROFILE`). Adding one also installs the outcome plugin
+/// unless `"plugin": false`.
 pub(super) fn change(api: &Api, w: &WebState, req: &ApiRequest, b: &Value, add: bool) -> ApiResult<Output> {
     if !local(w, req) {
         return Err(ApiError::new(403, NOT_LOCAL).code("opencode_local_only"));
     }
-    let id = str_field(b, &["model", "id"]).ok_or_else(|| ApiError::bad("opencode: no \"model\"").param("model"))?;
+    let model = str_field(b, &["model", "id"]).ok_or_else(|| ApiError::bad("opencode: no \"model\"").param("model"))?;
+    let profile = match b.get("profile") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(p)) if crate::server::learn::valid_profile(p) => Some(p.as_str()),
+        Some(p) => {
+            return Err(ApiError::bad(format!(
+                "profile {p}: expected 1 to 64 of A-Z a-z 0-9 _ . - (not starting with a dot)"
+            ))
+            .param("profile"));
+        }
+    };
+    let id = &match profile {
+        Some(p) => crate::opencode::profile_id(model, p),
+        None => model.to_string(),
+    };
     let cfg = detected()?;
     let edit_err = |e: anyhow::Error| ApiError::new(409, format!("cannot edit opencode's configuration: {e:#}")).code("opencode_config");
     if !add {
@@ -264,13 +365,20 @@ pub(super) fn change(api: &Api, w: &WebState, req: &ApiRequest, b: &Value, add: 
         .models
         .status()
         .into_iter()
-        .find(|s| s.spec.id == id)
-        .ok_or_else(|| ApiError::new(404, format!("no model {id:?} is listed")).code("model_not_found"))?;
+        .find(|s| s.spec.id == model)
+        .ok_or_else(|| ApiError::new(404, format!("no model {model:?} is listed")).code("model_not_found"))?;
     if !is_chat(&s) {
-        return Err(ApiError::bad(format!("{id} is not a chat model")).param("model"));
+        return Err(ApiError::bad(format!("{model} is not a chat model")).param("model"));
     }
-    let (caps, source) = capabilities(api, &s);
-    let m = Model::new(id, &caps);
+    if profile.is_some() && !profiles_served(api) {
+        return Err(ApiError::new(
+            409,
+            format!("{id}: this server does not serve profiles (learn_dir=none, or a non-loopback listener without an API key)"),
+        )
+        .code("profiles_off")
+        .param("profile"));
+    }
+    let (m, _, source) = entry(api, &s, profile);
     let c = cfg.add(&provider(api, req), &m).map_err(edit_err)?;
     if api.opts.log && c.changed {
         eprintln!("[opencode: wrote {id} to {}]", c.path.display());
@@ -278,5 +386,28 @@ pub(super) fn change(api: &Api, w: &WebState, req: &ApiRequest, b: &Value, add: 
     let mut v = change_json(id, &c, true);
     v["entry"] = m.to_json();
     v["source"] = json!(source);
+    if let Some(p) = profile {
+        v["profile"] = json!(p);
+        let mut msg = format!(
+            "{}. In opencode, pick {}/{id}: its requests are logged under profile {p}",
+            v["message"].as_str().unwrap_or_default(),
+            crate::opencode::PROVIDER
+        );
+        if b.get("plugin") != Some(&Value::Bool(false)) {
+            let pc = cfg
+                .install_plugin()
+                .map_err(|e| ApiError::new(409, format!("{id} was written, but not opencode's plugin: {e:#}")).code("opencode_config"))?;
+            if api.opts.log && pc.changed {
+                eprintln!("[opencode: wrote {}]", pc.path.display());
+            }
+            msg.push_str(&format!(
+                ", and {} reports its test, build and lint results{}",
+                pc.path.display(),
+                if pc.changed { " (written now: restart opencode)" } else { "" }
+            ));
+            v["plugin"] = json!({"path": pc.path, "changed": pc.changed});
+        }
+        v["message"] = json!(msg);
+    }
     json_ok(v)
 }

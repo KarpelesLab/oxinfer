@@ -66,6 +66,16 @@ fn model_of_dir(name: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// The longest conversation name kept ([`session_name`]).
+const MAX_SESSION: usize = 128;
+
+/// The name a request gives its conversation (the `X-Session-Id` header, as opencode sends it):
+/// 1 to 128 printable ASCII characters without spaces, else none.
+pub(crate) fn session_name(header: Option<&str>) -> Option<String> {
+    let s = header?.trim();
+    ((1..=MAX_SESSION).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_graphic())).then(|| s.to_string())
+}
+
 /// The adapter a logged reply was sampled with.
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct EpisodeAdapter {
@@ -82,6 +92,9 @@ pub(crate) struct Episode<'a> {
     pub time: u64,
     pub model: &'a str,
     pub profile: &'a str,
+    /// The conversation the request named ([`session_name`]); absent when it named none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<&'a str>,
     pub adapters: Vec<EpisodeAdapter>,
     pub prompt_tokens: &'a [u32],
     pub completion_tokens: &'a [u32],
@@ -96,6 +109,8 @@ struct EpisodeLine {
     id: String,
     #[serde(default)]
     time: u64,
+    #[serde(default)]
+    session: Option<String>,
     #[serde(default)]
     adapters: Vec<serde::de::IgnoredAny>,
     #[serde(default)]
@@ -125,6 +140,8 @@ struct Meta {
     time: u64,
     model: String,
     profile: String,
+    /// The conversation it belongs to, when the request named one.
+    session: Option<String>,
     prompt: usize,
     completion: usize,
     finish: String,
@@ -143,6 +160,7 @@ impl Meta {
             "time": self.time,
             "model": self.model,
             "profile": self.profile,
+            "session": self.session,
             "adapter": self.adapted,
             "prompt_tokens": self.prompt,
             "completion_tokens": self.completion,
@@ -292,6 +310,7 @@ impl Learn {
                             time: e.time,
                             model: model.clone(),
                             profile: profile.clone(),
+                            session: e.session,
                             prompt: e.prompt_tokens.len(),
                             completion: e.completion_tokens.len(),
                             finish: e.finish_reason,
@@ -332,6 +351,7 @@ impl Learn {
             time: e.time,
             model: e.model.to_string(),
             profile: e.profile.to_string(),
+            session: e.session.map(str::to_string),
             prompt: e.prompt_tokens.len(),
             completion: e.completion_tokens.len(),
             finish: e.finish_reason.to_string(),
@@ -340,6 +360,22 @@ impl Learn {
             last: None,
         });
         Ok(())
+    }
+
+    /// The episodes of conversation `session` logged after its last one that has an outcome,
+    /// oldest first: what a verdict on "the replies since the previous verdict" is about.
+    fn unjudged(&self, session: &str) -> Vec<String> {
+        let st = self.index();
+        let mut ids: Vec<String> = st
+            .episodes
+            .iter()
+            .rev()
+            .filter(|m| m.session.as_deref() == Some(session))
+            .take_while(|m| m.outcomes == 0)
+            .map(|m| m.id.clone())
+            .collect();
+        ids.reverse();
+        ids
     }
 
     /// Appends the outcomes to their episodes' profiles' `outcomes.jsonl`, all or none: a 404
@@ -485,14 +521,16 @@ fn json_ok(v: Value) -> ApiResult<Output> {
     Ok(Output::Full(ApiResponse::json(200, &v)))
 }
 
-/// One reported outcome: `{"id": ...}` or `{"ids": [...]}` (`id`: the path's), with `reward`
-/// (-1 to 1) or `result` (`good`: 1, `bad`: -1), and optionally `kind` and `note`.
-fn parse_outcome(v: &Value, id: Option<&str>, time: u64, out: &mut Vec<Outcome>) -> ApiResult<()> {
+/// One reported outcome: `{"id": ...}`, `{"ids": [...]}` (`id`: the path's) or
+/// `{"session": ...}` (the conversation's responses that `unjudged` gives: those since its last
+/// outcome, possibly none), with `reward` (-1 to 1) or `result` (`good`: 1, `bad`: -1), and
+/// optionally `kind` and `note`.
+fn parse_outcome(v: &Value, id: Option<&str>, time: u64, unjudged: &dyn Fn(&str) -> Vec<String>, out: &mut Vec<Outcome>) -> ApiResult<()> {
     let o = v.as_object().ok_or_else(|| ApiError::bad("an outcome must be a JSON object"))?;
     for k in o.keys() {
-        if !["id", "ids", "reward", "result", "kind", "note"].contains(&k.as_str()) {
+        if !["id", "ids", "session", "reward", "result", "kind", "note"].contains(&k.as_str()) {
             return Err(ApiError::bad(format!(
-                "unknown outcome field {k:?} (id, ids, reward, result, kind, note)"
+                "unknown outcome field {k:?} (id, ids, session, reward, result, kind, note)"
             )));
         }
     }
@@ -537,10 +575,15 @@ fn parse_outcome(v: &Value, id: Option<&str>, time: u64, out: &mut Vec<Outcome>)
         }
         Some(_) => return Err(ApiError::bad("ids must be an array of response ids").param("ids")),
     }
+    let session = text("session")?;
+    if let Some(s) = &session {
+        // (An outcome of this request already names them: they are judged once.)
+        ids.extend(unjudged(s).into_iter().filter(|i| !out.iter().any(|o| o.id == *i)));
+    }
     let mut seen = std::collections::HashSet::new();
     ids.retain(|i| seen.insert(i.clone()));
-    if ids.is_empty() {
-        return Err(ApiError::bad("an outcome needs the id of a response (id, or ids)").param("id"));
+    if ids.is_empty() && session.is_none() {
+        return Err(ApiError::bad("an outcome needs the id of a response (id, ids) or a session").param("id"));
     }
     out.extend(ids.into_iter().map(|id| Outcome {
         id,
@@ -565,7 +608,8 @@ fn recorded(outcomes: &[Outcome]) -> Value {
 }
 
 /// `GET /v1/episodes`: the episodes, newest first (`order=asc`: oldest first), `limit` of them
-/// (default 50, at most 1000) after episode `after`, of `model` and `profile` when given.
+/// (default 50, at most 1000) after episode `after`, of `model`, `profile` and `session` when
+/// given.
 fn list(api: &Api, req: &ApiRequest) -> ApiResult<Output> {
     let limit = match req.query_param("limit") {
         Some(l) => l
@@ -581,6 +625,7 @@ fn list(api: &Api, req: &ApiRequest) -> ApiResult<Output> {
         Some(_) => return Err(ApiError::bad("order must be asc or desc").param("order")),
     };
     let (model, profile, after) = (req.query_param("model"), req.query_param("profile"), req.query_param("after"));
+    let session = req.query_param("session");
     let st = api.learn.index();
     let start = match &after {
         Some(a) => Some(
@@ -590,7 +635,11 @@ fn list(api: &Api, req: &ApiRequest) -> ApiResult<Output> {
         ),
         None => None,
     };
-    let wanted = |m: &&Meta| model.as_ref().is_none_or(|x| *x == m.model) && profile.as_ref().is_none_or(|x| *x == m.profile);
+    let wanted = |m: &&Meta| {
+        model.as_ref().is_none_or(|x| *x == m.model)
+            && profile.as_ref().is_none_or(|x| *x == m.profile)
+            && session.as_ref().is_none_or(|x| Some(x.as_str()) == m.session.as_deref())
+    };
     let mut it: Box<dyn Iterator<Item = &Meta>> = match (asc, start) {
         (true, s) => Box::new(st.episodes[s.map_or(0, |i| i + 1)..].iter()),
         (false, s) => Box::new(st.episodes[..s.unwrap_or(st.episodes.len())].iter().rev()),
@@ -642,6 +691,7 @@ pub(crate) fn route(api: &Api, req: &ApiRequest, path: &str) -> Option<ApiResult
     let delete = req.method.eq_ignore_ascii_case("DELETE");
     let wrong = || ApiError::new(405, format!("{} is not allowed on {path}", req.method));
     let off = || ApiError::new(404, "profiles are off on this server (learn_dir=none)");
+    let unjudged = |s: &str| api.learn.unjudged(s);
     let run = |write: bool, f: &mut dyn FnMut() -> ApiResult<Output>| -> ApiResult<Output> {
         api.manage(req, write)?;
         if api.learn.dir.is_none() {
@@ -664,11 +714,11 @@ pub(crate) fn route(api: &Api, req: &ApiRequest, path: &str) -> Option<ApiResult
                 match v.get("outcomes") {
                     Some(Value::Array(a)) => {
                         for o in a {
-                            parse_outcome(o, None, time, &mut out)?;
+                            parse_outcome(o, None, time, &unjudged, &mut out)?;
                         }
                     }
                     Some(_) => return Err(ApiError::bad("outcomes must be an array").param("outcomes")),
-                    None => parse_outcome(&v, None, time, &mut out)?,
+                    None => parse_outcome(&v, None, time, &unjudged, &mut out)?,
                 }
                 api.learn.report(out.clone())?;
                 json_ok(recorded(&out))
@@ -682,7 +732,7 @@ pub(crate) fn route(api: &Api, req: &ApiRequest, path: &str) -> Option<ApiResult
             } else {
                 run(true, &mut || {
                     let mut out = Vec::new();
-                    parse_outcome(&body(req)?, Some(id), now(), &mut out)?;
+                    parse_outcome(&body(req)?, Some(id), now(), &unjudged, &mut out)?;
                     api.learn.report(out.clone())?;
                     json_ok(recorded(&out))
                 })
@@ -769,7 +819,14 @@ mod tests {
     fn outcomes_parse() {
         let parse = |v: Value, id: Option<&str>| {
             let mut out = Vec::new();
-            parse_outcome(&v, id, 7, &mut out).map(|_| out).map_err(|e| e.message)
+            let unjudged = |s: &str| {
+                if s == "s1" {
+                    vec!["u1".to_string(), "u2".to_string()]
+                } else {
+                    Vec::new()
+                }
+            };
+            parse_outcome(&v, id, 7, &unjudged, &mut out).map(|_| out).map_err(|e| e.message)
         };
         let o = parse(json!({"result": "bad", "kind": "tests", "note": "2 failed"}), Some("a")).unwrap();
         assert_eq!(
@@ -799,6 +856,15 @@ mod tests {
             assert!(parse(bad.clone(), Some("a")).is_err(), "{bad}");
         }
         assert!(parse(json!({"reward": 1}), None).is_err());
+        // A conversation: its responses since the last outcome, with those named beside it.
+        let ids = |v: Value| parse(v, None).unwrap().into_iter().map(|o| o.id).collect::<Vec<_>>();
+        assert_eq!(ids(json!({"session": "s1", "result": "good"})), ["u1", "u2"]);
+        assert_eq!(
+            ids(json!({"session": "s1", "id": "u2", "ids": ["x"], "result": "good"})),
+            ["u2", "x", "u1"]
+        );
+        assert!(ids(json!({"session": "other", "result": "bad"})).is_empty());
+        assert!(parse(json!({"session": 3, "result": "bad"}), None).is_err());
     }
 
     /// The logs are appended to and read back by a server started later.
@@ -812,6 +878,7 @@ mod tests {
             time,
             model: "org/m",
             profile,
+            session: None,
             adapters: Vec::new(),
             prompt_tokens: &[1, 2, 3],
             completion_tokens: &[4, 5],
@@ -857,6 +924,64 @@ mod tests {
             );
             assert!(p[0].adapter.is_none());
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A conversation's episodes carry its name; a verdict on the conversation is about those
+    /// since its last one with an outcome, also after a restart.
+    #[test]
+    fn sessions() {
+        assert_eq!(session_name(Some(" ses_1aB ")).as_deref(), Some("ses_1aB"));
+        for bad in [None, Some(""), Some("a b"), Some("é"), Some(&*"x".repeat(129))] {
+            assert_eq!(session_name(bad), None, "{bad:?}");
+        }
+        let dir = std::env::temp_dir().join(format!("oxinfer-learn-sessions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let learn = Learn::new(Some(dir.clone()));
+        let ep = |id: &'static str, time: u64, session: Option<&'static str>| Episode {
+            id,
+            time,
+            model: "m",
+            profile: "p",
+            session,
+            adapters: Vec::new(),
+            prompt_tokens: &[1],
+            completion_tokens: &[2],
+            logprobs: None,
+            finish_reason: "stop",
+        };
+        for (id, t, s) in [("a1", 1, Some("A")), ("b1", 2, Some("B")), ("a2", 3, Some("A")), ("n1", 4, None)] {
+            learn.log(&ep(id, t, s)).unwrap();
+        }
+        let text = std::fs::read_to_string(dir.join("m").join("p").join("episodes.jsonl")).unwrap();
+        assert!(
+            text.starts_with("{\"id\":\"a1\",\"time\":1,\"model\":\"m\",\"profile\":\"p\",\"session\":\"A\",\"adapters\":[],"),
+            "{text}"
+        );
+        let last = text.lines().last().unwrap();
+        assert!(
+            last.starts_with("{\"id\":\"n1\",\"time\":4,\"model\":\"m\",\"profile\":\"p\",\"adapters\""),
+            "{last}"
+        );
+        assert_eq!(learn.unjudged("A"), ["a1", "a2"]);
+        assert_eq!(learn.unjudged("B"), ["b1"]);
+        assert!(learn.unjudged("C").is_empty());
+        let o = |id: &str| Outcome {
+            id: id.into(),
+            time: 5,
+            reward: 1.0,
+            kind: None,
+            note: None,
+        };
+        learn.report(vec![o("a1")]).unwrap();
+        assert_eq!(learn.unjudged("A"), ["a2"]);
+        learn.log(&ep("a3", 6, Some("A"))).unwrap();
+        // (Read again from the files.)
+        let learn = Learn::new(Some(dir.clone()));
+        assert_eq!(learn.unjudged("A"), ["a2", "a3"]);
+        learn.report(vec![o("a2"), o("a3")]).unwrap();
+        assert!(learn.unjudged("A").is_empty());
+        assert_eq!(learn.unjudged("B"), ["b1"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

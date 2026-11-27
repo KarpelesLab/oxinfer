@@ -110,12 +110,13 @@ export function opencodeOf(id) {
   return s.models?.find((m) => m.id === id) || null;
 }
 
-/// Adds (or updates) or removes model `id` in opencode's configuration.
-export async function opencodeChange(id, add) {
+/// Adds (or updates) or removes model `id` in opencode's configuration, as `id@profile` when a
+/// profile is given.
+export async function opencodeChange(id, add, profile) {
   opencode.busy[id] = true;
   opencode.error = '';
   try {
-    const r = add ? await store.api.opencodeAdd(id) : await store.api.opencodeRemove(id);
+    const r = add ? await store.api.opencodeAdd(id, profile) : await store.api.opencodeRemove(id, profile);
     opencode.message = r.message || '';
   } catch (e) {
     opencode.error = e.message;

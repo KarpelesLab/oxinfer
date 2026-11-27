@@ -13,6 +13,11 @@
 //! temporary file renamed over it, with the same permissions; a symbolic link keeps pointing at
 //! the file it pointed at, which is the one written).
 //!
+//! A model's entry may also be `MODEL@PROFILE` ([`profile_id`]): the same model, whose requests
+//! the server logs and runs with the profile's adapter (docs/learning.md). [`Config::install_plugin`]
+//! writes the opencode plugin that reports the outcomes of such a session
+//! (`plugins/oxinfer-outcomes.js`, [`PLUGIN_SOURCE`]).
+//!
 //! ```no_run
 //! use oxinfer::opencode::{Capabilities, Config, Model, Provider};
 //! let cfg = oxinfer::opencode::detect().expect("opencode is not set up for this user");
@@ -40,6 +45,16 @@ pub const NPM: &str = "@ai-sdk/openai-compatible";
 pub const SCHEMA: &str = "https://opencode.ai/config.json";
 /// The context written when the model's is not known.
 pub const DEFAULT_CONTEXT: u64 = 32768;
+/// The default cap on the context written for a model without a `max_context` option
+/// ([`Model::capped`]). opencode compacts a conversation as it nears `limit.context`: a model
+/// trained for a million tokens would otherwise be sent conversations of that size, which few
+/// machines can hold and no local model reads fast.
+pub const CONTEXT_CAP: u64 = 131072;
+/// The outcome plugin's file name in opencode's `plugins` directory.
+pub const PLUGIN_FILE: &str = "oxinfer-outcomes.js";
+/// The outcome plugin ([`Config::install_plugin`]): it reports the test, build and lint results
+/// of a `MODEL@PROFILE` session to the server (`POST /v1/outcomes`).
+pub const PLUGIN_SOURCE: &str = include_str!("opencode/oxinfer-outcomes.js");
 /// Backups kept per configuration file.
 const BACKUPS: usize = 5;
 
@@ -75,6 +90,11 @@ pub struct Provider {
     pub api_key: Option<String>,
 }
 
+/// The id of `model` run under `profile` (`MODEL@PROFILE`), as a chat request names it.
+pub fn profile_id(model: &str, profile: &str) -> String {
+    format!("{model}@{profile}")
+}
+
 /// One model's entry under `provider.oxinfer.models`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Model {
@@ -100,7 +120,14 @@ impl Model {
     /// `max_context` option or its trained context), [`DEFAULT_CONTEXT`] when unknown; the
     /// output a quarter of it, from 1024 to 32768 tokens.
     pub fn new(id: &str, caps: &Capabilities) -> Model {
+        Model::capped(id, caps, None)
+    }
+
+    /// [`Model::new`] with the context limited to `cap` tokens: for a model whose context is its
+    /// trained one, not a `max_context` the user chose ([`CONTEXT_CAP`] is the server's default).
+    pub fn capped(id: &str, caps: &Capabilities, cap: Option<u64>) -> Model {
         let context = caps.context.map_or(DEFAULT_CONTEXT, |c| c as u64).max(1);
+        let context = cap.map_or(context, |c| context.min(c.max(1)));
         let output = (context / 4).clamp(1024.min(context), 32768);
         let mut input = vec!["text".to_string()];
         if caps.vision {
@@ -150,6 +177,15 @@ pub enum EntryState {
     Current,
     /// There, but [`Config::add`] would change it or the provider.
     Outdated,
+}
+
+/// What [`Config::install_plugin`] or [`Config::remove_plugin`] did.
+#[derive(Clone, Debug, Serialize)]
+pub struct PluginChange {
+    /// The plugin's file.
+    pub path: PathBuf,
+    /// It was written or removed (false: it already was as asked).
+    pub changed: bool,
 }
 
 /// What [`Config::add`] or [`Config::remove`] did.
@@ -255,6 +291,61 @@ impl Config {
             c.created = old.is_none();
         }
         Ok(c)
+    }
+
+    /// Where the outcome plugin is or would be: `plugins/oxinfer-outcomes.js` in the
+    /// configuration directory (`plugin/` when it is already there; opencode loads both).
+    pub fn plugin_path(&self) -> PathBuf {
+        let old = self.dir.join("plugin").join(PLUGIN_FILE);
+        if old.is_file() {
+            old
+        } else {
+            self.dir.join("plugins").join(PLUGIN_FILE)
+        }
+    }
+
+    /// Whether the outcome plugin is installed, and whether it is this version's.
+    pub fn plugin_state(&self) -> EntryState {
+        match std::fs::read_to_string(self.plugin_path()) {
+            Ok(t) if t == PLUGIN_SOURCE => EntryState::Current,
+            Ok(_) => EntryState::Outdated,
+            Err(_) => EntryState::Absent,
+        }
+    }
+
+    /// Writes the outcome plugin ([`PLUGIN_SOURCE`]) to [`Config::plugin_path`], replacing
+    /// another version of it. opencode loads it at its next start.
+    pub fn install_plugin(&self) -> Result<PluginChange> {
+        let _w = WRITE.lock().unwrap_or_else(|p| p.into_inner());
+        let path = self.plugin_path();
+        let state = self.plugin_state();
+        if state != EntryState::Current {
+            let dir = path.parent().context("the file has no directory")?;
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+            let tmp = dir.join(format!(".{PLUGIN_FILE}.oxinfer-{}.tmp", std::process::id()));
+            let _ = std::fs::remove_file(&tmp);
+            let r = replace_with(&tmp, &path, state != EntryState::Absent, PLUGIN_SOURCE);
+            if r.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            r?;
+        }
+        Ok(PluginChange {
+            path,
+            changed: state != EntryState::Current,
+        })
+    }
+
+    /// Deletes the outcome plugin's file.
+    pub fn remove_plugin(&self) -> Result<PluginChange> {
+        let _w = WRITE.lock().unwrap_or_else(|p| p.into_inner());
+        let path = self.plugin_path();
+        let changed = match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e).with_context(|| format!("remove {}", path.display())),
+        };
+        Ok(PluginChange { path, changed })
     }
 
     /// Removes the entry of model `id`, and the provider when it has no model left. opencode's
@@ -1061,6 +1152,53 @@ mod tests {
             },
         );
         assert_eq!((small.context, small.output), (2048, 1024));
+        // A cap on the context: a million trained tokens, an unknown context, a smaller one.
+        let big = Capabilities {
+            context: Some(1 << 20),
+            ..Default::default()
+        };
+        let m = Model::new("b", &big);
+        assert_eq!((m.context, m.output), (1 << 20, 32768));
+        let m = Model::capped("b", &big, Some(CONTEXT_CAP));
+        assert_eq!((m.context, m.output), (131072, 32768));
+        let m = Model::capped("b", &Capabilities::default(), Some(CONTEXT_CAP));
+        assert_eq!(m.context, DEFAULT_CONTEXT);
+        assert_eq!(
+            Model::capped("s", &caps(true), Some(4096)).to_json()["limit"],
+            json!({"context": 4096, "output": 1024})
+        );
+        assert_eq!(profile_id("org/a", "repo"), "org/a@repo");
+    }
+
+    #[test]
+    fn plugin_file() {
+        let d = temp("plugin");
+        let cfg = Config::at(&d);
+        assert_eq!(cfg.plugin_state(), EntryState::Absent);
+        assert!(!cfg.remove_plugin().unwrap().changed);
+        let c = cfg.install_plugin().unwrap();
+        assert_eq!((c.changed, c.path.clone()), (true, d.join("plugins").join(PLUGIN_FILE)));
+        assert_eq!(std::fs::read_to_string(&c.path).unwrap(), PLUGIN_SOURCE);
+        assert_eq!(cfg.plugin_state(), EntryState::Current);
+        assert!(!cfg.install_plugin().unwrap().changed);
+        std::fs::write(&c.path, "old").unwrap();
+        assert_eq!(cfg.plugin_state(), EntryState::Outdated);
+        assert!(cfg.install_plugin().unwrap().changed);
+        assert_eq!(std::fs::read_to_string(&c.path).unwrap(), PLUGIN_SOURCE);
+        assert_eq!(
+            std::fs::read_dir(d.join("plugins")).unwrap().count(),
+            1,
+            "no temporary file is left"
+        );
+        assert!(cfg.remove_plugin().unwrap().changed);
+        assert_eq!(cfg.plugin_state(), EntryState::Absent);
+        // One already in opencode's other plugin directory is the one kept up to date.
+        std::fs::create_dir_all(d.join("plugin")).unwrap();
+        std::fs::write(d.join("plugin").join(PLUGIN_FILE), "old").unwrap();
+        assert_eq!(cfg.install_plugin().unwrap().path, d.join("plugin").join(PLUGIN_FILE));
+        // The plugin's only export is the plugin (opencode calls every export of the file).
+        assert_eq!(PLUGIN_SOURCE.matches("\nexport ").count(), 1);
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

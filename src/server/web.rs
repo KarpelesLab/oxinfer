@@ -29,6 +29,7 @@
 //! | `GET /api/web/opencode` | opencode's configuration ([`crate::opencode`]): detected, its file, and per chat model whether it has an entry and whether that is up to date |
 //! | `POST /api/web/opencode/add` | `{"model"}`: writes the model's entry (and the `oxinfer` provider) to opencode's configuration |
 //! | `POST /api/web/opencode/remove` | `{"model"}`: removes its entry (and the provider when it has no model left) |
+//! | `POST /api/web/opencode/plugin` | `{"install"}`: writes (or deletes) the plugin that reports a profile session's outcomes |
 //!
 //! Every endpoint but `info` needs the API key when one is set. Requests that change anything
 //! (POST, DELETE) must be JSON and, when the browser sends an `Origin`, come from the page's own
@@ -490,6 +491,7 @@ fn management(api: &Arc<Api>, w: &WebState, req: &ApiRequest, rest: &str) -> Api
         (["opencode"], true, _, _) => json_ok(opencode::status(api, w, req)),
         (["opencode", "add"], _, true, _) => opencode::change(api, w, req, &body(req)?, true),
         (["opencode", "remove"], _, true, _) => opencode::change(api, w, req, &body(req)?, false),
+        (["opencode", "plugin"], _, true, _) => opencode::plugin(api, w, req, &body(req)?),
         (["models"], true, _, _) => json_ok(models(api, w)),
         (["activity"], true, _, _) => json_ok(api.status()),
         (["requests"], true, _, _) => {

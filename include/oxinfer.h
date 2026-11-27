@@ -1370,6 +1370,8 @@ typedef int (*oxi_bytes_fn)(void *user, const char *data, size_t len);
  *   learn_dir=DIR        where the profiles of chat models live (requests for MODEL@PROFILE are
  *                        logged as episodes and run with the profile's adapter, see
  *                        docs/learning.md; default ~/.cache/oxinfer/learn; none: off)
+ *   opencode_context=N   the most context written to opencode's configuration for a model
+ *                        without max_context (default 131072; none: its trained context)
  *   config=PATH         read a JSON file of these options
  * `progress` (may be NULL) reports downloads made by preload / download. Returns NULL on error. */
 OxiServer *oxi_server_new(const char *options, oxi_progress_fn progress, void *user);

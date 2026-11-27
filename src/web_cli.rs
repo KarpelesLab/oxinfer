@@ -53,6 +53,8 @@ options:\n\
 \x20 --learn-dir DIR       where the profiles of chat models live (MODEL@PROFILE: logged\n\
 \x20                       episodes, outcomes, the profile's adapter; docs/learning.md);\n\
 \x20                       default ~/.cache/oxinfer/learn, none: off\n\
+\x20 --opencode-context N  the most context written to opencode's configuration for a model\n\
+\x20                       without max_context (default 131072; none: its trained context)\n\
 \x20 --threads N           CPU threads (default: all cores)\n\
 \x20 --parallel N          conversations each chat model runs at once, each with its own caches\n\
 \x20                       (default 4; prompts interleaved with the others' decoding, decode\n\

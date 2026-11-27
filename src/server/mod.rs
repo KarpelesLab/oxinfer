@@ -342,6 +342,11 @@ pub struct ServerOptions {
     /// are not logged. Only on a loopback listener or with an [`ServerOptions::api_key`]. See
     /// docs/learning.md.
     pub learn_dir: Option<PathBuf>,
+    /// The most tokens of context written to opencode's configuration for a model that has no
+    /// `max_context` option (key `opencode_context`: tokens, default 131072; `none` writes the
+    /// model's trained context whatever its size). A model's own `max_context` always wins. See
+    /// [`crate::opencode::CONTEXT_CAP`].
+    pub opencode_context: Option<u64>,
 }
 
 /// [`ServerOptions::parallel`]'s default.
@@ -378,6 +383,7 @@ impl Default for ServerOptions {
             auto_models: false,
             idle_unload: Some(std::time::Duration::from_secs(30 * 60)),
             learn_dir: Some(default_learn_dir()),
+            opencode_context: Some(crate::opencode::CONTEXT_CAP),
         }
     }
 }
@@ -428,6 +434,7 @@ impl ServerOptions {
         "auto_models",
         "idle_unload_min",
         "learn_dir",
+        "opencode_context",
         "config",
     ];
 
@@ -498,6 +505,18 @@ impl ServerOptions {
                     "none" | "off" | "0" => None,
                     "" | "auto" | "on" | "1" => Some(default_learn_dir()),
                     v => Some(PathBuf::from(v)),
+                }
+            }
+            "opencode_context" => {
+                self.opencode_context = match value {
+                    "none" | "off" | "0" => None,
+                    "" | "auto" => Some(crate::opencode::CONTEXT_CAP),
+                    v => Some(
+                        v.parse::<u64>()
+                            .ok()
+                            .filter(|&n| n > 0)
+                            .with_context(|| format!("opencode_context: expected a number of tokens (none: no cap), got {v:?}"))?,
+                    ),
                 }
             }
             "config" => {
@@ -571,6 +590,10 @@ pub struct ApiRequest {
     /// The client's address (`IP:PORT`) and `User-Agent`, when known: shown on the status page.
     pub peer: Option<String>,
     pub user_agent: Option<String>,
+    /// The `X-Session-Id` header (else `X-Opencode-Session-Id`): the conversation a chat request
+    /// belongs to, as the client names it. Kept with the episode of a `MODEL@PROFILE` request, so
+    /// that an outcome can name the conversation instead of response ids.
+    pub session: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -588,6 +611,7 @@ impl ApiRequest {
             host: None,
             peer: None,
             user_agent: None,
+            session: None,
             body,
         }
     }
@@ -1052,8 +1076,8 @@ impl Api {
                 }
                 Ok(Output::Full(ApiResponse::json(200, &m)))
             }
-            "/v1/chat/completions" if post => openai::chat(self, &json_body(req)?),
-            "/v1/messages" if post => openai::messages(self, &json_body(req)?),
+            "/v1/chat/completions" if post => openai::chat(self, &json_body(req)?, req.session.as_deref()),
+            "/v1/messages" if post => openai::messages(self, &json_body(req)?, req.session.as_deref()),
             "/v1/messages/count_tokens" if post => openai::count_tokens(self, &json_body(req)?),
             "/v1/completions" if post => openai::completions(self, &json_body(req)?),
             "/v1/embeddings" if post => openai::embeddings(self, &json_body(req)?),

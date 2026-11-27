@@ -2550,6 +2550,97 @@ fn jsonl(path: &std::path::Path) -> Vec<Value> {
         .collect()
 }
 
+/// A harness that cannot see response ids (opencode's plugins): the conversation a request names
+/// with `X-Session-Id` is logged with its episode, and an outcome for the session is one for its
+/// episodes since its last outcome.
+#[test]
+fn outcomes_for_a_session() {
+    let base = std::env::temp_dir().join(format!("oxinfer-learn-session-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (model, learn) = (base.join("model"), base.join("learn"));
+    oxinfer::qwen::tiny::write(&model, false, false).unwrap();
+    let s = serve(&format!("model=q={},device=cpu; learn_dir={}", model.display(), learn.display()));
+    let a = s.addr();
+    let chat = |path: &str, header: Option<&str>, stream: bool| -> String {
+        let req = json!({"model": "q@dev", "messages": [{"role": "user", "content": "Hi"}], "temperature": 0,
+            "max_tokens": 4, "stream": stream});
+        let mut headers = vec!["Host: localhost", "Content-Type: application/json"];
+        headers.extend(header);
+        let (st, body) = request_with(a, "POST", path, &headers, &req.to_string());
+        assert_eq!(st, 200, "{body}");
+        // (The episode's id is read from the log: a streamed body is not parsed here.)
+        jsonl(&learn.join("q/dev/episodes.jsonl")).pop().unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let a1 = chat("/v1/chat/completions", Some("X-Session-Id: ses_A"), false);
+    let b1 = chat("/v1/chat/completions", Some("x-session-id: ses_B"), false);
+    let a2 = chat("/v1/chat/completions", Some("X-Session-Id: ses_A"), true);
+    let n1 = chat("/v1/chat/completions", None, false);
+    let n2 = chat("/v1/chat/completions", Some("X-Session-Id: not a name"), false);
+    let eps = jsonl(&learn.join("q/dev/episodes.jsonl"));
+    let sessions: Vec<&Value> = eps.iter().map(|e| &e["session"]).collect();
+    assert_eq!(
+        sessions,
+        [&json!("ses_A"), &json!("ses_B"), &json!("ses_A"), &Value::Null, &Value::Null]
+    );
+    assert!(eps[3].get("session").is_none(), "an episode without a session has no such key");
+
+    let post = |body: Value| {
+        let (st, out) = request(a, "POST", "/v1/outcomes", &body.to_string());
+        (st, json_of(&out))
+    };
+    let ids = |v: &Value| -> Vec<String> {
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (st, v) = post(json!({"session": "ses_A", "result": "bad", "kind": "tests", "note": "exit 1: make test"}));
+    assert_eq!((st, v["recorded"].as_u64()), (200, Some(2)), "{v}");
+    assert_eq!(ids(&v), [a1.clone(), a2.clone()]);
+    // Nothing new since: nothing recorded, and no error (also for a session never seen).
+    for session in ["ses_A", "nobody"] {
+        let (st, v) = post(json!({"session": session, "result": "good"}));
+        assert_eq!((st, v["recorded"].as_u64()), (200, Some(0)), "{v}");
+    }
+    // The replies since, of both APIs and under opencode's other header.
+    let a3 = chat("/v1/messages", Some("X-Session-Id: ses_A"), false);
+    let a4 = chat("/v1/chat/completions", Some("X-Opencode-Session-Id: ses_A"), false);
+    let (_, v) = post(json!({"outcomes": [{"session": "ses_A", "result": "good", "kind": "tests"},
+        {"session": "ses_A", "result": "good", "kind": "build"}, {"id": n1, "reward": 0.5}]}));
+    assert_eq!(
+        ids(&v),
+        [a3.clone(), a4.clone(), n1.clone()],
+        "a batch judges a session's replies once"
+    );
+    let outs = jsonl(&learn.join("q/dev/outcomes.jsonl"));
+    assert_eq!(outs.len(), 5);
+    assert_eq!(
+        outs[0],
+        json!({"id": a1, "time": outs[0]["time"], "reward": -1.0, "kind": "tests", "note": "exit 1: make test"})
+    );
+    // The listing by session; the other conversation is still unjudged.
+    let (st, body) = request(a, "GET", "/v1/episodes?session=ses_A&order=asc", "");
+    assert_eq!(st, 200, "{body}");
+    let list = json_of(&body);
+    let d = list["data"].as_array().unwrap();
+    assert_eq!(
+        d.iter().map(|e| e["id"].as_str().unwrap()).collect::<Vec<_>>(),
+        [a1.as_str(), a2.as_str(), a3.as_str(), a4.as_str()]
+    );
+    assert!(d.iter().all(|e| e["session"] == "ses_A" && e["outcomes"] == 1), "{list}");
+    let (_, v) = post(json!({"session": "ses_B", "reward": -0.5}));
+    assert_eq!(ids(&v), [b1]);
+    let (_, body) = request(a, "GET", &format!("/v1/episodes/{n2}"), "");
+    assert_eq!(json_of(&body)["session"], Value::Null);
+    s.stop().unwrap();
+    std::fs::remove_dir_all(&base).ok();
+}
+
 /// `MODEL@PROFILE` (docs/learning.md): the episodes logged for chat requests of both APIs,
 /// streamed or not, the outcomes reported for them, and the profile's adapter attached, replaced
 /// and removed while the model stays loaded; requests for `MODEL` are the base model's and are

@@ -446,8 +446,8 @@ curl -s localhost:8080/v1/episodes/chatcmpl-1a21c98f7fe0001/outcome -H 'Content-
 | Endpoint | |
 |---|---|
 | `POST /v1/episodes/{id}/outcome` | `{"reward": -1..1}` or `{"result": "good" \| "bad"}`, with optional `kind` and `note` |
-| `POST /v1/outcomes` | the same with `id` / `ids`, or `{"outcomes": [...]}` |
-| `GET /v1/episodes`, `GET /v1/episodes/{id}` | the logged episodes with their last outcome (`limit`, `after`, `order`, `model`, `profile`) |
+| `POST /v1/outcomes` | the same with `id` / `ids` or `session` (the replies of that conversation since its last outcome), or `{"outcomes": [...]}` |
+| `GET /v1/episodes`, `GET /v1/episodes/{id}` | the logged episodes with their last outcome (`limit`, `after`, `order`, `model`, `profile`, `session`) |
 | `GET /v1/models/{id}/profiles` | a model's profiles; `GET /v1/models` lists their names as `profiles` |
 | `DELETE /v1/models/{id}/profiles/{profile}/adapter` | removes a profile's adapter, keeps its logs |
 
@@ -486,11 +486,31 @@ Adding writes the model under an `oxinfer` provider, created when missing:
   a `vision_config`), or the catalog does for a vision model whose GGUF projector its load fetches.
 - `reasoning`: its chat format has a thinking block; `tool_call`: it has tool calls (before the
   first load: the catalog, or the chat template).
-- `limit.context`: the model's `max_context` option, else its trained context (32768 when
-  neither is known); `limit.output` a quarter of it, from 1024 to 32768 tokens.
+- `limit.context`: the model's `max_context` option when it has one; else its trained context,
+  but at most 131072 tokens (32768 when the context is not known); `limit.output` a quarter of
+  it, from 1024 to 32768 tokens. `limit.context` is the size opencode takes the model's
+  context to be (what it compacts a conversation against; opencode's side of this was not
+  tested here), so the cap is for models trained for more than a machine holds: Inkling-2's
+  1,048,576 tokens, which the entry used to say. `--opencode-context N` (`opencode_context`)
+  sets another cap and `--opencode-context none` lifts it; a model's own `max_context` is
+  written as it is, whatever the cap. An entry written with another figure shows **Update**.
 - `options.baseURL` is this server as a program on this machine reaches it (`https` with TLS),
   and `options.apiKey` its API key when it has one. An existing provider keeps its name and
   other options; an existing entry keeps its `name` (rename it freely) and any other key.
+
+**Profiles.** `{"model": "qwen", "profile": "myrepo"}` (the GUI's **with a profile…** beside
+the buttons, which asks for the name) writes the same entry under the id `qwen@myrepo`: in
+opencode, `oxinfer/qwen@myrepo` is the model whose requests the server logs as episodes of the
+profile and runs with the profile's adapter ([docs/learning.md](learning.md)). It is another
+entry beside the model's own (listed under the model as `profiles`, with its own `state`), and
+is removed with the same `{"model", "profile"}`. A server that does not serve profiles
+(`--learn-dir none`, or a non-loopback listener without a key) refuses it (409, `profiles_off`).
+Adding one also writes the plugin that reports the session's test, build and lint results to
+the server, `plugins/oxinfer-outcomes.js` in opencode's configuration directory, unless the
+request says `"plugin": false`; `POST /api/web/opencode/plugin` writes it (`{"install": true}`,
+the default) or deletes it (`{"install": false}`) on its own. opencode loads plugins when it
+starts. What the plugin does, its settings and what was checked of it with opencode are in
+[docs/learning.md](learning.md#opencode).
 
 The file is `opencode.jsonc` when there is one (opencode reads it last), else `opencode.json`
 (created when missing, readable by its owner only). It is read as JSONC (comments, trailing
@@ -507,17 +527,21 @@ opencode's `model` (or `small_model`) names the removed model, the answer's `def
 
 | Endpoint | |
 |---|---|
-| `GET /api/web/opencode` | `{available, detected, writable, dir, path, exists, error, provider, base_url, default_model, models, other}`: `models` the server's chat models with `state` (`absent`, `current`, `outdated`), `present`, `up_to_date`, `capabilities` (`vision`, `thinking`, `tools`, `context`), `source` (`loaded`: the engine's; `files`: not loaded yet) and the `entry` it would write; `other` the provider's models the server does not list. `available` is false (and nothing else is said) for a request from another machine |
-| `POST /api/web/opencode/add` | `{"model"}`: writes or updates its entry; answers `{model, changed, created, path, backup, comments_removed, message, entry, source}` (nothing is written when the file already says it) |
-| `POST /api/web/opencode/remove` | `{"model"}`: answers `{model, changed, path, backup, provider_removed, default_model, comments_removed, message}` |
+| `GET /api/web/opencode` | `{available, detected, writable, dir, path, exists, error, provider, base_url, default_model, context_cap, profiles, plugin, models, other}`: `models` the server's chat models with `state` (`absent`, `current`, `outdated`), `present`, `up_to_date`, `capabilities` (`vision`, `thinking`, `tools`, `context`: the model's, before the cap), `source` (`loaded`: the engine's; `files`: not loaded yet), the `entry` it would write, and `profiles`: its entries under a profile (`id`, `profile`, `state`, `up_to_date`, `entry`); `other` the provider's models the server does not list; `context_cap` the cap (null: none); `profiles` whether the server serves profiles; `plugin` the outcome plugin's `path`, `state`, `installed`, `up_to_date`. `available` is false (and nothing else is said) for a request from another machine |
+| `POST /api/web/opencode/add` | `{"model"}`, optionally `"profile"` and `"plugin": false`: writes or updates the entry; answers `{model, changed, created, path, backup, comments_removed, message, entry, source}` (nothing is written when the file already says it), with a profile also `profile` and `plugin` (`path`, `changed`) |
+| `POST /api/web/opencode/remove` | `{"model"}`, optionally `"profile"`: answers `{model, changed, path, backup, provider_removed, default_model, comments_removed, message}` |
+| `POST /api/web/opencode/plugin` | `{"install": true \| false}`: writes or deletes the outcome plugin; answers `{path, changed, installed, message}` |
 
 They follow the management API's rules (the API key, JSON bodies from the page's own origin, a
 loopback `Host` on a loopback listener, read-only without a key on a non-loopback listener), and
 since they write to the home directory of the user running the server, they also need a request
 from this machine: a loopback listener, or a client connecting from a loopback address (403,
 `opencode_local_only`). The library has them as `oxinfer::opencode` (`detect`, `Config::add`,
-`Config::remove`, `Config::state`, `Model::new` from `Engine::capabilities`), the C API as
-`oxi_opencode_detect`, `oxi_opencode_add` and `oxi_opencode_remove`.
+`Config::remove`, `Config::state`, `Config::install_plugin`, `Model::new` from
+`Engine::capabilities`, `Model::capped` for the cap), the C API as `oxi_opencode_detect`,
+`oxi_opencode_add` and `oxi_opencode_remove`. `Model::new` and `oxi_opencode_add` write the
+engine's context without a cap (set the engine's `max_context` to bound it): only the server
+knows whether `max_context` was the user's choice.
 
 ### Models on request
 
@@ -566,6 +590,7 @@ requests need `Authorization: Bearer KEY`), `--cors ORIGIN`, `--max-body-mb N` (
 `--cache-dir DIR`, `--threads N`,
 `--prompt-cache DIR|auto` and `--prompt-cache-gb F` (the chat models' prompt cache),
 `--learn-dir DIR|none` (the [profiles](#profiles-episodes-and-outcomes)' logs and adapters),
+`--opencode-context N|none` (the cap on the context written to [opencode](#opencode)'s entries),
 `--thinking-key KEY` (the key of [thinking signatures](#anthropic-messages-api)),
 `--tls-cert FILE --tls-key FILE` or `--self-signed` for HTTPS, `--workers N` (connections served
 at once, default 32), `--quiet`; `web=1` (the key of `ServerOptions` and `oxi_server_new`; what `oxinfer web` sets) also serves the [web GUI](web.md) and its `/api/web/` management API, whose release check (at most one anonymous request to GitHub every 6 hours, made only when the GUI asks; [Updates](web.md#updates)) `--no-update-check` / `update_check=0` turns off (`update_feed=FILE_OR_URL` reads the release from elsewhere; `serve` without `web` never checks). Media URLs in requests may be `data:` URLs or `http(s)://` URLs,

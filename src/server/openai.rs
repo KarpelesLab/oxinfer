@@ -64,6 +64,8 @@ struct ChatRequest {
     name: String,
     /// The profile the request runs and is logged under (`super::learn`).
     profile: Option<String>,
+    /// The conversation the client named (`super::learn::session_name`), logged with the episode.
+    session: Option<String>,
     messages: Vec<InMessage>,
     tools: Vec<ToolSpec>,
     tool_choice: ToolChoice,
@@ -396,6 +398,7 @@ impl ChatRequest {
             model: model.to_string(),
             name: model.to_string(),
             profile: None,
+            session: None,
             messages,
             tools,
             tool_choice,
@@ -407,8 +410,9 @@ impl ChatRequest {
 
     /// The engine's messages, with the media written to temporary files.
     /// Splits a `MODEL@PROFILE` name into the model and its profile (`super::learn::resolve`).
-    fn resolved(mut self, api: &Api) -> ApiResult<Self> {
+    fn resolved(mut self, api: &Api, session: Option<&str>) -> ApiResult<Self> {
         (self.model, self.profile) = super::learn::resolve(api, &self.name)?;
+        self.session = super::learn::session_name(session);
         Ok(self)
     }
 
@@ -814,6 +818,7 @@ fn run_chat(api: &Api, req: &ChatRequest, id: &str, emit: Emit, on: Option<OnSta
                         time: super::now(),
                         model: &req.model,
                         profile,
+                        session: req.session.as_deref(),
                         adapters: adapters.clone(),
                         prompt_tokens: prompt,
                         completion_tokens: &reply.tokens,
@@ -937,7 +942,7 @@ pub(super) fn spoken_input(api: &Api, body: &Value, temp: &mut TempFiles) -> Api
 }
 
 /// `POST /v1/chat/completions`.
-pub(super) fn chat(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
+pub(super) fn chat(api: &Arc<Api>, body: &Value, session: Option<&str>) -> ApiResult<Output> {
     // Audio out (OpenAI's `modalities: ["text", "audio"]`): LFM3-Omni, Haru.
     if body
         .get("modalities")
@@ -946,7 +951,7 @@ pub(super) fn chat(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
     {
         return super::speech::spoken_chat(api, body);
     }
-    let req = ChatRequest::parse(body)?.resolved(api)?;
+    let req = ChatRequest::parse(body)?.resolved(api, session)?;
     api.models.check(&req.model, Kind::Chat)?;
     let id = api.new_id("chatcmpl-");
     let created = now();
@@ -1316,8 +1321,8 @@ fn anthropic_tool_id(api: &Api) -> String {
 /// speak) over the chat models: system prompt, text and image blocks, tools with `tool_use` /
 /// `tool_result` blocks, thinking (`thinking` blocks), `max_tokens`, `stop_sequences`, sampling,
 /// and streaming in Anthropic's event format. Errors have Anthropic's shape.
-pub(super) fn messages(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
-    match messages_inner(api, body) {
+pub(super) fn messages(api: &Arc<Api>, body: &Value, session: Option<&str>) -> ApiResult<Output> {
+    match messages_inner(api, body, session) {
         Ok(o) => Ok(o),
         Err(e) => Ok(Output::Full(ApiResponse::json(e.status, &anthropic_error(&e)))),
     }
@@ -1341,11 +1346,11 @@ fn thinking_blocks(api: &Api, body: &Value) -> (usize, usize) {
     (ok, dropped)
 }
 
-fn messages_inner(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
+fn messages_inner(api: &Arc<Api>, body: &Value, session: Option<&str>) -> ApiResult<Output> {
     if body.get("max_tokens").is_none() {
         return Err(ApiError::bad("max_tokens is required").param("max_tokens"));
     }
-    let req = ChatRequest::parse(&anthropic_to_openai(body, Some(&api.signer))?)?.resolved(api)?;
+    let req = ChatRequest::parse(&anthropic_to_openai(body, Some(&api.signer))?)?.resolved(api, session)?;
     api.models.check(&req.model, Kind::Chat)?;
     if api.opts.log {
         let (ok, dropped) = thinking_blocks(api, body);
