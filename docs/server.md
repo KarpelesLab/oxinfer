@@ -423,6 +423,34 @@ them as `Api::status` (the same JSON), `Api::requests`, `Api::cancel`, `Api::unl
 engine; the C API as `oxi_server_status`, `oxi_server_cancel`, `oxi_server_unload_model`,
 `oxi_server_clear_prompt_cache`, `oxi_server_free_caches` and `oxi_engine_clear_prompt_cache`.
 
+### Profiles, episodes and outcomes
+
+A chat request for `MODEL@PROFILE` runs `MODEL` with the profile's LoRA adapter when it has one
+and is logged as an episode (the prompt's and the reply's tokens) under the response's `id`; the
+outcome of a response is reported later. A request for `MODEL` is neither adapted nor logged.
+[Learning from outcomes](learning.md) has the file formats, the adapter's life cycle and the
+notes for agent harnesses.
+
+```sh
+curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "qwen@myrepo", "messages": [{"role": "user", "content": "Fix the test."}]}' | jq -r .id
+curl -s localhost:8080/v1/episodes/chatcmpl-1a21c98f7fe0001/outcome -H 'Content-Type: application/json' \
+  -d '{"result": "bad", "kind": "tests", "note": "2 of 14 failed"}'
+```
+
+| Endpoint | |
+|---|---|
+| `POST /v1/episodes/{id}/outcome` | `{"reward": -1..1}` or `{"result": "good" \| "bad"}`, with optional `kind` and `note` |
+| `POST /v1/outcomes` | the same with `id` / `ids`, or `{"outcomes": [...]}` |
+| `GET /v1/episodes`, `GET /v1/episodes/{id}` | the logged episodes with their last outcome (`limit`, `after`, `order`, `model`, `profile`) |
+| `GET /v1/models/{id}/profiles` | a model's profiles; `GET /v1/models` lists their names as `profiles` |
+| `DELETE /v1/models/{id}/profiles/{profile}/adapter` | removes a profile's adapter, keeps its logs |
+
+Profiles need a loopback listener or `--api-key`, and these endpoints follow the management
+API's rules (the key, a loopback `Host` on a loopback listener, JSON bodies and no cross-site
+requests for changes, read-only without a key on a non-loopback listener). `--learn-dir DIR`
+sets the directory (default `~/.cache/oxinfer/learn`), `--learn-dir none` turns profiles off.
+
 ### opencode
 
 When the server finds opencode's global configuration directory (`$XDG_CONFIG_HOME/opencode`, else
@@ -531,6 +559,7 @@ requests need `Authorization: Bearer KEY`), `--cors ORIGIN`, `--max-body-mb N` (
 `--preload`, `--download`, `--memory-gb F`, `--idle-unload MIN`, `--no-auto-models`,
 `--cache-dir DIR`, `--threads N`,
 `--prompt-cache DIR|auto` and `--prompt-cache-gb F` (the chat models' prompt cache),
+`--learn-dir DIR|none` (the [profiles](#profiles-episodes-and-outcomes)' logs and adapters),
 `--thinking-key KEY` (the key of [thinking signatures](#anthropic-messages-api)),
 `--tls-cert FILE --tls-key FILE` or `--self-signed` for HTTPS, `--workers N` (connections served
 at once, default 32), `--quiet`; `web=1` (the key of `ServerOptions` and `oxi_server_new`; what `oxinfer web` sets) also serves the [web GUI](web.md) and its `/api/web/` management API, whose release check (at most one anonymous request to GitHub every 6 hours, made only when the GUI asks; [Updates](web.md#updates)) `--no-update-check` / `update_check=0` turns off (`update_feed=FILE_OR_URL` reads the release from elsewhere; `serve` without `web` never checks). Media URLs in requests may be `data:` URLs or `http(s)://` URLs,

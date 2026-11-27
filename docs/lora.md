@@ -35,10 +35,49 @@ adapter.
 | Library | `EngineOptions::loras` (`Vec<oxinfer::lora::LoraSpec>`) and `lora_merge`, or `opts.set("lora", "FILE[:SCALE]")` once per adapter (`none` clears the list, a JSON array of specs adds them all) and `opts.set("lora_merge", "1")`; `Engine::loras()` lists the attached adapters (`oxinfer::lora::Attached`: path, format, rank, alpha, updates, merged count, bytes), `Engine::set_lora_strength(i, s)` changes a strength (0: off) and starts the conversation again |
 | Lower level | `oxinfer::lora::attach_specs(&mut model, &specs, model_path, merge)` on a `QwenModel`, Gemma `Model` or `Inkling2Model` (the `Adaptable` trait); `LoraAdapter::open` / `load` / `load_gguf` |
 | C API | `lora=FILE[:SCALE]` lines (repeatable) and `lora_merge=1` in the options of `oxi_engine_load`; `oxi_engine_loras_json`, `oxi_engine_set_lora_strength(engine, index, strength)` |
+| Server, per request | `MODEL@PROFILE` runs with the profile's adapter ([learning from outcomes](learning.md)) |
 | Server | the same model options: `qwen=Qwen/Qwen3-8B,lora=./adapter:0.5,lora=./other`; in a JSON config, `"options": {"lora": ["./a", "./b:0.5"]}` (an array) or one string |
 
 The prompt cache keys snapshots by the adapters and their strengths, so a cached conversation of
 the base model is never restored into an adapted one (or the reverse).
+
+## Adapters on a loaded model
+
+`EnginePool::attach_adapter(name, path, strength, version)` puts an adapter on a model that is
+already loaded, without reloading its weights, and `detach_adapter(name)` takes it off. Such an
+adapter sits behind a switch of its own, off by default: `EnginePool::acquire_with(messages,
+Some(name), ..)` turns it on for one request. The server uses this for the profiles of
+[learning from outcomes](learning.md) (`MODEL@PROFILE`): one adapter per profile, on the shared
+weights. Adapters given at load (`lora=`) are not affected: they stay on for every request.
+
+What it does, and what that costs:
+
+- attaching and detaching wait for the requests in flight on the model to end (none sees the
+  change), and requests arriving meanwhile wait;
+- every session of the pool then starts again: conversations in memory are read again on their
+  next request (or restored from the prompt cache, which keys its snapshots by the adapter's
+  path, version and strength as well);
+- the GPU decode and prefill plans are dropped and compiled again on their next use, since
+  they hold the adapters' side paths (see below);
+- the switch is the model's, so the requests running at one time all use the same adapter, or
+  none: a request for another one waits for them to end (docs/learning.md, "Requests at the same
+  time");
+- a detached or replaced adapter is retired, not freed: its updates add nothing on the CPU and
+  are left out of the plans compiled from then on, but its factors stay in memory until the model
+  is unloaded. An adapter attached and switched off is still in the plans, where its side paths
+  add zeros.
+
+Attaching is for Qwen-path and Gemma models decoded without MTP or a DSpark draft, not streamed
+from disk, without interventions or decision assets; the others return an error and stay as they
+were. Updates are runtime ones (no merge). An adapter that fails part of the way (a module of
+another shape) is retired as a whole. MTP-layer modules of such an adapter are not applied
+(these models decode without the MTP layer).
+
+Checked (`engine::pool_slots::tests`, tiny Qwen3.5, CPU): requests with the adapter give the
+tokens of a model loaded with it, requests without it the base model's, with two adapters
+attached, after a replacement, a failed load and a detach; requests with different adapters do
+not overlap. On the CUDA backend, see docs/learning.md, "What was checked". Gemma and Metal were
+not run.
 
 ## GPU plans
 

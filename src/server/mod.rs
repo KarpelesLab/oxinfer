@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod activity;
 pub mod http;
+mod learn;
 mod media;
 mod openai;
 mod registry;
@@ -330,6 +331,14 @@ pub struct ServerOptions {
     /// needs their memory (the budget, the system's or the GPU's) and while the system runs short
     /// of memory (other programs' demand included).
     pub idle_unload: Option<std::time::Duration>,
+    /// Where the profiles of the chat models live (key `learn_dir`: a directory, created
+    /// private; `auto`, the default, for `~/.cache/oxinfer/learn`; `none` turns profiles off): a
+    /// chat request for `MODEL@PROFILE` runs `MODEL` with the LoRA adapter of
+    /// `DIR/<model>/<profile>/adapter` when there is one and is logged there as an episode, whose
+    /// outcome is reported later (`POST /v1/episodes/{id}/outcome`); requests for `MODEL` itself
+    /// are not logged. Only on a loopback listener or with an [`ServerOptions::api_key`]. See
+    /// docs/learning.md.
+    pub learn_dir: Option<PathBuf>,
 }
 
 /// [`ServerOptions::parallel`]'s default.
@@ -365,8 +374,16 @@ impl Default for ServerOptions {
             update_feed: None,
             auto_models: false,
             idle_unload: Some(std::time::Duration::from_secs(30 * 60)),
+            learn_dir: Some(default_learn_dir()),
         }
     }
+}
+
+/// [`ServerOptions::learn_dir`]'s default: `learn` beside the prompt cache's default directory
+/// (`~/.cache/oxinfer/learn`).
+pub fn default_learn_dir() -> PathBuf {
+    let pc = crate::snapshot::default_dir();
+    pc.parent().map_or_else(|| pc.join("learn"), |p| p.join("learn"))
 }
 
 fn parse_bool(key: &str, v: &str) -> Result<bool> {
@@ -407,6 +424,7 @@ impl ServerOptions {
         "update_feed",
         "auto_models",
         "idle_unload_min",
+        "learn_dir",
         "config",
     ];
 
@@ -470,6 +488,13 @@ impl ServerOptions {
                         }
                         Some(std::time::Duration::from_secs_f64(m * 60.0))
                     }
+                }
+            }
+            "learn_dir" => {
+                self.learn_dir = match value {
+                    "none" | "off" | "0" => None,
+                    "" | "auto" | "on" | "1" => Some(default_learn_dir()),
+                    v => Some(PathBuf::from(v)),
                 }
             }
             "config" => {
@@ -751,6 +776,8 @@ pub struct Api {
     activity: Arc<activity::Activity>,
     /// The prompt-cache snapshots' metadata, by file (the status page reads it often).
     snap_index: std::sync::Mutex<status::SnapIndex>,
+    /// The profiles' logs and adapters ([`ServerOptions::learn_dir`]).
+    learn: learn::Learn,
 }
 
 impl Api {
@@ -780,6 +807,7 @@ impl Api {
             models,
             web: opts.web.then(|| web::WebState::new(&opts)),
             signer: sign::ThinkingSigner::new(opts.thinking_key.as_deref()),
+            learn: learn::Learn::new(opts.learn_dir.clone()),
             opts,
             ids: AtomicU64::new(0),
             videos: video::Videos::default(),
@@ -1001,6 +1029,9 @@ impl Api {
         let get = req.method.eq_ignore_ascii_case("GET");
         let post = req.method.eq_ignore_ascii_case("POST");
         let wrong_method = || ApiError::new(405, format!("{} is not allowed on {path}", req.method));
+        if let Some(out) = learn::route(self, req, path) {
+            return out;
+        }
         match path {
             "/v1/models" if get => Ok(Output::Full(ApiResponse::json(200, &self.models_json()))),
             p if p.starts_with("/v1/models/") && get => {
@@ -1077,7 +1108,56 @@ impl Api {
             return Ok(());
         }
         let Some(id) = requested_model(req) else { return Ok(()) };
-        self.models.admit(&id)
+        // (`MODEL@PROFILE` names model `MODEL`.)
+        let id = if self.opts.learn_dir.is_some() {
+            learn::base_model(&id)
+        } else {
+            &id
+        };
+        self.models.admit(id)
+    }
+
+    /// Whether this server's models may be managed: a loopback listener, or an API key.
+    pub(crate) fn admin(&self) -> bool {
+        self.loopback || self.opts.api_key.is_some()
+    }
+
+    /// The management API's rules ([`web`]) for a `/v1` endpoint that reads (`write` false) or
+    /// changes the server's state, after the API key was checked: on a loopback listener the
+    /// `Host` must be a loopback name (DNS rebinding); changes take a JSON content type, come
+    /// from the server's own origin when a browser sends one, and are refused on a non-loopback
+    /// listener without an API key.
+    pub(crate) fn manage(&self, req: &ApiRequest, write: bool) -> ApiResult<()> {
+        if self.loopback
+            && let Some(h) = &req.host
+            && !web::loopback_name(web::host_name(h))
+        {
+            return Err(ApiError::new(403, format!("Host {h:?} is not a loopback name")));
+        }
+        if !write {
+            return Ok(());
+        }
+        let json_ct = req.content_type.as_deref().is_some_and(|c| c.starts_with("application/json"));
+        if !json_ct && (!req.body.is_empty() || req.origin.is_some()) {
+            return Err(ApiError::new(
+                415,
+                "this endpoint takes a JSON body (Content-Type: application/json)",
+            ));
+        }
+        if let Some(origin) = &req.origin {
+            let authority = origin.split_once("://").map_or(origin.as_str(), |(_, a)| a);
+            if !req.host.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(authority)) {
+                return Err(ApiError::new(403, format!("cross-origin request from {origin} refused")));
+            }
+        }
+        if !self.admin() {
+            return Err(ApiError::new(
+                403,
+                "read-only: the server listens on a non-loopback address without an API key (start it with --api-key KEY)",
+            )
+            .code("read_only"));
+        }
+        Ok(())
     }
 
     fn check_auth(&self, req: &ApiRequest) -> ApiResult<()> {
@@ -1119,6 +1199,13 @@ impl Api {
                         "input": if v { vec!["text", "image"] } else { vec!["text"] },
                         "output": ["text"],
                     });
+                }
+                // The profiles a chat request can name as `ID@PROFILE` (docs/learning.md).
+                if self.admin() {
+                    let profiles = self.learn.profile_names(&id);
+                    if !profiles.is_empty() {
+                        m["profiles"] = json!(profiles);
+                    }
                 }
                 m
             })

@@ -409,7 +409,10 @@ impl ChatLease<'_> {
 
     /// The idle session best for `messages` ([`EnginePool::acquire`]), waiting for one while
     /// all are busy (reported to `on` every two seconds, as [`Registry::acquire_with`] does).
-    pub fn engine(&self, messages: &[Message], mut on: Option<OnStage<'_, '_>>) -> ApiResult<PoolGuard<'_>> {
+    ///
+    /// `adapter`: the adapter of the pool the request runs with
+    /// ([`EnginePool::acquire_with`]: requests with another one, or none, end first).
+    pub fn engine(&self, messages: &[Message], adapter: Option<&str>, mut on: Option<OnStage<'_, '_>>) -> ApiResult<PoolGuard<'_>> {
         let mut gone = false;
         let mut first = true;
         let mut wait = || {
@@ -428,7 +431,10 @@ impl ChatLease<'_> {
             }
             true
         };
-        let Some(engine) = self.pool.acquire(messages, std::time::Duration::from_secs(2), &mut wait) else {
+        let Some(engine) = self
+            .pool
+            .acquire_with(messages, adapter, std::time::Duration::from_secs(2), &mut wait)
+        else {
             return Err(if gone {
                 ApiError::new(499, "the client closed the request")
             } else {

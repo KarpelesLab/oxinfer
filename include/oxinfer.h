@@ -1333,6 +1333,9 @@ typedef int (*oxi_bytes_fn)(void *user, const char *data, size_t len);
  *   idle_unload_min=F    unload models unused for F minutes (default 30; 0: never); idle models
  *                        also go when a load needs their RAM or GPU memory, and while the
  *                        system is short of memory
+ *   learn_dir=DIR        where the profiles of chat models live (requests for MODEL@PROFILE are
+ *                        logged as episodes and run with the profile's adapter, see
+ *                        docs/learning.md; default ~/.cache/oxinfer/learn; none: off)
  *   config=PATH         read a JSON file of these options
  * `progress` (may be NULL) reports downloads made by preload / download. Returns NULL on error. */
 OxiServer *oxi_server_new(const char *options, oxi_progress_fn progress, void *user);

@@ -50,6 +50,9 @@ options:\n\
 \x20 --prompt-cache DIR    keep chat models' session snapshots in DIR (auto:\n\
 \x20                       ~/.cache/oxinfer/prompt-cache) across requests and restarts\n\
 \x20 --prompt-cache-gb F   size cap of the prompt cache (default 20; least recently used go)\n\
+\x20 --learn-dir DIR       where the profiles of chat models live (MODEL@PROFILE: logged\n\
+\x20                       episodes, outcomes, the profile's adapter; docs/learning.md);\n\
+\x20                       default ~/.cache/oxinfer/learn, none: off\n\
 \x20 --threads N           CPU threads (default: all cores)\n\
 \x20 --parallel N          conversations each chat model runs at once, each with its own caches\n\
 \x20                       (default 4; prompts interleaved with the others' decoding, decode\n\

@@ -55,7 +55,12 @@ struct Gen {
 
 #[derive(Clone, Debug)]
 struct ChatRequest {
+    /// The listed model's id.
     model: String,
+    /// The `model` of the request, echoed in the response: `MODEL`, or `MODEL@PROFILE`.
+    name: String,
+    /// The profile the request runs and is logged under (`super::learn`).
+    profile: Option<String>,
     messages: Vec<InMessage>,
     tools: Vec<ToolSpec>,
     tool_choice: ToolChoice,
@@ -370,6 +375,8 @@ impl ChatRequest {
         };
         Ok(Self {
             model: model.to_string(),
+            name: model.to_string(),
+            profile: None,
             messages,
             tools,
             tool_choice,
@@ -380,6 +387,12 @@ impl ChatRequest {
     }
 
     /// The engine's messages, with the media written to temporary files.
+    /// Splits a `MODEL@PROFILE` name into the model and its profile (`super::learn::resolve`).
+    fn resolved(mut self, api: &Api) -> ApiResult<Self> {
+        (self.model, self.profile) = super::learn::resolve(api, &self.name)?;
+        Ok(self)
+    }
+
     fn messages(&self, api: &Api, temp: &mut TempFiles) -> ApiResult<Vec<Message>> {
         self.messages
             .iter()
@@ -702,12 +715,29 @@ impl<'a> Stages<'a> {
 
 /// Runs the request's `n` choices on its model, streaming the text to `emit` and what it waits
 /// for before that to `on`.
-fn run_chat(api: &Api, req: &ChatRequest, emit: Emit, on: Option<OnStage<'_, '_>>) -> ApiResult<Vec<Choice>> {
+///
+/// A request with a profile ([`ChatRequest::profile`]) runs with the profile's adapter when it
+/// has one, and each choice is logged as an episode: `id` for the first, `id.1`, `id.2`... for
+/// the others of `n`.
+fn run_chat(api: &Api, req: &ChatRequest, id: &str, emit: Emit, on: Option<OnStage<'_, '_>>) -> ApiResult<Vec<Choice>> {
     let mut temp = TempFiles::default();
     let messages = req.messages(api, &mut temp)?;
     let mut on = on;
     let lease = api.models.acquire_chat(&req.model, on.as_deref_mut())?;
-    let mut session = lease.engine(&messages, on.as_deref_mut())?;
+    let adapter = req
+        .profile
+        .as_deref()
+        .and_then(|p| api.learn.sync_adapter(&lease, &req.model, p, api.opts.log));
+    let mut session = lease.engine(&messages, adapter.as_deref(), on.as_deref_mut())?;
+    let adapters: Vec<super::learn::EpisodeAdapter> = session
+        .adapter()
+        .map(|a| super::learn::EpisodeAdapter {
+            path: a.info.path.display().to_string(),
+            strength: a.info.strength,
+            version: a.version.clone(),
+        })
+        .into_iter()
+        .collect();
     let mut prompt = |done: usize, total: usize| {
         super::activity::prompt(done, total);
         if let Some(on) = on.as_deref_mut() {
@@ -752,6 +782,31 @@ fn run_chat(api: &Api, req: &ChatRequest, emit: Emit, on: Option<OnStage<'_, '_>
         if !rest.is_empty() || !last.is_empty() {
             text.push_str(&rest);
             emit(i, &rest, false, &last);
+        }
+        if let Some(profile) = &req.profile {
+            // What the model read: the conversation's tokens up to the reply (the rendered chat
+            // template). A reply cut short by the client is logged too.
+            let n = reply.stats.prompt_tokens + reply.stats.cached_tokens;
+            match engine.session_tokens().get(..n).filter(|p| !p.is_empty()) {
+                Some(prompt) => {
+                    let episode = super::learn::Episode {
+                        id: &if i == 0 { id.to_string() } else { format!("{id}.{i}") },
+                        time: super::now(),
+                        model: &req.model,
+                        profile,
+                        adapters: adapters.clone(),
+                        prompt_tokens: prompt,
+                        completion_tokens: &reply.tokens,
+                        logprobs: (reply.logprobs.len() == reply.tokens.len() && !reply.tokens.is_empty())
+                            .then(|| reply.logprobs.iter().map(|l| l.logprob).collect()),
+                        finish_reason: if gone { "cancelled" } else { finish_reason(&reply, filter.hit) },
+                    };
+                    if let Err(e) = api.learn.log(&episode) {
+                        eprintln!("[{}: episode {id} not logged: {e:#}]", req.name);
+                    }
+                }
+                None => eprintln!("[{}: episode {id} not logged: the prompt's tokens are not known]", req.name),
+            }
         }
         if gone {
             break;
@@ -871,7 +926,7 @@ pub(super) fn chat(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
     {
         return super::speech::spoken_chat(api, body);
     }
-    let req = ChatRequest::parse(body)?;
+    let req = ChatRequest::parse(body)?.resolved(api)?;
     api.models.check(&req.model, Kind::Chat)?;
     let id = api.new_id("chatcmpl-");
     let created = now();
@@ -885,7 +940,7 @@ pub(super) fn chat(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
             }),
         });
     }
-    let choices = run_chat(api, &req, &mut |_, _, _, _| true, None)?;
+    let choices = run_chat(api, &req, &id, &mut |_, _, _, _| true, None)?;
     api.flush_prompt_cache_later(&req.model);
     let list: Vec<Value> = choices
         .iter()
@@ -910,7 +965,7 @@ pub(super) fn chat(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
             "id": id,
             "object": "chat.completion",
             "created": created,
-            "model": req.model,
+            "model": req.name,
             "choices": list,
             "usage": usage(&choices),
             "system_fingerprint": null,
@@ -925,7 +980,7 @@ fn sse(sink: Sink, v: &Value) -> bool {
 fn stream_chat(api: &Api, req: &ChatRequest, id: &str, created: u64, sink: Sink) {
     let chunk_with = |delta: Value, finish: Value, logprobs: Value| {
         json!({
-            "id": id, "object": "chat.completion.chunk", "created": created, "model": req.model,
+            "id": id, "object": "chat.completion.chunk", "created": created, "model": req.name,
             "choices": [{ "index": 0, "delta": delta, "logprobs": logprobs, "finish_reason": finish }],
         })
     };
@@ -935,10 +990,11 @@ fn stream_chat(api: &Api, req: &ChatRequest, id: &str, created: u64, sink: Sink)
     }
     // The text and the stages before it go out through the same sink.
     let out = std::cell::RefCell::new(&mut *sink);
-    let mut stages = Stages::new(&req.model, req.params.progress);
+    let mut stages = Stages::new(&req.name, req.params.progress);
     let r = run_chat(
         api,
         req,
+        id,
         &mut |_, text, thinking, logprobs| {
             let delta = if thinking {
                 json!({ "reasoning_content": text })
@@ -967,7 +1023,7 @@ fn stream_chat(api: &Api, req: &ChatRequest, id: &str, created: u64, sink: Sink)
             sse(sink, &chunk(json!({}), c.finish.into()));
             if req.params.include_usage {
                 let u = json!({
-                    "id": id, "object": "chat.completion.chunk", "created": created, "model": req.model,
+                    "id": id, "object": "chat.completion.chunk", "created": created, "model": req.name,
                     "choices": [], "usage": usage(&choices),
                 });
                 sse(sink, &u);
@@ -1268,7 +1324,7 @@ fn messages_inner(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
     if body.get("max_tokens").is_none() {
         return Err(ApiError::bad("max_tokens is required").param("max_tokens"));
     }
-    let req = ChatRequest::parse(&anthropic_to_openai(body, Some(&api.signer))?)?;
+    let req = ChatRequest::parse(&anthropic_to_openai(body, Some(&api.signer))?)?.resolved(api)?;
     api.models.check(&req.model, Kind::Chat)?;
     if api.opts.log {
         let (ok, dropped) = thinking_blocks(api, body);
@@ -1287,7 +1343,7 @@ fn messages_inner(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
             }),
         });
     }
-    let choices = run_chat(api, &req, &mut |_, _, _, _| true, None)?;
+    let choices = run_chat(api, &req, &id, &mut |_, _, _, _| true, None)?;
     api.flush_prompt_cache_later(&req.model);
     let c = choices.first().ok_or_else(|| ApiError::new(499, "the client closed the request"))?;
     let mut content = Vec::new();
@@ -1307,7 +1363,7 @@ fn messages_inner(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
             "id": id,
             "type": "message",
             "role": "assistant",
-            "model": req.model,
+            "model": req.name,
             "content": content,
             "stop_reason": anthropic_stop(c),
             "stop_sequence": c.stop_sequence,
@@ -1333,7 +1389,7 @@ fn stream_messages(api: &Api, req: &ChatRequest, id: &str, sink: Sink) {
     let start = json!({
         "type": "message_start",
         "message": {
-            "id": id, "type": "message", "role": "assistant", "model": req.model, "content": [],
+            "id": id, "type": "message", "role": "assistant", "model": req.name, "content": [],
             "stop_reason": null, "stop_sequence": null, "usage": { "input_tokens": 0, "output_tokens": 0 },
         },
     });
@@ -1360,6 +1416,7 @@ fn stream_messages(api: &Api, req: &ChatRequest, id: &str, sink: Sink) {
     let r = run_chat(
         api,
         req,
+        id,
         &mut |_, text, thinking, _| {
             let mut s = out.borrow_mut();
             if block.is_some_and(|(_, t)| t != thinking) && !close(&mut **s, block.take().unwrap()) {
@@ -1448,6 +1505,8 @@ pub(super) fn count_tokens(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
             .get("model")
             .and_then(Value::as_str)
             .ok_or_else(|| ApiError::bad("model is required").param("model"))?;
+        // (`MODEL@PROFILE` counts as `MODEL`: the profile's adapter does not change the prompt.)
+        let model = &super::learn::resolve(api, model)?.0;
         api.models.check(model, Kind::Chat)?;
         let mut text = String::new();
         let mut n_msgs = 0;
@@ -1621,7 +1680,7 @@ impl Completion {
         let lease = api.models.acquire_chat(&self.model, on.as_deref_mut())?;
         // (Matched as a one-message conversation.)
         let first = self.prompts.first().and_then(Value::as_str).unwrap_or_default();
-        let mut engine = lease.engine(&[crate::engine::Message::user(first)], on.as_deref_mut())?;
+        let mut engine = lease.engine(&[crate::engine::Message::user(first)], None, on.as_deref_mut())?;
         let mut reading = |done: usize, total: usize| {
             super::activity::prompt(done, total);
             if let Some(on) = on.as_deref_mut() {

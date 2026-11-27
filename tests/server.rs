@@ -2531,3 +2531,315 @@ fn concurrent_chats_match_alone() {
         assert_eq!(a, b, "request {i}");
     }
 }
+
+/// Replaces `dir/adapter` with a new PEFT folder the way a trainer does: written beside it, then
+/// renamed into place.
+fn put_adapter(profile: &std::path::Path, seed: u64) {
+    let tmp = profile.join("adapter.tmp");
+    let _ = std::fs::remove_dir_all(&tmp);
+    oxinfer::qwen::tiny::write_adapter(&tmp, seed, 0.6).unwrap();
+    let _ = std::fs::remove_dir_all(profile.join("adapter"));
+    std::fs::rename(&tmp, profile.join("adapter")).unwrap();
+}
+
+fn jsonl(path: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// `MODEL@PROFILE` (docs/learning.md): the episodes logged for chat requests of both APIs,
+/// streamed or not, the outcomes reported for them, and the profile's adapter attached, replaced
+/// and removed while the model stays loaded; requests for `MODEL` are the base model's and are
+/// not logged.
+#[test]
+fn profiles_log_episodes_take_outcomes_and_switch_adapters() {
+    let base = std::env::temp_dir().join(format!("oxinfer-learn-server-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (model, learn) = (base.join("model"), base.join("learn"));
+    oxinfer::qwen::tiny::write(&model, false, false).unwrap();
+    let (ad1, ad2) = (base.join("ad1"), base.join("ad2"));
+    oxinfer::qwen::tiny::write_adapter(&ad1, 21, 0.6).unwrap();
+    oxinfer::qwen::tiny::write_adapter(&ad2, 22, 0.6).unwrap();
+    let spec = |extra: &str| format!("model=q={},device=cpu{extra}; learn_dir={}", model.display(), learn.display());
+    let chat = |addr: SocketAddr, name: &str, extra: Value| -> Value {
+        let mut req = json!({"model": name, "messages": [{"role": "user", "content": "Hello there, how are you?"}],
+            "temperature": 0, "max_tokens": 12});
+        for (k, v) in extra.as_object().unwrap() {
+            req[k] = v.clone();
+        }
+        let (st, body) = request(addr, "POST", "/v1/chat/completions", &req.to_string());
+        assert_eq!(st, 200, "{body}");
+        serde_json::from_str(&body).unwrap()
+    };
+    let text = |v: &Value| v["choices"][0]["message"]["content"].as_str().unwrap().to_string();
+    // What the model says alone, and loaded with each adapter.
+    let reference = |extra: &str| {
+        let s = serve(&spec(extra));
+        let t = text(&chat(s.addr(), "q", json!({})));
+        s.stop().unwrap();
+        t
+    };
+    let plain = reference("");
+    let with1 = reference(&format!(",lora={}", ad1.display()));
+    let with2 = reference(&format!(",lora={}", ad2.display()));
+    assert!(plain != with1 && with1 != with2 && plain != with2, "the adapters change nothing");
+    assert!(!learn.exists(), "a request without a profile wrote to the learn directory");
+
+    let s = serve(&spec(""));
+    let a = s.addr();
+    let pdir = learn.join("q").join("dev");
+    // A profile without an adapter: the base model, logged.
+    let r = chat(a, "q@dev", json!({}));
+    assert_eq!((r["model"].as_str(), text(&r)), (Some("q@dev"), plain.clone()));
+    let id1 = r["id"].as_str().unwrap().to_string();
+    let eps = jsonl(&pdir.join("episodes.jsonl"));
+    assert_eq!(eps.len(), 1);
+    let e = &eps[0];
+    assert_eq!(
+        (e["id"].as_str(), e["model"].as_str(), e["profile"].as_str()),
+        (Some(id1.as_str()), Some("q"), Some("dev"))
+    );
+    assert_eq!(e["adapters"], json!([]));
+    assert_eq!(
+        e["prompt_tokens"].as_array().unwrap().len() as u64,
+        r["usage"]["prompt_tokens"].as_u64().unwrap()
+    );
+    let (logged, counted) = (
+        e["completion_tokens"].as_array().unwrap().len() as u64,
+        r["usage"]["completion_tokens"].as_u64().unwrap(),
+    );
+    // (The stop token, when one ended the reply, is logged and not counted.)
+    assert!(
+        logged == counted || logged == counted + 1,
+        "{logged} tokens logged, {counted} counted"
+    );
+    assert_eq!(e["finish_reason"], r["choices"][0]["finish_reason"]);
+    assert!(e.get("logprobs").is_none());
+    // The byte-level tokenizer: the prompt's tokens hold the message's bytes.
+    let bytes: Vec<u8> = e["prompt_tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| u8::try_from(t.as_u64()?).ok())
+        .collect();
+    assert!(String::from_utf8_lossy(&bytes).contains("Hello there, how are you?"));
+    // With log probabilities: one per sampled token.
+    let r = chat(a, "q@dev", json!({"logprobs": true}));
+    let e = jsonl(&pdir.join("episodes.jsonl")).pop().unwrap();
+    assert_eq!(e["id"], r["id"]);
+    assert_eq!(
+        e["logprobs"].as_array().unwrap().len(),
+        e["completion_tokens"].as_array().unwrap().len()
+    );
+    assert!(
+        e["logprobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|l| l.as_f64().is_some_and(|l| l <= 0.0))
+    );
+    // Streamed: every chunk carries the id the episode is logged under.
+    let req = json!({"model": "q@dev", "messages": [{"role": "user", "content": "Hi"}], "temperature": 0, "max_tokens": 6, "stream": true});
+    let (st, body) = request(a, "POST", "/v1/chat/completions", &req.to_string());
+    assert_eq!(st, 200, "{body}");
+    let chunks = sse_events(&body);
+    let id2 = chunks[0]["id"].as_str().unwrap().to_string();
+    assert!(chunks.iter().all(|c| c["id"] == id2.as_str() && c["model"] == "q@dev"), "{body}");
+    // Anthropic's API, plain and streamed (the id is in `message_start`).
+    let msg = |stream: bool| {
+        json!({"model": "q@other", "max_tokens": 6, "temperature": 0, "stream": stream,
+        "messages": [{"role": "user", "content": "Hi"}]})
+    };
+    let (st, body) = request(a, "POST", "/v1/messages", &msg(false).to_string());
+    assert_eq!(st, 200, "{body}");
+    let id3 = json_of(&body)["id"].as_str().unwrap().to_string();
+    let (st, body) = request(a, "POST", "/v1/messages", &msg(true).to_string());
+    assert_eq!(st, 200, "{body}");
+    let start = sse_events(&body).into_iter().find(|e| e["type"] == "message_start").unwrap();
+    let id4 = start["message"]["id"].as_str().unwrap().to_string();
+    let logged = |p: &str| -> Vec<String> {
+        jsonl(&learn.join("q").join(p).join("episodes.jsonl"))
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(logged("dev")[2], id2);
+    assert_eq!(logged("other"), [id3.clone(), id4.clone()]);
+    let (st, body) = request(a, "POST", "/v1/messages/count_tokens", &msg(false).to_string());
+    assert_eq!(st, 200, "{body}");
+    // Names that are not profiles.
+    for bad in ["q@", "q@a b", "q@.x", "q@a/b"] {
+        let req = json!({"model": bad, "messages": [{"role": "user", "content": "Hi"}]});
+        let (st, body) = request(a, "POST", "/v1/chat/completions", &req.to_string());
+        assert!(st == 400 || st == 404, "{bad}: {st} {body}");
+    }
+    assert_eq!(subdirs_of(&learn.join("q")), ["dev", "other"]);
+
+    // Outcomes: by path, with the shorthand; several ids at once; a batch; unknown ids.
+    let post = |path: &str, v: Value| {
+        let (st, body) = request(a, "POST", path, &v.to_string());
+        (st, json_of(&body))
+    };
+    let (st, v) = post(
+        &format!("/v1/episodes/{id1}/outcome"),
+        json!({"result": "bad", "kind": "tests", "note": "2 failed"}),
+    );
+    assert_eq!((st, v["recorded"].as_u64()), (200, Some(1)), "{v}");
+    let (st, v) = post("/v1/episodes/nope/outcome", json!({"reward": 1}));
+    assert_eq!((st, v["error"]["code"].as_str()), (404, Some("episode_not_found")), "{v}");
+    let (st, _) = post(&format!("/v1/episodes/{id1}/outcome"), json!({"reward": 3}));
+    assert_eq!(st, 400);
+    let (st, v) = post("/v1/outcomes", json!({"ids": [id1, id2], "reward": 0.5, "kind": "build"}));
+    assert_eq!((st, v["recorded"].as_u64()), (200, Some(2)), "{v}");
+    let batch = json!({"outcomes": [{"id": id3, "result": "good", "kind": "user_accepted"}, {"ids": [id4, id2], "result": "bad"}]});
+    let (st, v) = post("/v1/outcomes", batch);
+    assert_eq!((st, v["recorded"].as_u64()), (200, Some(3)), "{v}");
+    // All or none.
+    let (st, _) = post(
+        "/v1/outcomes",
+        json!({"outcomes": [{"id": id3, "result": "bad"}, {"id": "nope", "result": "bad"}]}),
+    );
+    assert_eq!(st, 404);
+    let outs = jsonl(&pdir.join("outcomes.jsonl"));
+    assert_eq!(outs.len(), 4);
+    assert_eq!(
+        outs[0],
+        json!({"id": id1, "time": outs[0]["time"], "reward": -1.0, "kind": "tests", "note": "2 failed"})
+    );
+    assert_eq!(
+        (outs[3]["id"].as_str(), outs[3]["reward"].as_f64(), &outs[3]["kind"]),
+        (Some(id2.as_str()), Some(-1.0), &Value::Null)
+    );
+    assert_eq!(jsonl(&learn.join("q/other/outcomes.jsonl")).len(), 2);
+
+    // The listing: newest first, paged, filtered, with each episode's last outcome.
+    let get = |path: &str| {
+        let (st, body) = request(a, "GET", path, "");
+        assert_eq!(st, 200, "{body}");
+        json_of(&body)
+    };
+    let all = get("/v1/episodes");
+    assert_eq!((all["data"].as_array().unwrap().len(), all["has_more"].as_bool()), (5, Some(false)));
+    let dev = get("/v1/episodes?profile=dev&order=asc");
+    let d = dev["data"].as_array().unwrap();
+    assert_eq!(d.len(), 3);
+    assert_eq!(
+        (d[0]["id"].as_str(), d[0]["outcomes"].as_u64(), d[0]["outcome"]["reward"].as_f64()),
+        (Some(id1.as_str()), Some(2), Some(0.5))
+    );
+    assert_eq!((d[0]["outcome"]["kind"].as_str(), d[1]["outcome"].is_null()), (Some("build"), true));
+    assert!(d[0]["prompt_tokens"].as_u64().unwrap() > 20 && d[0]["completion_tokens"].as_u64().unwrap() > 0);
+    let page = get("/v1/episodes?limit=2");
+    assert_eq!(
+        (page["data"].as_array().unwrap().len(), page["has_more"].as_bool()),
+        (2, Some(true))
+    );
+    let next = get(&format!("/v1/episodes?limit=10&after={}", page["last_id"].as_str().unwrap()));
+    assert_eq!(next["data"].as_array().unwrap().len(), 3);
+    assert_eq!(get(&format!("/v1/episodes/{id3}"))["outcome"]["kind"], "user_accepted");
+    // The profiles, in the model list and on their own.
+    let models = get("/v1/models");
+    assert_eq!(models["data"][0]["profiles"], json!(["dev", "other"]));
+    let p = get("/v1/models/q/profiles");
+    assert_eq!(p["data"][0]["id"], "q@dev");
+    assert_eq!(
+        (
+            p["data"][0]["episodes"].as_u64(),
+            p["data"][0]["outcomes"].as_u64(),
+            p["data"][0]["adapter"].is_null()
+        ),
+        (Some(3), Some(4), true)
+    );
+
+    // The trainer writes the profile's adapter: later requests of the profile run with it, the
+    // model's own requests and the other profile's do not, the weights stay loaded.
+    put_adapter(&pdir, 21);
+    let r = chat(a, "q@dev", json!({}));
+    assert_eq!(text(&r), with1);
+    let e = jsonl(&pdir.join("episodes.jsonl")).pop().unwrap();
+    assert_eq!(e["adapters"][0]["path"].as_str(), Some(pdir.join("adapter").to_str().unwrap()));
+    assert_eq!(e["adapters"][0]["strength"].as_f64(), Some(1.0));
+    let v1 = e["adapters"][0]["version"].as_str().unwrap().to_string();
+    assert_eq!(get("/v1/models/q/profiles")["data"][0]["adapter"]["version"], v1.as_str());
+    assert_eq!(text(&chat(a, "q", json!({}))), plain);
+    assert_eq!(text(&chat(a, "q@other", json!({}))), plain);
+    assert_eq!(text(&chat(a, "q@dev", json!({}))), with1);
+    // Trained again: the new files are picked up.
+    put_adapter(&pdir, 22);
+    assert_eq!(text(&chat(a, "q@dev", json!({}))), with2);
+    let e = jsonl(&pdir.join("episodes.jsonl")).pop().unwrap();
+    assert_ne!(e["adapters"][0]["version"].as_str(), Some(v1.as_str()));
+    // A second profile's adapter beside it.
+    put_adapter(&learn.join("q/other"), 21);
+    assert_eq!(text(&chat(a, "q@other", json!({}))), with1);
+    assert_eq!(text(&chat(a, "q@dev", json!({}))), with2);
+    // An adapter that does not load: the base model answers.
+    std::fs::write(pdir.join("adapter/adapter_model.safetensors"), b"not a safetensors file").unwrap();
+    assert_eq!(text(&chat(a, "q@dev", json!({}))), plain);
+    assert_eq!(jsonl(&pdir.join("episodes.jsonl")).pop().unwrap()["adapters"], json!([]));
+    assert_eq!(text(&chat(a, "q@other", json!({}))), with1);
+    // Deleted (the logs stay): the base model again.
+    put_adapter(&pdir, 22);
+    assert_eq!(text(&chat(a, "q@dev", json!({}))), with2);
+    let (st, body) = request(a, "DELETE", "/v1/models/q/profiles/dev/adapter", "");
+    assert_eq!((st, json_of(&body)["deleted"].as_bool()), (200, Some(true)), "{body}");
+    assert!(!pdir.join("adapter").exists() && pdir.join("episodes.jsonl").exists());
+    assert_eq!(text(&chat(a, "q@dev", json!({}))), plain);
+    let (st, body) = request(a, "DELETE", "/v1/models/q/profiles/dev/adapter", "");
+    assert_eq!((st, json_of(&body)["deleted"].as_bool()), (200, Some(false)), "{body}");
+    let (st, _) = request(a, "DELETE", "/v1/models/q/profiles/nope/adapter", "");
+    assert_eq!(st, 404);
+    s.stop().unwrap();
+
+    // After a restart the episodes are still known: outcomes are taken, the listing has them.
+    let s = serve(&spec(""));
+    let a = s.addr();
+    let (st, body) = request(a, "POST", &format!("/v1/episodes/{id4}/outcome"), r#"{"result": "good"}"#);
+    assert_eq!(st, 200, "{body}");
+    let (st, body) = request(a, "GET", &format!("/v1/episodes/{id4}"), "");
+    assert_eq!((st, json_of(&body)["outcome"]["reward"].as_f64()), (200, Some(1.0)), "{body}");
+    assert_eq!(text(&chat(a, "q@other", json!({}))), with1);
+    s.stop().unwrap();
+
+    // Profiles off; and on a listener that is neither loopback nor keyed.
+    let off = serve(&format!("model=q={},device=cpu; learn_dir=none", model.display()));
+    let req = json!({"model": "q@dev", "messages": [{"role": "user", "content": "Hi"}]}).to_string();
+    let (st, _) = request(off.addr(), "POST", "/v1/chat/completions", &req);
+    assert_eq!(st, 404);
+    let (st, _) = request(off.addr(), "GET", "/v1/episodes", "");
+    assert_eq!(st, 404);
+    off.stop().unwrap();
+    let mut o = ServerOptions::from_pairs(&spec("")).unwrap();
+    o.set("listen", "0.0.0.0:1").unwrap();
+    o.set("log", "0").unwrap();
+    let api = Api::new(o).unwrap();
+    let handle = |method: &str, path: &str, body: &str| {
+        let r = api
+            .handle(&oxinfer::server::ApiRequest::new(
+                method,
+                path,
+                Some("application/json"),
+                body.as_bytes().to_vec(),
+            ))
+            .collect();
+        r.status
+    };
+    assert_eq!(handle("POST", "/v1/chat/completions", &req), 403);
+    assert_eq!(handle("POST", &format!("/v1/episodes/{id1}/outcome"), r#"{"result": "good"}"#), 403);
+    assert_eq!(handle("DELETE", "/v1/models/q/profiles/other/adapter", ""), 403);
+    assert_eq!(handle("GET", "/v1/episodes", ""), 200);
+    std::fs::remove_dir_all(&base).ok();
+}
+
+fn subdirs_of(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
