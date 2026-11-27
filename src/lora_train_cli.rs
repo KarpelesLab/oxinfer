@@ -88,7 +88,7 @@ pub fn run(args: &[String]) -> Result<()> {
         }
     }
     o.alpha = alpha.unwrap_or(2.0 * o.rank as f32);
-    if !(o.neg_clip > 0.0) || !(0.0..1.0).contains(&o.holdout) {
+    if o.neg_clip.is_nan() || o.neg_clip <= 0.0 || !(0.0..1.0).contains(&o.holdout) {
         bail!("--neg-clip must be positive and --holdout in 0..1");
     }
     let spec = model.with_context(|| format!("lora-train: --model is required\n\n{USAGE}"))?;
