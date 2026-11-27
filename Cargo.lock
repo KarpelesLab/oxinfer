@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "oxinfer"
-version = "0.0.23"
+version = "0.0.24"
 dependencies = [
  "anyhow",
  "compcol 0.7.9",
