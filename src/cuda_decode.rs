@@ -20,7 +20,8 @@
 //! per ggml format: [`COp::Gmv`]); a gate / up pair of one format is one matvec with the activation
 //! (`mvp_K`; two matvecs and the activation otherwise, and in prefill plans).
 //!
-//! Prefill plans (`Backend::decode_plan_prefill`, GGUF weights only) are multi-token plans of up
+//! Prefill plans (`Backend::decode_plan_prefill`: GGUF weights, and bf16 matrices read as the
+//! ggml BF16 format) are multi-token plans of up
 //! to 512 tokens whose matvecs run as tensor-core GEMMs over the stored blocks (`gemmi_K`) and
 //! whose other ops take every token of the step in one launch (`*_t` kernels: the Gated DeltaNet
 //! conv and rule loop over the tokens on the device; attention in batches of 32 tokens); ops
@@ -818,8 +819,9 @@ impl CudaBackend {
     /// Compiles `g` as a prefill plan (`Backend::decode_plan_prefill`): steps of up to
     /// `OXINFER_CUDA_PREFILL_TOKENS` tokens (default 512, at most `tokens`), the matmuls as
     /// tensor-core GEMMs over the stored GGUF blocks and every other op over all the step's
-    /// tokens in one launch (attention in batches). Graphs with weights in other formats are
-    /// declined (their prompts keep the op-by-op path).
+    /// tokens in one launch (attention in batches); bf16 matrices go through the ggml BF16
+    /// kernels. Graphs with weights in other formats (oxinfer's Q8 / Q4) are declined (their
+    /// prompts keep the op-by-op path).
     pub(super) fn build_plan_pf(&self, g: &Graph, tokens: usize) -> Option<CudaPlan<'_>> {
         let n = std::env::var("OXINFER_CUDA_PREFILL_TOKENS")
             .ok()
@@ -962,13 +964,32 @@ impl CudaBackend {
                             return None;
                         }
                         let cw = &dev.downcast_ref::<CudaWeightBox>()?.0;
-                        if let WeightRef::Gguf(_) = w {
+                        // Prefill plans read bf16 matrices as the ggml BF16 format (the same
+                        // rows of bf16 values), through its GEMM.
+                        let as_gg = |w: &WeightRef, cw: &CudaWeight| -> Option<Option<(super::GgKernels, Wg)>> {
+                            Some(match w {
+                                WeightRef::Gguf(_) => Some(Wg::of(cw)?),
+                                WeightRef::Bf16(v) if pf && v.len() == n_out * n_in => Some((
+                                    self.gg_kernels(crate::ggml::GgmlType::BF16)?,
+                                    Wg {
+                                        q: cw.data,
+                                        rb: 2 * n_in as u64,
+                                        f: 1.0,
+                                        sr: 1,
+                                        sc: 1,
+                                        ncb: 1,
+                                        ..Wg::default()
+                                    },
+                                )),
+                                _ => None,
+                            })
+                        };
+                        if let Some((k, wg)) = as_gg(w, cw)? {
                             gemm_in_max = gemm_in_max.max(n_in);
                             // The kernel reads x four floats at a time.
                             if !x.off.is_multiple_of(4) {
                                 return None;
                             }
-                            let (k, wg) = Wg::of(cw)?;
                             let mut mv = |k: super::GgKernels, w: Wg, y: P, mode: u32| {
                                 // A store after one of the same format over the same x (q / k
                                 // / v): one launch for up to three (`Gmv3`), not across the head.
@@ -1026,8 +1047,8 @@ impl CudaBackend {
                             match (mode, w2) {
                                 (LinMode::Store, None) => mv(k, wg, byte(y), 0),
                                 (LinMode::Add, None) => mv(k, wg, byte(y), 1),
-                                (LinMode::SiluPair | LinMode::GeluPair, Some((WeightRef::Gguf(_), d2))) => {
-                                    let (k2, wg2) = Wg::of(&d2.downcast_ref::<CudaWeightBox>()?.0)?;
+                                (LinMode::SiluPair | LinMode::GeluPair, Some((w2, d2))) => {
+                                    let (k2, wg2) = as_gg(w2, &d2.downcast_ref::<CudaWeightBox>()?.0)??;
                                     // One format: one launch for both and the activation.
                                     if !pf && k.mvp == k2.mvp {
                                         ops.push(COp::Gmv {
@@ -1060,7 +1081,7 @@ impl CudaBackend {
                             }
                             continue;
                         }
-                        // Prefill plans have GEMMs for the GGUF formats only.
+                        // Prefill plans have GEMMs for the GGUF formats (and bf16) only.
                         if pf {
                             return None;
                         }
