@@ -2150,7 +2150,9 @@ impl<'a> QwenModel<'a> {
                         params: None,
                         capture: (nc > 0).then(|| &mut captured[c * nc * h..(c + m) * nc * h]),
                         scratch: false,
-                        states_kept: false,
+                        // Past the first chunk the states are the chunk before's, untouched
+                        // (CUDA then skips their upload, 2.5 ms for Qwen3.5-0.8B's 19 MB).
+                        states_kept: c > 0,
                     },
                 )
             };
