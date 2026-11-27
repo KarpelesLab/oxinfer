@@ -83,9 +83,9 @@ ggml-org's Q4_0 GGUF of Lightning on the M5 Max (greedy, the machine shared with
 |---|---|---|
 | decoding, 34-token prompt | 153 tok/s (before the prefill plan and the experts fix below: 93) | 104 tok/s (`llama-cli`), `llama-bench` tg128 115 |
 | decoding after a 3,056-token prompt | 136 tok/s (70) | |
-| prefill | 1,848 tok/s at 3,056 tokens (596 with the matmuls alone on the GPU) | `llama-bench` pp512 3,390, pp2048 2,761 |
+| prefill | 1,990-2,030 tok/s at 3,056 tokens in chunks of 2,048 (1,910-1,990 in the CLI's former chunks of 1,024; 596 with the matmuls alone on the GPU) | `llama-bench` pp512 3,390, pp2048 2,761 |
 
-Decoding is ahead of llama.cpp; prompts run at about two thirds of its speed. Where a chunk's
+Decoding is ahead of llama.cpp; prompts run at about 0.7x its pp2048. Where a chunk's
 GPU time goes (`OXINFER_PF_PROFILE=1` prints each prefill chunk's by kind of op, every op in a
 command buffer of its own): of 266 ms for 1,024 tokens, the Mamba-2 scan 88 ms (a third: each
 layer's tokens one after the other, a SIMD-group per state row), the routed experts' grouped

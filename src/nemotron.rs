@@ -1810,6 +1810,18 @@ impl crate::generate::TextLm for NemotronModel<'_> {
     fn forward(&self, sess: &mut NemotronSession, tokens: &[u32]) -> Vec<f32> {
         NemotronModel::forward(self, sess, tokens)
     }
+    /// GPU-sized chunks (1024 and up) take the prefill plan's size (as `QwenModel::prefill_chunk`).
+    fn prefill_chunk(&self, chunk: usize) -> usize {
+        let plan = chunk >= 1024
+            && crate::gpu::decode_enabled()
+            && crate::gpu::active().is_some()
+            && crate::qwen::prefill_gpu(crate::qwen::PREFILL_GPU_MIN, "plan");
+        if plan {
+            chunk.max(crate::qwen::prefill_plan_tokens())
+        } else {
+            chunk
+        }
+    }
 }
 
 /// Runtime interventions (`crate::intervene`): the residual points after the embeddings and
