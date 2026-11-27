@@ -2281,11 +2281,88 @@ __device__ __forceinline__ void mvq_body(const W& w, const W& w2, const u8* xq, 
                     }
                     *o = act * u;
                 } else {
-                    *o = mode ? *o + g : g;
+                    // Not fused with the factor's product (the module is compiled with fast
+                    // math): `mvqt_body` must give the same bits.
+                    *o = mode ? __fadd_rn(*o, g) : g;
                 }
             }
         }
     }
+}
+// `mvq_K` over up to MVQT tokens in one sweep of the weights (`mvqt_K`, `mvqpt_K`, `mvq3t_K`:
+// multi-token plans' steps and batched rows; grid row 0 only, the tokens' rows of xq / xd / y
+// one after the other): a lane's block of a weight row is loaded once and multiplied with each
+// token's block of x, every token's sums taken as `mvq_body` takes them (the same `mvq_dot`
+// per block, the blocks in the same order), so each token gets its one-token launch's bits.
+#define MVQT 8
+template <int K, bool PAIR>
+__device__ __forceinline__ void mvqt_body(const W& w, const W& w2, const u8* xq, const float2* xd, float* y, u32 n_in, u32 n_out, u32 ys,
+                                          u32 mode, u32 bx, u32 nt) {
+    if constexpr (has_mvq<K>()) {
+        u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+        u32 r0 = (bx * (blockDim.x >> 5) + warp) * MVQ_ROWS;
+        if (r0 >= n_out) return;
+        u32 nb = n_in / 32;
+        float a[2][MVQ_ROWS][MVQT];
+#pragma unroll
+        for (int i = 0; i < MVQ_ROWS; i++)
+#pragma unroll
+            for (int t = 0; t < MVQT; t++) a[0][i][t] = a[1][i][t] = 0.f;
+        for (u32 b = lane; b < nb; b += 32) {
+#pragma unroll
+            for (int t = 0; t < MVQT; t++) {
+                if ((u32)t < nt) {
+                    const int4* xr = (const int4*)(xq + (u64)t * n_in);
+                    int4 x0 = xr[2 * b], x1 = xr[2 * b + 1];
+                    const int xv[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+                    float2 d = xd[(u64)t * nb + b];
+#pragma unroll
+                    for (int i = 0; i < MVQ_ROWS; i++) {
+                        u32 row = min(r0 + i, n_out - 1);
+                        a[0][i][t] += mvq_dot<K>(w.q + (u64)row * w.rb, b, xv, d);
+                        if constexpr (PAIR) a[1][i][t] += mvq_dot<K>(w2.q + (u64)row * w2.rb, b, xv, d);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < MVQT; t++) {
+            if ((u32)t >= nt) break;
+#pragma unroll
+            for (int i = 0; i < MVQ_ROWS; i++) {
+                float gs = warp_sum(a[0][i][t]);
+                float g = gs * w.f;
+                float u = PAIR ? warp_sum(a[1][i][t]) * w2.f : 0.f;
+                if (lane == 0 && r0 + i < n_out) {
+                    float* o = y + (u64)t * ys + r0 + i;
+                    if constexpr (PAIR) {
+                        float act;
+                        if (mode) {
+                            float tt = 0.7978845608f * (g + 0.044715f * g * g * g);
+                            act = 0.5f * g * (1.0f + tanhf(tt));
+                        } else {
+                            act = g / (1.0f + expf(-g));
+                        }
+                        *o = act * u;
+                    } else {
+                        // (As `mvq_body`: the factor's product is not fused into the sum.)
+                        *o = mode ? __fadd_rn(*o, __fmul_rn(gs, w.f)) : g;
+                    }
+                }
+            }
+        }
+    }
+}
+template <int K>
+__device__ __forceinline__ void mvq3t_body(const W& w0, const W& w1, const W& w2, const u8* xq, const float2* xd, float* y0, float* y1,
+                                           float* y2, u32 n_in, u32 n0, u32 n1, u32 n2, u32 ys0, u32 ys1, u32 ys2, u32 nt) {
+    u32 rpb = (blockDim.x >> 5) * MVQ_ROWS, b0 = (n0 + rpb - 1) / rpb, b1 = (n1 + rpb - 1) / rpb, b = blockIdx.x;
+    if (b < b0)
+        mvqt_body<K, false>(w0, w0, xq, xd, y0, n_in, n0, ys0, 0, b, nt);
+    else if (b < b0 + b1)
+        mvqt_body<K, false>(w1, w1, xq, xd, y1, n_in, n1, ys1, 0, b - b0, nt);
+    else
+        mvqt_body<K, false>(w2, w2, xq, xd, y2, n_in, n2, ys2, 0, b - b0 - b1, nt);
 }
 // Up to three matvecs over one x in one launch (`mvq3_K`: the q / k / v of a layer, one format):
 // the grid's blocks are the three's `mvq_K` blocks in turn (n2 0: two), each block's sums its own
@@ -2360,6 +2437,19 @@ __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
     extern "C" __global__ void __launch_bounds__(256) mvq3_##K(W w0, W w1, W w2, const u8* xq, const float2* xd, float* y0, float* y1,      \
                                                                float* y2, u32 n_in, u32 n0, u32 n1, u32 n2, u32 ys0, u32 ys1, u32 ys2) {   \
         mvq3_body<K>(w0, w1, w2, xq, xd, y0, y1, y2, n_in, n0, n1, n2, ys0, ys1, ys2);                                                   \
+    }                                                                                                                                      \
+    extern "C" __global__ void __launch_bounds__(256)                                                                                      \
+        mvqt_##K(W w, const u8* xq, const float2* xd, float* y, u32 n_in, u32 n_out, u32 ys, u32 mode, u32 nt) {                         \
+        mvqt_body<K, false>(w, w, xq, xd, y, n_in, n_out, ys, mode, blockIdx.x, nt);                                                       \
+    }                                                                                                                                      \
+    extern "C" __global__ void __launch_bounds__(256)                                                                                      \
+        mvqpt_##K(W w, W w2, const u8* xq, const float2* xd, float* y, u32 n_in, u32 n_out, u32 ys, u32 gelu, u32 nt) {                  \
+        mvqt_body<K, true>(w, w2, xq, xd, y, n_in, n_out, ys, gelu, blockIdx.x, nt);                                                       \
+    }                                                                                                                                      \
+    extern "C" __global__ void __launch_bounds__(256) mvq3t_##K(W w0, W w1, W w2, const u8* xq, const float2* xd, float* y0, float* y1,     \
+                                                                float* y2, u32 n_in, u32 n0, u32 n1, u32 n2, u32 ys0, u32 ys1, u32 ys2,   \
+                                                                u32 nt) {                                                                 \
+        mvq3t_body<K>(w0, w1, w2, xq, xd, y0, y1, y2, n_in, n0, n1, n2, ys0, ys1, ys2, nt);                                              \
     }
 // The stream-K GEMM's second pass (grid (blocks of `gemmhk`, bm / 8), `fix` as its, bm its
 // tile's rows): a block whose share ends inside a tile it began adds, to 8 rows of the tile

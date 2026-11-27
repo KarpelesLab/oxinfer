@@ -799,6 +799,13 @@ fn fattn2_from(hd: usize) -> usize {
 }
 
 /// `OXINFER_CUDA_DECODE_TRACE=1`: times each step's parts (synchronizing after the kernels).
+/// Whether multi-token int8 matvecs sweep the weights once for their tokens (`mvqt_K`;
+/// `OXINFER_CUDA_MVQT=0`: a grid row per token of `mvq_K`, as before).
+fn mvqt_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OXINFER_CUDA_MVQT").map_or(true, |v| v != "0"))
+}
+
 fn trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("OXINFER_CUDA_DECODE_TRACE").is_some())
@@ -2524,13 +2531,30 @@ impl CudaPlan<'_> {
         self.q8_last.set(key);
         let blocks: u32 = n.iter().map(|&m| m.div_ceil(rows)).sum();
         let ([w0, w1, w2], [y0, y1, y2], [n0, n1, n2], [s0, s1, s2]) = (w, y, n, ys);
-        (fresh || be.launch(k.dq8_x, ((n_in / 32).div_ceil(8), t), 256, &mut args![x, n_in, xs, xq, xd]))
-            && be.launch(
-                k.mvq3,
-                (blocks, t),
-                k.mv_threads,
-                &mut args![w0, w1, w2, xq, xd, y0, y1, y2, n_in, n0, n1, n2, s0, s1, s2],
-            )
+        if !(fresh || be.launch(k.dq8_x, ((n_in / 32).div_ceil(8), t), 256, &mut args![x, n_in, xs, xq, xd])) {
+            return false;
+        }
+        if t > 1 && !k.mvq3t.is_null() && mvqt_on() {
+            // One sweep of the weights for up to `MVQT` tokens.
+            return (0..t).step_by(super::MVQT as usize).all(|j0| {
+                let nt = (t - j0).min(super::MVQT);
+                let (xq, xd) = (xq + (j0 * n_in) as u64, xd + (j0 * (n_in / 32) * 8) as u64);
+                let at = |y: u64, s: u32| y + 4 * (j0 * s) as u64;
+                let (y0, y1, y2) = (at(y0, s0), at(y1, s1), at(y2, s2));
+                be.launch(
+                    k.mvq3t,
+                    (blocks, 1),
+                    k.mv_threads,
+                    &mut args![w0, w1, w2, xq, xd, y0, y1, y2, n_in, n0, n1, n2, s0, s1, s2, nt],
+                )
+            });
+        }
+        be.launch(
+            k.mvq3,
+            (blocks, t),
+            k.mv_threads,
+            &mut args![w0, w1, w2, xq, xd, y0, y1, y2, n_in, n0, n1, n2, s0, s1, s2],
+        )
     }
 
     /// The int8 matvec (or gate / up pair) over `t` rows of x (`xs` floats apart): x rounded to
@@ -2556,21 +2580,44 @@ impl CudaPlan<'_> {
         let key = (x, xs, n_in, t);
         let fresh = self.q8_last.get() == key;
         self.q8_last.set(key);
-        (fresh || be.launch(k.dq8_x, ((n_in / 32).div_ceil(8), t), 256, &mut args![x, n_in, xs, xq, xd]))
-            && match w2 {
-                Some(w2) => be.launch(
-                    k.mvqp,
-                    (n_out.div_ceil(rows), t),
-                    k.mv_threads,
-                    &mut args![w, w2, xq, xd, y, n_in, n_out, ys, mode],
-                ),
-                None => be.launch(
-                    k.mvq,
-                    (n_out.div_ceil(rows), t),
-                    k.mv_threads,
-                    &mut args![w, xq, xd, y, n_in, n_out, ys, mode],
-                ),
-            }
+        if !(fresh || be.launch(k.dq8_x, ((n_in / 32).div_ceil(8), t), 256, &mut args![x, n_in, xs, xq, xd])) {
+            return false;
+        }
+        if t > 1 && !k.mvqt.is_null() && !k.mvqpt.is_null() && mvqt_on() {
+            // One sweep of the weights for up to `MVQT` tokens.
+            return (0..t).step_by(super::MVQT as usize).all(|j0| {
+                let nt = (t - j0).min(super::MVQT);
+                let (xq, xd, y) = (xq + (j0 * n_in) as u64, xd + (j0 * (n_in / 32) * 8) as u64, y + 4 * (j0 * ys) as u64);
+                match w2 {
+                    Some(w2) => be.launch(
+                        k.mvqpt,
+                        (n_out.div_ceil(rows), 1),
+                        k.mv_threads,
+                        &mut args![w, w2, xq, xd, y, n_in, n_out, ys, mode, nt],
+                    ),
+                    None => be.launch(
+                        k.mvqt,
+                        (n_out.div_ceil(rows), 1),
+                        k.mv_threads,
+                        &mut args![w, xq, xd, y, n_in, n_out, ys, mode, nt],
+                    ),
+                }
+            });
+        }
+        match w2 {
+            Some(w2) => be.launch(
+                k.mvqp,
+                (n_out.div_ceil(rows), t),
+                k.mv_threads,
+                &mut args![w, w2, xq, xd, y, n_in, n_out, ys, mode],
+            ),
+            None => be.launch(
+                k.mvq,
+                (n_out.div_ceil(rows), t),
+                k.mv_threads,
+                &mut args![w, xq, xd, y, n_in, n_out, ys, mode],
+            ),
+        }
     }
 
     /// Launches `op` over the step's `t` tokens: matvecs at once, the rest token by token; the

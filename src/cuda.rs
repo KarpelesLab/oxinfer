@@ -455,6 +455,9 @@ struct CudaWeight {
     gg: Option<(GgKernels, u64, f32)>,
 }
 
+/// Most tokens of a launch of the multi-token int8 matvecs (`MVQT` in `inkling_cuda.cu`).
+pub(crate) const MVQT: u32 = 8;
+
 /// The kernels over one ggml block format: `inkling_cuda.cu` compiled for that format alone
 /// (`GGML_ONLY`) the first time a weight of it is uploaded, and kept on disk
 /// ([`CudaBackend::cached_module`]).
@@ -492,6 +495,11 @@ struct GgKernels {
     pub(crate) mvqp: *mut c_void,
     /// `mvq3_K`: two or three int8 matvecs over one x in one launch (decode plans' q / k / v).
     pub(crate) mvq3: *mut c_void,
+    /// `mvqt_K`, `mvqpt_K`, `mvq3t_K`: the three over up to [`MVQT`] tokens in one sweep of the
+    /// weights (null with `mvq`).
+    pub(crate) mvqt: *mut c_void,
+    pub(crate) mvqpt: *mut c_void,
+    pub(crate) mvq3t: *mut c_void,
     pub(crate) dq8_x: *mut c_void,
 }
 
@@ -1221,6 +1229,9 @@ impl CudaBackend {
                     mvq: q8.then(|| get(format!("mvq_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
                     mvqp: q8.then(|| get(format!("mvqp_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
                     mvq3: q8.then(|| get(format!("mvq3_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
+                    mvqt: q8.then(|| get(format!("mvqt_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
+                    mvqpt: q8.then(|| get(format!("mvqpt_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
+                    mvq3t: q8.then(|| get(format!("mvq3t_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
                     dq8_x: get("dq8_x".to_string())?,
                 })
             }
@@ -3808,6 +3819,33 @@ mod tests {
                         .fold(0f64, f64::max);
                     assert!(worst < 2e-6, "{kind} int8 matvec mode {mode}: {worst:.2e}");
                     let (_, wg2) = Wg::of(&cw2).unwrap();
+                    // One sweep of the weights for the tokens (`mvqt`, up to `MVQT` a launch): each
+                    // token's bits are its own grid row's.
+                    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                    if !k.mvqt.is_null() {
+                        assert!(be.htod(dy, &y0));
+                        for j0 in (0..t).step_by(MVQT as usize) {
+                            let nt = (t - j0).min(MVQT as usize) as u32;
+                            let (xq, xd, dy) = (xq + (j0 * n_in) as u64, xd + (j0 * nb * 8) as u64, dy + (j0 * ysu as usize * 4) as u64);
+                            let mut a = [
+                                &w as *const _ as *mut c_void,
+                                &xq as *const _ as *mut c_void,
+                                &xd as *const _ as *mut c_void,
+                                &dy as *const _ as *mut c_void,
+                                &ni as *const _ as *mut c_void,
+                                &no as *const _ as *mut c_void,
+                                &ysu as *const _ as *mut c_void,
+                                &mode as *const _ as *mut c_void,
+                                &nt as *const _ as *mut c_void,
+                            ];
+                            assert!(be.launch(k.mvqt, (no.div_ceil(rws), 1), k.mv_threads, &mut a));
+                        }
+                        let mut yt = vec![0f32; t * n_out];
+                        assert!(be.dtoh(&mut yt, dy));
+                        let n = yt.iter().zip(&y).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                        let worst = yt.iter().zip(&y).map(|(a, b)| (a - b).abs() / b.abs().max(1e-3)).fold(0f32, f32::max);
+                        assert!(n == 0, "{kind} mvqt mode {mode}: {n} of {} values differ from mvq's, by up to {worst:e}", y.len());
+                    }
                     // Three at once (`mvq3`: W, W2, W into three outputs): each the same bits as
                     // its own launch (W's), W2's within the same bound of its definition.
                     if mode == 0 && !k.mvq3.is_null() {
@@ -3836,9 +3874,46 @@ mod tests {
                         assert!(be.launch(k.mvq3, (blocks, t as u32), k.mv_threads, &mut a));
                         let (mut y0b, mut y1b, mut y2b) = (vec![0f32; t * n_out], vec![0f32; t * n_out], vec![0f32; t * n_out]);
                         assert!(be.dtoh(&mut y0b, d0) && be.dtoh(&mut y1b, d1) && be.dtoh(&mut y2b, d2));
-                        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
                         assert_eq!(bits(&y0b), bits(&y), "{kind}: mvq3's first output");
                         assert_eq!(bits(&y2b), bits(&y), "{kind}: mvq3's third output");
+                        if !k.mvq3t.is_null() {
+                            let (mut e0, mut e1, mut e2) = (0u64, 0u64, 0u64);
+                            for e in [&mut e0, &mut e1, &mut e2] {
+                                assert_eq!(unsafe { be.cu.cuMemAlloc_v2(e, t * n_out * 4) }, 0);
+                            }
+                            for j0 in (0..t).step_by(MVQT as usize) {
+                                let nt = (t - j0).min(MVQT as usize) as u32;
+                                let yo = (j0 * ysu as usize * 4) as u64;
+                                let (xq, xd, e0, e1, e2) = (xq + (j0 * n_in) as u64, xd + (j0 * nb * 8) as u64, e0 + yo, e1 + yo, e2 + yo);
+                                let mut a = [
+                                    &w as *const _ as *mut c_void,
+                                    &wg2 as *const _ as *mut c_void,
+                                    &w as *const _ as *mut c_void,
+                                    &xq as *const _ as *mut c_void,
+                                    &xd as *const _ as *mut c_void,
+                                    &e0 as *const _ as *mut c_void,
+                                    &e1 as *const _ as *mut c_void,
+                                    &e2 as *const _ as *mut c_void,
+                                    &ni as *const _ as *mut c_void,
+                                    &no as *const _ as *mut c_void,
+                                    &no as *const _ as *mut c_void,
+                                    &no as *const _ as *mut c_void,
+                                    &ysu as *const _ as *mut c_void,
+                                    &ysu as *const _ as *mut c_void,
+                                    &ysu as *const _ as *mut c_void,
+                                    &nt as *const _ as *mut c_void,
+                                ];
+                                assert!(be.launch(k.mvq3t, (blocks, 1), k.mv_threads, &mut a));
+                            }
+                            let (mut z0, mut z1, mut z2) = (vec![0f32; t * n_out], vec![0f32; t * n_out], vec![0f32; t * n_out]);
+                            assert!(be.dtoh(&mut z0, e0) && be.dtoh(&mut z1, e1) && be.dtoh(&mut z2, e2));
+                            assert_eq!(bits(&z0), bits(&y0b), "{kind}: mvq3t's first output");
+                            assert_eq!(bits(&z1), bits(&y1b), "{kind}: mvq3t's second output");
+                            assert_eq!(bits(&z2), bits(&y2b), "{kind}: mvq3t's third output");
+                            for p in [e0, e1, e2] {
+                                unsafe { be.cu.cuMemFree_v2(p) };
+                            }
+                        }
                         let worst = (0..t * n_out)
                             .map(|i| {
                                 let (j, o) = (i / n_out, i % n_out);
@@ -3869,6 +3944,29 @@ mod tests {
                     ];
                     assert!(be.launch(k.mvqp, (no.div_ceil(rws), t as u32), k.mv_threads, &mut a));
                     assert!(be.dtoh(&mut y, dy));
+                    if !k.mvqpt.is_null() {
+                        assert!(be.htod(dy, &y0));
+                        for j0 in (0..t).step_by(MVQT as usize) {
+                            let nt = (t - j0).min(MVQT as usize) as u32;
+                            let (xq, xd, dy) = (xq + (j0 * n_in) as u64, xd + (j0 * nb * 8) as u64, dy + (j0 * ysu as usize * 4) as u64);
+                            let mut a = [
+                                &w as *const _ as *mut c_void,
+                                &wg2 as *const _ as *mut c_void,
+                                &xq as *const _ as *mut c_void,
+                                &xd as *const _ as *mut c_void,
+                                &dy as *const _ as *mut c_void,
+                                &ni as *const _ as *mut c_void,
+                                &no as *const _ as *mut c_void,
+                                &ysu as *const _ as *mut c_void,
+                                &mode as *const _ as *mut c_void,
+                                &nt as *const _ as *mut c_void,
+                            ];
+                            assert!(be.launch(k.mvqpt, (no.div_ceil(rws), 1), k.mv_threads, &mut a));
+                        }
+                        let mut yt = vec![0f32; t * n_out];
+                        assert!(be.dtoh(&mut yt, dy));
+                        assert_eq!(bits(&yt), bits(&y), "{kind}: mvqpt's outputs (mode {mode})");
+                    }
                     let mut worst = 0f64;
                     for j in 0..t {
                         for o in 0..n_out {
