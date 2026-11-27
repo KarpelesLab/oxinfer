@@ -172,6 +172,60 @@ pub struct Corrector {
     final_norm: Norm,
     final_mod: DLin<'static>,
     patch_out: DLin<'static>,
+    /// Run the blocks on the accelerator's whole-pass session when it has one (Metal), else on
+    /// the CPU.
+    pub gpu: bool,
+    /// The blocks' layers as float16 pairs for that session (made on the first device pass;
+    /// None: some layer has no such form).
+    twins: std::sync::OnceLock<Option<Vec<[Pair; 8]>>>,
+    session: std::sync::Mutex<Option<Box<dyn crate::gpu::dit::CorrSession>>>,
+}
+
+/// A float32 layer as `hi + lo` float16 matrices, and its bias.
+struct Pair {
+    hi: crate::model::Lin<'static>,
+    lo: crate::model::Lin<'static>,
+    bias: Option<Vec<f32>>,
+    n_out: usize,
+    n_in: usize,
+}
+
+impl Pair {
+    fn of(d: &DLin) -> Option<Self> {
+        let mut w = vec![0f32; d.n_out * d.n_in];
+        let rows: Vec<u32> = (0..d.n_out as u32).collect();
+        if !d.w.rows(&rows, d.n_in, &mut w) || d.w.has_lora() {
+            return None;
+        }
+        let hi: Vec<f32> = w.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
+        let lo: Vec<f32> = w.iter().zip(&hi).map(|(&v, &h)| v - h).collect();
+        Some(Self {
+            hi: crate::ltx::device::f16_lin(&hi, d.n_out, d.n_in),
+            lo: crate::ltx::device::f16_lin(&lo, d.n_out, d.n_in),
+            bias: d.b.clone(),
+            n_out: d.n_out,
+            n_in: d.n_in,
+        })
+    }
+
+    fn dev(&self) -> Option<crate::gpu::dit::SplitLin<'_>> {
+        Some(crate::gpu::dit::SplitLin {
+            hi: self.part(&self.hi, self.bias.as_deref())?,
+            lo: Some(self.part(&self.lo, None)?),
+        })
+    }
+
+    fn part<'s>(&self, l: &'s crate::model::Lin<'static>, bias: Option<&'s [f32]>) -> Option<crate::gpu::dit::Lin<'s>> {
+        Some(crate::gpu::dit::Lin {
+            w: l.as_ref(),
+            dev: l.device_weight_unfolded(self.n_out, self.n_in)?,
+            n_out: self.n_out,
+            n_in: self.n_in,
+            bias,
+            side: None,
+            rot: None,
+        })
+    }
 }
 
 /// LayerNorm of each row of `x` (`[rows, w.len()]`) with weight and bias, float64 sums.
@@ -315,6 +369,9 @@ impl Corrector {
             final_mod: lin("final_modulation", 2 * w, w)?,
             patch_out: lin("patch_out", c * pp, w)?,
             path: path.to_path_buf(),
+            gpu: true,
+            twins: Default::default(),
+            session: Default::default(),
             cfg,
         })
     }
@@ -384,7 +441,8 @@ impl Corrector {
         let tw = 2 * (dh / 8);
         let hw = 2 * ((dh - tw) / 4);
         let segs = [(0, tw, &pos_t), (tw, hw, &pos_y), (tw + hw, dh - tw - hw, &pos_x)];
-        for b in &self.blocks {
+        let on_device = self.blocks_device(&mut hid, &txt, l, &time, &segs);
+        for b in self.blocks.iter().filter(|_| !on_device) {
             let m = b.modulation.forward(&time, 1);
             let ch = |k: usize| &m[k * d..(k + 1) * d];
             // Self-attention.
@@ -438,6 +496,138 @@ impl Corrector {
             }
         }
         Ok(out)
+    }
+
+    /// The blocks on the accelerator's session (`OXINFER_H3_GPU=0` or [`Corrector::gpu`] false:
+    /// never): `hid` replaced by the tokens after the last block; false when there is none or it
+    /// declined.
+    fn blocks_device(&self, hid: &mut [f32], txt: &[f32], l: usize, time: &[f32], segs: &[(usize, usize, &Vec<f32>); 3]) -> bool {
+        use crate::gpu::dit::{CorrBlock, CorrIn, CorrModel};
+        if !self.gpu || std::env::var("OXINFER_H3_GPU").is_ok_and(|v| v == "0") {
+            return false;
+        }
+        let Some(be) = crate::gpu::active() else { return false };
+        let cfg = &self.cfg;
+        let (d, heads, dh) = (cfg.width, cfg.heads, cfg.head_dim);
+        if dh != 64 {
+            return false;
+        }
+        let twins = self.twins.get_or_init(|| {
+            self.blocks
+                .iter()
+                .map(|b| -> Option<[Pair; 8]> {
+                    Some([
+                        Pair::of(&b.qkv)?,
+                        Pair::of(&b.out)?,
+                        Pair::of(&b.cq)?,
+                        Pair::of(&b.ck)?,
+                        Pair::of(&b.cv)?,
+                        Pair::of(&b.cout)?,
+                        Pair::of(&b.fc1)?,
+                        Pair::of(&b.fc2)?,
+                    ])
+                })
+                .collect()
+        });
+        let Some(twins) = twins else { return false };
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        for (b, t) in self.blocks.iter().zip(twins) {
+            let [qkv, out, cq, ck, cv, cout, fc1, fc2] = t;
+            blocks.push(CorrBlock {
+                ln: [
+                    [&b.norm_self.w, &b.norm_self.b],
+                    [&b.norm_cross.w, &b.norm_cross.b],
+                    [&b.norm_mlp.w, &b.norm_mlp.b],
+                ],
+                qkv: match qkv.dev() {
+                    Some(x) => x,
+                    None => return false,
+                },
+                out: match out.dev() {
+                    Some(x) => x,
+                    None => return false,
+                },
+                cq: match cq.dev() {
+                    Some(x) => x,
+                    None => return false,
+                },
+                ck: match ck.dev() {
+                    Some(x) => x,
+                    None => return false,
+                },
+                cv: match cv.dev() {
+                    Some(x) => x,
+                    None => return false,
+                },
+                cout: match cout.dev() {
+                    Some(x) => x,
+                    None => return false,
+                },
+                fc1: match fc1.dev() {
+                    Some(x) => x,
+                    None => return false,
+                },
+                fc2: match fc2.dev() {
+                    Some(x) => x,
+                    None => return false,
+                },
+            });
+        }
+        let model = CorrModel {
+            width: d,
+            heads,
+            head_dim: dh,
+            ffn: d * cfg.mlp_ratio,
+            eps: cfg.norm_eps,
+            blocks,
+        };
+        let n = hid.len() / d;
+        let mods: Vec<f32> = self.blocks.iter().flat_map(|b| b.modulation.forward(time, 1)).collect();
+        // The angle of every rotary pair of a head: the segments' pairs in order.
+        let ln = -(10_000f64.ln() as f32);
+        let (mut cos, mut sin) = (vec![0f32; n * dh / 2], vec![0f32; n * dh / 2]);
+        let mut pair = 0;
+        for &(start, width, pos) in segs {
+            debug_assert_eq!(start, 2 * pair);
+            let half = width / 2;
+            for j in 0..half {
+                let inv = (ln * j as f32 / half.max(1) as f32).exp();
+                for t in 0..n {
+                    let (s, c) = (pos[t] * inv).sin_cos();
+                    cos[t * dh / 2 + pair + j] = c;
+                    sin[t * dh / 2 + pair + j] = s;
+                }
+            }
+            pair += half;
+        }
+        if pair != dh / 2 {
+            return false;
+        }
+        let inp = CorrIn {
+            x: hid,
+            rows: n,
+            ctx: txt,
+            n_ctx: l,
+            mods: &mods,
+            cos: &cos,
+            sin: &sin,
+        };
+        let mut sess = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        if sess.is_none() {
+            *sess = be.corrector_session();
+        }
+        let Some(s) = sess.as_mut() else { return false };
+        let mut out = Vec::new();
+        if !s.forward(&model, &inp, &mut out) {
+            return false;
+        }
+        hid.copy_from_slice(&out);
+        true
+    }
+
+    /// Frees the device memory of the corrector's session.
+    pub fn release_device(&self) {
+        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// The velocity correction of one step: the residual for `z` / `v` (`[C, T, H, W]`), capped

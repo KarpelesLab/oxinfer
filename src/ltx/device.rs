@@ -29,7 +29,7 @@ pub(crate) struct Twins<'a> {
 }
 
 /// An f32 matrix `[n_out, n_in]` as a float16 "GGUF" layer.
-fn f16_lin(w: &[f32], n_out: usize, n_in: usize) -> crate::model::Lin<'static> {
+pub(crate) fn f16_lin(w: &[f32], n_out: usize, n_in: usize) -> crate::model::Lin<'static> {
     let mut v = crate::quant::PageVec::<u8>::zeroed(w.len() * 2);
     for (o, x) in v.as_chunks_mut::<2>().0.iter_mut().zip(w) {
         *o = half::f16::from_f32(*x).to_le_bytes();
@@ -109,29 +109,33 @@ fn q8_twin<'a>(d: &DLin<'a>) -> Option<crate::model::Lin<'a>> {
 impl<'a> Twins<'a> {
     pub(crate) fn build(dit: &Dit<'a>) -> Self {
         let mut t = Self::default();
-        dit.for_each_block_layer(&mut |d, gate| {
-            if gate {
-                let mut w = vec![0f32; d.n_out * d.n_in];
-                let rows: Vec<u32> = (0..d.n_out as u32).collect();
-                if d.w.rows(&rows, d.n_in, &mut w) {
-                    t.gates.insert(key(d), (w, d.b.clone().unwrap_or_else(|| vec![0.0; d.n_out])));
-                }
-            } else {
-                if let Some(q) = q8_twin(d) {
-                    t.q8.insert(key(d), q);
-                }
-                let rot = d.w.fold.as_ref().map(|f| f.block);
-                if let Some(s) = side_of(d, rot) {
-                    t.sides.insert(key(d), s);
-                }
-            }
-        });
+        dit.for_each_block_layer(&mut |d, gate| t.add(d, gate));
         t
+    }
+
+    /// Makes the device state of layer `d` (a gate: its float32 copy; otherwise an int8
+    /// layer's Q8 twin and its LoRA side path).
+    pub(crate) fn add(&mut self, d: &DLin<'a>, gate: bool) {
+        if gate {
+            let mut w = vec![0f32; d.n_out * d.n_in];
+            let rows: Vec<u32> = (0..d.n_out as u32).collect();
+            if d.w.rows(&rows, d.n_in, &mut w) {
+                self.gates.insert(key(d), (w, d.b.clone().unwrap_or_else(|| vec![0.0; d.n_out])));
+            }
+        } else {
+            if let Some(q) = q8_twin(d) {
+                self.q8.insert(key(d), q);
+            }
+            let rot = d.w.fold.as_ref().map(|f| f.block);
+            if let Some(s) = side_of(d, rot) {
+                self.sides.insert(key(d), s);
+            }
+        }
     }
 
     /// `d` as the device sees it: None when the device has no state for it or its input
     /// transform is not ConvRot's.
-    fn lin<'s>(&'s self, d: &'s DLin<'a>) -> Option<DevLin<'s>> {
+    pub(crate) fn lin<'s>(&'s self, d: &'s DLin<'a>) -> Option<DevLin<'s>> {
         if d.w.active_lora().is_some() && !self.sides.contains_key(&key(d)) {
             return None;
         }

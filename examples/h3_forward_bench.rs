@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! h3_forward_bench TRANSFORMER.safetensors DUMP_DIR [--lora FILE]... [--step I[,J...]] [--blocks N]
-//!     [--device cpu|cuda] [--write DIR] [--ref DIR]
+//!     [--device cpu|cuda|metal] [--attention half|split|f32] [--write DIR] [--ref DIR]
 //! ```
 //!
 //! `--step` names the forwards to run, one after the other (default 0).
@@ -38,9 +38,12 @@ fn cmp(name: &str, a: &[f32], b: &[f32]) {
     let max = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
     let mean = a.iter().zip(b).map(|(x, y)| (x - y).abs() as f64).sum::<f64>() / a.len() as f64;
     let scale = b.iter().map(|v| v.abs() as f64).sum::<f64>() / b.len() as f64;
+    let num: f64 = a.iter().zip(b).map(|(x, y)| ((x - y) as f64).powi(2)).sum();
+    let den: f64 = b.iter().map(|y| (*y as f64).powi(2)).sum();
     println!(
-        "{name}: {} values, max abs diff {max:.3e}, mean abs diff {mean:.3e}, ref mean |v| {scale:.3e}",
-        a.len()
+        "{name}: {} values, max abs diff {max:.3e}, mean abs diff {mean:.3e}, ref mean |v| {scale:.3e}, relative L2 {:.3e}",
+        a.len(),
+        (num / den).sqrt()
     );
 }
 
@@ -93,7 +96,7 @@ fn main() -> Result<()> {
     }
     let dump = PathBuf::from(args.next().context("DUMP_DIR (or FILE.latents)")?);
     let (mut loras, mut steps, mut blocks, mut device) = (Vec::new(), vec![0usize], None, "cpu".to_string());
-    let (mut out, mut reference) = (None, None);
+    let (mut out, mut reference, mut attention) = (None, None, None);
     while let Some(a) = args.next() {
         let mut v = || args.next().with_context(|| format!("{a} needs a value"));
         match a.as_str() {
@@ -101,6 +104,7 @@ fn main() -> Result<()> {
             "--step" => steps = v()?.split(',').map(|s| s.parse()).collect::<Result<_, _>>()?,
             "--blocks" => blocks = Some(v()?.parse::<usize>()?),
             "--device" => device = v()?,
+            "--attention" => attention = Some(v()?),
             "--write" => out = Some(PathBuf::from(v()?)),
             "--ref" => reference = Some(PathBuf::from(v()?)),
             _ => anyhow::bail!("unknown option {a}"),
@@ -121,6 +125,9 @@ fn main() -> Result<()> {
     }
     if let Some(n) = blocks {
         dit.truncate_blocks(n);
+    }
+    if let Some(a) = &attention {
+        dit.gpu_attention = oxinfer::gpu::dit::AttnPrecision::parse(a).context("--attention: half, split or f32")?;
     }
     println!("[loaded in {:.1}s]", t0.elapsed().as_secs_f64());
     let h = dit.cfg.hidden;

@@ -175,6 +175,13 @@ pub struct VaeDecoder<'a> {
     inv_freq: Vec<f32>,
     /// The engine that runs the block stack on an accelerator, if any.
     device: super::stack_dev::Device,
+    /// Run the block stack on the accelerator's whole-pass session when it has one (Metal; else,
+    /// or when it declines, on `device` or the CPU).
+    pub gpu: bool,
+    twins: std::sync::OnceLock<crate::ltx::device::Twins<'a>>,
+    session: std::sync::Mutex<Option<Box<dyn crate::gpu::dit::H3Session>>>,
+    /// The query / key norms' weights (none stored: ones).
+    ones: Vec<f32>,
 }
 
 impl super::stack_dev::Source for VaeDecoder<'_> {
@@ -287,8 +294,93 @@ impl<'a> VaeDecoder<'a> {
             proj_out: DLin::load(files, "decoder.proj_out", 3 * cfg.patch_t * cfg.patch * cfg.patch, d, true)?,
             inv_freq,
             device: Default::default(),
+            gpu: true,
+            twins: Default::default(),
+            session: Default::default(),
+            ones: vec![1.0; hd],
             cfg,
         })
+    }
+
+    /// The block stack over `x` on the accelerator's whole-pass session (`OXINFER_H3_GPU=0` or
+    /// [`VaeDecoder::gpu`] false: never); false when there is none or it declined.
+    fn blocks_session(&self, x: &mut [f32], cos: &[f32], sin: &[f32]) -> bool {
+        use crate::gpu::dit::{AttnPrecision, H3Block, H3In, H3Model};
+        if !self.gpu || std::env::var("OXINFER_H3_GPU").is_ok_and(|v| v == "0") {
+            return false;
+        }
+        let Some(be) = crate::gpu::active() else { return false };
+        let twins = self.twins.get_or_init(|| {
+            let mut t = crate::ltx::device::Twins::default();
+            for b in &self.blocks {
+                if let Qkv::Interleaved(w) = &b.qkv {
+                    t.add(w, false);
+                }
+                for l in [&b.out, &b.fc1, &b.fc2] {
+                    t.add(l, false);
+                }
+            }
+            t
+        });
+        let c = &self.cfg;
+        let Some(first) = self.blocks.first() else { return false };
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        for b in &self.blocks {
+            let Qkv::Interleaved(qkv) = &b.qkv else { return false };
+            if b.gate_first != first.gate_first {
+                return false;
+            }
+            let (Some(qkv), Some(out), Some(fc1), Some(fc2)) = (twins.lin(qkv), twins.lin(&b.out), twins.lin(&b.fc1), twins.lin(&b.fc2))
+            else {
+                return false;
+            };
+            blocks.push(H3Block {
+                norm1: &b.norm1,
+                norm2: &b.norm2,
+                q_norm: &self.ones,
+                k_norm: &self.ones,
+                qkv,
+                out,
+                fc1,
+                fc2,
+                scale: Some((&b.scale1, &b.scale2)),
+            });
+        }
+        let model = H3Model {
+            hidden: c.dim,
+            heads: c.heads,
+            head_dim: c.dim / c.heads,
+            ffn: 4 * c.dim,
+            rope_half: c.axes * self.inv_freq.len(),
+            eps: c.eps,
+            qk_eps: c.eps,
+            stacked: false,
+            gate_first: first.gate_first,
+            blocks,
+            attention: AttnPrecision::F32,
+        };
+        let n = x.len() / c.dim;
+        let inp = H3In {
+            x,
+            rows: n,
+            key: &[],
+            sets: 0,
+            tables: &[],
+            cos,
+            sin,
+            skip: &[],
+        };
+        let mut sess = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        if sess.is_none() {
+            *sess = be.h3_session();
+        }
+        let Some(s) = sess.as_mut() else { return false };
+        let mut out = Vec::new();
+        if !s.forward(&model, &inp, &mut out) {
+            return false;
+        }
+        x.copy_from_slice(&out);
+        true
     }
 
     /// Decodes one `[C, h, w]` latent tile into `[3, 16h, 16w]` (no tiling).
@@ -334,10 +426,11 @@ impl<'a> VaeDecoder<'a> {
         }
         let scale = (hd as f32).powf(-0.5);
         // The whole stack on the accelerator when it takes it.
-        let on_device = self
-            .device
-            .get(self, "video VAE")
-            .is_some_and(|dev| dev.stack(self, &mut x, None, &cos, &sin));
+        let on_device = self.blocks_session(&mut x, &cos, &sin)
+            || self
+                .device
+                .get(self, "video VAE")
+                .is_some_and(|dev| dev.stack(self, &mut x, None, &cos, &sin));
         for b in self.blocks.iter().filter(|_| !on_device) {
             let mut hn = x.clone();
             rmsnorm_f32w_rows_inplace(&mut hn, d, &b.norm1, cfg.eps);
@@ -434,6 +527,7 @@ impl<'a> VaeDecoder<'a> {
     /// Frees the device memory the block stack holds on an accelerator.
     pub fn release_device(&self) {
         self.device.release();
+        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// `_split_tiles`: tile starts and overlaps over `length` pixels.

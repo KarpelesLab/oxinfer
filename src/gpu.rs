@@ -278,6 +278,16 @@ pub trait Backend: Send + Sync {
     fn ltx_voc_session(&'static self) -> Option<Box<dyn dit::LtxVocSession>> {
         None
     }
+    /// A session running whole MiniMax-H3 block stacks on the device; None when the backend
+    /// has none.
+    fn h3_session(&'static self) -> Option<Box<dyn dit::H3Session>> {
+        None
+    }
+    /// A session running whole H3 corrector passes on the device; None when the backend has
+    /// none.
+    fn corrector_session(&'static self) -> Option<Box<dyn dit::CorrSession>> {
+        None
+    }
     /// A session running whole CLIP text-encoder passes on the device; None when the backend
     /// has none.
     fn clip_session(&'static self) -> Option<Box<dyn dit::ClipSession>> {

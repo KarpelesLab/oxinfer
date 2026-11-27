@@ -9,7 +9,8 @@
 //! raw residual and of the capped one for each case.
 //!
 //! `h3_corrector_check --time FILE T H W [L]` instead times one forward of a real corrector file
-//! on random inputs of that latent shape (24 channels; `L` caption rows of the file's width).
+//! on random inputs of that latent shape (24 channels; `L` caption rows of the file's width);
+//! with `--device gpu` on the accelerator's session, then once on the CPU for a comparison.
 
 use anyhow::{Context, Result};
 use oxinfer::minimax_h3::corrector::{Corrector, bound_residual};
@@ -38,7 +39,7 @@ fn main() -> Result<()> {
         let (t, h, w) = (p(2)?, p(3)?, p(4)?);
         let l = p(5).unwrap_or(124);
         let t0 = Instant::now();
-        let net = Corrector::load(Path::new(args.get(1).context(usage)?))?;
+        let mut net = Corrector::load(Path::new(args.get(1).context(usage)?))?;
         println!("loaded in {:.1}s: {:?}", t0.elapsed().as_secs_f64(), net.cfg);
         let mut rng = oxinfer::sd::ops::Rng::new(1);
         let c = net.cfg.video_channels;
@@ -47,7 +48,8 @@ fn main() -> Result<()> {
             rng.normals(c * t * h * w),
             rng.normals(l * net.cfg.text_dim),
         );
-        for i in 0..2 {
+        let mut last = Vec::new();
+        for i in 0..3 {
             let t1 = Instant::now();
             let raw = net.forward(&z, &v, t, h, w, 0.9, 0.85, &text)?;
             let (_, ratio) = bound_residual(&raw, &v, 0.5, 1e-3);
@@ -55,6 +57,20 @@ fn main() -> Result<()> {
                 "forward {i}: [{c}, {t}, {h}, {w}] ({} tokens), {l} text rows: {:.2}s, ratio {ratio:.3}",
                 t * (h / 2) * (w / 2),
                 t1.elapsed().as_secs_f64()
+            );
+            last = raw;
+        }
+        if gpu {
+            net.gpu = false;
+            let t1 = Instant::now();
+            let cpu = net.forward(&z, &v, t, h, w, 0.9, 0.85, &text)?;
+            let num: f64 = last.iter().zip(&cpu).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+            let den: f64 = cpu.iter().map(|b| (*b as f64).powi(2)).sum();
+            let (d, m) = max_diff(&last, &cpu);
+            println!(
+                "CPU forward {:.2}s; device vs CPU: relative L2 {:.3e}, max abs {d:.3e} (values up to {m:.3})",
+                t1.elapsed().as_secs_f64(),
+                (num / den).sqrt()
             );
         }
         return Ok(());

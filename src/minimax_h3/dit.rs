@@ -402,6 +402,14 @@ pub struct Dit<'a> {
     inv_freq: Vec<f32>,
     /// The engine that runs the block stack on an accelerator, if any.
     device: super::stack_dev::Device,
+    /// Run the block stack on the accelerator's whole-pass session when it has one (Metal; else,
+    /// or when it declines, on `device` or the CPU).
+    pub gpu: bool,
+    /// The operands of that session's attention.
+    pub gpu_attention: crate::gpu::dit::AttnPrecision,
+    /// The session's view of int8 layers and LoRA side paths, made on the first device pass.
+    twins: std::sync::OnceLock<crate::ltx::device::Twins<'a>>,
+    session: std::sync::Mutex<Option<Box<dyn crate::gpu::dit::H3Session>>>,
 }
 
 impl super::stack_dev::Source for Dit<'_> {
@@ -617,6 +625,10 @@ impl<'a> Dit<'a> {
             audio,
             inv_freq,
             device: Default::default(),
+            gpu: true,
+            gpu_attention: crate::gpu::dit::AttnPrecision::Split,
+            twins: Default::default(),
+            session: Default::default(),
             cfg,
         })
     }
@@ -814,6 +826,14 @@ impl<'a> Dit<'a> {
         }
         // The whole stack on the accelerator when it takes it (not while every block is dumped,
         // nor with blocks bypassed).
+        if dump.is_none() && self.blocks.iter().all(|b| b.adaln.is_some()) {
+            let tm = stage::start(stage::DEV);
+            let tables: Vec<Vec<f32>> = self.blocks.iter().map(|b| b.adaln.as_ref().unwrap().forward(st, nt)).collect();
+            if self.stack_session(x, &tables, &key, nt * MODALITIES, &cos, &sin, skip) {
+                return;
+            }
+            drop(tm);
+        }
         if dump.is_none()
             && skip.is_empty()
             && let Some(dev) = self.device.get(self, "transformer")
@@ -854,6 +874,105 @@ impl<'a> Dit<'a> {
     /// there at the next forward): what follows the sampling may need it.
     pub fn release_device(&self) {
         self.device.release();
+        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The block stack on the accelerator's whole-pass session (`OXINFER_H3_GPU=0` or
+    /// [`Dit::gpu`] false: never): false when there is none or it declined, `x` untouched.
+    #[allow(clippy::too_many_arguments)]
+    fn stack_session(
+        &self,
+        x: &mut [f32],
+        tables: &[Vec<f32>],
+        key: &[usize],
+        sets: usize,
+        cos: &[f32],
+        sin: &[f32],
+        skip: &[usize],
+    ) -> bool {
+        use crate::gpu::dit::{H3Block, H3In, H3Model};
+        if !self.gpu || std::env::var("OXINFER_H3_GPU").is_ok_and(|v| v == "0") {
+            return false;
+        }
+        let Some(be) = crate::gpu::active() else { return false };
+        let twins = self.twins.get_or_init(|| {
+            let mut t = crate::ltx::device::Twins::default();
+            for b in &self.blocks {
+                if let Qkv::Interleaved(w) | Qkv::Stacked(w) = &b.attn.qkv {
+                    t.add(w, false);
+                }
+                for l in [&b.attn.out, &b.ff.fc1, &b.ff.fc2] {
+                    t.add(l, false);
+                }
+            }
+            t
+        });
+        let c = &self.cfg;
+        let Some(first) = self.blocks.first() else { return false };
+        let stacked = matches!(first.attn.qkv, Qkv::Stacked(_));
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        for b in &self.blocks {
+            let qkv = match &b.attn.qkv {
+                Qkv::Stacked(w) if stacked => &**w,
+                Qkv::Interleaved(w) if !stacked => &**w,
+                _ => return false,
+            };
+            if b.ff.gate_first != first.ff.gate_first {
+                return false;
+            }
+            let (Some(qkv), Some(out), Some(fc1), Some(fc2)) =
+                (twins.lin(qkv), twins.lin(&b.attn.out), twins.lin(&b.ff.fc1), twins.lin(&b.ff.fc2))
+            else {
+                return false;
+            };
+            blocks.push(H3Block {
+                norm1: &b.norm1,
+                norm2: &b.norm2,
+                q_norm: &b.attn.norm_q,
+                k_norm: &b.attn.norm_k,
+                qkv,
+                out,
+                fc1,
+                fc2,
+                scale: None,
+            });
+        }
+        let model = H3Model {
+            hidden: c.hidden,
+            heads: c.heads,
+            head_dim: c.head_dim,
+            ffn: c.ffn,
+            rope_half: self.inv_freq.len() * 3,
+            eps: c.norm_eps,
+            qk_eps: c.qk_eps,
+            stacked,
+            gate_first: first.ff.gate_first,
+            blocks,
+            attention: self.gpu_attention,
+        };
+        let key: Vec<u32> = key.iter().map(|&k| k as u32).collect();
+        let n = x.len() / c.hidden;
+        let inp = H3In {
+            x,
+            rows: n,
+            key: &key,
+            sets,
+            tables,
+            cos,
+            sin,
+            skip,
+        };
+        let mut sess = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        if sess.is_none() {
+            *sess = be.h3_session();
+        }
+        let Some(s) = sess.as_mut() else { return false };
+        let mut out = Vec::new();
+        if !s.forward(&model, &inp, &mut out) {
+            return false;
+        }
+        x.copy_from_slice(&out);
+        true
     }
 
     /// The output norm of the rows `rows` of `x` (RMSNorm, then the shift / scale of each row's
@@ -1113,6 +1232,8 @@ impl<'a> Dit<'a> {
     pub(crate) fn layer_mut(&mut self, id: LayerId) -> &mut DLin<'a> {
         // An engine built before this change holds the layer as it was.
         self.device.reset();
+        self.twins = Default::default();
+        *self.session.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
         if id.block == usize::MAX {
             return &mut self.norm_out_ada;
         }
@@ -1130,6 +1251,8 @@ impl<'a> Dit<'a> {
     /// Keeps the first `n` blocks only (timing and comparing part of the stack).
     pub fn truncate_blocks(&mut self, n: usize) {
         self.device.reset();
+        self.twins = Default::default();
+        *self.session.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
         self.blocks.truncate(n);
     }
 

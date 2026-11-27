@@ -2842,7 +2842,7 @@ pub struct OxiVideo {
 /// Loads a video model: MiniMax-H3 (a release folder, a single-file transformer or a repo id;
 /// `options` as the server's: `text_encoder`, `transformer`, `vae`, `audio_vae`, `quant`, `lora`,
 /// `shift`, `audio_shift`, `corrector` and `corrector_strength` / `_budget` / `_floor` / `_start` /
-/// `_end`: [`crate::minimax_h3::video::load_with_options`]) or LTX-2.5 (`Lightricks/LTX-2.5`, its
+/// `_end`, `device`, `attention`: [`crate::minimax_h3::video::load_with_options`]) or LTX-2.5 (`Lightricks/LTX-2.5`, its
 /// parts fetched from the public mirror, a release folder or a transformer file; options
 /// `transformer` (`int8`, `bf16`, `nvfp4`, `dev`, `dev-bf16` or a file), `text_encoder`, `vae`
 /// (`conv`, `diff`: the diffusion decoder, or a file), `audio_vae`, `upsampler`,

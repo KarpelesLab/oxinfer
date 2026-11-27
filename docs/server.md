@@ -168,7 +168,10 @@ jobs keep their files in memory for an hour (`expires_at`); the server keeps the
 The model's options: `text_encoder`, `transformer`, `vae`, `audio_vae` (parts replacing the
 folder's: paths, `org/name/file.safetensors` or repo ids), `quant` (the text encoder's: `bf16` or
 `q8`), `lora` (`FILE[:SCALE]`, repeatable; a turbo LoRA sets the step count and the shifts),
-`shift`, `audio_shift`. In the library the pipeline is `minimax_h3::video::VideoPipeline`
+`shift`, `audio_shift`, `corrector` (Sulphur-3's) and its `corrector_*` settings, `device`
+(`cpu`: the transformer, its VAE decoder and the corrector stay on the CPU with a GPU there) and
+`attention` (the Metal transformer's attention operands: `split`, the default, `half` or `f32`;
+[video.md](video.md#on-metal)). In the library the pipeline is `minimax_h3::video::VideoPipeline`
 (`VideoParams::cancel` stops it), the files `minimax_h3::encode`; in C `oxi_video_load`,
 `oxi_video_generate` and `oxi_video_free`.
 

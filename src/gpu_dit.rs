@@ -482,3 +482,140 @@ pub trait NaSession: Send {
     /// then unchanged).
     fn blocks(&mut self, blocks: &[NaBlock], x: &mut [f32], ctx: Option<&[f32]>, d: [usize; 3]) -> bool;
 }
+
+/// One block of MiniMax-H3's transformer (`crate::minimax_h3::dit`): RMS norms with weights
+/// under per-row AdaLN sets, a fused q / k / v projection, per-head RMS norms of queries and
+/// keys, a 3-axis RoPE on the first `2 * rope_half` channels of each head (half against half),
+/// joint attention without a mask, a SwiGLU feed-forward, gated residuals. Its video VAE
+/// decoder's blocks (`crate::minimax_h3::vae`) are the same with biases, no AdaLN and residuals
+/// scaled by fixed vectors (`scale`), 64-wide heads.
+pub struct H3Block<'a> {
+    pub norm1: &'a [f32],
+    pub norm2: &'a [f32],
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
+    /// `[3 inner, hidden]`: `[q; k; v]` rows (`stacked`) or `[q k v]` per head.
+    pub qkv: Lin<'a>,
+    pub out: Lin<'a>,
+    /// `[2 ffn, hidden]`: gate rows first (`gate_first`) or value rows first.
+    pub fc1: Lin<'a>,
+    pub fc2: Lin<'a>,
+    /// The residual scales of the attention and of the feed-forward (none: AdaLN).
+    pub scale: Option<(&'a [f32], &'a [f32])>,
+}
+
+/// How a device runs an attention: half-precision operands, float32 ones, or queries and keys
+/// as pairs of halves (hi + lo) on the half-precision matrix units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttnPrecision {
+    Half,
+    F32,
+    Split,
+}
+
+impl AttnPrecision {
+    /// `half`, `split` or `f32` (`exact`, `float32`).
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "half" | "f16" => Self::Half,
+            "split" | "hilo" => Self::Split,
+            "f32" | "float32" | "exact" => Self::F32,
+            _ => return None,
+        })
+    }
+}
+
+pub struct H3Model<'a> {
+    pub hidden: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub ffn: usize,
+    pub rope_half: usize,
+    pub eps: f32,
+    pub qk_eps: f32,
+    pub stacked: bool,
+    pub gate_first: bool,
+    pub blocks: Vec<H3Block<'a>>,
+    pub attention: AttnPrecision,
+}
+
+/// One forward of the block stack.
+pub struct H3In<'a> {
+    /// `[rows, hidden]`.
+    pub x: &'a [f32],
+    pub rows: usize,
+    /// Each row's AdaLN set (empty without AdaLN).
+    pub key: &'a [u32],
+    pub sets: usize,
+    /// Per block `[sets, 6 hidden]`: shift, scale, gate of the attention, then of the
+    /// feed-forward (empty without AdaLN).
+    pub tables: &'a [Vec<f32>],
+    /// Per row `rope_half` cosines, and as many sines.
+    pub cos: &'a [f32],
+    pub sin: &'a [f32],
+    /// Blocks bypassed (the identity).
+    pub skip: &'a [usize],
+}
+
+/// MiniMax-H3 block-stack passes on the device, the rows kept in device buffers.
+pub trait H3Session: Send {
+    /// The rows after the last block (`[rows, hidden]`) into `out`; false when the device
+    /// declined or failed (the caller runs the CPU path).
+    fn forward(&mut self, m: &H3Model, inp: &H3In, out: &mut Vec<f32>) -> bool;
+}
+
+/// A float32 linear layer of the H3 corrector as two float16 parts (`w = hi + lo`, 22
+/// significant bits): `lo` none when the layer is exact in float16.
+pub struct SplitLin<'a> {
+    pub hi: Lin<'a>,
+    pub lo: Option<Lin<'a>>,
+}
+
+/// One block of SulphurAI's H3 corrector (`crate::minimax_h3::corrector`): LayerNorms with
+/// weights and biases, AdaLN-modulated self-attention over 64-wide heads with rotary pairs,
+/// cross-attention to the caption, a tanh-GELU MLP; biases on every linear layer.
+pub struct CorrBlock<'a> {
+    /// LayerNorm weight and bias of the self-attention, the cross-attention and the MLP.
+    pub ln: [[&'a [f32]; 2]; 3],
+    /// `[q; k; v]` rows.
+    pub qkv: SplitLin<'a>,
+    pub out: SplitLin<'a>,
+    pub cq: SplitLin<'a>,
+    pub ck: SplitLin<'a>,
+    pub cv: SplitLin<'a>,
+    pub cout: SplitLin<'a>,
+    pub fc1: SplitLin<'a>,
+    pub fc2: SplitLin<'a>,
+}
+
+pub struct CorrModel<'a> {
+    pub width: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub ffn: usize,
+    pub eps: f32,
+    pub blocks: Vec<CorrBlock<'a>>,
+}
+
+/// One corrector forward.
+pub struct CorrIn<'a> {
+    /// The tokens after `patch_in` (`[rows, width]`).
+    pub x: &'a [f32],
+    pub rows: usize,
+    /// The caption after its norm and projection (`[ctx, width]`).
+    pub ctx: &'a [f32],
+    pub n_ctx: usize,
+    /// Per block the modulation of this step: shift, scale, gate of the self-attention, then of
+    /// the MLP (`6 width`).
+    pub mods: &'a [f32],
+    /// Per token the angle of each rotary pair of a head (`head_dim / 2` cosines, as many sines).
+    pub cos: &'a [f32],
+    pub sin: &'a [f32],
+}
+
+/// H3 corrector passes on the device, the tokens kept in device buffers.
+pub trait CorrSession: Send {
+    /// The tokens after the last block (`[rows, width]`) into `out`; false when the device
+    /// declined or failed (the caller runs the CPU path).
+    fn forward(&mut self, m: &CorrModel, inp: &CorrIn, out: &mut Vec<f32>) -> bool;
+}

@@ -11,6 +11,8 @@ use crate::gpu::dit::{FluxInput, FluxModel, FluxSession, Lin, Model, Seq, Sessio
 
 #[path = "metal_diffvae.rs"]
 mod diffvae;
+#[path = "metal_h3.rs"]
+mod h3;
 #[path = "metal_ltx.rs"]
 mod ltx;
 #[path = "metal_ltx_vae.rs"]
@@ -25,6 +27,8 @@ pub(crate) const SRC: &str = include_str!("metal_dit.metal");
 pub(crate) const MMA_SRC: &str = include_str!("metal_dit_mma.metal");
 /// LTX-2.5's row kernels (appended after `SRC`).
 pub(crate) const LTX_SRC: &str = include_str!("metal_ltx.metal");
+/// MiniMax-H3's row kernels (appended after `LTX_SRC`).
+pub(crate) const H3_SRC: &str = include_str!("metal_h3.metal");
 
 /// Blocks per command buffer (the GPU starts on the first while the rest is encoded).
 const BLOCKS_PER_CB: usize = 6;

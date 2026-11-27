@@ -938,6 +938,73 @@ the disk of these runs); requests whose activations do not fit beside two blocks
 then runs); the VAE decoder's tiles, which still go to the device one at a time (28 tiles per
 clip of latent frames at 1344x768, 66 s of the 525); a second prompt or seed at 1344x768.
 
+### On Metal
+
+On a Mac whose GPU has matrix units (M5), the transformer's 50 blocks, the video VAE decoder's 36
+and Sulphur-3's corrector run as whole passes on the GPU (`src/metal_h3.rs`,
+`src/metal_h3.metal`), one submission per forward (the blocks spread over a few command
+buffers): the packed sequence stays in float32 device buffers from the first block to the last,
+the projections run on the matrix-unit GEMMs of the diffusion-transformer plans (half inputs
+with a power of two per row), and the host keeps the text encoder and its refiner, the layers
+before and after the blocks, the AdaLN tables (one small product per block and step) and the
+schedule. It takes the formats of the runs on this page: bf16 as stored; int8 rows with a row
+scale (`int8_tensorwise`, and the W4A8 / W6A8 codes, decoded to int8 at load) through a Q8 twin
+that borrows the int8 bytes; ConvRot inputs rotated on the device (`dit_rot_half`); LoRA updates
+as side paths (`up (down x)` in float16, the rank padded to 64); mixed files (the Ref2VA hybrid's
+bf16 and int8 blocks); the float16 VAE (biases, scaled residuals, 64-wide heads); structure
+guidance's bypassed blocks. The corrector's float32 weights go to the GPU as two float16
+matrices each (`w = hi + lo`, 22 significant bits; 8 GB beside its 8 GB, made at its first
+step). Without matrix units, with `--device cpu` (load option `device=cpu` in the C API and the
+server; `Dit::gpu`, `VaeDecoder::gpu`, `Corrector::gpu` in the library) or with
+`OXINFER_H3_GPU=0` everything runs on the CPU as before. FP8 and NVFP4 files and MiniMax-H3-Image
+(the same blocks and image VAE, so they take the same path) were not run on it.
+
+Attention: 128-wide heads on the fused matrix-unit kernels, by default with queries and keys as
+hi + lo half pairs (`--attention split`, load option `attention`, `Dit::gpu_attention`): as exact
+as float32 operands at the speed of half ones; `--attention half` (half operands) and
+`--attention f32` are the others. The VAE's and the corrector's 64-wide heads run in float32.
+
+M5 Max, a `--profile ci` build, the kept Sulphur-3 caption embedding, 448x256, 22 frames (1208
+rows), seed 60, 20 Euler forwards at shifts 12 / 3, one run each under the benchmark lock (the
+CPU columns are the runs of [Sulphur-3](#runs)):
+
+| | CPU | Metal |
+|---|---|---|
+| one forward, `quantized/s3_w4a8` | 31.0 s | 1.7 s (1.6 to 1.9 s; 2.2 s the first) |
+| one forward, `s3` (pruned bf16) | 31.5 s | 2.0 s (the first 9.3 s: the 40 GB of weights paged in) |
+| the corrector, a step | 1.6 to 2.1 s (0.75 s alone) | 0.3 s (2.0 s the first: its float16 pairs made) |
+| video VAE decode, 22 frames | 11.2 to 16.8 s | 0.8 to 0.9 s |
+| `s3_w4a8` clip | 685 s | 41.9 s |
+| `s3` + `corrector2s` clip | 721 s | 64.6 s |
+| Comfy-Org's pruned int8 ConvRot + `minimax_S3_tuned_normal` LoRA clip | 685 s | 48.8 s |
+| the Ref2VA hybrid with one image reference (12 forwards, the text encoder included) | 424 s | 41.9 s |
+
+Five-second clips of the same caption (`s3_w4a8`, 124 frames, 37 latent frames), which the CPU
+did not run: at 448x256 (4908 rows) 10.4 s a forward, the VAE 6.5 s, the clip in 251 s (peak
+resident 35.5 GB); at 672x384 (10,088 rows) 46 s a forward (attention grows with the square of
+the rows), the VAE 25.7 s, the clip in 969 s (36.7 GB). Both show the caption's kitchen and
+woman, sharp and coherent through the clip, with more motion than the 22-frame clips (she walks
+towards the camera at 448x256, gestures with her arms at 672x384; sheets of every 16th frame).
+
+Against the CPU path (`h3_forward_bench` on the inputs a CPU run kept with `OXINFER_H3_DUMP`, the
+W4A8 file, relative L2 of the video / audio velocities):
+
+| forward | `split` (default) | `half` | `f32` |
+|---|---|---|---|
+| 1 | 7.3e-4 / 3.0e-4 (max abs 7.4e-3, mean \|v\| 1.24) | 1.1e-3 / 8.1e-4 | 6.2e-4 / 5.3e-4 |
+| 2 | 5.2e-4 / 5.8e-4 | 1.0e-3 / 1.3e-3 | 8.2e-4 / 4.4e-4 |
+| time | 1.67 to 1.85 s | 1.66 to 1.72 s | 1.85 to 2.04 s |
+
+What is left is the half-precision inputs of the projections (the attention's operands move it
+by a third at most). The corrector against its CPU path (`h3_corrector_check --time FILE 7 16 28
+350 --device gpu`, random inputs of the clip's shape): relative L2 1.7e-4 of the raw residual
+(max abs 1.3e-4, values up to 0.67), 0.19 to 0.22 s against 0.75 s. The video VAE decoder
+against its CPU path on the latents of the W4A8 clip (`h3_forward_bench vae`): relative L2
+1.0e-4 (max abs 3.3e-3, mean magnitude 0.85), 0.93 s against 11.7 s. The clips are the CPU clips'
+samples (the same seed): frame for frame the same scene and motion, 45.9 dB (W4A8), 45.0 dB (bf16 +
+corrector), 39.7 dB (the dancing LoRA clip) and 43.1 dB (Ref2VA) from the CPU files (PSNR of the
+H.264 frames); contact sheets of every third frame read by the model that ran this.
+
 ### Still not supported
 
 | files | why not |
@@ -1058,8 +1125,8 @@ the prompt.
 
 ### Runs
 
-On this machine's CPU (M5 Max, 18 cores, 128 GB; `--device cpu`, a release build; the
-transformer has no Metal path), every file mapped, the text encoder `Qwen3-VL-32B-Instruct-Q8_0.gguf`
+On this machine's CPU (M5 Max, 18 cores, 128 GB; `--device cpu`, a release build; the same runs
+on Metal take 42 to 65 s: [On Metal](#on-metal)), every file mapped, the text encoder `Qwen3-VL-32B-Instruct-Q8_0.gguf`
 (the 350-row JSON caption of the release's example workflow in 18.4 s; kept with
 `OXINFER_H3_PROMPT_EMBEDS`), the VAEs of `Comfy-Org/MiniMax-H3` (fp16 video, fp32 audio), 448x256,
 22 frames (7 latent frames: 784 video and 74 audio rows), seed 60, 20 Euler forwards (`--steps
@@ -1087,9 +1154,9 @@ at the camera with a smile. The first-frame clip starts on the given frame and c
 (the same woman, kitchen and framing, a slight smile and head turn). The corrector's capped residual is 0.49 of the velocity's RMS at the
 first step (the cap is 0.5), 0.33 to 0.37 in the middle and 0.04 at the end.
 
-Not done: a 5-second clip (124 frames; 4,682 rows: about 200 s a forward on this CPU by the
-earlier runs' scaling), the 1344x768 / 672x384 sizes of the release's workflows, any comparison with
-ComfyUI's own output (nothing here runs ComfyUI), the release's other files (`s3_raw`,
-`s3_ref2va`, `s3k8*`, the other LoRAs, `s3_corrector` itself: `corrector2s` was run, which has
-the same architecture and size; disk), the pack's corrector speed options and residual-shaping
-experiments, and the transformer on Metal.
+Not done: on the CPU a 5-second clip (124 frames: about 200 s a forward by the earlier runs'
+scaling; on Metal 448x256 and 672x384 were run, [On Metal](#on-metal)), the 1344x768 size of the
+release's workflows, any comparison with ComfyUI's own output (nothing here runs ComfyUI), the
+release's other files (`s3_raw`, `s3_ref2va`, `s3k8*`, the other LoRAs, `s3_corrector` itself:
+`corrector2s` was run, which has the same architecture and size; disk), and the pack's corrector
+speed options and residual-shaping experiments.

@@ -1,7 +1,8 @@
 //! What an accelerator needs to run a stack of MiniMax-H3's transformer blocks (the DiT's and the
 //! video VAE decoder's are the same block: RMS norm, a fused q / k / v projection, per-head
 //! query / key norms and RoPE, attention, a gated residual, then the same around a SwiGLU
-//! feed-forward), and the slot a model keeps its engine in. The engine is `cuda.rs`.
+//! feed-forward), and the slot a model keeps its engine in. The engine is `cuda.rs`; Metal runs the
+//! same stacks through `crate::gpu::dit::H3Session` (`src/metal_h3.rs`).
 
 #![cfg_attr(
     not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),

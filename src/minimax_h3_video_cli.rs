@@ -21,6 +21,7 @@
 //! `--corrector FILE` applies an H3 corrector (SulphurAI/Sulphur-3's `s3_corrector.safetensors`:
 //! `oxinfer::minimax_h3::corrector`) with `--corrector-strength`, `--corrector-budget`,
 //! `--corrector-floor`, `--corrector-start` and `--corrector-end`.
+//! `--attention split|half|f32` sets the operands of the Metal transformer's attention.
 //!
 //! `OXINFER_H3_PROMPT_EMBEDS=FILE` keeps the text encoder's output of a text-only prompt in FILE
 //! (written when missing, read when present), so the 63 GB text encoder and the 66 GB transformer
@@ -287,6 +288,10 @@ pub fn run(args: &Args) -> Result<()> {
     }
     for (k, v) in &args.h3_corrector_opts {
         pipe.corrector_settings.set(k, v)?;
+    }
+    if let Some(a) = &args.h3_attention {
+        pipe.dit.gpu_attention =
+            oxinfer::gpu::dit::AttnPrecision::parse(a).with_context(|| format!("--attention {a}: half, split or f32"))?;
     }
     // A turbo LoRA is distilled for a step count and a pair of shifts (its name says which).
     if let Some(t) = args.loras.iter().find_map(|l| oxinfer::minimax_h3::lora::turbo_settings(&l.path)) {

@@ -1279,6 +1279,9 @@ impl VideoPipeline {
         // On an accelerator the transformer's blocks make room for the decoder's, and those for
         // the next sampling's.
         self.dit.release_device();
+        if let Some(c) = &self.corrector {
+            c.release_device();
+        }
         let decoded = self.vae.decode_video(&lat, g.lt, g.lh, g.lw);
         self.vae.release_device();
         let (px, nf) = decoded?;
@@ -1443,7 +1446,9 @@ fn video_part(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
 /// and the shifts), `shift`, `audio_shift`, `corrector` (an H3 corrector file, e.g. Sulphur-3's
 /// `s3_corrector.safetensors`: [`super::corrector`]) and its `corrector_strength`,
 /// `corrector_budget`, `corrector_floor`, `corrector_start`, `corrector_end`
-/// ([`CorrectorSettings::set`]). Returns the pipeline and the step count a turbo LoRA
+/// ([`CorrectorSettings::set`]), `device` (`cpu`: the transformer, its VAE decoder and the corrector on the CPU
+/// even with a GPU) and `attention` (the Metal transformer's attention operands: `split`, the
+/// default, `half` or `f32`). Returns the pipeline and the step count a turbo LoRA
 /// is distilled for.
 pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Path>) -> Result<(VideoPipeline, Option<usize>)> {
     use crate::model::Quant;
@@ -1462,6 +1467,7 @@ pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Pa
     };
     let (mut te, mut loras, mut shift, mut audio_shift) = (None, Vec::new(), None, None);
     let (mut corrector, mut corr_settings) = (None, CorrectorSettings::default());
+    let (mut gpu, mut attention) = (true, None);
     let num = |k: &str, v: &str| -> Result<f32> { v.parse().with_context(|| format!("{k}: not a number: {v:?}")) };
     for (k, v) in opts {
         match *k {
@@ -1484,9 +1490,13 @@ pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Pa
             "shift" => shift = Some(num(k, v)?),
             "audio_shift" => audio_shift = Some(num(k, v)?),
             "corrector" => corrector = Some(video_part(v, cache_dir)?),
+            "device" => gpu = !v.eq_ignore_ascii_case("cpu"),
+            "attention" | "gpu_attention" => {
+                attention = Some(crate::gpu::dit::AttnPrecision::parse(v).with_context(|| format!("{k}: {v:?} (half, split, f32)"))?)
+            }
             k if corr_settings.set(k, v)? => {}
             k => bail!(
-                "unknown MiniMax-H3 option {k:?} (text_encoder, transformer, vae, audio_vae, quant, lora, shift, audio_shift, corrector, corrector_strength, corrector_budget, corrector_floor, corrector_start, corrector_end)"
+                "unknown MiniMax-H3 option {k:?} (text_encoder, transformer, vae, audio_vae, quant, lora, shift, audio_shift, corrector, corrector_strength, corrector_budget, corrector_floor, corrector_start, corrector_end, device, attention)"
             ),
         }
     }
@@ -1500,6 +1510,14 @@ pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Pa
     let mut pipe = VideoPipeline::load_from(&s)?;
     if let Some(c) = &corrector {
         pipe.load_corrector(c)?;
+    }
+    pipe.dit.gpu = gpu;
+    pipe.vae.gpu = gpu;
+    if let Some(a) = attention {
+        pipe.dit.gpu_attention = a;
+    }
+    if let Some(c) = &mut pipe.corrector {
+        c.gpu = gpu;
     }
     pipe.corrector_settings = corr_settings;
     for line in pipe.apply_loras(&loras)? {

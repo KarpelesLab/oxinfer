@@ -5475,7 +5475,7 @@ other (see [Stable Diffusion XL](stable-diffusion.md#stable-diffusion-xl)).
 
 ## Video generation on the CPU (MiniMax-H3 / Sulphur-3)
 
-MiniMax-H3's transformer runs on the CPU here (its device engine is CUDA's,
+With `--device cpu` (on Metal: the table after this one; on CUDA:
 [video.md](video.md#on-cuda)). M5 Max, 18 cores, a 448x256 clip of 22 frames (784 video + 74
 audio + 350 text rows), 20 Euler forwards, one run each under the benchmark lock
 ([video.md](video.md#sulphur-3) has the setup and the clips):
@@ -5490,6 +5490,17 @@ audio + 350 text rows), 20 Euler forwards, one run each under the benchmark lock
 Of a bf16 forward (`--profile`, 20 forwards): the four projections 88% (`qkv_proj` 164 s,
 `fc1` 216 s, `fc2` 121 s, `out_proj` 55 s), attention 57 s; the W4A8 file splits the same way
 (its int8 rows cost what bf16 rows do: products are float32 on decoded rows).
+
+On Metal (the transformer, the video VAE decoder and the corrector as whole GPU passes,
+[video.md](video.md#on-metal); a `--profile ci` build, the same requests):
+
+| transformer | a forward | the clip | against the CPU |
+|---|---|---|---|
+| `quantized/s3_w4a8` | 1.7 s | 41.9 s | 16x (velocities within 7.3e-4) |
+| `s3` with the corrector (0.3 s a step) | 2.0 s | 64.6 s | 11x |
+| Comfy-Org's int8 ConvRot + LoRA | 1.8 s | 48.8 s | 14x |
+| the Ref2VA hybrid, one reference (text encoder included) | 1.6 to 1.8 s | 41.9 s | 10x |
+| `s3_w4a8`, 448x256, 124 frames (4908 rows) | 10.4 s | 251 s | || `s3_w4a8`, 672x384, 124 frames (10,088 rows) | 46 s | 969 s | |
 
 ## Speech to text against whisper.cpp
 
