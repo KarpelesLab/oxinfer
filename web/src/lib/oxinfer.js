@@ -881,6 +881,11 @@ export class Oxinfer {
     this.ex.web_set_sampling(temperature, topK, topP, BigInt(seed));
   }
 
+  /// No n-gram of `n` tokens twice in the conversation (0: off; transformers' no_repeat_ngram_size).
+  setNoRepeatNgram(n = 0) {
+    if (this.ex.web_set_no_repeat_ngram) this.ex.web_set_no_repeat_ngram(n >>> 0);
+  }
+
   reset() { this.ex.web_reset(); }
 
   /// Runs the prefill for a user turn; resolves to the number of prompt tokens.

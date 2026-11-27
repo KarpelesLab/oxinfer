@@ -262,8 +262,9 @@ pub unsafe extern "C" fn oxi_engine_set(e: *mut OxiEngine, key: *const c_char, v
             "seed" => s.seed = v.parse().map_err(|_| anyhow!("seed: expected an integer, got {v:?}"))?,
             "repetition_penalty" => s.repetition_penalty = num("a number")? as f32,
             "min_p" => s.min_p = num("a number")? as f32,
+            "no_repeat_ngram" | "no_repeat_ngram_size" => g.config_mut().no_repeat_ngram = num("a count")? as usize,
             _ => bail!(
-                "unknown setting {key:?} (system, think, max_tokens, response_format, temperature, top_k, top_p, min_p, seed, repetition_penalty)"
+                "unknown setting {key:?} (system, think, max_tokens, response_format, temperature, top_k, top_p, min_p, seed, repetition_penalty, no_repeat_ngram)"
             ),
         }
         if s != g.sampling() {

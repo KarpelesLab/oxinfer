@@ -82,6 +82,8 @@ impl ModelSpec {
     /// - `max_tokens`: reply length when a request sets none (default 4096);
     /// - `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`: sampling defaults
     ///   (OpenAI's: temperature 1, top-p 1, no top-k, no min-p);
+    /// - `no_repeat_ngram`: the n-gram ban when a request sets no `no_repeat_ngram_size`
+    ///   (default 0: off);
     /// - `prompt_name`: embedding models, the named prompt used when a request names none;
     /// - `memory_gb`: the memory the model is counted for (default: estimated from its files);
     /// - `parallel`: chat models, the conversations run at once (default
@@ -102,6 +104,7 @@ impl ModelSpec {
         "top_k",
         "min_p",
         "repetition_penalty",
+        "no_repeat_ngram",
         "prompt_name",
         "memory_gb",
         "parallel",

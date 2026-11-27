@@ -6,7 +6,7 @@
 //   session.reset()    starts a new conversation
 //
 // settings: { images: [{ url, kind: 'image' | 'audio' | 'video', name }], system, think,
-//             maxTokens, temperature, topP, tools }
+//             maxTokens, temperature, topP, noRepeatNgram, tools }
 // hooks:    { onText(text, thinking), onTool(call) -> Promise<result text>, onNextReply(),
 //             onStage(text) }
 import { TOOL_SPECS, runTool } from './tools.js';
@@ -34,6 +34,7 @@ export class WasmChat {
     this.stopRequested = false;
     this.setTools(!!s.tools);
     engine.setSampling({ temperature: s.temperature, topK: 64, topP: s.topP ?? 0.95, seed: Date.now() % 1e9 });
+    engine.setNoRepeatNgram(s.noRepeatNgram || 0);
     const t0 = performance.now();
     const promptTokens = await engine.chatTurn(text, { system: s.system || null, think: s.think, maxTokens: s.maxTokens });
     const t1 = performance.now();
@@ -136,6 +137,7 @@ export class HttpChat {
             max_tokens: s.maxTokens,
             temperature: s.temperature,
             top_p: s.topP,
+            ...(s.noRepeatNgram > 0 ? { no_repeat_ngram_size: s.noRepeatNgram } : {}),
             reasoning_effort: s.think ? 'medium' : 'none',
             tools,
           },

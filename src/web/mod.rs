@@ -91,6 +91,10 @@ struct Engine {
     tools: Vec<crate::tools::ToolSpec>,
     /// The token that opens a tool call; reply text is shown up to it.
     call_token: Option<u32>,
+    /// `web_set_no_repeat_ngram`: no n-gram of this many tokens twice (0: off).
+    no_repeat_ngram: usize,
+    /// Every token of the conversation (fed and generated), for the n-gram ban.
+    history: Vec<u32>,
 }
 
 thread_local! {
@@ -240,6 +244,8 @@ fn load(dir: &Path, quant: u32, gpu: bool, prefill_chunk: usize) -> Result<Engin
         text: String::new(),
         tools: Vec::new(),
         call_token: None,
+        no_repeat_ngram: 0,
+        history: Vec::new(),
     })
     .map(|mut e| {
         e.call_token = e.tok.token_to_id(e.lm.fmt().tool_call_marker());
@@ -257,12 +263,24 @@ pub extern "C" fn web_set_sampling(temperature: f32, top_k: u32, top_p: f32, see
     });
 }
 
+/// Bans repeated n-grams of `n` tokens in the following replies, the conversation's tokens
+/// included (transformers' `no_repeat_ngram_size`; 0: off).
+#[unsafe(no_mangle)]
+pub extern "C" fn web_set_no_repeat_ngram(n: u32) {
+    ENGINE.with(|g| {
+        if let Some(e) = g.borrow_mut().as_mut() {
+            e.no_repeat_ngram = n as usize;
+        }
+    });
+}
+
 /// Starts a new conversation (drops the KV cache).
 #[unsafe(no_mangle)]
 pub extern "C" fn web_reset() {
     ENGINE.with(|g| {
         if let Some(e) = g.borrow_mut().as_mut() {
             e.lm.reset();
+            e.history.clear();
             e.turns = 0;
             e.logits.clear();
             e.out.clear();
@@ -318,9 +336,7 @@ impl Engine {
             .to_vec();
         self.out.clear();
         self.logits.clear();
-        for c in ids.chunks(self.prefill_chunk) {
-            self.logits = self.lm.forward(c);
-        }
+        self.feed(&ids);
         self.turns += 1;
         self.max_tokens = max_tokens;
         self.think = think;
@@ -334,6 +350,7 @@ impl Engine {
             return None;
         }
         let id = self.sampler.sample(&self.logits);
+        self.history.push(id);
         if self.eos.contains(&id) {
             // Keep it in `out` so the next turn knows the model turn is closed, but do not emit it.
             self.out.push(id);
@@ -373,10 +390,21 @@ impl Engine {
             .to_vec();
         self.out.clear();
         self.logits.clear();
+        self.feed(&ids);
+        Ok(ids.len())
+    }
+
+    /// Runs `ids` through the model; with the n-gram ban, the sampler then bans the n-grams of
+    /// the conversation so far.
+    fn feed(&mut self, ids: &[u32]) {
         for c in ids.chunks(self.prefill_chunk) {
             self.logits = self.lm.forward(c);
         }
-        Ok(ids.len())
+        self.history.extend_from_slice(ids);
+        let guide = (self.no_repeat_ngram > 0).then(|| {
+            Box::new(crate::sampler::NoRepeatNgram::new(self.no_repeat_ngram, &self.history, None)) as Box<dyn crate::sampler::TokenFilter>
+        });
+        self.sampler.set_guide(guide, None);
     }
 }
 

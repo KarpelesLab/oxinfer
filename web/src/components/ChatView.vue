@@ -28,6 +28,7 @@ const messages = ref([]); // { role: 'user' | 'model' | 'tool', text, thinking, 
 const draft = ref(props.initialDraft);
 const temperature = ref(props.initialTemperature);
 const topP = ref(0.95);
+const noRepeatNgram = ref(0);
 const maxTokens = ref(props.initialMaxTokens);
 const think = ref(false);
 const useTools = ref(props.initialTools);
@@ -95,7 +96,7 @@ async function send() {
   try {
     stats.value = await props.session.send(
       text,
-      { images: media, system: systemText.value.trim(), think: think.value, maxTokens: maxTokens.value, temperature: temperature.value, topP: topP.value, tools: useTools.value },
+      { images: media, system: systemText.value.trim(), think: think.value, maxTokens: maxTokens.value, temperature: temperature.value, topP: topP.value, noRepeatNgram: noRepeatNgram.value, tools: useTools.value },
       {
         onText(t, thinking) {
           reply.text = t;
@@ -205,6 +206,7 @@ defineExpose({ newConversation, send, draft, messages, useTools });
         <summary>Settings</summary>
         <label class="inline">Temperature <input v-model.number="temperature" class="num" type="number" min="0" max="2" step="0.1" /></label>
         <label v-if="native" class="inline">Top-p <input v-model.number="topP" class="num" type="number" min="0.05" max="1" step="0.05" /></label>
+        <label class="inline" title="No run of this many tokens appears twice in the conversation (0: off)">No repeated runs of <input v-model.number="noRepeatNgram" class="num" type="number" min="0" max="64" step="1" /> tokens</label>
         <label class="inline">Longest reply <input v-model.number="maxTokens" class="num" type="number" min="1" max="32768" step="1" /> tokens</label>
         <label class="inline"><input v-model="think" type="checkbox" /> Let the model think first</label>
         <label class="inline"><input v-model="useTools" type="checkbox" @change="onToolsChange" /> Let the model use tools</label>

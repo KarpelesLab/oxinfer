@@ -51,6 +51,9 @@ struct Gen {
     progress: bool,
     /// Log probabilities with this many alternatives per token.
     logprobs: Option<usize>,
+    /// `no_repeat_ngram_size` (an extension, as transformers' `generate`): no n-gram of this
+    /// many tokens twice in the context, the prompt included (0: off).
+    no_repeat_ngram: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +153,13 @@ impl Gen {
         if min_p.is_some_and(|p| !(0.0..=1.0).contains(&p)) {
             return Err(ApiError::bad("min_p must be between 0 and 1").param("min_p"));
         }
+        let no_repeat_ngram = match num(v, "no_repeat_ngram_size")? {
+            None => None,
+            Some(n) if n >= 0.0 && n.fract() == 0.0 && n <= 1e6 => Some(n as usize),
+            Some(_) => {
+                return Err(ApiError::bad("no_repeat_ngram_size must be a non-negative integer").param("no_repeat_ngram_size"));
+            }
+        };
         Ok(Self {
             temperature: temperature.map(|t| t as f32),
             top_p: top_p.map(|p| p as f32),
@@ -168,7 +178,16 @@ impl Gen {
             include_usage: v.pointer("/stream_options/include_usage").and_then(Value::as_bool).unwrap_or(false),
             progress: v.pointer("/stream_options/progress").and_then(Value::as_bool).unwrap_or(false),
             logprobs,
+            no_repeat_ngram,
         })
+    }
+
+    /// The n-gram ban: the request's `no_repeat_ngram_size` over the model's `no_repeat_ngram`
+    /// option (default off).
+    fn no_repeat_ngram(&self, spec: &super::ModelSpec) -> usize {
+        self.no_repeat_ngram
+            .or_else(|| spec.option("no_repeat_ngram").and_then(|v| v.parse().ok()))
+            .unwrap_or(0)
     }
 
     /// The sampler for choice `i`, the request's values over the model's defaults (the `temperature`,
@@ -751,6 +770,7 @@ fn run_chat(api: &Api, req: &ChatRequest, id: &str, emit: Emit, on: Option<OnSta
     c.response_format = req.response_format.clone();
     c.tool_choice = req.tool_choice.clone();
     c.logprobs = req.params.logprobs;
+    c.no_repeat_ngram = req.params.no_repeat_ngram(&spec);
     let seed = req.params.seed.unwrap_or_else(random_seed);
     let mut out = Vec::new();
     for i in 0..req.params.n {
@@ -1211,6 +1231,7 @@ fn anthropic_to_openai(v: &Value, signer: Option<&super::sign::ThinkingSigner>) 
         ("temperature", "temperature"),
         ("top_p", "top_p"),
         ("top_k", "top_k"),
+        ("no_repeat_ngram_size", "no_repeat_ngram_size"),
         ("stop_sequences", "stop"),
         ("stream", "stream"),
     ] {
@@ -1695,6 +1716,7 @@ impl Completion {
         c.response_format = ResponseFormat::Text;
         c.tool_choice = ToolChoice::Auto;
         c.logprobs = self.params.logprobs;
+        c.no_repeat_ngram = self.params.no_repeat_ngram(&spec);
         let seed = self.params.seed.unwrap_or_else(random_seed);
         let mut out = Vec::new();
         for p in &self.prompts {
@@ -2007,6 +2029,15 @@ mod tests {
         // Completions take the number of alternatives.
         assert_eq!(Gen::parse(&json!({"logprobs": 3}), 1).unwrap().logprobs, Some(3));
         assert!(Gen::parse(&json!({"logprobs": 99}), 1).is_err());
+        assert_eq!(Gen::parse(&json!({"no_repeat_ngram_size": 5}), 1).unwrap().no_repeat_ngram, Some(5));
+        assert!(Gen::parse(&json!({"no_repeat_ngram_size": -1}), 1).is_err());
+        assert!(Gen::parse(&json!({"no_repeat_ngram_size": 2.5}), 1).is_err());
+        let spec = super::super::ModelSpec::parse("m=x/y,no_repeat_ngram=4").unwrap();
+        assert_eq!(Gen::parse(&json!({}), 1).unwrap().no_repeat_ngram(&spec), 4);
+        assert_eq!(
+            Gen::parse(&json!({"no_repeat_ngram_size": 0}), 1).unwrap().no_repeat_ngram(&spec),
+            0
+        );
     }
 
     #[test]

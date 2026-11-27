@@ -248,6 +248,8 @@ struct Args {
     decode_codes: Option<PathBuf>,
     repetition_penalty: Option<f32>,
     min_p: f32,
+    /// `--no-repeat-ngram N`: no N tokens twice in the context (0: off).
+    no_repeat_ngram: usize,
     // Set explicitly (text to speech has its own defaults).
     temperature_set: Option<f32>,
     top_p_set: Option<f32>,
@@ -292,6 +294,8 @@ fn usage() -> ! {
          \x20 --top-k N            top-k (default 64)\n\
          \x20 --top-p F            top-p (default 0.95)\n\
          \x20 --min-p F            min-p: cut tokens less likely than F times the most likely (default 0)\n\
+         \x20 --no-repeat-ngram N  no N tokens twice in the context, the prompt included (transformers'\n\
+         \x20                      no_repeat_ngram_size; default 0: off)\n\
          \x20 --seed N             RNG seed\n\
          \x20 --threads N          worker threads (default: all cores)\n\
          \x20 --qos C              thread QoS on Apple platforms: interactive (default), initiated,\n\
@@ -902,6 +906,7 @@ fn parse_args() -> Result<Args> {
         decode_codes: None,
         repetition_penalty: None,
         min_p: 0.0,
+        no_repeat_ngram: 0,
         temperature_set: None,
         top_p_set: None,
         max_tokens_set: None,
@@ -1250,6 +1255,7 @@ fn parse_args() -> Result<Args> {
             "--decode-codes" => a.decode_codes = Some(PathBuf::from(val()?)),
             "--repetition-penalty" | "--repeat-penalty" => a.repetition_penalty = Some(val()?.parse()?),
             "--min-p" => a.min_p = val()?.parse()?,
+            "--no-repeat-ngram" => a.no_repeat_ngram = val()?.parse()?,
             "-h" | "--help" => usage(),
             _ if a.iv.parse(&k, &mut val)? => {}
             _ if a.moss.parse(&k, &mut val)? => {}
@@ -1397,6 +1403,7 @@ fn generate<M: oxinfer::dspark::Target>(
     fed: &[u32],
 ) -> (Vec<u32>, usize, f64) {
     let mut printer = Printer::new(fmt, think, tok);
+    ngram_begin(sampler, fed);
     let stream = STREAM.lock().unwrap().clone();
     let trace = TRACE.load(std::sync::atomic::Ordering::Relaxed);
     let s_start = stream.as_ref().map(|s| s.stats());
@@ -1442,6 +1449,7 @@ fn generate<M: oxinfer::dspark::Target>(
         }),
     };
     drop(lookup);
+    ngram_end(sampler, &d.tokens);
     printer.finish(tok, &d.tokens, eos);
     if let (Some(s), Some(s0)) = (&stream, s_start) {
         let st = s.stats() - s0;
@@ -1756,6 +1764,7 @@ fn run_session(args: &Args) -> Result<()> {
     };
     c.think = args.think;
     c.max_tokens = args.max_tokens;
+    c.no_repeat_ngram = args.no_repeat_ngram;
     e.set_sampling(SamplingParams {
         temperature: args.temperature,
         top_k: args.top_k,
@@ -1968,6 +1977,7 @@ fn run_decide(args: &Args) -> Result<()> {
 
 fn run(mut args: Args) -> Result<()> {
     *LOOKUP.lock().unwrap() = make_lookup(&args, &[]);
+    *NGRAM.lock().unwrap() = (args.no_repeat_ngram, Vec::new());
     // ANEMLL models (meta.yaml + compiled Core ML parts) run on Core ML, not on our kernels.
     #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
     if anemll_cli::detect(&args.model) {
@@ -3562,6 +3572,29 @@ static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new
 /// tokens.
 static LOOKUP: std::sync::Mutex<Option<oxinfer::lookup::Lookup>> = std::sync::Mutex::new(None);
 
+/// `--no-repeat-ngram`: the size of the banned n-grams (0: off) and the tokens of the context so
+/// far (what was fed and generated, across the turns of a chat).
+static NGRAM: std::sync::Mutex<(usize, Vec<u32>)> = std::sync::Mutex::new((0, Vec::new()));
+
+/// Before a reply: `fed` joins the context and the sampler bans the n-grams in it.
+fn ngram_begin(sampler: &mut Sampler, fed: &[u32]) {
+    let mut g = NGRAM.lock().unwrap();
+    if g.0 > 0 {
+        g.1.extend_from_slice(fed);
+        let f = oxinfer::sampler::NoRepeatNgram::new(g.0, &g.1, None);
+        sampler.set_guide(Some(Box::new(f)), None);
+    }
+}
+
+/// After a reply: its tokens join the context.
+fn ngram_end(sampler: &mut Sampler, tokens: &[u32]) {
+    let mut g = NGRAM.lock().unwrap();
+    if g.0 > 0 {
+        g.1.extend_from_slice(tokens);
+        sampler.set_guide(None, None);
+    }
+}
+
 /// The prompt-lookup drafter the options ask for.
 fn make_lookup(args: &Args, stop: &[u32]) -> Option<oxinfer::lookup::Lookup> {
     args.lookup.unwrap_or(oxinfer::lookup::BY_DEFAULT).then(|| {
@@ -3819,6 +3852,7 @@ fn run_qwen_mtp(
         let s0 = stream.map(|s| s.stats());
         let mut printer = Printer::new(fmt, args.think, tok);
         let (mut s_last, mut t_last, mut n_last) = (s0, Instant::now(), 0usize);
+        ngram_begin(&mut sampler, &ids);
         let d = generate::decode_mtp(dec, &logits, &mut sampler, eos, args.max_tokens, &mut |out| {
             // A round commits several tokens at once: report when its reads show up.
             if let (true, Some(s), Some(sl)) = (args.stream_trace, stream, &s_last) {
@@ -3832,6 +3866,7 @@ fn run_qwen_mtp(
             printer.print(tok, out)
         });
         let out = d.tokens;
+        ngram_end(&mut sampler, &out);
         let decode_secs = d.secs;
         printer.finish(tok, &out, eos);
         if args.show_tokens {
@@ -4026,9 +4061,11 @@ fn run_dspark<M: oxinfer::dspark::Target<Sess: Clone>>(
         let before = dec.stats.clone();
         let s0 = stream.map(|s| s.stats());
         let mut printer = Printer::new(fmt, args.think, tok);
+        ngram_begin(&mut sampler, &ids);
         let d = generate::decode_rounds(dec, &logits, &mut sampler, eos, args.max_tokens, &mut |out| printer.print(tok, out));
         unfed = d.unfed;
         let out = d.tokens;
+        ngram_end(&mut sampler, &out);
         printer.finish(tok, &out, eos);
         if args.show_tokens {
             eprintln!("[output ids: {out:?}]");
@@ -4250,6 +4287,9 @@ fn run_gemma_loaded(args: &Args, model: &Model, files: &safetensors::ModelFiles,
             }
             if args.temperature > 0.0 {
                 eprintln!("[note: speculative decoding is greedy; --temp ignored]");
+            }
+            if args.no_repeat_ngram > 0 {
+                bail!("--no-repeat-ngram does not go with the Gemma 4 drafter (--draft), which decodes greedily without the sampler");
             }
             eprintln!(
                 "[drafter loaded: {} layers, hidden {}, {} draft tokens/round]",
