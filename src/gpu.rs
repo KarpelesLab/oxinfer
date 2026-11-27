@@ -14,6 +14,8 @@ pub mod decode;
 pub mod dit;
 #[path = "gpu_unet.rs"]
 pub mod unet;
+#[path = "gpu_vi.rs"]
+pub mod vi;
 #[path = "gpu_whisper.rs"]
 pub mod whisper;
 
@@ -301,6 +303,11 @@ pub trait Backend: Send + Sync {
     /// A session running whole Whisper encoder passes on the device (see [`whisper`]); None when
     /// the backend has none.
     fn whisper_session(&'static self) -> Option<Box<dyn whisper::Session>> {
+        None
+    }
+    /// The realtime voice isolator's weights uploaded for whole stream steps on the device (see
+    /// [`vi`]); None when the backend has none.
+    fn vi_device(&'static self, _m: &vi::Model) -> Option<std::sync::Arc<dyn vi::Device>> {
         None
     }
     /// See [`AttnJob`]. False when the backend does not run it (the caller then does).

@@ -84,6 +84,19 @@ CLI do. `window_frames: 0` gives the plain stream (the attention over its whole 
 output equals a whole-clip causal pass. Neither depends on how the audio is pushed, and
 `isolate` with the realtime checkpoint runs this stream over the clip (in blocks of 64 frames).
 
+On Metal a stream's steps run whole on the GPU (`src/metal_vi.rs`, `src/metal_vi.metal`, through
+`gpu::vi`): the realtime checkpoint's weights go up once (f32), each stream keeps both lanes'
+states on the device (the time attention's keys and values, the time Mambas' conv tails and scan
+states, double-buffered so a failed step leaves them as they were), and a step runs the band
+encoders, every block of each lane (one lane, two during a crossfade) and the decoder heads in
+one command buffer, all in f32 with the CPU's exponential and erf: projections on SIMD-group
+matrix GEMMs (16 outputs a threadgroup, K split over the four SIMD-groups), the LayerNorms,
+rotary positions, the attention over the cache (one threadgroup a query), the conv and the
+selective scan in kernels of their own. Only the spectra go up and the decoder outputs come back;
+the STFT, the overlap-add and the cache bookkeeping (growth, compaction) stay on the CPU. Should
+a step fail, the stream carries on on the CPU from the states the GPU held. `--device cpu` (load
+option `device=cpu`) keeps it on the CPU, as does `OXINFER_VI_GPU=0`.
+
 ## Accuracy
 
 Against the reference package (torch 2.15 CPU, float32) on the repository's
@@ -92,7 +105,10 @@ Against the reference package (torch 2.15 CPU, float32) on the repository's
 | | max abs difference | SNR of the difference |
 |---|---|---|
 | offline (`voice-isolator-v1`, two 8 s windows) | 4.2e-7 | 126.7 dB |
-| streaming, default windows, look-ahead 2, 20 ms pushes | 3.0e-7 | 131.6 dB |
+| streaming, default windows, look-ahead 2, 20 ms pushes, CPU | 3.0e-7 | 131.6 dB |
+| the same, Metal | 2.4e-7 | 131.7 dB |
+| plain stream (`window_frames 0`), 20 ms pushes, Metal | 2.5e-7 | 131.3 dB |
+| whole clip (`isolate`, 64-frame blocks), Metal | 2.4e-7 | 131.9 dB |
 
 `tests` in `src/voice_isolator.rs` check the band layout against the reference's, the FFT, the
 offline windows and that the stream's output does not depend on the pushes or the block size
@@ -103,14 +119,18 @@ offline windows and that the stream's output does not depend on the pushes or th
 M5 Max (18 cores), sample_14.wav (10.8 s), under `tools/bench/with-lock.sh` on a machine shared
 with other builds:
 
-| | Metal (per-op GPU matmuls and attention, scan on the CPU) | CPU |
+| | Metal | CPU |
 |---|---|---|
-| offline | 4.5 s (2.4x real time) | 7.6 s (1.4x) |
-| realtime checkpoint, whole clip (`isolate`, 64-frame blocks) | 5.8 s (1.9x) | 6.2 s (1.7x) |
-| realtime checkpoint, 20 ms pushes | 11.2 s (1.0x; slowest push 59 ms) | 11.3 s (0.9x) |
+| offline (per-op GPU matmuls and attention, scan on the CPU) | 4.5 s (2.4x real time) | 7.6 s (1.4x) |
+| realtime checkpoint, whole clip (`isolate`, 64-frame blocks; whole steps on the GPU) | 1.12 s (9.7x) | 7.3 s (1.5x) |
+| realtime checkpoint, 20 ms pushes, default windows | 2.63 s (4.1x; slowest push 34 ms) | 12.5 s (0.9x; 81 ms) |
+| realtime checkpoint, 20 ms pushes, plain stream | 2.63 s (4.1x; slowest push 48 ms) | 9.9 s (1.1x; 72 ms) |
 
-The reference package takes 297 s offline and 555 s streaming on the same machine (its selective
-scan runs frame by frame in Python on the CPU). A live stream on this machine runs at about real
-time on the CPU: each 20 ms push computes two frames (92 tokens) through every layer; the matmuls
-(6 ms of each 10 ms frame) dominate. A whole-pass Metal implementation of the stream is the next
-step to give it headroom.
+A 20 ms push computes two frames (92 tokens) through every layer. On the GPU such a step takes
+4.5 ms (median of the command buffers' GPU time) with one lane and 8.7 ms (90th percentile) during
+the crossfades, where both lanes run, against 20 ms of audio; the matmuls are most of it (the
+attention about 0.8 ms, the other kernels 0.6 ms). The slowest pushes are the plain stream's cache
+compactions (every 600 frames: 1200 slots of keys moved and rotated back on the CPU) and moments
+where the shared GPU was busy. On the CPU a live stream runs at about real time (the matmuls of 92
+rows dominate). The reference package takes 297 s offline and 555 s streaming on the same machine
+(its selective scan runs frame by frame in Python on the CPU).

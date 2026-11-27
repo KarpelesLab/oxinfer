@@ -60,6 +60,8 @@ pub(crate) mod inkling_draft;
 mod prefill;
 #[path = "metal_unet.rs"]
 mod unet;
+#[path = "metal_vi.rs"]
+mod vi;
 #[path = "metal_whisper.rs"]
 mod whisper;
 
@@ -2484,7 +2486,8 @@ impl MetalBackend {
             decode::shader_src(),
             dit::SRC
         ) + dit::LTX_SRC
-            + dit::H3_SRC;
+            + dit::H3_SRC
+            + vi::SRC;
         let compile = |src: &str, metal4: bool| -> Result<Id> {
             let src = CString::new(src)?;
             let ns_src = unsafe { msg_str(nsstring_cls, o.sel(c"stringWithUTF8String:"), src.as_ptr()) };
@@ -4511,6 +4514,10 @@ impl Backend for MetalBackend {
 
     fn whisper_session(&'static self) -> Option<Box<dyn crate::gpu::whisper::Session>> {
         self.whisper_session_impl()
+    }
+
+    fn vi_device(&'static self, m: &crate::gpu::vi::Model) -> Option<std::sync::Arc<dyn crate::gpu::vi::Device>> {
+        self.vi_device_impl(m)
     }
 
     fn attention_cached(&self, j: &mut crate::gpu::AttnJob) -> bool {

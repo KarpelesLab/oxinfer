@@ -34,9 +34,13 @@
 //!
 //! Everything runs in f32 (the reference's precision off CUDA); the matrices stay f32 by default
 //! (`IsolatorOptions::f32_weights`) and run through the shared matmul driver (the GPU backend
-//! for large inputs). The selective scan runs on the CPU (vectorized over the 16 states).
+//! for large inputs). The selective scan runs on the CPU (vectorized over the 16 states). With an
+//! accelerator that has them ([`crate::gpu::vi`]: Metal), a stream's steps run whole on the
+//! device instead (encoders, every block of each lane, decoder heads in one submission, the
+//! lanes' states kept there), still in f32.
 
 use crate::ggml::{GgmlType, GgufMatrix};
+use crate::gpu::vi;
 use crate::kernels::{dot, dots, fast_exp, for_chunks, weighted_values};
 use crate::model::{Lin, linear};
 use crate::platform::DevicePref;
@@ -383,6 +387,32 @@ impl Dense {
         Ok(Self { w, b, n_out, n_in })
     }
 
+    /// The weights as f32 `[n_out][n_in]` (borrowed when stored as f32).
+    fn f32w(&self) -> std::borrow::Cow<'_, [f32]> {
+        match &self.w.w {
+            crate::model::Weight::Bf16(v, _) => v.iter().map(|&u| f32::from_bits((u as u32) << 16)).collect(),
+            crate::model::Weight::Gguf(m) if m.kind == GgmlType::F32 && !m.x4 && (m.data.as_ptr() as usize).is_multiple_of(4) => {
+                // SAFETY: the matrix's bytes are n_out * n_in little-endian f32, aligned.
+                std::borrow::Cow::Borrowed(unsafe { std::slice::from_raw_parts(m.data.as_ptr() as *const f32, m.data.len() / 4) })
+            }
+            crate::model::Weight::Gguf(m) => {
+                let mut v = vec![0f32; self.n_out * self.n_in];
+                m.dequantize_rows(0, self.n_out, &mut v);
+                v.into()
+            }
+            _ => unreachable!("voice isolator weights are f32 or bf16"),
+        }
+    }
+
+    fn dev(&self) -> vi::Dense<'_> {
+        vi::Dense {
+            w: self.f32w(),
+            b: self.b.as_deref(),
+            n_out: self.n_out,
+            n_in: self.n_in,
+        }
+    }
+
     /// `x` `[t, n_in]` -> `[t, n_out]`.
     fn fwd(&self, x: &[f32], t: usize) -> Vec<f32> {
         let _p = crate::prof::phase(0, "vi matmul");
@@ -430,6 +460,10 @@ impl Norm {
 
     fn row(&self, x: &[f32], out: &mut [f32]) {
         layer_norm(x, &self.w, &self.b, out);
+    }
+
+    fn dev(&self) -> vi::Norm<'_> {
+        vi::Norm { w: &self.w, b: &self.b }
     }
 
     fn fwd(&self, x: &[f32]) -> Vec<f32> {
@@ -579,9 +613,29 @@ impl Rope {
     fn rotate(&self, v: &mut [f32], pos: usize, sign: f32) {
         let half = self.inv.len();
         for i in 0..half {
-            let a = pos as f32 * self.inv[i];
-            let (s, c) = (a as f64).sin_cos();
+            let (s, c) = ((pos as f32 * self.inv[i]) as f64).sin_cos();
             let (s, c) = (sign * s as f32, c as f32);
+            let (x1, x2) = (v[i], v[i + half]);
+            v[i] = x1 * c - x2 * s;
+            v[i + half] = x1 * s + x2 * c;
+        }
+    }
+
+    /// The `(cos, sign * sin)` pairs of position `pos`.
+    fn table(&self, pos: usize, sign: f32) -> Vec<(f32, f32)> {
+        self.inv
+            .iter()
+            .map(|&f| {
+                let (s, c) = ((pos as f32 * f) as f64).sin_cos();
+                (c as f32, sign * s as f32)
+            })
+            .collect()
+    }
+
+    /// Rotates `v` by a [`Self::table`].
+    fn apply(tab: &[(f32, f32)], v: &mut [f32]) {
+        let half = tab.len();
+        for (i, &(c, s)) in tab.iter().enumerate() {
             let (x1, x2) = (v[i], v[i + half]);
             v[i] = x1 * c - x2 * s;
             v[i + half] = x1 * s + x2 * c;
@@ -663,12 +717,13 @@ impl KvCache {
             return;
         }
         let cap = self.cap;
+        let tab = rope.table(shift, -1.0);
         for rh in 0..rows * heads {
             let base = rh * cap * hd;
             for s in 0..keep {
                 let (src, dst) = (base + (shift + s) * hd, base + s * hd);
                 self.k.copy_within(src..src + hd, dst);
-                rope.rotate(&mut self.k[dst..dst + hd], shift, -1.0);
+                Rope::apply(&tab, &mut self.k[dst..dst + hd]);
                 self.v.copy_within(src..src + hd, dst);
             }
         }
@@ -804,6 +859,8 @@ struct Net {
     rope: Rope,
     fft: Fft,
     params: usize,
+    /// The realtime network's weights on the accelerator (made for the first stream).
+    device: std::sync::OnceLock<Option<Arc<dyn vi::Device>>>,
 }
 
 fn load_mamba(f: &ModelFiles, p: &str, width: usize, cfg: &IsolatorConfig, f32w: bool) -> Result<Mamba> {
@@ -989,7 +1046,94 @@ impl Net {
             window,
             params,
             cfg,
+            device: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The accelerator's copy of the realtime network for whole stream steps, when there is one
+    /// (`OXINFER_VI_GPU=0` keeps the streams on the CPU path).
+    fn device(&self) -> Option<Arc<dyn vi::Device>> {
+        if !self.cfg.causal || std::env::var("OXINFER_VI_GPU").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        let be = crate::gpu::active()?;
+        self.device.get_or_init(|| be.vi_device(&self.dev_model())).clone()
+    }
+
+    /// The network as [`vi::Model`] describes it.
+    fn dev_model(&self) -> vi::Model<'_> {
+        fn mamba(m: &Mamba) -> vi::Mamba<'_> {
+            vi::Mamba {
+                in_proj: m.in_proj.dev(),
+                conv_w: &m.conv_w,
+                conv_b: &m.conv_b,
+                x_proj: m.x_proj.dev(),
+                dt_proj: m.dt_proj.dev(),
+                dt_bias: &m.dt_bias,
+                a: &m.a,
+                d: &m.d,
+                out_proj: m.out_proj.dev(),
+            }
+        }
+        fn bi(b: &BiMamba) -> vi::BiMamba<'_> {
+            vi::BiMamba {
+                fwd: mamba(&b.fwd),
+                bwd: b.bwd.as_ref().map(mamba),
+                output_proj: b.output_proj.dev(),
+                norm: b.norm.dev(),
+            }
+        }
+        let blocks = self
+            .blocks
+            .iter()
+            .map(|b| match b {
+                Block::Attn(t, a) => vi::Block::Attn(
+                    Box::new(vi::TimeAttn {
+                        norm1: t.norm1.dev(),
+                        qkv: t.qkv.dev(),
+                        proj: t.proj.dev(),
+                        norm2: t.norm2.dev(),
+                        ffn1: t.ffn1.dev(),
+                        ffn2: t.ffn2.dev(),
+                        exclusive: t.exclusive,
+                    }),
+                    Box::new(vi::TimeAttn {
+                        norm1: a.norm1.dev(),
+                        qkv: a.in_proj.dev(),
+                        proj: a.out_proj.dev(),
+                        norm2: a.norm2.dev(),
+                        ffn1: a.lin1.dev(),
+                        ffn2: a.lin2.dev(),
+                        exclusive: a.exclusive,
+                    }),
+                ),
+                Block::Mamba(t, f) => vi::Block::Mamba(Box::new(bi(t)), Box::new(bi(f))),
+            })
+            .collect();
+        vi::Model {
+            width: self.cfg.width,
+            heads: self.cfg.num_heads,
+            bins: self.bins(),
+            edges: &self.edges,
+            enc_norm: self.enc_norm.iter().map(Norm::dev).collect(),
+            enc: self.enc.iter().map(Dense::dev).collect(),
+            band_emb: &self.band_emb,
+            look_emb: self.look_emb.as_deref(),
+            blocks,
+            dec_scale: &self.dec_scale,
+            dec_shift: &self.dec_shift,
+            heads_dec: self
+                .heads
+                .iter()
+                .map(|h| vi::Head {
+                    norm: h.norm.dev(),
+                    l1: h.l1.dev(),
+                    l2: h.l2.dev(),
+                })
+                .collect(),
+            window: self.cfg.attention_window_frames,
+            rope_inv: &self.rope.inv,
+        }
     }
 
     fn bands(&self) -> usize {
@@ -1990,6 +2134,11 @@ pub struct IsolatorStream {
     closed: bool,
     /// Lane boundaries crossed (frames), as the reference's `boundaries`.
     pub boundaries: Vec<usize>,
+    /// The lanes on the accelerator (whole steps there): the session, the device lane of
+    /// `lane`, whether the other one is the second lane (`lane_b`).
+    dev: Option<Box<dyn vi::Session>>,
+    dev_lane: usize,
+    dev_b: bool,
 }
 
 impl IsolatorStream {
@@ -2029,7 +2178,22 @@ impl IsolatorStream {
         };
         let lane = net.new_lane();
         let n_fft = c.n_fft;
+        let look = net
+            .look_emb
+            .as_ref()
+            .and_then(|_| c.lookahead_frames_choices.iter().position(|&x| x == lookahead));
+        let dev = net.device().and_then(|d| {
+            d.session(&vi::StreamSpec {
+                look,
+                cache_frames,
+                capacity,
+                max_frames: block_frames,
+            })
+        });
         Ok(Self {
+            dev,
+            dev_lane: 0,
+            dev_b: false,
             lookahead,
             block_frames,
             cache_frames,
@@ -2103,27 +2267,26 @@ impl IsolatorStream {
         for s in spectra {
             spec.extend_from_slice(s);
         }
-        let feats = net.encode(&spec, nf, Some(self.lookahead));
-        let Some((w, cf)) = self.windows else {
-            let mut x = feats;
-            net.backbone(&mut x, nf, Some((&mut self.lane, self.cache_frames, self.capacity)));
-            return net.decode(&x, nf);
+        // Whether the second lane runs too (the crossfade before a window's end).
+        let two = self.windows.is_some_and(|(w, cf)| {
+            let first = self.frames % w;
+            debug_assert!(first + nf <= w && !(first < w - cf && w - cf < first + nf));
+            first >= w - cf
+        });
+        if two && !self.has_b() {
+            if let Some(d) = self.dev.as_mut() {
+                d.fork(self.dev_lane, 1 - self.dev_lane);
+                self.dev_b = true;
+            } else {
+                self.lane_b = Some(self.lane.fork());
+            }
+        }
+        let (mut raw, raw_b) = self.run_lanes(&spec, nf, two);
+        let (Some((w, cf)), Some(raw_b)) = (self.windows, raw_b) else {
+            return raw;
         };
         let first = self.frames % w;
         let cs = w - cf;
-        debug_assert!(first + nf <= w && !(first < cs && cs < first + nf));
-        if first >= cs && self.lane_b.is_none() {
-            self.lane_b = Some(self.lane.fork());
-        }
-        let mut x = feats.clone();
-        net.backbone(&mut x, nf, Some((&mut self.lane, self.cache_frames, self.capacity)));
-        let mut raw = net.decode(&x, nf);
-        if first < cs {
-            return raw;
-        }
-        let mut xb = feats;
-        net.backbone(&mut xb, nf, Some((self.lane_b.as_mut().unwrap(), self.cache_frames, self.capacity)));
-        let raw_b = net.decode(&xb, nf);
         for f in 0..nf {
             let wt = (((first + f) as f32 - cs as f32 + 1.0) / cf as f32).clamp(0.0, 1.0);
             for (a, &b) in raw[f * bins * 4..(f + 1) * bins * 4]
@@ -2135,9 +2298,58 @@ impl IsolatorStream {
         }
         if first + nf == w {
             self.boundaries.push(self.frames + nf);
-            self.lane = self.lane_b.take().unwrap();
+            if self.dev.is_some() {
+                self.dev_lane = 1 - self.dev_lane;
+                self.dev_b = false;
+            } else {
+                self.lane = self.lane_b.take().unwrap();
+            }
         }
         raw
+    }
+
+    fn has_b(&self) -> bool {
+        if self.dev.is_some() { self.dev_b } else { self.lane_b.is_some() }
+    }
+
+    /// The decoder outputs of the lane (and, with `two`, of the second lane) over a block of
+    /// spectra: one step on the accelerator, else (or when it fails, the lanes then carried on
+    /// from its states) the CPU path.
+    fn run_lanes(&mut self, spec: &[f32], nf: usize, two: bool) -> (Vec<f32>, Option<Vec<f32>>) {
+        if let Some(d) = self.dev.as_mut() {
+            let _p = crate::prof::phase(7, "vi device step");
+            let lanes = [self.dev_lane, 1 - self.dev_lane];
+            let lanes = &lanes[..1 + two as usize];
+            let mut raw = vec![Vec::new(); lanes.len()];
+            if d.step(spec, nf, lanes, &mut raw) {
+                let b = two.then(|| raw.pop().unwrap());
+                return (raw.pop().unwrap(), b);
+            }
+            crate::gpu::warn("voice isolator: a stream step failed on the GPU, the stream carries on on the CPU");
+            let import = |blocks: Vec<vi::LaneBlock>| Lane {
+                blocks: blocks
+                    .into_iter()
+                    .map(|b| match b {
+                        vi::LaneBlock::Attn { k, v, cap, end } => BlockState::Attn(KvCache { k, v, cap, end }),
+                        vi::LaneBlock::Mamba { tail, ssm } => BlockState::Mamba(MambaCarry { tail, ssm }),
+                    })
+                    .collect(),
+            };
+            self.lane = import(d.export(self.dev_lane));
+            self.lane_b = self.dev_b.then(|| import(d.export(1 - self.dev_lane)));
+            self.dev = None;
+        }
+        let net = self.net.clone();
+        let mut feats = net.encode(spec, nf, Some(self.lookahead));
+        let mut x = if two { feats.clone() } else { std::mem::take(&mut feats) };
+        net.backbone(&mut x, nf, Some((&mut self.lane, self.cache_frames, self.capacity)));
+        let raw = net.decode(&x, nf);
+        if !two {
+            return (raw, None);
+        }
+        let mut xb = feats;
+        net.backbone(&mut xb, nf, Some((self.lane_b.as_mut().unwrap(), self.cache_frames, self.capacity)));
+        (raw, Some(net.decode(&xb, nf)))
     }
 
     fn advance(&mut self, limit: usize) {
