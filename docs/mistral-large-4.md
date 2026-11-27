@@ -220,7 +220,8 @@ draft with bf16 weights matches to 8e-7 relative on the logits of all 3 slots; t
 draft on the real target's features to 2-6e-3 relative (int8 activations, as llama.cpp), KL
 under 9e-5, the same drafts. Greedy output with DSpark (cutoff 0.85 or none) is identical to
 plain greedy on the real model (128 tokens, a chat answer and a Python function, Metal and CPU;
-compare runs with `--no-system`, the default system prompt holds the time). With the draft on
+compare runs with `--no-system`: the default system prompt held the time of day then, and
+holds the date now). With the draft on
 the GPU (float activations): the tiny draft to 8e-7 as on the CPU, the real draft to 2.2e-4,
 6.6e-4 and 2.4e-3 relative on its 3 slots (KL up to 1.1e-5, the same drafts), and the greedy
 output again identical to plain greedy (the same two prompts, 128 tokens, and 96 tokens through

@@ -256,3 +256,28 @@ step after a restore copies the caches to the GPU, as the first step after a pre
 Snapshots hold f32 caches: about 0.3 MB per token for Qwen3-8B, 0.09 MB for Qwen3.5-4B (a quarter
 of its layers have a KV cache), 0.7 MB for Gemma 4 12B, whose sliding-window layers keep every
 position.
+
+## The default system prompt
+
+The default system prompt (the command line without `--system`, `SystemPrompt::Default` in the
+library, a NULL `system` in the C API, `system=default` in a server model spec) says that the model
+runs locally with oxinfer, without internet access, and ends with the local date, weekday and
+time zone: "The current local date is 2027-01-15 Friday (UTC+09:00, JST)." It does not have the
+time of day: the text is the same for every conversation started that day, so a conversation's
+next turn finds its cache, and a new conversation the prefix (and the stored snapshots) of the
+earlier ones. The time of day is what the built-in `get_current_datetime` tool returns (`--tools`,
+`oxinfer::tools::builtin_specs`).
+
+A conversation keeps the prompt of its first turn. `Engine::send` renders it once, at the first
+turn. `Engine::chat`, which renders the whole conversation at every call, remembers the prompt of
+the 64 latest conversations (of an engine and its forks, so of a server model's sessions),
+identified by their first turn (the messages before the first reply): a conversation past its
+first turn gets the text its first turn was rendered with, also on a later day, and a
+conversation at its first turn the date of the day. The memory is the process's: after a restart,
+or once 64 other conversations came, a conversation that goes on on another day is rendered with
+the new date, and its prompt computed again.
+
+On two tiny checkpoints on the CPU (`default_system_prompt_keeps_a_conversation_cache` in
+`src/engine.rs`), the second turn of a conversation under the default prompt a second after the
+first reused 281 of the 281 tokens of the first prompt (Inkling-2) and 282 of 283 (Qwen3.5); with
+the time of day in the prompt, it reused none (of 301 and 303).

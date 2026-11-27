@@ -77,7 +77,7 @@ impl ModelSpec {
     /// - `kind`: `chat`, `embedding`, `image`, `transcription`, `speech`, `video`, `isolation`,
     ///   `depth` or `ocr` (default: detected);
     /// - `system`: the system prompt when a request has none (default none; `default` for the
-    ///   CLI's prompt with the local date and time);
+    ///   CLI's prompt with the local date, weekday and time zone);
     /// - `think`: thinking by default (`1` / `0`; requests override it);
     /// - `max_tokens`: reply length when a request sets none (default 4096);
     /// - `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`: sampling defaults

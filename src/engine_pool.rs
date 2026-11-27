@@ -41,6 +41,9 @@ impl Engine {
             turns: 0,
             unfed: None,
             chat_ids: None,
+            default_systems: self.default_systems.clone(),
+            #[cfg(test)]
+            clock_override: self.clock_override,
             cancel: Arc::new(AtomicBool::new(false)),
             stats: Stats::default(),
             // The first engine stops it when it drops.
@@ -771,8 +774,9 @@ mod tests {
             e.config_mut().max_tokens = 12;
             e
         };
-        // A system message of its own: the default system prompt tells the time to the second, so
-        // the replies of two requests a second apart are those of two different prompts.
+        // A system message of its own: the default system prompt depends on the clock (the date;
+        // the time to the second when this was written, so the replies of two requests a second
+        // apart were those of two different prompts).
         let m = vec![Message::system("You answer briefly."), Message::user("Hello there, how are you?")];
         let alone = |lora: Option<&std::path::Path>| {
             let mut o = o.clone();
@@ -839,7 +843,7 @@ mod tests {
             e.config_mut().max_tokens = 12;
             e
         };
-        // (With a system message: the default one carries the time of day, and this random
+        // (With a system message: the default one carries the date (once the time of day), and this random
         // model's reply follows every byte of its prompt.)
         let m = vec![Message::system("Be brief."), Message::user("Hello there, how are you?")];
         let alone = |lora: Option<&std::path::Path>| {

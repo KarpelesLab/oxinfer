@@ -7,7 +7,8 @@ Qwen 3.5 / 3.8 lists JSON schemas in `<tools>` and answers with `<tool_call><fun
 template does, and the rendered prompts are byte-identical to `transformers`'
 `apply_chat_template(..., tools=...)` for both families.
 
-On the command line `--tools` enables two built-in tools, the local date and time and an exact
+On the command line `--tools` enables two built-in tools, the local date and time
+(`get_current_datetime`: the default system prompt has the date, not the time of day) and an exact
 calculator:
 
 ```sh

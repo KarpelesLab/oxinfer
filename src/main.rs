@@ -283,7 +283,7 @@ fn usage() -> ! {
          options:\n\
          \x20 --prompt TEXT        single prompt (default: read from stdin)\n\
          \x20 --chat               interactive multi-turn chat\n\
-         \x20 --system TEXT        system prompt (default: a short one with the local date and time)\n\
+         \x20 --system TEXT        system prompt (default: a short one with the local date and zone)\n\
          \x20 --no-system          no system prompt\n\
          \x20 --tools              let the model call built-in tools (date and time, calculator)\n\
          \x20 --print-prompt       print the formatted prompt and exit\n\

@@ -552,7 +552,7 @@ of the loader for the other kinds (Whisper `encoder` / `decoder` precision, Orph
 | Key | Meaning |
 |---|---|
 | `kind` | `chat`, `embedding`, `image`, `transcription`, `speech`, `video`, `isolation` or `ocr` (default: detected) |
-| `system` | system prompt when a request has none (default none; `default` for the CLI's prompt with the date and time) |
+| `system` | system prompt when a request has none (default none; `default` for the CLI's prompt with the local date, weekday and time zone, the same all day; a conversation keeps the one of its first turn) |
 | `think` | thinking by default (`1`); requests override it |
 | `max_tokens` | reply length when a request sets none (default 4096) |
 | `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty` | sampling defaults (default OpenAI's: temperature 1, top-p 1; no top-k, min-p or penalty) |

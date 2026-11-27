@@ -13,7 +13,7 @@ Useful flags:
 |---|---|
 | `--temp F --top-k N --top-p F --min-p F --seed N` | sampling (default is greedy, `--temp 0`); `--min-p` cuts tokens less likely than F times the most likely one, after top-k and top-p |
 | `--no-repeat-ngram N` | no `N` tokens twice in the context, the prompt and earlier turns included (transformers' `no_repeat_ngram_size`; default 0: off; not with the Gemma 4 `--draft`) |
-| `--system TEXT` | system prompt (default: a short one saying the model runs locally, with the local date, time and zone) |
+| `--system TEXT` | system prompt (default: a short one saying the model runs locally, with the local date, weekday and time zone; not the time of day, which the model gets from `get_current_datetime` with `--tools`) |
 | `--no-system` | no system prompt (also implied by `--raw` and `--dump-logits`) |
 | `--tools` | let the model call built-in tools: `get_current_datetime` and `calculate` (see [Tool calling](tool-calling.md)) |
 | `--print-prompt` | print the fully formatted prompt and exit |

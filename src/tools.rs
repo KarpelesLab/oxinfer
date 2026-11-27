@@ -1323,7 +1323,11 @@ pub mod inkling {
 
 /// Local wall-clock time: (`YYYY-MM-DD HH:MM:SS`, weekday, UTC offset in seconds, zone name).
 pub fn local_now() -> (String, &'static str, i64, String) {
-    let secs = crate::clock::unix_time().as_secs() as i64;
+    local_at(crate::clock::unix_time().as_secs() as i64)
+}
+
+/// [`local_now`] at `secs` seconds since the Unix epoch.
+pub fn local_at(secs: i64) -> (String, &'static str, i64, String) {
     let (offset, zone) = local_offset(secs);
     let t = secs + offset;
     let (days, rem) = (t.div_euclid(86400), t.rem_euclid(86400));
@@ -1394,17 +1398,33 @@ fn local_offset(_secs: i64) -> (i64, String) {
 /// "2026-10-24 14:05:09 Friday (UTC+09:00, JST)".
 pub fn now_string() -> String {
     let (t, wd, off, zone) = local_now();
+    format!("{t} {wd} ({})", zone_string(off, &zone))
+}
+
+/// "UTC+09:00, JST".
+fn zone_string(off: i64, zone: &str) -> String {
     let sign = if off < 0 { '-' } else { '+' };
     let a = off.abs();
     let z = if zone.is_empty() { String::new() } else { format!(", {zone}") };
-    format!("{t} {wd} (UTC{sign}{:02}:{:02}{z})", a / 3600, a % 3600 / 60)
+    format!("UTC{sign}{:02}:{:02}{z}", a / 3600, a % 3600 / 60)
 }
 
-/// The default system prompt of the command line.
+/// The default system prompt of the command line, of [`crate::engine::SystemPrompt::Default`]
+/// and of the C API: where the model runs and the local date, weekday and time zone. Not the
+/// time of day, so that every conversation started on the same day has the same prompt (its
+/// replies can be reproduced, and the cache of its prefix reused); a model that needs the time
+/// asks the `get_current_datetime` tool ([`builtin_specs`]).
 pub fn default_system_prompt(tools: bool) -> String {
+    default_system_prompt_at(tools, crate::clock::unix_time().as_secs() as i64)
+}
+
+/// [`default_system_prompt`] at `secs` seconds since the Unix epoch.
+pub fn default_system_prompt_at(tools: bool, secs: i64) -> String {
+    let (t, wd, off, zone) = local_at(secs);
     let mut s = format!(
-        "You are a helpful assistant running locally on the user's computer with oxinfer, an open-source inference engine. You have no internet access. The current local date and time is {}.",
-        now_string()
+        "You are a helpful assistant running locally on the user's computer with oxinfer, an open-source inference engine. You have no internet access. The current local date is {} {wd} ({}).",
+        &t[..10],
+        zone_string(off, &zone)
     );
     if tools {
         s.push_str(" Use the provided tools when they help answer accurately; otherwise answer directly.");
@@ -1628,6 +1648,38 @@ pub mod calc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default system prompt has the local date, weekday and zone, and no time of day: the
+    /// same text a second later, another one the next day.
+    #[test]
+    fn default_system_prompt_is_the_same_all_day() {
+        // Local noon of some day (a second later is the same day in every zone).
+        let t = 1_800_000_000;
+        let (now, _, _, _) = local_at(t);
+        let part = |r: std::ops::Range<usize>| now[r].parse::<i64>().unwrap();
+        let noon = t - (part(11..13) * 3600 + part(14..16) * 60 + part(17..19)) + 12 * 3600;
+        let (now, weekday, _, _) = local_at(noon);
+        assert_eq!(&now[11..], "12:00:00");
+        for tools in [false, true] {
+            let p = default_system_prompt_at(tools, noon);
+            assert_eq!(p, default_system_prompt_at(tools, noon + 1));
+            assert_eq!(p, default_system_prompt_at(tools, noon + 11 * 3600));
+            assert_ne!(p, default_system_prompt_at(tools, noon + 86400));
+            assert!(
+                p.contains(&format!("The current local date is {} {weekday} (UTC", &now[..10])),
+                "{p}"
+            );
+            assert!(!p.contains("12:00:00") && !p.contains(" time is "), "{p}");
+            assert_eq!(p.contains("tools"), tools);
+        }
+        // The built-in tool still tells the time of day.
+        let call = ToolCall {
+            name: "get_current_datetime".into(),
+            arguments: Default::default(),
+        };
+        let now = run_builtin(&call);
+        assert_eq!(now.as_bytes()[13], b':', "{now}");
+    }
 
     #[test]
     fn gemma_declaration_matches_the_template() {

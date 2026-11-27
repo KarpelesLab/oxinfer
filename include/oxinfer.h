@@ -230,7 +230,9 @@ OxiEngine *oxi_engine_load(const char *model, const char *options, oxi_progress_
 void oxi_engine_free(OxiEngine *engine);
 
 /* Conversation and sampling settings:
- *   system       system prompt; NULL value = default prompt (date and time), "" = none
+ *   system       system prompt; NULL value = default prompt (runs locally, the local date,
+ *                weekday and time zone, not the time of day; a conversation keeps the one of
+ *                its first turn), "" = none
  *   think        0|1 thinking mode
  *   max_tokens   max tokens per reply (default 1024)
  *   response_format  constrained decoding of the answer (thinking stays free): "json_object"

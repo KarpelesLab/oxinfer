@@ -1013,7 +1013,11 @@ impl Default for SamplingParams {
 /// The system prompt of a conversation.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum SystemPrompt {
-    /// A short prompt with the local date and time ([`crate::tools::default_system_prompt`]).
+    /// A short prompt with the local date, weekday and time zone
+    /// ([`crate::tools::default_system_prompt`]); not the time of day. A conversation keeps the
+    /// text of its first turn: [`Engine::send`] renders it once, and [`Engine::chat`] renders a
+    /// conversation that continues one of its latest calls' (or of its forks') with that call's
+    /// text, past midnight too.
     #[default]
     Default,
     None,
@@ -1888,6 +1892,12 @@ pub struct Engine {
     /// The tokens in the cache when it holds exactly what [`Engine::chat`] fed and generated
     /// (None after any other turn), for the next call to reuse.
     chat_ids: Option<Vec<u32>>,
+    /// The default system prompts of the latest [`Engine::chat`] conversations, of this engine
+    /// and its forks ([`Engine::fork`]), newest last.
+    default_systems: Arc<std::sync::Mutex<Vec<conversation::DefaultSystem>>>,
+    /// The wall clock of the default system prompt, in seconds since the Unix epoch.
+    #[cfg(test)]
+    pub(crate) clock_override: Option<i64>,
     cancel: Arc<AtomicBool>,
     stats: Stats,
     /// The weight streamer (`EngineOptions::stream`), stopped on drop before the files go.
@@ -2828,6 +2838,9 @@ impl Engine {
             turns: 0,
             unfed: None,
             chat_ids: None,
+            default_systems: Default::default(),
+            #[cfg(test)]
+            clock_override: None,
             cancel: Arc::new(AtomicBool::new(false)),
             stats: Stats::default(),
             streamer,
@@ -2912,6 +2925,9 @@ impl Engine {
             turns: 0,
             unfed: None,
             chat_ids: None,
+            default_systems: Default::default(),
+            #[cfg(test)]
+            clock_override: None,
             cancel: Arc::new(AtomicBool::new(false)),
             stats: Stats::default(),
             streamer: None,
@@ -3633,7 +3649,7 @@ impl Engine {
         let (fmt, c) = (self.fmt, &self.config);
         if self.turns == 0 {
             let system = match &c.system {
-                SystemPrompt::Default => Some(crate::tools::default_system_prompt(!c.tools.is_empty())),
+                SystemPrompt::Default => Some(self.fresh_default_system()),
                 SystemPrompt::None => None,
                 SystemPrompt::Text(t) => Some(t.clone()),
             };
@@ -5102,6 +5118,78 @@ mod tests {
             assert_eq!(r2.stats.cached_tokens, 0);
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Under the default system prompt (no system message), a conversation keeps one prompt: a
+    /// second turn a second later reuses the cache of the first, and so does a turn on the next
+    /// day, with the date of the first turn; a new conversation gets the date of its day. (The
+    /// clock is the engine's test clock: local noon, so that a second later is the same day.)
+    #[test]
+    fn default_system_prompt_keeps_a_conversation_cache() {
+        let noon = {
+            let t = 1_800_000_000;
+            let (now, _, _, _) = crate::tools::local_at(t);
+            let secs = |r: std::ops::Range<usize>| now[r].parse::<i64>().unwrap();
+            t - (secs(11..13) * 3600 + secs(14..16) * 60 + secs(17..19)) + 12 * 3600
+        };
+        let day = |t: i64| crate::tools::local_at(t).0[..10].to_string();
+        assert_ne!(day(noon), day(noon + 86400));
+        let qwen = std::env::temp_dir().join(format!("oxinfer-default-system-qwen-{}", std::process::id()));
+        crate::qwen::tiny::write(&qwen, false, false).unwrap();
+        for (name, dir) in [("inkling", tiny_inkling("default-system")), ("qwen", qwen)] {
+            let mut e = Engine::load(dir.to_str().unwrap(), &cpu_options()).unwrap();
+            assert_eq!(e.config().system, SystemPrompt::Default, "{name}");
+            e.config_mut().max_tokens = 8;
+            e.clock_override = Some(noon);
+            let hi = [Message::user("Hi")];
+            let first = e.render(&hi).unwrap().0;
+            assert!(e.prompt_text("Hi").contains(&day(noon)), "{name}");
+            assert!(first.contains(&day(noon)) && !first.contains("12:00"), "{name}: {first}");
+            let mut convo = vec![Message::user("Hello there, what is the weather like today?")];
+            let r1 = e.chat(&convo, &mut quiet).unwrap();
+            assert_eq!(r1.stats.cached_tokens, 0, "{name}");
+            let len1 = r1.stats.prompt_tokens;
+            // A second later: the same prompt for a new conversation, and the cache for this one.
+            e.clock_override = Some(noon + 1);
+            assert_eq!(e.render(&hi).unwrap().0, first, "{name}");
+            convo.push(Message::assistant(r1.text.clone()));
+            convo.push(Message::user("And tomorrow?"));
+            let r2 = e.chat(&convo, &mut quiet).unwrap();
+            assert!(
+                r2.stats.cached_tokens + 1 >= len1,
+                "{name}: {} cached of {len1}",
+                r2.stats.cached_tokens
+            );
+            let len2 = r2.stats.cached_tokens + r2.stats.prompt_tokens;
+            // The next day: the conversation keeps its first day's prompt, and its cache.
+            e.clock_override = Some(noon + 86400);
+            convo.push(Message::assistant(r2.text.clone()));
+            convo.push(Message::user("And the day after?"));
+            let kept = e.render(&convo).unwrap().0;
+            assert!(kept.contains(&day(noon)) && !kept.contains(&day(noon + 86400)), "{name}: {kept}");
+            // (Another session of the model knows the conversation too.)
+            if name == "qwen" {
+                assert_eq!(e.fork().unwrap().render(&convo).unwrap().0, kept);
+            }
+            let r3 = e.chat(&convo, &mut quiet).unwrap();
+            assert!(
+                r3.stats.cached_tokens + 1 >= len2,
+                "{name}: {} cached of {len2}",
+                r3.stats.cached_tokens
+            );
+            // A new conversation, the same first message included: that day's date.
+            let new = e.render(&convo[..1]).unwrap().0;
+            assert!(new.contains(&day(noon + 86400)) && !new.contains(&day(noon)), "{name}: {new}");
+            e.chat(&convo[..1], &mut quiet).unwrap();
+            let new = e.render(&convo[..3]).unwrap().0;
+            assert!(new.contains(&day(noon + 86400)) && !new.contains(&day(noon)), "{name}: {new}");
+            // Another conversation past its first turn: not the one this engine holds.
+            let other = [Message::user("Hello!"), Message::assistant("Hi."), Message::user("And tomorrow?")];
+            e.clock_override = Some(noon + 2 * 86400);
+            let text = e.render(&other).unwrap().0;
+            assert!(text.contains(&day(noon + 2 * 86400)), "{name}: {text}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// A 24-bit BMP of `w x h` pixels, a gradient that `seed` shifts.

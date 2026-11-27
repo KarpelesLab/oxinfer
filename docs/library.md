@@ -43,6 +43,14 @@ with `lora_merge`; `Engine::loras` lists them and `Engine::set_lora_strength` ch
 `prompt_cache` option keeps them in a directory for `Engine::chat` (see
 [Session snapshots and the prompt cache](sessions.md#session-snapshots-and-the-prompt-cache)); prompt-lookup
 drafting is the `lookup` options ([Prompt lookup](speculative-decoding.md#prompt-lookup)).
+Without a system message or another `ChatConfig::system`, a conversation starts with the default
+system prompt (`SystemPrompt::Default`, `oxinfer::tools::default_system_prompt`): the model runs
+locally with oxinfer, without internet access, and the local date, weekday and time zone ("The
+current local date is 2027-01-15 Friday (UTC+09:00, JST)."). It has no time of day, so it is the
+same text all day, and a conversation keeps the text of its first turn (see
+[The default system prompt](sessions.md#the-default-system-prompt)); declare
+`oxinfer::tools::builtin_specs` (`get_current_datetime`) or write the time in a system prompt of
+your own for a model that needs it. `SystemPrompt::None` is no system prompt.
 
 ### Token hook
 

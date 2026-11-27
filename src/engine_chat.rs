@@ -92,6 +92,36 @@ impl Message {
     }
 }
 
+/// The default system prompt [`Engine::chat`] rendered for a conversation
+/// ([`SystemPrompt::Default`] and no system message).
+pub(crate) struct DefaultSystem {
+    text: String,
+    /// Whether tools were declared (the prompt then says to use them).
+    tools: bool,
+    /// The conversation ([`DefaultSystem::opening`]).
+    opening: u64,
+}
+
+impl DefaultSystem {
+    /// Conversations kept (by an engine and its forks together).
+    const KEPT: usize = 64;
+
+    /// What identifies the conversation of `messages`, a hash of its first turn (the messages
+    /// before the first reply), and whether it is past that turn.
+    fn opening(messages: &[Message]) -> (u64, bool) {
+        use std::hash::{Hash, Hasher};
+        let n = messages
+            .iter()
+            .position(|m| matches!(m.role, Role::Assistant | Role::Tool))
+            .unwrap_or(messages.len());
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for m in &messages[..n] {
+            (m.role as u8, &m.content).hash(&mut h);
+        }
+        (h.finish(), n < messages.len())
+    }
+}
+
 impl Engine {
     /// Runs a whole conversation and generates the next reply, streaming it to `on_delta`. The
     /// conversation replaces the engine's: system messages (joined) are the system prompt
@@ -115,6 +145,7 @@ impl Engine {
     /// embeddings are compared, see [`crate::snapshot::MediaMarks`]); Qwen models, whose images
     /// take position tables of their own, start over when the reused part has any.
     pub fn chat(&mut self, messages: &[Message], on_delta: &mut dyn FnMut(&Delta) -> Flow) -> Result<Reply> {
+        self.keep_default_system(messages);
         let (text, feats) = self.render(messages)?;
         let ids = self.tok.encode(text, false).map_err(|e| anyhow!("encode: {e}"))?.get_ids().to_vec();
         if ids.is_empty() {
@@ -316,6 +347,55 @@ impl Engine {
         }
     }
 
+    /// [`crate::tools::default_system_prompt`] of now, for the tools declared.
+    pub(crate) fn fresh_default_system(&self) -> String {
+        #[cfg(test)]
+        if let Some(secs) = self.clock_override {
+            return crate::tools::default_system_prompt_at(!self.config.tools.is_empty(), secs);
+        }
+        crate::tools::default_system_prompt(!self.config.tools.is_empty())
+    }
+
+    /// The default system prompt of `messages`: the one [`Engine::keep_default_system`] kept for
+    /// their conversation when they are past its first turn, else today's.
+    fn default_system(&self, messages: &[Message]) -> String {
+        let tools = !self.config.tools.is_empty();
+        let (opening, continued) = DefaultSystem::opening(messages);
+        let kept = self.default_systems.lock().unwrap();
+        match kept.iter().find(|d| continued && d.opening == opening && d.tools == tools) {
+            Some(d) => d.text.clone(),
+            None => self.fresh_default_system(),
+        }
+    }
+
+    /// Before a call renders `messages`: keeps the default system prompt their conversation was
+    /// first rendered with (by this engine or its forks, for the [`DefaultSystem::KEPT`] latest
+    /// conversations), so that a conversation has one system prompt, and its cache, across a
+    /// change of date. A conversation at its first turn is a new one and takes today's date.
+    /// (Conversations have no identity beyond their messages: a conversation is known by its
+    /// first turn, and one that opens as an earlier one did goes on with the date of the latest
+    /// such first turn.)
+    fn keep_default_system(&mut self, messages: &[Message]) {
+        if self.config.system != SystemPrompt::Default || messages.iter().any(|m| m.role == Role::System) {
+            return;
+        }
+        let tools = !self.config.tools.is_empty();
+        let (opening, continued) = DefaultSystem::opening(messages);
+        let mut kept = self.default_systems.lock().unwrap();
+        let old = kept
+            .iter()
+            .position(|d| d.opening == opening && d.tools == tools)
+            .map(|i| kept.remove(i));
+        let text = match old {
+            Some(d) if continued => d.text,
+            _ => self.fresh_default_system(),
+        };
+        if kept.len() >= DefaultSystem::KEPT {
+            kept.remove(0);
+        }
+        kept.push(DefaultSystem { text, tools, opening });
+    }
+
     /// The length of the prompt prefix that every conversation with the same system prompt and
     /// tools shares: `ids`' common prefix with the first turn rendered with an empty message.
     fn shared_prefix_len(&self, messages: &[Message], ids: &[u32]) -> usize {
@@ -327,7 +407,7 @@ impl Engine {
             .collect();
         let system = if sys.is_empty() {
             match &c.system {
-                SystemPrompt::Default => Some(crate::tools::default_system_prompt(!c.tools.is_empty())),
+                SystemPrompt::Default => Some(self.default_system(messages)),
                 SystemPrompt::None => None,
                 SystemPrompt::Text(t) => Some(t.clone()),
             }
@@ -350,7 +430,7 @@ impl Engine {
             .collect();
         let system = if sys.is_empty() {
             match &c.system {
-                SystemPrompt::Default => Some(crate::tools::default_system_prompt(!c.tools.is_empty())),
+                SystemPrompt::Default => Some(self.default_system(messages)),
                 SystemPrompt::None => None,
                 SystemPrompt::Text(t) => Some(t.clone()),
             }
