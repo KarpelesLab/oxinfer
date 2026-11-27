@@ -300,7 +300,7 @@ files, the single-file text encoders, the bf16 transformers) were not.
 | `--model FILE` | a single-file transformer in ComfyUI's layout instead of the release folder; `--vae` is then required, the shifts are 12 and 3 (there is no scheduler folder), and there is a soundtrack only with `--audio-vae` |
 | `--transformer FILE\|DIR`, `--vae FILE\|DIR` | one part of a release folder from another place |
 | `--audio-vae FILE\|DIR` | the audio VAE: ComfyUI's `vae/minimax_h3_audio_vae_fp32.safetensors` or the release's `audio_vae/` folder (0.6 GB either way) |
-| `--text-encoder DIR\|FILE.gguf\|FILE.safetensors` | a Qwen3-VL-32B-Instruct folder, or its language model as GGUF, or one of ComfyUI's single files (`text_encoders/qwen3vl_32b_minimax_h3_{bf16,int8_convrot,nvfp4_awq}.safetensors`); a file is for text-only prompts (no `--init-image` / `--last-image`), and a safetensors file needs the release's `tokenizer.json`: in `--model`'s `tokenizer/`, in a `tokenizer/` folder beside the file or beside the file itself |
+| `--text-encoder DIR\|FILE.gguf\|FILE.safetensors` | a Qwen3-VL-32B-Instruct folder, or its language model as GGUF, or one of ComfyUI's single files (`text_encoders/qwen3vl_32b_minimax_h3_{bf16,int8_convrot,nvfp4_awq}.safetensors`); a single safetensors file is for text-only prompts (no `--init-image` / `--last-image` / `--ref`), a GGUF file takes them with its vision tower as one `mmproj*.gguf` beside it (llama.cpp's `qwen3vl_merger`, e.g. unsloth's `mmproj-F16.gguf`), and a safetensors file needs the release's `tokenizer.json`: in `--model`'s `tokenizer/`, in a `tokenizer/` folder beside the file or beside the file itself |
 | `--quant q8` | the text encoder's safetensors weights quantized at load (memory, not download; `q4` is taken as `q8`) |
 | `--lora FILE[:SCALE]` | LoRA files on the transformer, repeatable. A file named `*turbo_Nstep*` sets `--steps N + 1` and the shifts: 6 / 3 for the `768p` files, 12 / 3 for the others |
 | `--shift F`, `--audio-shift F` | the sigma shifts of the video and audio schedules |
@@ -645,10 +645,10 @@ Not checked or not done:
   what Q8_0 weights do to the embedding against the release's bf16 weights was not measured (the
   63 GB encoder was not downloaded); Q4_K_M was compared with Q8_0 on two prompts (below), and
   `--quant q8` was not run;
-- keyframes with a GGUF text encoder (the vision tower is a separate `mmproj` file, not read
-  here) or with a single-file one (its `visual.*` tensors are there, but the tower's
-  configuration is not, and it is not built from the shapes), LoRAs on the text encoder, LoRA
-  keys other than the two namings above.
+- keyframes with a single-file text encoder (its `visual.*` tensors are there, but the tower's
+  configuration is not, and it is not built from the shapes), LoRAs on the text encoder. (A
+  GGUF text encoder takes keyframes and references since Sulphur-3: the tower is read from the
+  `mmproj*.gguf` beside it, [below](#sulphur-3); kohya-named LoRA keys load too.)
 
 ### Real runs
 
@@ -944,6 +944,152 @@ clip of latent frames at 1344x768, 66 s of the 525); a second prompt or seed at 
 |---|---|
 | ComfyUI's int8 kernels (`comfy_kitchen`'s `int8_linear`: the rotated input rounded to int8 per row, integer products) | the int8 and W6A8 files run on float32 products of the decoded weights instead (see "How they run"). oxinfer's int8 matmul kernels take activations in blocks of 32 with their own scales and weights with a scale per 32, not a scale per row and a rotation: wiring them in would give a third arithmetic, matching neither ComfyUI path, for a gain in speed that was not measured |
 | the vision tower of ComfyUI's single-file text encoders (keyframes with `--text-encoder FILE.safetensors`) | the files carry `visual.*` without the tower's configuration (ComfyUI hardcodes it: depth 27, width 1152, DeepStack after blocks 8, 16, 24); only the language model is read |
-| other `comfy_quant` formats: `asym_w4a8_int8` (4-bit codes with an optional codebook), `convrot_w4a4`; a `weight_correction` or `weight_codebook` beside a 6-bit weight; `mxfp8`, `float8_e5m2`; `input_scale` | none of `Comfy-Org/MiniMax-H3`'s files uses them. The first two and a 6-bit weight with a correction are refused by name; `mxfp8` and `float8_e5m2` entries are not interpreted here (nothing was written or checked for them in this model); `input_scale`, a calibrated activation scale for ComfyUI's FP8 / NVFP4 kernels, is ignored |
+| other `comfy_quant` formats: `convrot_w4a4`; a `weight_correction` (an asymmetric zero point) beside a grouped weight; `mxfp8`, `float8_e5m2`; `input_scale` | none of the files read uses them (`asym_w4a8_int8` is read since Sulphur-3, [below](#sulphur-3)). `convrot_w4a4` and a grouped weight with a correction are refused by name; `mxfp8` and `float8_e5m2` entries are not interpreted here (nothing was written or checked for them in this model); `input_scale`, a calibrated activation scale for ComfyUI's FP8 / NVFP4 kernels, is ignored |
 | `diffusion_models/minimax_h3_ref2va_*`, `model_patches/*controlnet*`, `embeddings/*`, `vae/minimax_h3_sol_vae_*` | `ref2va`, the Fun ControlNet, prompt embeddings and the "sol" VAE are not implemented |
 | `VideoRebirthAI/hyperflow-h3-flash` | a 13.7B few-step (4 / 6 / 8) transformer as GGUF, 7.2 GB (Q3_K_M) to 14.9 GB (Q8_0), or 16 GB rotated INT8: another architecture on the same blocks, per its `hyperflow_h3_flash_transformer.py`: a second (endpoint) timestep embedder mixed with gate 0.25, three dropped blocks, 102 low-rank factored linears, its own sigma grids. The GGUF tensor layout was not read |
+
+## Sulphur-3
+
+[`SulphurAI/Sulphur-3`](https://huggingface.co/SulphurAI/Sulphur-3) is a fine-tune of MiniMax-H3
+(`fl2va`) distributed as ComfyUI single files, plus an optional second network, the
+"corrector". oxinfer runs it as MiniMax-H3 with the parts of `Comfy-Org/MiniMax-H3` and a
+Qwen3-VL-32B-Instruct GGUF:
+
+```sh
+# the release's recommended file (40.2 GB, pruned bf16) with its corrector, the settings of its
+# ComfyUI workflow: Euler, 20 steps (21 grid points), shifts 12 / 3, the prompt a JSON caption
+./target/release/oxinfer --device cpu \
+    --model SulphurAI/Sulphur-3/s3.safetensors \
+    --vae Comfy-Org/MiniMax-H3/vae/minimax_h3_video_vae_fp16.safetensors \
+    --audio-vae Comfy-Org/MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors \
+    --text-encoder unsloth/Qwen3-VL-32B-Instruct-GGUF/Qwen3-VL-32B-Instruct-Q8_0.gguf \
+    --corrector SulphurAI/Sulphur-3/s3_corrector.safetensors \
+    --steps 21 --size 672x384 --frames 124 -p "$(cat caption.json)" -o clip.mp4
+# the 11.4 GB W4A8 file instead of s3.safetensors
+    --model SulphurAI/Sulphur-3/quantized/s3_w4a8.safetensors
+# the motion / structure guidance of the experimental node pack
+    --still-prompt "$(cat still_caption.json)"   # --motion-scale 1 --stg-scale 1 --stg-layers 20,21,22 --guidance-until 0.25
+```
+
+### The files
+
+Read from the safetensors headers (range requests) and, for the node packs, from their Python
+sources:
+
+| file | size | what it is | in oxinfer |
+|---|---|---|---|
+| `s3.safetensors` (README: "please use this one"), `s3_raw.safetensors` (without the RL LoRA), `s3_ref2va.safetensors` ("Ref2VA variant, not trained") | 40.2 GB each | the pruned bf16 layout of `Comfy-Org/MiniMax-H3` (`adaln_t_table`, `[96768, 8]` float16 AdaLN projections, 50 blocks + 2 refiner blocks in bf16) | loads as it is (run: below). The `ref2va` one is a Ref2VA transformer: give it `--ref` |
+| `quantized/s3_w4a8.safetensors`, `quantized/s3_raw_w4a8.safetensors` | 11.4 GB | `asym_w4a8_int8` (comfy_kitchen): the blocks' and refiner's four matrices as 4-bit codes, a nibble per column (`[N, K/2]` int8), an FP8 E4M3 scale per 16 columns (`weight_s_rel`, stored as `U8`), a float32 scale per row and a 16-level float32 `weight_codebook` per matrix, in the ConvRot basis (groups of 256). The `comfy_quant` entries are not tensors but the header's `_quantization_metadata` | **new**: the header's entries are read when a module has no `comfy_quant` tensor, and the 4-bit codes are decoded (through the codebook) to the int8 values comfy_kitchen computes with (`src/comfy_quant.rs`); products in float32 as for W6A8 |
+| `quantized/s3_raw_int8.safetensors` | 20.9 GB | `int8_tensorwise` without ConvRot for the blocks' four matrices and their `[96768, 8]` AdaLN projections (scale per row), the rest bf16 | loads as it is |
+| `experimental/Sulphur-3_Ref2VA-hybrid_mid_int8_convrot_keepB0-1-49.safetensors` | 22.1 GB | a Ref2VA transformer: blocks 2 to 48 in int8 ConvRot (the AdaLN projections int8 without rotation), blocks 0, 1 and 49 and the refiner in bf16 | loads as it is (run: below) |
+| `experimental/s3k8.safetensors`, `s3k8_w4a8.safetensors` | 34.0 / 9.7 GB | a 42-block transformer (blocks 0 to 41: eight fewer), pruned bf16 / W4A8 | the block count is read from the file; not downloaded (disk) |
+| `s3_raw_lora.safetensors` | 4.8 GB | rank-512 LoRA, `s3_raw` minus ComfyUI's pruned int8 ConvRot H3 (header: `minimax_h3_original`) | **new**: kohya's flattened names (`lora_unet_blocks_N_attn_qkv_proj.lora_down.weight`) |
+| `experimental/minimax_h3_max`, `minimax_S3_tuned_normal`, `_TameV2` (rank 128), `_Tame` (rank 512), `s3_raw_lora_calibrated`, `sulphur3_lora_r256` (rank 256, extracted from `s3` against the pruned bf16 H3), `s3rl1` / `s3rl2` / `s3rl3` / `s3rl3_e990` (rank 128, resized ranks: RL training runs) | 0.4 to 9.5 GB | LoRAs on the base H3 in the same naming, float32 or bf16, an `.alpha` per module; the `tuned` files' headers record the per-part strengths they were exported with (`minimax_h3_settings`) | the same LoRA loader (`--lora FILE[:SCALE]`, on the base H3: `Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_*`) |
+| `s3_corrector.safetensors`, `experimental/corrector2s.safetensors` | 8.0 GB each | the corrector (below): float32, the architecture in the `h3_corrector` header entry, identical for the two (55 blocks of width 1280) | **new**: `src/minimax_h3/corrector.rs`, `--corrector FILE` |
+| `S3_ComfyUI.zip` | 11 kB | ComfyUI nodes `LoadH3Corrector` / `ApplyH3Corrector` (`corrector.py`, `__init__.py`) and a workflow | the corrector and its application are implemented from it |
+| `experimental/H3_Corrector_Advanced_Motion_STG .zip`, `H3_Corrector_Advanced_Complete_Parameter_Guide.docx` | 142 / 63 kB | a larger node pack on the same network (byte-identical `corrector.py`): bf16 / compile / cache options, interval skipping, per-layer residual controls, and a guider with motion contrast and skip-block structure guidance (`guidance.py`) | the guider is implemented ([below](#motion-and-structure-guidance)); the pack's speed options (bf16 corrector, `torch.compile`, caching), interval skipping and residual-shaping experiments are not |
+
+### The corrector
+
+A 2.0B-parameter space-time transformer trained against S3 (`corrector.py`): `patch_in`, a
+1 x 2 x 2 convolution of the noisy latent and H3's velocity concatenated (48 channels), to
+`T x H/2 x W/2` tokens of 1280 (the DiT's video rows); 55 blocks of AdaLN-modulated joint
+self-attention (20 heads of 64, rotary positions on three segments of each head: 16 channels for
+time, 24 for rows, 24 for columns), cross-attention to the raw Qwen3-VL caption states
+(LayerNorm, linear 5120 to 1280) and a tanh-GELU MLP; the modulation is a linear of a time
+vector made from the sinusoidal embeddings of `sigma`, `sigma_next` and their difference. It
+predicts a velocity residual `r`; `ApplyH3Corrector` caps it, `r / sqrt(1 + mean(r^2) /
+budget^2)` with `budget = 0.5 max(rms(v), 0.001)`, and adds it to the video velocity (`v + strength
+r`; the audio keeps H3's) on every step (`start_step` / `end_step` select some). oxinfer does the
+same inside the denoising loop on the generated video rows, in float32 (the node keeps the
+network float32: "bf16 weights change its output several-fold"):
+
+| option (CLI / server and C API load option) | default | |
+|---|---|---|
+| `--corrector FILE` / `corrector` | | the corrector file |
+| `--corrector-strength F` / `corrector_strength` | 1 | the multiplier (0: off) |
+| `--corrector-budget F` / `corrector_budget` | 0.5 | the cap's fraction of the velocity RMS (trained at 0.5) |
+| `--corrector-floor F` / `corrector_floor` | 0.001 | the lower bound on the velocity RMS of the cap |
+| `--corrector-start N`, `--corrector-end N` / `corrector_start`, `corrector_end` | 0, -1 | the steps (0-based, inclusive; -1: the last) corrected |
+
+`OXINFER_H3_CORRECTOR_LOG=1` prints each step's sigma interval, the applied residual's RMS
+over the velocity's, and the time. Against the node pack's network: `tools/minimax_h3_corrector_tiny.py`
+builds a tiny random corrector (3 blocks of width 64, 6 channels) with its `corrector.py` and
+`examples/h3_corrector_check.rs` compares the raw and the capped residual on two latent shapes
+and sigma intervals (float32, CPU): within 7.0e-7 of the largest value, the RMS ratio to five
+digits.
+
+### Motion and structure guidance
+
+The guider of the experimental pack (`H3MotionGuider`, `guidance.py`), as `VideoParams::guidance`
+(`minimax_h3::video::MotionGuidance`): on the first `round(steps * until)` steps the
+video velocity of the prompt `v` is pushed away from two weaker predictions, `g = v + stg_scale (v
+- v_skip)` with `v_skip` the prompt's velocity with blocks `stg_layers` bypassed (the identity,
+as ComfyUI's `double_block` patch does), then `g += motion_scale (g - v_still)` with `v_still` the
+velocity of a "still" caption, the same scene with every motion frozen (its own packed layout:
+the text rows differ); the audio keeps `v`, and the corrector runs on `g`. A guided step costs
+two forwards more with both terms. Options (CLI / server request and C API `params_json`):
+`--still-prompt` / `still_prompt`, `--motion-scale` / `motion_scale` (1, the pack's workflows;
+its node defaults to 2), `--stg-scale` / `stg_scale` (1), `--stg-layers` / `stg_layers` (`20,21,22`;
+an array in JSON), `--guidance-until` / `guidance_until` (0.25). Setting any of them turns the
+guidance on with the others' defaults; without a still caption the motion term is off. With
+`--ref` (Ref2VA) only the structure term is taken: a still caption would need the references'
+presentation of its own. The still caption is encoded in the same load of the text encoder as
+the prompt.
+
+### What was checked
+
+- The decoded weights against comfy_kitchen's eager backend (`dequantize_w4a8_int8_weight`,
+  ConvRot included) on the real files: `examples/comfy_quant_check.rs` computes `W x` for 8
+  seeded rows as the loaders do and `tools/comfy_quant_check.py` compares with `x W^T` of the
+  dequantized weight (float64):
+
+| file, tensor | format | relative L2 (max abs, values up to) |
+|---|---|---|
+| `s3_w4a8`, `blocks.0.attn.qkv_proj` | `asym_w4a8_int8`, codebook | 1.35e-6 (1.1e-4, 42) |
+| `s3_w4a8`, `blocks.25.mlp.fc2` | | 2.16e-6 (3.9e-4, 90) |
+| `s3_w4a8`, `token_refiner.blocks.1.mlp.fc1` | | 1.35e-6 (1.2e-4, 52) |
+| `s3_raw_int8`, `blocks.0.attn.qkv_proj` | `int8_tensorwise`, no ConvRot | 1.30e-6 (1.2e-4, 42) |
+| `s3_raw_int8`, `blocks.30.adaln_proj.linear` (`[96768, 8]`) | | 5.3e-8 (1.9e-6, 18) |
+
+- The corrector against the node pack's network (above).
+- The guidance parameters and their parsing (unit tests); the guided loop was run on the real
+  file (below), not compared with ComfyUI.
+
+### Runs
+
+On this machine's CPU (M5 Max, 18 cores, 128 GB; `--device cpu`, a release build; the
+transformer has no Metal path), every file mapped, the text encoder `Qwen3-VL-32B-Instruct-Q8_0.gguf`
+(the 350-row JSON caption of the release's example workflow in 18.4 s; kept with
+`OXINFER_H3_PROMPT_EMBEDS`), the VAEs of `Comfy-Org/MiniMax-H3` (fp16 video, fp32 audio), 448x256,
+22 frames (7 latent frames: 784 video and 74 audio rows), seed 60, 20 Euler forwards (`--steps
+21`) at shifts 12 / 3, one run each under the machine's benchmark lock:
+
+| transformer | forwards | VAEs | in all | peak resident |
+|---|---|---|---|---|
+| `quantized/s3_w4a8` | 620.6 s (31.0 s each) | 16.8 s + 1.2 s | 685 s | 33.8 GB |
+| `s3` (pruned bf16) + `corrector2s` | 663.3 s (33.2 s a step, the corrector 1.6 to 2.1 s of it) | 11.2 s + 0.7 s | 721 s | 62.4 GB |
+| the same + motion / structure guidance (the example's still caption; a cargo build shared the cores) | 906.6 s: 5 guided steps of three forwards (85 to 89 s each), 15 plain ones (30 to 34 s) | 14.3 s + 0.7 s | 943 s | 63.0 GB |
+| `Comfy-Org`'s pruned int8 ConvRot H3 + `experimental/minimax_S3_tuned_normal` (200 modules, rank 128) | 666.5 s (33.3 s each) | 11.5 s + 0.7 s | 685 s | 29.7 GB |
+| the Ref2VA hybrid with one image reference (a frame of the first clip, `--ref-image-edge 256`: 112 rows; 1261 rows in all), 12 forwards (`--steps 13`), the vision tower from `mmproj-F16.gguf` | 385.2 s (32.1 s each) | 14.6 s | 424 s | 37.1 GB |
+| `quantized/s3_w4a8`, the first frame given (`--init-image`: the frame of the W4A8 clip above as `<Picture 1>`, 120 vision rows through the `mmproj-F16.gguf` tower; 470 text rows; the text encoder in the same process) | 714.7 s (35.7 s each) | 11.4 s + 0.7 s | 777 s (text 21.5 s) | 68.6 GB |
+
+What the clips show (contact sheets of every third frame read by the model that ran them, not by
+a person): every one shows the caption's scene, sharp and coherent through the clip: a woman with
+long red hair, a white tank top and dark jeans standing on a wooden floor in a sunny kitchen,
+the phone on the counter, filmed slightly from above. The W4A8 and the bf16 + corrector clips are
+two samples of it (other weights, the same noise), the woman nearly still over the 0.9 s (the
+caption's first beat, "she stands still and looks at the camera"). The LoRA clip (the base H3
+turned into S3 by the `tuned_normal` LoRA) has her dancing: hips, arms raised and swung, the mug
+and the rug of the caption. The guided clip is a third sample, again with little motion in 0.9 s.
+The Ref2VA clip keeps the reference's woman (face, hair, top) on the beach of its prompt, waving
+at the camera with a smile. The first-frame clip starts on the given frame and continues it
+(the same woman, kitchen and framing, a slight smile and head turn). The corrector's capped residual is 0.49 of the velocity's RMS at the
+first step (the cap is 0.5), 0.33 to 0.37 in the middle and 0.04 at the end.
+
+Not done: a 5-second clip (124 frames; 4,682 rows: about 200 s a forward on this CPU by the
+earlier runs' scaling), the 1344x768 / 672x384 sizes of the release's workflows, any comparison with
+ComfyUI's own output (nothing here runs ComfyUI), the release's other files (`s3_raw`,
+`s3_ref2va`, `s3k8*`, the other LoRAs, `s3_corrector` itself: `corrector2s` was run, which has
+the same architecture and size; disk), the pack's corrector speed options and residual-shaping
+experiments, and the transformer on Metal.

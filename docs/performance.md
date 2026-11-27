@@ -5473,6 +5473,24 @@ SDXL base (the public fp16 files, 1024^2, 20 steps): oxinfer samples in 9.6-12.9
 47.6 dB (oxinfer) and 44.9 dB (stable-diffusion.cpp) from diffusers in float32, 43.5 dB from each
 other (see [Stable Diffusion XL](stable-diffusion.md#stable-diffusion-xl)).
 
+## Video generation on the CPU (MiniMax-H3 / Sulphur-3)
+
+MiniMax-H3's transformer runs on the CPU here (its device engine is CUDA's,
+[video.md](video.md#on-cuda)). M5 Max, 18 cores, a 448x256 clip of 22 frames (784 video + 74
+audio + 350 text rows), 20 Euler forwards, one run each under the benchmark lock
+([video.md](video.md#sulphur-3) has the setup and the clips):
+
+| transformer (SulphurAI/Sulphur-3 unless named) | a forward | 20 forwards + VAEs | peak resident |
+|---|---|---|---|
+| `quantized/s3_w4a8` (4-bit codebook codes, decoded to int8 at load) | 31.0 s | 685 s | 33.8 GB |
+| `s3` (pruned bf16) with the 2.0B corrector (1.7 s a step) | 33.2 s | 721 s | 62.4 GB |
+| Comfy-Org's pruned int8 ConvRot H3 + the rank-128 `minimax_S3_tuned_normal` LoRA | 33.3 s | 685 s | 29.7 GB |
+| the Ref2VA int8 ConvRot hybrid, one image reference (1261 rows) | 32.1 s | 424 s (12 forwards) | 37.1 GB |
+
+Of a bf16 forward (`--profile`, 20 forwards): the four projections 88% (`qkv_proj` 164 s,
+`fc1` 216 s, `fc2` 121 s, `out_proj` 55 s), attention 57 s; the W4A8 file splits the same way
+(its int8 rows cost what bf16 rows do: products are float32 on decoded rows).
+
 ## Speech to text against whisper.cpp
 
 November 2026, M5 Max, LibriSpeech test-clean 672-122797 (496 s, long-form), greedy, English,
