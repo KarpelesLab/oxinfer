@@ -67,6 +67,8 @@ struct TaskState {
     step: Option<(usize, usize)>,
     /// Bytes fetched of the file being downloaded.
     download: Option<(u64, Option<u64>)>,
+    /// The peer the request was forwarded to.
+    peer: Option<String>,
 }
 
 /// A tracked request.
@@ -133,6 +135,7 @@ impl Task {
             tokens_per_sec: rate,
             step: s.step,
             download: s.download,
+            peer: s.peer.clone(),
             client: self.client.clone(),
             user_agent: self.user_agent.clone(),
             cancelling: self.cancelled(),
@@ -171,6 +174,8 @@ pub struct RequestInfo {
     pub user_agent: Option<String>,
     /// Cancelled, not stopped yet.
     pub cancelling: bool,
+    /// The peer it was forwarded to ([`super::ServerOptions::peers`]; None: it runs here).
+    pub peer: Option<String>,
 }
 
 impl RequestInfo {
@@ -192,6 +197,7 @@ impl RequestInfo {
             "client": self.client,
             "user_agent": self.user_agent,
             "cancelling": self.cancelling,
+            "peer": self.peer,
         })
     }
 }
@@ -290,6 +296,7 @@ impl Activity {
                 last_token: None,
                 step: None,
                 download: None,
+                peer: None,
             }),
             hooks: Mutex::new(Vec::new()),
         });
@@ -409,6 +416,13 @@ pub(crate) fn set_stage(stage: Stage) {
 
 pub(crate) fn set_model(model: &str) {
     with_current(|t| t.state().model = Some(model.to_string()));
+}
+
+/// The request runs on a peer.
+pub(crate) fn set_peer(task: &Task, addr: &str) {
+    let mut s = task.state();
+    s.peer = Some(addr.to_string());
+    s.stage = Stage::Generating;
 }
 
 pub(crate) fn set_stream(task: &Task) {

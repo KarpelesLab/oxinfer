@@ -315,5 +315,6 @@ pub(crate) fn status_json(api: &Api) -> Value {
         "degraded": crate::gpu::degraded(),
         "warnings": crate::gpu::warnings(),
         "prompt_cache": prompt_cache_json(api, &models),
+        "peers": api.peers.status_json(),
     })
 }

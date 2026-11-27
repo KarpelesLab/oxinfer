@@ -603,6 +603,12 @@ impl Registry {
         Ok(())
     }
 
+    /// The memory a model a request names would take, from its files on this machine's disk (0:
+    /// not known).
+    pub fn estimate_id(&self, id: &str) -> u64 {
+        ModelSpec::new(id).map_or(0, |s| estimate(&s, self.cache_dir.as_deref()))
+    }
+
     /// Unloads model `id` now: false when it was not loaded, a 409 while a request uses it.
     pub fn unload(&self, id: &str) -> ApiResult<bool> {
         let e = self.find(id)?;
@@ -1527,7 +1533,7 @@ fn load_video(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Path>) -> Res
 
 /// Whether a model name a request gives may be listed on request ([`Registry::admit`]): a repo
 /// id (`org/name`, `org/name:QUANT`) or a preset of the catalog; never a path.
-fn auto_name(id: &str) -> bool {
+pub(crate) fn auto_name(id: &str) -> bool {
     if crate::advisor::preset(id).is_some() {
         return true;
     }

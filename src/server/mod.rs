@@ -47,6 +47,7 @@ pub mod http;
 mod learn;
 mod media;
 mod openai;
+mod peer;
 mod registry;
 mod sign;
 mod speech;
@@ -56,6 +57,7 @@ mod video;
 pub mod web;
 
 pub use activity::{RequestInfo, Stage as RequestStage};
+pub use peer::PeerSpec;
 pub use registry::Kind;
 pub use status::PromptCacheCleared;
 
@@ -347,6 +349,14 @@ pub struct ServerOptions {
     /// model's trained context whatever its size). A model's own `max_context` always wins. See
     /// [`crate::opencode::CONTEXT_CAP`].
     pub opencode_context: Option<u64>,
+    /// Other oxinfer servers this one sends requests to (key `peer`, repeatable:
+    /// `HOST:PORT[,key=KEY]`, see [`PeerSpec`]): their models are listed with this server's, a
+    /// request for a model only a peer has is forwarded to it, and one for a model several
+    /// machines have goes to the machine that holds its conversation, else to the least loaded
+    /// one. Each peer is an `oxinfer serve` started with an API key (KEY; default this
+    /// server's own [`ServerOptions::api_key`]); a peer that answers without a key is not used.
+    /// See docs/cluster.md.
+    pub peers: Vec<PeerSpec>,
 }
 
 /// [`ServerOptions::parallel`]'s default.
@@ -384,6 +394,7 @@ impl Default for ServerOptions {
             idle_unload: Some(std::time::Duration::from_secs(30 * 60)),
             learn_dir: Some(default_learn_dir()),
             opencode_context: Some(crate::opencode::CONTEXT_CAP),
+            peers: Vec::new(),
         }
     }
 }
@@ -435,6 +446,7 @@ impl ServerOptions {
         "idle_unload_min",
         "learn_dir",
         "opencode_context",
+        "peer",
         "config",
     ];
 
@@ -519,6 +531,7 @@ impl ServerOptions {
                     ),
                 }
             }
+            "peer" | "peers" => self.peers.push(PeerSpec::parse(value)?),
             "config" => {
                 let text = std::fs::read_to_string(value).with_context(|| format!("config: {value}"))?;
                 let v: Value = serde_json::from_str(&text).with_context(|| format!("config: {value}"))?;
@@ -546,6 +559,12 @@ impl ServerOptions {
                     }
                 }
                 ("models" | "model", m @ Value::Object(_)) => self.models.push(ModelSpec::from_json(m)?),
+                ("peers" | "peer", Value::Array(a)) => {
+                    for p in a {
+                        self.peers.push(PeerSpec::from_json(p)?);
+                    }
+                }
+                ("peers" | "peer", p @ Value::Object(_)) => self.peers.push(PeerSpec::from_json(p)?),
                 (_, Value::String(s)) => self.set(k, s)?,
                 (_, Value::Bool(b)) => self.set(k, if *b { "1" } else { "0" })?,
                 (_, Value::Null) => self.set(k, "")?,
@@ -594,6 +613,9 @@ pub struct ApiRequest {
     /// belongs to, as the client names it. Kept with the episode of a `MODEL@PROFILE` request, so
     /// that an outcome can name the conversation instead of response ids.
     pub session: Option<String>,
+    /// Another oxinfer server forwarded the request (the `X-Oxinfer-Forwarded` header): it runs
+    /// here, whatever [`ServerOptions::peers`] says.
+    pub forwarded: bool,
     pub body: Vec<u8>,
 }
 
@@ -612,6 +634,7 @@ impl ApiRequest {
             peer: None,
             user_agent: None,
             session: None,
+            forwarded: false,
             body,
         }
     }
@@ -764,6 +787,7 @@ impl ApiError {
             403 => "permission_error",
             404 => "not_found_error",
             409 => "conflict_error",
+            502 => "peer_error",
             413 | 400 | 405 | 415 | 422 => "invalid_request_error",
             503 => "service_unavailable",
             507 => "insufficient_storage",
@@ -805,6 +829,8 @@ pub struct Api {
     snap_index: std::sync::Mutex<status::SnapIndex>,
     /// The profiles' logs and adapters ([`ServerOptions::learn_dir`]).
     learn: learn::Learn,
+    /// The other servers requests may go to ([`ServerOptions::peers`]).
+    peers: Arc<peer::Peers>,
 }
 
 impl Api {
@@ -830,7 +856,9 @@ impl Api {
         models.prompt_cache_gb = opts.prompt_cache_gb;
         models.parallel = opts.parallel;
         models.session_cache = opts.session_cache;
+        let peers = peer::Peers::new(&opts)?;
         let api = Arc::new(Api {
+            peers,
             models,
             web: opts.web.then(|| web::WebState::new(&opts)),
             signer: sign::ThinkingSigner::new(opts.thinking_key.as_deref()),
@@ -854,6 +882,9 @@ impl Api {
                 api.models.sweep(api.opts.idle_unload);
             }
         });
+        // The peers' state before the first request, then kept current.
+        api.peers.refresh();
+        peer::spawn_poller(&api);
         if api.opts.preload {
             api.models.preload()?;
         } else if api.opts.download {
@@ -942,6 +973,12 @@ impl Api {
         status::status_json(self)
     }
 
+    /// Asks the peers ([`ServerOptions::peers`]) for their state now, instead of at the next
+    /// poll (every two seconds): their models, load and free memory.
+    pub fn refresh_peers(&self) {
+        self.peers.refresh();
+    }
+
     /// A fresh id after a prefix (`chatcmpl-` gives `chatcmpl-...`).
     pub(crate) fn new_id(&self, prefix: &str) -> String {
         let n = self.ids.fetch_add(1, Ordering::Relaxed);
@@ -991,7 +1028,8 @@ impl Api {
         if path == "/health" || path == "/v1/health" {
             // Still "ok" (the server answers), with the degraded-mode warnings beside it: kernels
             // that failed to compile and the like (`gpu::warnings`).
-            let warnings = crate::gpu::warnings();
+            let mut warnings = crate::gpu::warnings();
+            warnings.extend(self.peers.warnings());
             return Ok(Output::Full(ApiResponse::json(
                 200,
                 &json!({ "status": "ok", "degraded": !warnings.is_empty(), "warnings": warnings }),
@@ -1001,17 +1039,27 @@ impl Api {
         if req.body.len() > self.opts.max_body {
             return Err(ApiError::new(413, format!("request body over {} bytes", self.opts.max_body)));
         }
-        self.admit(req)?;
+        // Where it runs: here, or on a peer.
+        let plan = self.peers.plan(self, req, &path);
+        if plan.as_ref().is_none_or(|p| p.order.first() == Some(&0) && !p.auto) {
+            self.admit(req)?;
+        }
         let post = req.method.eq_ignore_ascii_case("POST");
         let kind = activity::kind_of(&path).filter(|_| post);
-        let Some(kind) = kind else { return self.dispatch(req, &path) };
+        let Some(kind) = kind else {
+            return self.run(plan.as_ref(), req, &path).map(|(out, _)| out);
+        };
         // A model request: listed (and cancellable) until its response is written.
         let mut reg = self
             .activity
             .start(kind, &path, requested_model(req), req.peer.clone(), req.user_agent.clone());
         let scope = activity::enter(&reg.task);
-        let out = self.dispatch(req, &path);
+        let out = self.run(plan.as_ref(), req, &path);
         drop(scope);
+        let (out, guard) = match out {
+            Ok((o, g)) => (Ok(o), g),
+            Err(e) => (Err(e), None),
+        };
         match out {
             Ok(Output::Stream { content_type, producer }) => {
                 activity::set_stream(&reg.task);
@@ -1020,6 +1068,7 @@ impl Api {
                 Ok(Output::Stream {
                     content_type,
                     producer: Box::new(move |sink| {
+                        let _guard = guard;
                         let task = reg.task.clone();
                         let _scope = activity::enter(&task);
                         // A cancel ends the body at its next write, with an error event.
@@ -1051,6 +1100,53 @@ impl Api {
         }
     }
 
+    /// Runs a request where its plan says ([`peer::Peers::plan`]; None: here): on the first
+    /// machine of the plan that can be reached, and for a model listed on request, that takes
+    /// it. The guard counts the conversation's request until the response is done.
+    fn run(self: &Arc<Self>, plan: Option<&peer::Plan>, req: &ApiRequest, path: &str) -> ApiResult<(Output, Option<peer::KeyGuard>)> {
+        let Some(plan) = plan else {
+            return self.dispatch(req, path).map(|o| (o, None));
+        };
+        // A machine without the memory or the disk for a model listed on request, or that
+        // cannot fetch it, passes the request on.
+        let pass = |status: u16| plan.auto && matches!(status, 404 | 507);
+        let mut last: Option<ApiError> = None;
+        for (n, &at) in plan.order.iter().enumerate() {
+            let more = n + 1 < plan.order.len();
+            if at == 0 {
+                if plan.auto || n > 0 {
+                    match self.admit(req) {
+                        Err(e) if more && pass(e.status) => {
+                            last = Some(e);
+                            continue;
+                        }
+                        r => r?,
+                    }
+                }
+                let guard = self.peers.begin(plan, 0);
+                return self.dispatch(req, path).map(|o| (o, Some(guard)));
+            }
+            let guard = self.peers.begin(plan, at);
+            match self.peers.forward(plan, at, req, path) {
+                Ok(Output::Full(r)) if more && pass(r.status) => {
+                    let msg = serde_json::from_slice::<Value>(&r.body)
+                        .ok()
+                        .and_then(|v| v.pointer("/error/message").and_then(Value::as_str).map(str::to_string))
+                        .unwrap_or_default();
+                    last = Some(ApiError::new(r.status, msg));
+                }
+                Ok(o) => return Ok((o, Some(guard))),
+                Err(Some(e)) => return Err(e),
+                Err(None) => {}
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            ApiError::new(502, "the machines that list this model cannot be reached (see GET /health)")
+                .param("model")
+                .code("peer_unavailable")
+        }))
+    }
+
     /// Runs a request on its endpoint.
     fn dispatch(self: &Arc<Self>, req: &ApiRequest, path: &str) -> ApiResult<Output> {
         let get = req.method.eq_ignore_ascii_case("GET");
@@ -1061,6 +1157,8 @@ impl Api {
         }
         match path {
             "/v1/models" if get => Ok(Output::Full(ApiResponse::json(200, &self.models_json()))),
+            // What this machine tells the servers that name it as a peer (docs/cluster.md).
+            "/v1/cluster" if get => Ok(Output::Full(ApiResponse::json(200, &peer::node_json(self)))),
             p if p.starts_with("/v1/models/") && get => {
                 let id = &p["/v1/models/".len()..];
                 let m = self
@@ -1119,21 +1217,7 @@ impl Api {
     /// Lists the model the request names when it is not listed and may be
     /// ([`ServerOptions::auto_models`], [`registry::Registry::admit`]).
     fn admit(&self, req: &ApiRequest) -> ApiResult<()> {
-        if !self.opts.auto_models || !(self.loopback || self.opts.api_key.is_some()) {
-            return Ok(());
-        }
-        // A page of another site (its own Origin), or one whose name resolves to this loopback
-        // address (DNS rebinding: its own Host), does not fetch models.
-        if let Some(origin) = &req.origin {
-            let authority = origin.split_once("://").map_or(origin.as_str(), |(_, a)| a);
-            if !req.host.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(authority)) {
-                return Ok(());
-            }
-        }
-        if self.loopback
-            && let Some(h) = &req.host
-            && !web::loopback_name(web::host_name(h))
-        {
+        if !self.may_admit(req) {
             return Ok(());
         }
         let Some(id) = requested_model(req) else { return Ok(()) };
@@ -1144,6 +1228,39 @@ impl Api {
             &id
         };
         self.models.admit(id)
+    }
+
+    /// Whether this request may list a model ([`ServerOptions::auto_models`]).
+    fn may_admit(&self, req: &ApiRequest) -> bool {
+        if !self.opts.auto_models || !(self.loopback || self.opts.api_key.is_some()) {
+            return false;
+        }
+        // A page of another site (its own Origin), or one whose name resolves to this loopback
+        // address (DNS rebinding: its own Host), does not fetch models.
+        if let Some(origin) = &req.origin {
+            let authority = origin.split_once("://").map_or(origin.as_str(), |(_, a)| a);
+            if !req.host.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(authority)) {
+                return false;
+            }
+        }
+        if self.loopback
+            && let Some(h) = &req.host
+            && !web::loopback_name(web::host_name(h))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// The memory this machine can still give to models: what is left of the budget, and no
+    /// more than the system can give now.
+    pub(crate) fn memory_free(&self) -> Option<u64> {
+        let used: u64 = self.models.status().iter().map(|m| m.bytes).sum();
+        let left = self.models.budget().map(|b| b.saturating_sub(used));
+        match (left, crate::platform::memory_headroom()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Whether this server's models may be managed: a loopback listener, or an API key.
@@ -1206,9 +1323,9 @@ impl Api {
         }
     }
 
-    fn models_json(&self) -> Value {
-        let data: Vec<Value> = self
-            .models
+    /// This machine's models, as `/v1/models` entries.
+    pub(crate) fn models_local_json(&self) -> Vec<Value> {
+        self.models
             .list_vision()
             .into_iter()
             .map(|(id, kind, loaded, vision)| {
@@ -1238,7 +1355,38 @@ impl Api {
                 }
                 m
             })
-            .collect();
+            .collect()
+    }
+
+    /// `/v1/models`: this machine's models and, with peers, theirs (`nodes`: where each is
+    /// listed, `local` for this machine).
+    fn models_json(&self) -> Value {
+        let mut data = self.models_local_json();
+        if self.peers.any() {
+            for m in &mut data {
+                m["nodes"] = json!(["local"]);
+            }
+            for (id, entry, at) in self.peers.models() {
+                match data.iter_mut().find(|m| m["id"] == id.as_str()) {
+                    Some(m) => {
+                        if let Some(n) = m["nodes"].as_array_mut() {
+                            n.extend(at.into_iter().map(Value::String));
+                        }
+                    }
+                    None => {
+                        let mut m = entry;
+                        // (The peer's own figures of the model stay in `GET /v1/cluster`.)
+                        if let Some(o) = m.as_object_mut() {
+                            for k in ["requests", "parallel", "memory"] {
+                                o.remove(k);
+                            }
+                        }
+                        m["nodes"] = json!(at);
+                        data.push(m);
+                    }
+                }
+            }
+        }
         json!({ "object": "list", "data": data })
     }
 }
@@ -1246,11 +1394,15 @@ impl Api {
 /// The event that ends a streamed response cancelled from the status page, in the endpoint's
 /// format.
 fn cancel_event(kind: &str, anthropic: bool) -> String {
-    let e = activity::cancelled_error();
+    error_event(&activity::cancelled_error(), kind, anthropic)
+}
+
+/// The event that ends a streamed response with an error, in the endpoint's format.
+pub(crate) fn error_event(e: &ApiError, kind: &str, anthropic: bool) -> String {
     if anthropic {
         format!(
             "event: error\ndata: {}\n\n",
-            String::from_utf8_lossy(&openai::anthropic_error_response(&e).body)
+            String::from_utf8_lossy(&openai::anthropic_error_response(e).body)
         )
     } else if kind == "image" {
         format!(
