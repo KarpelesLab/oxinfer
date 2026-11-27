@@ -247,6 +247,7 @@ pub fn run(args: &Args) -> Result<()> {
         height: clip.height,
         frames: clip.frames,
         fps: FPS,
+        rate: None,
         audio: Some(Soundtrack {
             sample_rate: OUT_RATE as u32,
             channels: vec![mix.clone(), mix],

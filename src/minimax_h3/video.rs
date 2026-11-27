@@ -763,10 +763,48 @@ pub struct Video {
     pub width: usize,
     pub height: usize,
     pub frames: Vec<Vec<u8>>,
-    /// Frames per second ([`FPS`] for MiniMax-H3; LongCat-Video-Avatar writes 25).
+    /// Frames per second ([`FPS`] for MiniMax-H3; LongCat-Video-Avatar writes 25), rounded when
+    /// the rate is not whole (`rate`).
     pub fps: usize,
+    /// The exact rate `num / den` frames per second when it is not `fps` (NTSC's 30000 / 1001:
+    /// `fps` 30); the containers store it. `None`: `fps`.
+    pub rate: Option<(u32, u32)>,
     /// `None` without an audio VAE (no `audio_vae/` in the release folder and none named).
     pub audio: Option<Soundtrack>,
+}
+
+impl Video {
+    /// The frame rate as `num / den` frames per second (`rate`, or `fps / 1`).
+    pub fn frame_rate(&self) -> (u32, u32) {
+        self.rate.unwrap_or((self.fps.max(1) as u32, 1))
+    }
+
+    /// The frame rate in frames per second.
+    pub fn fps_f64(&self) -> f64 {
+        let (n, d) = self.frame_rate();
+        n as f64 / d.max(1) as f64
+    }
+}
+
+/// A frame rate as `num / den`: a whole rate as itself, NTSC's (23.976, 29.97, 59.94, ...) as
+/// `1000 k / 1001`, anything else in thousandths.
+pub fn rational_rate(fps: f64) -> (u32, u32) {
+    let fps = if fps.is_finite() && fps > 0.0 { fps } else { FPS as f64 };
+    let r = fps.round();
+    if (fps - r).abs() < 1e-4 * fps.max(1.0) {
+        return (r as u32, 1);
+    }
+    let k = (fps * 1.001).round();
+    if (fps - k * 1000.0 / 1001.0).abs() < 1e-4 * fps {
+        return ((k * 1000.0) as u32, 1001);
+    }
+    let n = (fps * 1000.0).round() as u32;
+    let g = gcd(n, 1000);
+    (n / g, 1000 / g)
+}
+
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a.max(1) } else { gcd(b, a % b) }
 }
 
 /// A generated soundtrack: one waveform per channel (left, right), samples in `[-1, 1]`.
@@ -1304,6 +1342,7 @@ impl VideoPipeline {
             height: h,
             frames,
             fps: FPS,
+            rate: None,
             audio: None,
         })
     }

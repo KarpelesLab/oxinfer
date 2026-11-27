@@ -1844,7 +1844,8 @@ impl Pipeline {
             width: w,
             height: h,
             frames: frames_rgb,
-            fps: fps.round() as usize,
+            fps: (fps.round() as usize).max(1),
+            rate: Some(crate::minimax_h3::video::rational_rate(fps as f64)).filter(|r| r.1 != 1),
             audio: soundtrack,
         })
     }

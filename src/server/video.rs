@@ -672,7 +672,7 @@ fn run_ltx(j: &Job, r: &Request, pipe: &crate::ltx::Pipeline) -> ApiResult<crate
     j.set(|s| {
         s.size = Some((video.width, video.height));
         s.frames = Some(video.frames.len());
-        s.fps = Some(video.fps as f64);
+        s.fps = Some(video.fps_f64());
     });
     Ok(video)
 }

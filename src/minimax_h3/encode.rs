@@ -86,13 +86,13 @@ pub fn avi_mjpeg(v: &Video) -> Result<Vec<u8>> {
     // (the last frame's chunk takes what is left).
     let audio = v.audio.as_ref().filter(|a| !a.is_empty() && n > 0);
     let (rate, block) = audio.map_or((0, 0), |a| (a.sample_rate as usize, 2 * a.channels.len()));
+    let (num, den) = v.frame_rate();
+    let (num, den) = (num as usize, den as usize);
+    // The first sample at frame `i`'s time.
+    let at = |i: usize| (i as u64 * rate as u64 * den as u64 / num as u64) as usize;
     let span = |a: &Soundtrack, i: usize| {
-        let end = if i + 1 == n {
-            a.len()
-        } else {
-            ((i + 1) * rate / v.fps).min(a.len())
-        };
-        (i * rate / v.fps).min(end)..end
+        let end = if i + 1 == n { a.len() } else { at(i + 1).min(a.len()) };
+        at(i).min(end)..end
     };
     let max_audio = audio.map_or(0, |a| (0..n).map(|i| span(a, i).len() * block).max().unwrap_or(0));
     // avih: microseconds per frame, max bytes / s, padding, flags (has index), frames, initial
@@ -100,13 +100,14 @@ pub fn avi_mjpeg(v: &Video) -> Result<Vec<u8>> {
     let mut avih = Vec::new();
     let streams = 1 + audio.is_some() as usize;
     let rest = [0, 0x10, n, 0, streams, max.max(max_audio), v.width, v.height, 0, 0, 0, 0];
-    for x in [1_000_000 / v.fps, max * v.fps + rate * block].into_iter().chain(rest) {
+    let per_second = (max * num).div_ceil(den) + rate * block;
+    for x in [1_000_000 * den / num, per_second].into_iter().chain(rest) {
         avih.extend_from_slice(&u(x));
     }
     // strh: type, handler, flags, priority + language, initial frames, scale, rate, start, length,
     // buffer size, quality, sample size, frame rectangle.
     let mut strh = b"vidsMJPG".to_vec();
-    for x in [0, 0, 0, 1, v.fps, 0, n, max, 0xFFFF_FFFF, 0] {
+    for x in [0, 0, 0, den, num, 0, n, max, 0xFFFF_FFFF, 0] {
         strh.extend_from_slice(&u(x));
     }
     for x in [0, 0, v.width, v.height] {
@@ -377,16 +378,17 @@ pub fn mp4_or_webm(v: &Video, format: VideoFormat) -> Result<Vec<u8>> {
     };
     let media = crate::media::Media::new();
     let ctx = media.context();
-    let fps = v.fps as i64;
+    let (num, den) = v.frame_rate();
     let mut vp = CodecParameters::video(CodecId::new(vcodec));
     vp.width = Some(v.width as u32);
     vp.height = Some(v.height as u32);
     vp.pixel_format = Some(PixelFormat::Yuv420P);
-    vp.frame_rate = Some(Rational::new(fps, 1));
+    vp.frame_rate = Some(Rational::new(num as i64, den as i64));
     if format == VideoFormat::Mp4 {
         vp.options = h264_options(chunk_of(v));
     }
-    let vtb = TimeBase::new(1, fps);
+    // A packet's pts counts frames.
+    let vtb = TimeBase::new(den as i64, num as i64);
     // One encoder per chunk, each run on a thread of the pool.
     let starts: Vec<usize> = (0..v.frames.len()).step_by(chunk_of(v)).collect();
     let mut encoders = Vec::with_capacity(starts.len());
@@ -534,7 +536,7 @@ pub fn mp4_or_webm(v: &Video, format: VideoFormat) -> Result<Vec<u8>> {
         VideoFormat::Webm => {
             let mut m = oxideav_mkv::mux::MkvMuxer::new_webm(Box::new(buf.clone()), &streams).map_err(av)?;
             let secs = audio.map_or(0.0, |a| a.len() as f64 / a.sample_rate as f64);
-            let secs = secs.max(v.frames.len() as f64 / v.fps as f64);
+            let secs = secs.max(v.frames.len() as f64 / v.fps_f64());
             m.set_duration(std::time::Duration::from_secs_f64(secs)).map_err(av)?;
             Box::new(m) as Box<dyn oxideav_core::Muxer>
         }
@@ -565,11 +567,152 @@ pub fn mp4_or_webm(v: &Video, format: VideoFormat) -> Result<Vec<u8>> {
     }
     mux.write_trailer().map_err(av)?;
     drop(mux);
-    let out = buf.0.lock().unwrap_or_else(|p| p.into_inner()).get_ref().clone();
+    let mut out = buf.0.lock().unwrap_or_else(|p| p.into_inner()).get_ref().clone();
+    if format == VideoFormat::Mp4 {
+        mp4_exact_rate(&mut out, num, den).context("the MP4's frame rate")?;
+    }
     Ok(out)
 }
 
-/// The frames as an animated WebP (lossless; no audio), 24 fps in whole milliseconds.
+/// The video track's timing of an MP4 written by oxideav-mp4 at the exact frame rate `num / den`.
+///
+/// oxideav-mp4 (0.0.11) gives every video track the media timescale 1000 and rescales each
+/// sample's duration to it by truncation: 1/24 s becomes 41 ticks, so a 24 fps clip plays at
+/// 24.39 fps and ends early against its soundtrack. Here the track's boxes are rewritten in
+/// place (same sizes): the timescale `512 num` with samples of `512` ticks for a whole rate (as
+/// FFmpeg's 12288 for 24 fps), or `num` with `den` ticks (24000 / 1001), the `stts` (and `ctts`,
+/// `elst`) in those ticks, and the track's and the movie's durations.
+fn mp4_exact_rate(mp4: &mut [u8], num: u32, den: u32) -> Result<()> {
+    let (ts, delta) = if den == 1 { (num * 512, 512) } else { (num, den) };
+    // The boxes in `buf[range]`: (type, start of the body, end).
+    fn boxes(buf: &[u8], range: std::ops::Range<usize>) -> Result<Vec<([u8; 4], usize, usize)>> {
+        let mut out = Vec::new();
+        let mut at = range.start;
+        while at + 8 <= range.end {
+            let size = u32::from_be_bytes(buf[at..at + 4].try_into()?) as u64;
+            let kind: [u8; 4] = buf[at + 4..at + 8].try_into()?;
+            let (size, head) = match size {
+                1 => (u64::from_be_bytes(buf[at + 8..at + 16].try_into()?), 16),
+                0 => ((range.end - at) as u64, 8),
+                s => (s, 8),
+            };
+            let end = at + size as usize;
+            if size < head as u64 || end > range.end {
+                bail!("a malformed box at {at}");
+            }
+            out.push((kind, at + head, end));
+            at = end;
+        }
+        Ok(out)
+    }
+    let find = |list: &[([u8; 4], usize, usize)], k: &[u8; 4]| list.iter().find(|b| &b.0 == k).map(|b| (b.1, b.2));
+    let rd32 = |b: &[u8], at: usize| u32::from_be_bytes(b[at..at + 4].try_into().unwrap());
+    let rd64 = |b: &[u8], at: usize| u64::from_be_bytes(b[at..at + 8].try_into().unwrap());
+    let top = boxes(mp4, 0..mp4.len())?;
+    let (ms, me) = find(&top, b"moov").context("no moov")?;
+    let moov = boxes(mp4, ms..me)?;
+    let (hs, _) = find(&moov, b"mvhd").context("no mvhd")?;
+    // mvhd / tkhd / mdhd: version and flags, then (32 or 64-bit) times, the timescale (not in
+    // tkhd) and the duration.
+    let movie_ts = if mp4[hs] == 1 { rd32(mp4, hs + 20) } else { rd32(mp4, hs + 12) } as u64;
+    let mut movie_duration = 0u64;
+    for &(kind, ts0, te) in &moov {
+        if &kind != b"trak" {
+            continue;
+        }
+        let trak = boxes(mp4, ts0..te)?;
+        let (tks, _) = find(&trak, b"tkhd").context("no tkhd")?;
+        let tk_dur_at = if mp4[tks] == 1 { tks + 28 } else { tks + 20 };
+        let (ds, de) = find(&trak, b"mdia").context("no mdia")?;
+        let mdia = boxes(mp4, ds..de)?;
+        let (hd, _) = find(&mdia, b"hdlr").context("no hdlr")?;
+        if &mp4[hd + 8..hd + 12] != b"vide" {
+            movie_duration = movie_duration.max(if mp4[tks] == 1 {
+                rd64(mp4, tk_dur_at)
+            } else {
+                rd32(mp4, tk_dur_at) as u64
+            });
+            continue;
+        }
+        let (mh, _) = find(&mdia, b"mdhd").context("no mdhd")?;
+        let v1 = mp4[mh] == 1;
+        let (ts_at, dur_at) = if v1 { (mh + 20, mh + 24) } else { (mh + 12, mh + 16) };
+        let old_ts = rd32(mp4, ts_at) as u64;
+        // A time in the old ticks as whole samples in the new ones.
+        let retime = |t: u64| (t as f64 * num as f64 / (den as f64 * old_ts.max(1) as f64)).round() as u64 * delta as u64;
+        let (ns, ne) = find(&mdia, b"minf").context("no minf")?;
+        let minf = boxes(mp4, ns..ne)?;
+        let (ss, se) = find(&minf, b"stbl").context("no stbl")?;
+        let stbl = boxes(mp4, ss..se)?;
+        let (st, _) = find(&stbl, b"stts").context("no stts")?;
+        let mut samples = 0u64;
+        for e in 0..rd32(mp4, st + 4) as usize {
+            let at = st + 8 + 8 * e;
+            samples += rd32(mp4, at) as u64;
+            mp4[at + 4..at + 8].copy_from_slice(&delta.to_be_bytes());
+        }
+        if let Some((cs, _)) = find(&stbl, b"ctts") {
+            for e in 0..rd32(mp4, cs + 4) as usize {
+                let at = cs + 8 + 8 * e + 4;
+                let off = rd32(mp4, at) as i32;
+                let new = retime(off.unsigned_abs() as u64) as i64 * off.signum() as i64;
+                mp4[at..at + 4].copy_from_slice(&(new as i32).to_be_bytes());
+            }
+        }
+        let media_duration = samples * delta as u64;
+        mp4[ts_at..ts_at + 4].copy_from_slice(&ts.to_be_bytes());
+        if v1 {
+            mp4[dur_at..dur_at + 8].copy_from_slice(&media_duration.to_be_bytes());
+        } else {
+            mp4[dur_at..dur_at + 4].copy_from_slice(&u32::try_from(media_duration)?.to_be_bytes());
+        }
+        let track_duration = (media_duration * movie_ts).div_ceil(ts as u64);
+        if mp4[tks] == 1 {
+            mp4[tk_dur_at..tk_dur_at + 8].copy_from_slice(&track_duration.to_be_bytes());
+        } else {
+            mp4[tk_dur_at..tk_dur_at + 4].copy_from_slice(&u32::try_from(track_duration)?.to_be_bytes());
+        }
+        // An edit list: each segment's media time in the new ticks; a single segment spans the
+        // track.
+        if let Some((es, ee)) = find(&trak, b"edts")
+            && let Some((ls, _)) = find(&boxes(mp4, es..ee)?, b"elst")
+        {
+            let v1 = mp4[ls] == 1;
+            let n = rd32(mp4, ls + 4) as usize;
+            let step = if v1 { 20 } else { 12 };
+            for e in 0..n {
+                let at = ls + 8 + step * e;
+                if v1 {
+                    let mt = rd64(mp4, at + 8) as i64;
+                    if mt >= 0 {
+                        mp4[at + 8..at + 16].copy_from_slice(&(retime(mt as u64) as i64).to_be_bytes());
+                    }
+                    if n == 1 {
+                        mp4[at..at + 8].copy_from_slice(&track_duration.to_be_bytes());
+                    }
+                } else {
+                    let mt = rd32(mp4, at + 4) as i32;
+                    if mt >= 0 {
+                        mp4[at + 4..at + 8].copy_from_slice(&(retime(mt as u64) as i32).to_be_bytes());
+                    }
+                    if n == 1 {
+                        mp4[at..at + 4].copy_from_slice(&u32::try_from(track_duration)?.to_be_bytes());
+                    }
+                }
+            }
+        }
+        movie_duration = movie_duration.max(track_duration);
+    }
+    let dur_at = if mp4[hs] == 1 { hs + 24 } else { hs + 16 };
+    if mp4[hs] == 1 {
+        mp4[dur_at..dur_at + 8].copy_from_slice(&movie_duration.to_be_bytes());
+    } else {
+        mp4[dur_at..dur_at + 4].copy_from_slice(&u32::try_from(movie_duration)?.to_be_bytes());
+    }
+    Ok(())
+}
+
+/// The frames as an animated WebP (lossless; no audio), the frame rate in whole milliseconds.
 pub fn animated_webp(v: &Video) -> Result<Vec<u8>> {
     use oxideav_webp::anim_encode::AnimFrame;
     let frames: Vec<AnimFrame> = v
@@ -578,8 +721,10 @@ pub fn animated_webp(v: &Video) -> Result<Vec<u8>> {
         .enumerate()
         .map(|(i, f)| {
             let rgba: Vec<u8> = f.chunks(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
-            // 41.67 ms on average.
-            let d = ((i + 1) * 1000 / v.fps - i * 1000 / v.fps) as u32;
+            // At 24 fps 41.67 ms on average.
+            let (num, den) = v.frame_rate();
+            let ms = |i: usize| i as u64 * 1000 * den as u64 / num as u64;
+            let d = (ms(i + 1) - ms(i)) as u32;
             AnimFrame::new(v.width as u32, v.height as u32, rgba, d)
         })
         .collect();
@@ -620,6 +765,7 @@ mod tests {
             height: h,
             frames,
             fps: FPS,
+            rate: None,
             audio: Some(Soundtrack {
                 sample_rate: 32000,
                 channels: vec![tone(440.0), tone(660.0)],
@@ -802,6 +948,48 @@ mod tests {
         assert!(d.audio[0].len() >= a.len());
     }
 
+    /// The MP4's video track keeps the exact frame rate: 24 fps as 512 ticks of 1/12288 s, NTSC's
+    /// 30000 / 1001 as 1001 ticks of 1/30000 s; the movie lasts as long as the frames.
+    #[test]
+    fn mp4_exact_frame_rate() {
+        for (rate, ts, delta) in [(None, 12288u32, 512i64), (Some((30000u32, 1001u32)), 30000, 1001)] {
+            let mut v = test_video(64, 32, 30);
+            v.rate = rate;
+            if rate.is_some() {
+                v.fps = 30;
+                v.audio = None;
+            }
+            let bytes = encode_video(&v, VideoFormat::Mp4).unwrap();
+            let media = crate::media::Media::new();
+            let ctx = media.context();
+            let mut input: Box<dyn oxideav_core::ReadSeek> = Box::new(std::io::Cursor::new(bytes));
+            let format = ctx.containers.probe_input(&mut *input, Some("mp4")).unwrap();
+            let mut demux = ctx.containers.open_demuxer(&format, input, &ctx.codecs).unwrap();
+            let vs = demux
+                .streams()
+                .iter()
+                .find(|s| s.params.media_type == MediaType::Video)
+                .unwrap()
+                .clone();
+            assert_eq!(vs.time_base.0.num, 1);
+            assert_eq!(vs.time_base.0.den, ts as i64);
+            let mut pts = Vec::new();
+            while let Ok(p) = demux.next_packet() {
+                if p.stream_index == vs.index {
+                    pts.push(p.pts.unwrap());
+                }
+            }
+            assert_eq!(pts, (0..30).map(|i| i * delta).collect::<Vec<_>>());
+            let secs = demux.duration_micros().unwrap() as f64 / 1e6;
+            let want = 30.0 / v.fps_f64();
+            assert!((secs - want).abs() < 2e-3 || rate.is_none() && secs >= want, "{secs} {want}");
+        }
+        assert_eq!(crate::minimax_h3::video::rational_rate(24.0), (24, 1));
+        assert_eq!(crate::minimax_h3::video::rational_rate(29.97002997), (30000, 1001));
+        assert_eq!(crate::minimax_h3::video::rational_rate(23.976), (24000, 1001));
+        assert_eq!(crate::minimax_h3::video::rational_rate(12.5), (25, 2));
+    }
+
     /// How long a 124-frame 448x256 video (5.2 s) takes to write as MP4 and as WebM:
     /// `cargo test --release --lib encode_speed -- --ignored --nocapture`.
     #[test]
@@ -839,6 +1027,7 @@ mod tests {
             height: h,
             frames,
             fps: FPS,
+            rate: None,
             audio: Some(audio),
         };
         let avi = avi_mjpeg(&v).unwrap();

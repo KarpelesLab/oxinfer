@@ -44,7 +44,11 @@ take the same choice): H.264 by oxideav-h264 (Main profile with CABAC, the level
 size and rate, e.g. 2.1 at 448x256, constant QP 19, an IDR picture every second), AAC-LC by
 oxideav-aac (64 kb/s per channel) and MP4 by oxideav-mp4 (0.0.11 or later, which strips the AAC
 encoder's ADTS headers; the `esds` gets the AAC-LC `AudioSpecificConfig` from oxinfer, since
-oxideav-aac 0.1.7 does not report it); VP9 by oxideav-vp9, Opus by oxideav-opus (the 32 kHz
+oxideav-aac 0.1.7 does not report it; oxideav-mp4 gives every video track the timescale 1000
+and truncates each frame's duration to it, 41 ticks at 24 fps, so oxinfer rewrites the video
+track's `mdhd` / `stts` / `tkhd` / `mvhd` (and any `ctts` / `elst`) in place for the exact rate:
+timescale `512 fps` with 512-tick frames, as FFmpeg's 12288 for 24 fps, or `num / den` for
+NTSC's rates such as 30000 / 1001, which `Video::rate` carries); VP9 by oxideav-vp9, Opus by oxideav-opus (the 32 kHz
 soundtrack is resampled to 48 kHz) and WebM by oxideav-mkv, with the Segment's `Duration`. Each
 second of video (an IDR picture or VP9 keyframe and what follows) is encoded by its own encoder
 on its own thread and the packets concatenated: oxideav-vp9 has no keyframe interval of its own,

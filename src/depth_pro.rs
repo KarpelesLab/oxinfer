@@ -1468,7 +1468,7 @@ pub fn load_video(path: &Path, frames_fps: Option<f64>) -> Result<crate::video::
 
 /// The color preview of a video's predictions as an MP4 (H.264): metric inverse depth through
 /// the turbo color map on the first frame's scale, the frames edge-padded to a multiple of 16,
-/// `fps` rounded.
+/// at `fps` (NTSC rates as `1000 k / 1001`).
 #[cfg(feature = "media")]
 pub fn preview_mp4(maps: &[DepthMap], fps: f64) -> Result<Vec<u8>> {
     use crate::minimax_h3::video::{Video, VideoFormat};
@@ -1496,6 +1496,7 @@ pub fn preview_mp4(maps: &[DepthMap], fps: f64) -> Result<Vec<u8>> {
         height: hp,
         frames,
         fps: (fps.round() as usize).max(1),
+        rate: Some(crate::minimax_h3::video::rational_rate(fps)).filter(|r| r.1 != 1),
         audio: None,
     };
     crate::minimax_h3::encode::mp4_or_webm(&v, VideoFormat::Mp4)
