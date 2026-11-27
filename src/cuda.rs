@@ -4539,6 +4539,7 @@ mod tests {
                     continue;
                 }
                 let mut hid = vec![0f32; nseq * h];
+                #[allow(clippy::type_complexity)]
                 let mut parts: Vec<(&mut Slot, [&mut LayerCache; 1], [&mut [f32]; 2])> = batch
                     .iter_mut()
                     .map(|q| (&mut q.slot, [&mut q.cache], [&mut q.s0[..], &mut q.s1[..]]))
