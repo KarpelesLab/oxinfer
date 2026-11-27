@@ -26,7 +26,9 @@ download progress and cancellation. Loading `org/repo:QUANT` fetches the GGUF re
 top-level `mmproj*.gguf` vision projector beside the model when it has one (BF16, else F16, else
 F32), unless the `mmproj` option (`EngineOptions::mmproj`) is `none` or a file;
 `oxinfer::engine::resolve_model_with` and `oxinfer::hf::resolve_with` fetch with that choice
-without loading, `resolve_model` / `hf::resolve` as `auto`. `Engine::accepts_images` tells
+without loading, `resolve_model` / `hf::resolve` as `auto`. `oxinfer::hf::set_offline(true)`
+(or `HF_HUB_OFFLINE=1`) makes repo ids load from the cache without asking a hub (see
+[Offline, and hubs that do not answer](weights.md#offline-and-hubs-that-do-not-answer)). `Engine::accepts_images` tells
 whether a loaded model takes images. [Core ML](coreml.md) packages load through the same
 `Engine::load` on macOS / iOS, with the options `coreml_units` (`ane`, `all`, `gpu`, `cpu`) and
 `coreml_prefill` (`auto`, `batch`, `pad`, `single`); `engine.info().coreml` describes them. The lower-level pieces the CLI is built from are public too:

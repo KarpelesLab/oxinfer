@@ -32,6 +32,68 @@ huggingface.co. `OXINFER_HUB=mirror` or `OXINFER_HUB=hf` (`oxinfer::hf::set_hub`
 only ever sent to huggingface.co. The browser build uses the same lookup (the mirror allows
 cross-origin requests).
 
+## Offline, and hubs that do not answer
+
+A load by repo id asks the hub for the repository's file list every time, as `huggingface_hub`
+does, so that a file whose size changed upstream is fetched again. How long it may wait depends
+on whether the cache can do without the answer:
+
+- **The cache holds what the load needs.** The whole question (the mirror and huggingface.co
+  together: name lookup, connection, TLS, answer) has 5 seconds, of which the mirror gets at
+  most half (`HF_HUB_ETAG_TIMEOUT=SECONDS` changes the 5). If no hub answers in that time, or
+  what answers is not the hub (an HTTP 408, 429 or 5xx, or a page that is not the listing, as a
+  captive portal sends), the cached files are used and one line on stderr says so:
+  `[the hub did not answer (...); using the cached files of org/name, and not asking again for 60 s]`.
+  For those 60 seconds, loads that the cache can serve do not ask at all.
+- **The cache does not hold it** (nothing cached, or a file missing). The listing has 30
+  seconds, and the load fails if it does not come, with what the hub said and what the cache
+  lacks.
+- **Offline**: `--offline` with any command, `HF_HUB_OFFLINE=1` or `OXINFER_OFFLINE=1` (`1`,
+  `true`, `yes`, `on`), or `oxinfer::hf::set_offline(true)` in the library. No hub is asked; a
+  repo id loads from the cache or fails at once, naming what is missing.
+
+A hub that answers "no" is not passed over: a repository that huggingface.co reports as not found
+or as denied (HTTP 401, 403, 404) fails the load even when it is in the cache, as before;
+`--offline` loads it.
+
+Without a listing, the cache's own files stand for it: every file of the repository's folder
+under its final name, at the size it has on disk. A download in progress lives in a
+`NAME.rsurlpart` file until it is whole, so a file under its final name is taken as complete. That
+also holds for a file put there by hand (`curl -o ~/.cache/oxinfer/hub/org--name/model.safetensors ...`):
+a truncated one is found by the loader, not by this check. The file sizes are compared with the
+hub's only when the hub answers.
+
+Nothing in a request waits without a bound:
+
+| step | bound |
+|---|---|
+| name lookup | 5 s |
+| each connection attempt | 5 s; a host with several addresses has them raced (below) |
+| a silent connection: TLS handshake, response headers, a body that stops | 20 s without a byte (`HF_HUB_DOWNLOAD_TIMEOUT=SECONDS`) |
+| a listing, or a small file read to choose the weights (`plan`) | 5 s or 30 s in all, as above |
+| a download that stops | dropped after the 20 s, resumed from the bytes on disk on a new connection; it gives up after 3 resumptions in a row that add nothing |
+
+When a name has several addresses (IPv6 and IPv4), they are tried the way Happy Eyeballs
+(RFC 8305) does: the families alternate, starting with the one the system resolver puts first,
+a new attempt starts 250 ms after the one before (at once if that one failed), and the address
+that connects first is used and remembered for a minute (its family's other addresses come
+next, three addresses in all). A first address that does not answer therefore costs that
+stagger on the first request to the host, not a connect timeout. The race runs on
+connections of its own that are closed at once (rsurl dials the addresses it is given in order),
+so the first request to a host with several addresses opens one connection more.
+
+`HF_ENDPOINT=URL` replaces `https://huggingface.co` (a mirror with the same API: `/api/models/org/name`
+and `/org/name/resolve/main/FILE`); the HuggingFace token is sent there and nowhere else.
+
+These were checked with local servers standing in for the hubs (`src/hf/offline_tests.rs`,
+`src/hf/net.rs`, with shorter timeouts than the defaults above): a server that accepts and
+never answers, one that sends part of a file and stops, a name whose first address drops every
+packet (simulated: the attempt waits out its timeout). With the defaults, `oxinfer --model
+Qwen/Qwen3.5-0.8B --download-only` on a cached model took 5.0 s against a local server that
+never answers (plain HTTP, a stalled TLS handshake, and a port that drops connection attempts
+alike), and 3 ms with `--offline`. The address race was not run against a real dead IPv6 route,
+and `HF_ENDPOINT` was run against a local server only.
+
 ## GGUF files
 
 `--model` also takes llama.cpp GGUF files, as a path or as `org/repo:QUANT` (the one file of a
@@ -44,7 +106,12 @@ fetches one beside the model too, with a note (BF16, else F16, else F32, else an
 subfolders such as `Old_Support/` are left alone), so that images work without naming it.
 Nothing more is fetched when an `mmproj*.gguf` is beside the model already (whatever its name),
 or when the `mmproj` option (`--mmproj`, engine / C / server `mmproj=`) is `none` or names a
-file. Architectures: `qwen35`
+file. The projector is an extra: when it cannot be fetched (the download fails or stops for
+good) a note says so and the model loads without image input; the part that arrived stays, and
+a later load completes it. Offline, or when the hub does not answer, a projector that is not in
+the cache is not asked for. A load does not know whether images will be sent, so a text-only use
+of such a repository still fetches the projector the first time; `--mmproj none` avoids that.
+Architectures: `qwen35`
 (Qwen3.5 / 3.6 / 3.8), `qwen35moe`, `qwen3`, `llama` (Llama 3.x, and Orpheus TTS, see
 [below](#llama-3-gguf)), `gemma4` (Gemma 4 text models, dense and 26B-A4B; see
 [Gemma 4 26B-A4B](gemma-4-26b.md#gemma-4-26b-a4b-moe)), `mistral-large4` (see
