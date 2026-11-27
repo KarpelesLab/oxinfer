@@ -529,6 +529,32 @@ mod tests {
         }
     }
 
+    /// The VAE's biases and norm gains come back as bfloat16 values (the tiny file stores float32
+    /// ones that are not), like its kernels.
+    #[test]
+    fn vae_parameters_are_rounded_to_bf16() {
+        let dir = tmp("vae-bf16");
+        vae(&dir, 16).unwrap();
+        let t = crate::sd::ops::Tensors::open(&dir.join("diffusion_pytorch_model.safetensors")).unwrap();
+        for name in [
+            "decoder.conv_in.bias",
+            "encoder.conv_out.bias",
+            "quant_conv.bias",
+            "decoder.norm_out.gamma",
+        ] {
+            let stored = t.f32(name).unwrap();
+            let got = super::super::vae::rounded(&t, name).unwrap();
+            assert_eq!(got.len(), stored.len(), "{name}");
+            assert!(got.iter().all(|v| v.to_bits() & 0xffff == 0), "{name}: not bfloat16 values");
+            for (g, s) in got.iter().zip(&stored) {
+                assert!((g - s).abs() <= s.abs() / 256.0, "{name}: {g} is not {s} rounded");
+            }
+            // (The stored values need the rounding: otherwise this says nothing.)
+            assert!(stored.iter().any(|v| v.to_bits() & 0xffff != 0), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn schedule_and_buckets() {
         // The reference's scheduler at shift 7 (tools/longcat_avatar_tiny.py, `sched_sigmas`).

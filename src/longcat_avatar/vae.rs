@@ -21,6 +21,17 @@ use std::path::Path;
 
 type Frame = Vec<f32>;
 
+/// A bias or a norm gain, rounded to bfloat16 as the kernels are: the reference loads the whole
+/// VAE in bfloat16, and with these left as stored the released VAE's latents sit 1.7e-3 (mean)
+/// away from the reference's float32 run on its rounded weights, instead of 7.8e-7.
+pub(crate) fn rounded(t: &Tensors, name: &str) -> Result<Vec<f32>> {
+    let mut v = t.f32(name)?;
+    for x in &mut v {
+        *x = f32::from_bits((crate::sd::ops::f32_to_bf16(*x) as u32) << 16);
+    }
+    Ok(v)
+}
+
 /// Channel RMS norm: `x / max(|x|, 1e-12) * sqrt(C) * gamma` per pixel.
 struct Rms {
     g: Vec<f32>,
@@ -28,7 +39,7 @@ struct Rms {
 
 impl Rms {
     fn load(t: &Tensors, name: &str, c: usize) -> Result<Self> {
-        let g = t.f32(&format!("{name}.gamma"))?;
+        let g = rounded(t, &format!("{name}.gamma"))?;
         if g.len() != c {
             bail!("{name}.gamma has {} values, expected {c}", g.len());
         }
@@ -99,7 +110,7 @@ impl CConv {
                 }
             }
         }
-        let bias = t.f32(&format!("{name}.bias")).ok();
+        let bias = rounded(t, &format!("{name}.bias")).ok();
         Ok(Self {
             conv: Conv::from_kernel(&w2, cout, kt * cin, kh, bias).with_context(|| name.to_string())?,
             kt,
@@ -227,7 +238,7 @@ fn conv2d(t: &Tensors, name: &str) -> Result<Conv> {
     if kh != kw {
         bail!("{wn}: kernel {kh}x{kw}");
     }
-    Conv::from_kernel(&t.f32(&wn)?, cout, cin, kh, t.f32(&format!("{name}.bias")).ok()).with_context(|| name.to_string())
+    Conv::from_kernel(&t.f32(&wn)?, cout, cin, kh, rounded(t, &format!("{name}.bias")).ok()).with_context(|| name.to_string())
 }
 
 impl Attn {
@@ -396,13 +407,13 @@ fn conv111(t: &Tensors, name: &str) -> Result<Conv> {
     let wn = format!("{name}.weight");
     let shape = t.shape(&wn)?;
     let (cout, cin) = (shape[0], shape[1]);
-    Conv::from_kernel(&t.f32(&wn)?, cout, cin, 1, t.f32(&format!("{name}.bias")).ok()).with_context(|| name.to_string())
+    Conv::from_kernel(&t.f32(&wn)?, cout, cin, 1, rounded(t, &format!("{name}.bias")).ok()).with_context(|| name.to_string())
 }
 
 impl VideoVae {
     /// Loads `vae/` (config and `diffusion_pytorch_model.safetensors`); `encoder` false skips the
-    /// encoder (text to video). The weights are rounded to bfloat16, which is what the reference
-    /// runs this VAE at (activations included; here they stay float32).
+    /// encoder (text to video). Every weight (kernels, biases, norm gains) is rounded to bfloat16,
+    /// which is what the reference runs this VAE at (activations included; here they stay float32).
     pub fn load(dir: &Path, encoder: bool) -> Result<Self> {
         let cfg: VaeConfig = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?).context("vae/config.json")?;
         if cfg.latents_mean.len() != cfg.z_dim || cfg.latents_std.len() != cfg.z_dim {
