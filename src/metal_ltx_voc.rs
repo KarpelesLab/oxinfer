@@ -3,7 +3,10 @@
 //! convolution is `un_gemm`'s shifted GEMMs over half rows (its dilated taps, at most nine per
 //! GEMM), the transposed convolutions one GEMM per output phase (strided stores), the
 //! anti-aliased SnakeBeta activations `lb_act` (`metal_ltx.metal`), which write the next
-//! convolution's half input directly. One command buffer per generator.
+//! convolution's half input directly. Each GEMM input is a pair of half rows, the value rounded
+//! to half and its remainder (two GEMMs into the same rows): float32-like inputs (the single
+//! half rounding cost the soundtrack its precision: 35 dB from the CPU path over two generators
+//! of 30 convolutions). One command buffer per generator.
 
 use super::super::decode::{FastEnc, Fns, run_concurrent};
 use super::super::*;
@@ -31,8 +34,10 @@ enum B {
     /// Weights, biases, activation constants (uploaded per pass).
     W,
     C,
+    /// The remainders of H's values (half).
+    L,
 }
-const NBUF: usize = 9;
+const NBUF: usize = 10;
 
 pub(crate) struct MetalLtxVoc {
     be: &'static MetalBackend,
@@ -265,6 +270,7 @@ impl LtxVocSession for MetalLtxVoc {
         let steps = s.t;
         let ok = [B::X, B::Y, B::T, B::Z0, B::Z1, B::Z2].iter().all(|&b| self.ensure(b, maxf * 4))
             && self.ensure(B::H, maxf * 2)
+            && self.ensure(B::L, maxf * 2)
             && self.ensure(B::W, pack.w.len())
             && self.ensure(B::C, pack.c.len() * 4);
         if !ok {
@@ -287,48 +293,52 @@ impl LtxVocSession for MetalLtxVoc {
             let nct = l.cout.div_ceil(64);
             let tiles = (r_end - r0).div_ceil(TM) * nct;
             let taps = l.offs.len();
-            for (ci, chunk) in l.offs.chunks(9).enumerate() {
-                let mut off = [0i32; 9];
-                off[..chunk.len()].copy_from_slice(chunk);
-                let addb = if ci == 0 { add } else { Some(y.0) };
-                e.pipe(p.gemm);
-                e.buf(id(B::W), at.w + ci * 9 * l.cin * 2, 0);
-                e.buf(id(B::H), 0, 1);
-                e.buf(id(y.0), y.1, 2);
-                e.buf(id(B::C), at.b, 3);
-                e.bytes(
-                    &Ug {
-                        n_out: l.cout as u32,
-                        ldw: (taps * l.cin) as u32,
-                        cin: l.cin as u32,
-                        taps: chunk.len() as u32,
-                        off,
-                        a_rows: s.rows() as u32,
-                        r0: r0 as u32,
-                        r_end: r_end as u32,
-                        omode: 0,
-                        ldy: ldy as u32,
-                        has_bias: (ci == 0) as u32,
-                        bstride: 0,
-                        add: addb.is_some() as u32,
-                        nimg: 1,
-                        g: Geo::default(),
-                        scaled: 0,
-                        full: tiles as u32,
-                        rs: 1,
-                        kper: (chunk.len() * l.cin) as u32,
-                        nct: nct as u32,
-                        tm: TM as u32,
-                        nrem: 0,
-                        _p: 0,
-                    },
-                    4,
-                );
-                e.buf(id(addb.unwrap_or(y.0)), y.1, 5);
-                e.buf(id(B::C), 0, 6);
-                e.buf(id(B::T), 0, 7);
-                e.dispatch((tiles, 1), 128);
-                e.barrier();
+            // The half rows, then their remainders (accumulated into the same outputs).
+            for (pass, input) in [B::H, B::L].into_iter().enumerate() {
+                for (ci, chunk) in l.offs.chunks(9).enumerate() {
+                    let first = ci == 0 && pass == 0;
+                    let mut off = [0i32; 9];
+                    off[..chunk.len()].copy_from_slice(chunk);
+                    let addb = if first { add } else { Some(y.0) };
+                    e.pipe(p.gemm);
+                    e.buf(id(B::W), at.w + ci * 9 * l.cin * 2, 0);
+                    e.buf(id(input), 0, 1);
+                    e.buf(id(y.0), y.1, 2);
+                    e.buf(id(B::C), at.b, 3);
+                    e.bytes(
+                        &Ug {
+                            n_out: l.cout as u32,
+                            ldw: (taps * l.cin) as u32,
+                            cin: l.cin as u32,
+                            taps: chunk.len() as u32,
+                            off,
+                            a_rows: s.rows() as u32,
+                            r0: r0 as u32,
+                            r_end: r_end as u32,
+                            omode: 0,
+                            ldy: ldy as u32,
+                            has_bias: first as u32,
+                            bstride: 0,
+                            add: addb.is_some() as u32,
+                            nimg: 1,
+                            g: Geo::default(),
+                            scaled: 0,
+                            full: tiles as u32,
+                            rs: 1,
+                            kper: (chunk.len() * l.cin) as u32,
+                            nct: nct as u32,
+                            tm: TM as u32,
+                            nrem: 0,
+                            _p: 0,
+                        },
+                        4,
+                    );
+                    e.buf(id(addb.unwrap_or(y.0)), y.1, 5);
+                    e.buf(id(B::C), 0, 6);
+                    e.buf(id(B::T), 0, 7);
+                    e.dispatch((tiles, 1), 128);
+                    e.barrier();
+                }
             }
         };
         // `x` (c channels, signal s) through an activation into H.
@@ -338,6 +348,7 @@ impl LtxVocSession for MetalLtxVoc {
             e.buf(id(B::H), 0, 1);
             e.buf(id(B::C), ab, 2);
             e.buf(id(B::C), filt, 3);
+            e.buf(id(B::L), 0, 5);
             e.bytes(
                 &Lba {
                     t: s.t as u32,
@@ -356,6 +367,7 @@ impl LtxVocSession for MetalLtxVoc {
             e.pipe(p.half);
             e.buf(id(x), 0, 0);
             e.buf(id(B::H), 0, 1);
+            e.buf(id(B::L), 0, 3);
             e.bytes(
                 &Lbh {
                     n: c as u32,

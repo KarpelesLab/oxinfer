@@ -498,12 +498,15 @@ kernel void lv_out(device const float* x [[buffer(0)]], device float* y [[buffer
 // the same layout (every row of `rows`, zeros outside the steps): per step i, the 2x upsampled
 // signal (filter `up` of k taps, already times 2, the input's ends repeated), x + inv sin(alpha
 // x)^2 of it, its 2x downsampling (filter `down`, the upsampled ends repeated). A thread per value.
+// The value goes out as two halves, `out` and the remainder `lo` (the GEMMs read both: about 21
+// bits of the input's mantissa instead of 11).
 struct LBA { uint t; uint g; uint c; uint k; uint rows; uint _p0; uint _p1; uint _p2; };
 kernel void lb_act(device const float* x [[buffer(0)]], device half* out [[buffer(1)]], device const float* ab [[buffer(2)]],
-                   device const float* filt [[buffer(3)]], constant LBA& p [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+                   device const float* filt [[buffer(3)]], constant LBA& p [[buffer(4)]], device half* lo [[buffer(5)]],
+                   uint i [[thread_position_in_grid]]) {
     uint row = i / p.c, ch = i - row * p.c;
     if (row >= p.rows) return;
-    if (row < p.g || row >= p.g + p.t) { out[i] = 0.0h; return; }
+    if (row < p.g || row >= p.g + p.t) { out[i] = 0.0h; lo[i] = 0.0h; return; }
     uint s = row - p.g;
     int k = int(p.k), pad = k / 2 - 1, pad_left = pad * 2 + (k - 2) / 2, t = int(p.t);
     float alpha = ab[ch], inv = ab[p.c + ch];
@@ -523,7 +526,9 @@ kernel void lb_act(device const float* x [[buffer(0)]], device half* out [[buffe
         float sv = sin(alpha * u);
         acc += down[j] * (u + inv * sv * sv);
     }
-    out[i] = half(acc);
+    half hi = half(acc);
+    out[i] = hi;
+    lo[i] = half(acc - float(hi));
 }
 // y[r] = (a[r] + b[r] + c[r]) * scale over rows g .. g + t of n channels (the mean of a stage's
 // AMP blocks).
@@ -534,11 +539,14 @@ kernel void lb_mean3(device const float* a [[buffer(0)]], device const float* b 
     ulong j = (ulong)p.g * p.n + i;
     y[j] = (a[j] + b[j] + c[j]) * p.scale;
 }
-// f32 rows to half rows, every row of `rows` (zeros outside steps g .. g + t).
+// f32 rows to half rows and their remainders, every row of `rows` (zeros outside steps g .. g + t).
 struct LBH { uint n; uint g; uint t; uint rows; };
 kernel void lb_half(device const float* x [[buffer(0)]], device half* out [[buffer(1)]], constant LBH& p [[buffer(2)]],
-                    uint i [[thread_position_in_grid]]) {
+                    device half* lo [[buffer(3)]], uint i [[thread_position_in_grid]]) {
     uint row = i / p.n;
     if (row >= p.rows) return;
-    out[i] = (row < p.g || row >= p.g + p.t) ? 0.0h : half(x[i]);
+    float v = (row < p.g || row >= p.g + p.t) ? 0.f : x[i];
+    half hi = half(v);
+    out[i] = hi;
+    lo[i] = half(v - float(hi));
 }

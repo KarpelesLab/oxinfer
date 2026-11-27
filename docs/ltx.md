@@ -261,9 +261,10 @@ and residuals on the `ltx_*` kernels of `metal_ltx.metal`. The rest, also as who
   `lv_d2s` / `lv_out`; one command buffer per block (`OXINFER_LTX_VAE_GPU=0`: the CPU path);
 - the vocoder's two BigVGAN generators ([`metal_ltx_voc.rs`](../src/metal_ltx_voc.rs)): 1-D
   convolutions as shifted GEMMs over their dilated taps, the transposed convolutions one GEMM
-  per output phase, the anti-aliased SnakeBeta `lb_act` writing the next GEMM's half input; the
-  STFT log-mel between them and the 3x sinc upsampling stay on the CPU
-  (`OXINFER_LTX_VOC_GPU=0`: the CPU path);
+  per output phase, the anti-aliased SnakeBeta `lb_act` writing the next GEMM's input as two half
+  rows, the value and its remainder (two GEMMs into the same outputs: about 21 bits of each
+  input instead of half's 11, the precision the soundtrack needs); the STFT log-mel between them
+  and the 3x sinc upsampling stay on the CPU (`OXINFER_LTX_VOC_GPU=0`: the CPU path);
 - the text encoder (Gemma 4 12B) runs on the GPU prefill plan with every layer's output copied
   out when the model has one (`OXINFER_LTX_TEXT_GPU=0`: the host path); the int8 ConvRot file's
   rotated layers have no plan, so it stays on the host path (CPU kernels, per-op GPU matmuls).
@@ -343,7 +344,7 @@ are `ref_*.py` beside `examples/ltx_check.rs`'s checks):
 | the same on the Metal blocks | 1.8e-4 / 2.8e-4 | half GEMM inputs and half q / k / v |
 | video VAE decoder, whole Metal pass (3 x 4 x 6 latents) | 2.9e-4 | half GEMM inputs; 2.7e-4 from the CPU path at 768x512x121 |
 | text connectors on the Metal session (video / audio) | 1.6e-4 / 7.6e-5 | half GEMM inputs, int8 file |
-| vocoder with BWE, whole Metal passes | 1.6e-2 | half GEMM inputs through two 30-convolution generators (35 dB SNR against the CPU path on 5 s of audio; the soundtracks of a run have the same levels) |
+| vocoder with BWE, whole Metal passes | 1.9e-3 | GEMM inputs as two halves (54.5 dB SNR against the CPU path on 5 s of audio; with single half inputs 1.8e-2, 34.8 dB: the rounding of each of the two 30-convolution generators' inputs; a precise `sin` in the SnakeBeta changes nothing). A news anchor's line generated at 768x512 (97 frames) is transcribed by Whisper large-v3-turbo word for word: "Good evening. Tonight we report on the new bridge across the river." |
 
 Positions (video and audio) are bit-identical to the reference's.
 
