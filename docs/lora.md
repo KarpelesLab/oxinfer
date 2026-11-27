@@ -68,22 +68,26 @@ What it does, and what that costs:
   is unloaded. An adapter attached and switched off is still in the plans, where its side paths
   add zeros.
 
-Attaching is for Qwen-path, Gemma and Inkling-2 models decoded without MTP or a DSpark draft, not
-streamed from disk, without interventions or decision assets; the others return an error and stay
-as they were. (Inkling-2 has no compiled plans: its GPU engine is built again for the new set of
-adapters at the next pass. On CUDA that engine leaves a model with attached adapters to the CPU,
-switched on or not, so from the first attached adapter every request of the model decodes on the
-CPU. Inkling-2-Mini's release drafts with its MTP head by default on a GPU: `mtp=0,draft=none`
-for a model that takes profiles.) Updates are runtime ones (no merge). An adapter that fails part of the way (a module of
-another shape) is retired as a whole. MTP-layer modules of such an adapter are not applied
-(these models decode without the MTP layer).
+Attaching is for Inkling-2 models, drafting with their MTP head or a DSpark draft or not, and for
+Qwen-path and Gemma models decoded without MTP or a DSpark draft; not streamed from disk, without
+interventions or decision assets; the others return an error and stay as they were. (Inkling-2
+has no compiled plans. Its CUDA engine keeps the weights it holds and reads the adapters' side
+paths again at its next pass, see [GPU plans](#gpu-plans); its Metal engine is built again for
+the new set of adapters. Its drafter reads the target's streams and its head through the model
+at every round and is not adapted itself: the drafts of a request with an adapter are made from
+the adapted model's streams and verified by it.) Updates are runtime ones (no merge). An adapter
+that fails part of the way (a module of another shape) is retired as a whole. MTP-layer modules
+of such an adapter are not applied.
 
 Checked (`engine::pool_slots::tests`, tiny Qwen3.5, CPU): requests with the adapter give the
 tokens of a model loaded with it, requests without it the base model's, with two adapters
 attached, after a replacement, a failed load and a detach; requests with different adapters do
 not overlap. The same on the tiny Inkling-2 loop checkpoint (CPU; two adapters, a replacement, a
-detach). On the CUDA backend, see docs/learning.md, "What was checked" and "Inkling-2". Gemma and
-Metal were not run.
+detach), and with its tiny MTP drafter drafting (the replies of the model loaded with `lora=` or
+with none and decoded without drafts, drafts made before and after the attach and with the
+adapter on). On the CUDA backend, see [GPU plans](#gpu-plans) and docs/learning.md, "What was
+checked" and "Inkling-2". Gemma and Metal were not run (Inkling-2 with a draft on Metal
+included: the drafter there holds a product made from the target's head when it was built).
 
 ## GPU plans
 
@@ -114,7 +118,43 @@ zeros): drop the adapter for the base model's speed.
 Inkling-2 has its own Metal engine (docs/inkling.md, "On the GPU") with the same side paths:
 the dense updates beside each matmul, the routed experts' down updates per slot, and their gate /
 up updates added by the pair kernels before SiTU (prefill passes with those take the per-slot
-pair kernels rather than the grouped GEMMs). Its CUDA engine leaves adapted models to the CPU.
+pair kernels rather than the grouped GEMMs).
+
+Its CUDA engine (`src/inkling_cuda.rs`) has side paths for the dense projections: the
+attention's seven (`wq_du`, `wk_dv`, `wv_dv`, `wr_du`, `gate_attn`, `attn_sink_proj`, `wo_ud`),
+the dynamic convolutions' `weight_proj`, the loop gates' `controllers.*` and the unembedding.
+What it does:
+
+- The weights stay on the device as stored. The factors of every attached update are uploaded
+  beside them at the first pass after the set of attached adapters changed (attach, replace,
+  detach; retired updates are left out), and nothing else is uploaded again.
+- One kernel (`lora_k`) for decode and prefill passes: a block per token computes `u = A x`
+  (ranks up to 256) and adds `s B^T u` to the projection's output, up to 8 updates of different
+  outputs per launch (the attention's input projections are one launch, its output projection
+  another). A token of a pass of several is computed as in a pass of its own, as the rest of
+  the engine's passes of up to 16 tokens.
+- The strengths are read on the host before each pass and written to the device, and a pass
+  launches only the updates whose strength is not 0. An adapter attached and switched off adds
+  no launch and leaves the base model's logits bit for bit. Passes of up to 16 tokens are CUDA
+  graphs captured per session, for the updates that were on: a session captures them again
+  when that set changes (a pool session that changes adapter starts again anyway).
+- A message gate with an update on runs its three projections as plain matvecs / GEMMs instead
+  of the two fused gate kernels. The embedding's update is the host's lookup.
+- Updates of the routed experts have no kernel (nor ranks over 256, which were not tried): a
+  pass with such an adapter switched on is run by the CPU, head included (the session moves to
+  the host, and back at its next pass without it). The requests without that adapter stay on the GPU. A warning is
+  recorded once (stderr, `GET /health`).
+
+Checked on the tiny looped checkpoint in the engine's shapes (`cargo test --lib
+inkling::cuda::tests::lora`, RTX 5080): adapters attached as the pool attaches them, one on every
+dense module above (rank 4; it moves the logits by up to 7.4), one on `wo_ud`, both on at once:
+every position of a 40-token prefill pass, a 7-token pass and 23 one-token passes within 1.5e-4
+of the CPU path with the same adapters (the base model: 3.0e-5); switched off, and after a
+request with them on, the base model's bits; a 13-token pass the bits of 13 one-token passes
+with both on; one of them retired, the bits of the other alone; an adapter with expert updates
+switched on runs on the CPU (within the test's bound, 2e-3, of the CPU-only model) while the
+requests without it stay on the device with the base model's bits, and the warning is recorded.
+Real weights, and the speeds: [inkling.md](inkling.md#with-lora-adapters).
 
 ## Families and what is adapted
 

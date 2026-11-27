@@ -117,9 +117,10 @@ files (`version` is those four numbers):
   base model answers (the episode's `adapters` is `[]`). It is tried again when its files change.
 
 No restart and no reload of the base weights is involved. What attaching costs and where it
-works is in [LoRA adapters](lora.md#adapters-on-a-loaded-model): Qwen-path, Gemma and Inkling-2
-models decoded without MTP or a DSpark draft, not streamed from disk. On other models the
-profile's requests are logged and answered by the base model, with the stderr line above.
+works is in [LoRA adapters](lora.md#adapters-on-a-loaded-model): Inkling-2 models (drafting
+with their MTP head or not), and Qwen-path and Gemma models decoded without MTP or a DSpark
+draft; not streamed from disk. On other models the profile's requests are logged and answered by
+the base model, with the stderr line above.
 
 `DELETE /v1/models/{id}/profiles/{profile}/adapter` removes the folder and keeps the logs: the
 way to drop an adapter that does not help.
@@ -640,11 +641,58 @@ On real weights, one DGX Spark (GB10; the training is on its 20 CPU cores, 10 Co
   "Ahoy! A week be seven days, matey.", the texts of a server loaded with `lora=` that folder,
   while `ink` kept its two answers; after `DELETE .../profiles/p/adapter`, `ink@p` answered
   "Tokyo." again. The requests took 1.6 to 2.7 s before the attach (after the first), then 1.5
-  to 2.0 s for the profile and 4.6 to 5.1 s for the base model; which of them ran on the GPU was
-  not looked at (by its code, the CUDA engine leaves a model with attached adapters to the CPU).
+  to 2.0 s for the profile and 4.6 to 5.1 s for the base model: at that time the CUDA engine
+  left a model with an attached adapter to the CPU, switched on or not (measured since, below).
   `engine::pool_slots::tests::inkling_adapters_attach_to_a_loaded_model_and_switch_per_request`
   checks the same on the tiny checkpoint, CPU: two adapters side by side, one replaced, one
   detached, each reply equal to that of a model loaded with `lora=` or with none.
+- **Served to a profile, on the GPU.** The CUDA engine now runs the adapters' updates as side
+  paths ([lora.md](lora.md#gpu-plans)), so a model that takes profiles stays on the GPU. The
+  same server (`ink=RELEASE,device=cuda`, `--parallel 2`, a system message, `temperature` 0,
+  `max_tokens` 200), the same trained folder (rank 8 on the 24 `wo_ud`) and two questions,
+  on the GB10, the build before this change and after it, seconds per request:
+
+  | Request | Tokens | Before | After |
+  |---|---:|---:|---:|
+  | `ink`, "capital of Japan", before the attach | 61 | 2.1 | 2.0 to 2.1 |
+  | `ink`, "four sentences about the sea", before the attach | 200 | 5.7 | 5.7 |
+  | `ink@p`, capital, adapter in place ("Ahoy! The capital of Japan be Tokyo, matey.") | 16 | 2.2 to 2.3 | 1.1 |
+  | `ink`, capital, adapter in place | 61 | 5.0 to 5.3 | 2.8 to 2.9 |
+  | `ink@p`, sea, adapter in place | 200 | 6.8 to 7.2 | 4.7 to 4.8 |
+  | `ink`, sea, adapter in place | 186 before, 200 after | 10.2 to 11.1 | 5.5 to 5.7 |
+  | `ink@p`, capital, after `DELETE .../adapter` | 61 | 5.1 to 5.2 | 2.4 to 2.5 |
+  | `ink@p`, sea, after the delete | 186 before, 200 after | 10.3 to 10.4 | 5.7 |
+
+  (Two servers of each build, loaded with and without `mtp=0,draft=none`: neither drafts, see
+  below.)
+
+  Before, the base model's sea reply changed once the adapter was attached (the CPU's decode
+  steps do not round as the GPU's do) and the model stayed on the CPU after the delete; after,
+  `ink` gives the same text before, during and after (`OXINFER_GPU_PLAN_DEBUG=1`: 24 updates on
+  the device, none without a GPU path). The profile's sea reply is "Ahoy!" repeated to the
+  token limit (the adapter was trained on one-line answers); why those 200 tokens take less
+  time than the base model's was not looked at. Decode and prefill rates with and without
+  adapters: [inkling.md](inkling.md#the-cuda-engine). On the RTX 5080, AtomicChat's AD-IQ2_M with the
+  same adapter (after this change only): `ink`'s 200-token sea reply took 1.69 s before the
+  attach, 1.69 s with the adapter in place and, as `ink@p` after the delete, 1.85 s, the same
+  text each time; `ink@p` answered "Ahoy! The capital of Japan be Tokyo, matey." in 0.42 s and
+  its 200 tokens in 1.38 to 1.39 s.
+- **With the MTP head drafting.** On CUDA an Inkling-2 model does not draft unless asked
+  (`mtp=1` or `draft=`: the backend prefers plain decoding, `cuda::prefers_plain_decode`; with
+  `mtp.safetensors` beside the release and no option, the server made no draft round, before
+  and after). With `mtp=1` (the release's `mtp.safetensors`, the drafter on the CPU) on the
+  GB10: before this change the attach was refused ("adapters are attached to a loaded model
+  for ... models decoded without MTP or a DSpark draft") and `ink@p` gave the base model's
+  replies; after it, `ink@p` answered "Ahoy! The capital of Japan be Tokyo, matey." (1.3 s) and
+  the "Ahoy!" reply (4.8 to 4.9 s, 74 to 75 draft rounds, 126 drafts accepted), `ink` its own
+  two texts (6.1 and 5.7 s for the 200 tokens, 151 to 152 rounds, 49 accepted; 5.9 s, 150
+  rounds, 51 accepted before the attach), and after the delete `ink@p` the base texts again:
+  the texts of the server without the draft. The draft rounds are counted from the server's
+  `OXINFER_DEBUG_DRAFT=1` lines.
+  `engine::pool_slots::tests::inkling_adapters_attach_while_the_mtp_head_drafts` checks the
+  same on the tiny checkpoint with its tiny drafter, CPU: two adapters, one detached, each
+  reply that of a model loaded with `lora=` or with none and decoded without drafts, with
+  drafts made before the attach, after it, and with the adapter on.
 
 Time and memory on that machine, the release, per optimizer step:
 
@@ -664,7 +712,7 @@ transposed products are plain loops over dequantized rows; neither was tuned.
 Not checked or not done:
 
 - **No GPU.** Training is CPU only. The CUDA engine ([inkling.md](inkling.md), "The CUDA
-  engine") has no LoRA side paths, so it cannot even run the adapted forward; a backward there
+  engine") runs the adapted forward but has no backward; one there
   would need transposed GEMMs over bf16 and over the experts' NVFP4 / MXFP8 / GGUF blocks grouped
   by expert, kernels for the gradients of attention (windowed, with the relative bias and the
   sink), of the mixes, gates, convolutions and norms, and the routing kept from the forward. A
@@ -679,4 +727,6 @@ Not checked or not done:
 - Adapters of other shapes: the trainer reads and continues only folders whose modules are these
   seven projections with one rank (the published adapters for this model were not tried as a
   starting point).
-- Attaching to a loaded model on Metal, and with the MTP draft on.
+- Attaching to a loaded model on Metal (with or without a draft), with a DSpark draft GGUF
+  rather than the release's MTP head, and an adapter on the unembedding together with a draft
+  (the drafter keeps a product made from the target's head when it was built).

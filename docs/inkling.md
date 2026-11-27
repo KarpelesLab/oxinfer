@@ -643,7 +643,13 @@ weight formats the model has, a few seconds; kept in `~/.cache/oxinfer/kernels`,
   f32 adds: 5e-8 of the summed magnitudes at worst, as an f32 GEMM (the matvecs: 2e-8). Plain
   f16 operands (`gpu_exact=0`, ~10% faster prefill) move the logits by KL ~2e-3: drifts of even
   3e-6 tip some of this model's near-tied expert choices.
-- A session the device cannot hold moves to the host and continues on the CPU; LoRA adapters,
+- **LoRA adapters** on the dense projections (the attention's seven, the dynamic
+  convolutions', the message gates', the unembedding) run beside the weights, for adapters
+  given at load (`--lora`) and for those attached to a loaded model
+  ([lora.md](lora.md#gpu-plans) has the mechanism): an adapter switched off costs nothing and
+  gives the base model's bits; a pass with an update of the routed experts switched on runs on
+  the CPU, that pass only (numbers [below](#with-lora-adapters)).
+- A session the device cannot hold moves to the host and continues on the CPU;
   Hadamard-folded or streamed weights, the ternary / 1-bit GGUF formats and MLX affine Q4 keep
   the CPU path (`OXINFER_GPU_PLAN_DEBUG=1` says why), and so does a model whose weights, 0.5 GB
   of activations and 1 GB to spare do not fit the device's free memory (Q8_0 on a 16 GB card:
@@ -671,6 +677,57 @@ last 64 positions are at 2e-8 with three such spikes. `cargo test --lib cuda::` 
 kernel against an f64 definition (every weight format through the matvec and both GEMMs, the
 experts on both paths, attention in the three cache formats with windows, rings and splits, the
 routing with ties and NaNs, the convolutions, mixes, clips and gates against the CPU's functions).
+
+#### With LoRA adapters
+
+`examples/inkling2_cuda_check MODEL --lora DIR [--lora-off]` attaches an adapter as the server
+attaches a profile's (behind a switch) and tells whether the session ended on the device.
+"Before" is the commit before the side paths (`f94c13f`), where the engine declined a model
+with any update on a weight; a 1024-token prompt as one pass and 64 decode steps, the second of
+two runs, tok/s, prefill / decode. The adapters: one trained by `oxinfer lora-train` on the
+release (rank 8 on the 24 `wo_ud`), random ones of rank 16 on the 24 `wo_ud` and on all seven
+attention projections of every layer (168 updates), and the two published ones.
+
+| | RTX 5080, AtomicChat AD-IQ2_M | | GB10, release (NVFP4) | |
+|---|---:|---:|---:|---:|
+| | before | after | before | after |
+| no adapter | 2351 / 105.7 | 2352 / 106.2 | 983 / 25.5 | 1000 / 27.7 |
+| `wo_ud` rank 16, attached, off | 153 / 8.5 (CPU) | 2391 / 107.9 | | |
+| `wo_ud` rank 16, on | 167 / 8.8 (CPU) | 2370 / 103.1 | | |
+| trained `wo_ud` rank 8, attached, off | | 2337 / 104.7 | 97 / 13.9 (CPU) | 1009 / 25.6 |
+| trained `wo_ud` rank 8, on | | 2340 / 102.4 | 96 / 14.4 (CPU) | 991 / 25.0 |
+| all seven, rank 16, attached, off | | 2363 / 106.4 | | 1000 / 25.3 |
+| all seven, rank 16, on | | 2279 / 97.5 | | 959 / 24.6 |
+| OpenUncensored's PEFT adapter (rank 2, 20 `wo_ud`), on | | 2357 / 102.8 | | |
+| AtomicChat's GGUF adapter (rank 1; 24 `wo_ud`, 3072 expert updates, the embedding), attached, off | | 2357 / 106.9 | | |
+| the same, on | | 159 / 9.9 (CPU) | | |
+
+(The decode figures of one build move by a few percent between runs on both machines, which
+other jobs shared: 25.3 to 27.7 tok/s on the GB10 for passes that launch the same kernels. The
+rank-16 `wo_ud` rows after the change are a later round, in which no adapter gave 2390 / 107.8.)
+A switched-on `wo_ud` adapter adds one launch to each of the 48 layer applications of a token,
+the seven projections two. The trained adapter given at load instead (`oxinfer --model
+AD-IQ2_M --lora DIR --device cuda`, RTX 5080): its 24 updates on the device, the adapter's
+reply ("Ahoy! The capital of Japan be Tokyo, matey."), 15 tokens decoded at 107.5 tok/s
+(prompt lookup on).
+
+Agreement, 300 pseudo-random tokens and the adapter on, every position:
+
+| Checkpoint, adapter | Prefill against the CPU's with the adapter | 32 decode steps against the CPU's f32 prefill | against the device's own prefill | Moved by the adapter (max logit diff) |
+|---|---|---|---|---|
+| AD-IQ2_M, trained `wo_ud` | KL 4.2e-11, max diff 8.5e-5 | KL 4.3e-11, 6.1e-5 | KL 1.6e-12 | 20.2 |
+| AD-IQ2_M, all seven | KL 4.1e-11, 6.1e-5 | KL 4.1e-11, 5.7e-5 | KL 1.4e-12 | 3.5 |
+| AD-IQ2_M, OpenUncensored's | KL 4.0e-11, 6.1e-5 | KL 4.0e-11, 5.4e-5 | | 6.1 |
+| release, trained `wo_ud` | KL 4.4e-11, 7.2e-5 | KL 4.4e-11, 5.7e-5 | KL 1.5e-12 | 22.2 |
+| release, all seven | KL 4.3e-11, 6.3e-5 | | | 5.3 |
+
+Same top token at every position in the three comparisons of each row. The CPU's own decode
+steps, which round otherwise, are further from both (KL 6e-4 to 2e-2 over 16 steps, same top
+token at each). The updates of the dynamic convolutions' projections, of the message gates and
+of the unembedding were run on the tiny checkpoint only ([lora.md](lora.md#gpu-plans)).
+Attached and switched off, on the device, against the model without an adapter: equal bits at
+all 300 positions and 32 decode steps (the trained and the all-seven adapters both attached on
+the release and on AD-IQ2_M; OpenUncensored's and AtomicChat's both attached on AD-IQ2_M).
 
 `OXINFER_GPU_DECODE=0` (or `--gpu-decode off`) keeps the passes on the CPU,
 `OXINFER_INKLING_PREFILL=0` the prefill passes; `OXINFER_GPU_DECODE_CHECK=1` runs each decode
@@ -1475,9 +1532,11 @@ each of the 48 applications, and the backward runs each application again from i
 Spark's CPU a step over one 2,048-token episode of the release takes 157 s and 22.7 GB. The
 gradients are PyTorch autograd's on transformers' model to 1e-4, on a tiny checkpoint without
 the loop and on the release itself (a 45-token exchange), and the adapter it writes runs
-through `--lora` with the logits of the training forward (4.5e-5 to 6.7e-5 on real weights). A model served with `mtp=0,draft=none` takes adapters after its load
-too ([LoRA adapters](lora.md#adapters-on-a-loaded-model)), which is what the server's profiles
-(`MODEL@PROFILE`) use. No GPU is involved in training.
+through `--lora` with the logits of the training forward (4.5e-5 to 6.7e-5 on real weights). A
+served model takes adapters after its load too, with or without its MTP head drafting
+([LoRA adapters](lora.md#adapters-on-a-loaded-model)), which is what the server's profiles
+(`MODEL@PROFILE`) use, and on CUDA it stays on the GPU with them
+([above](#with-lora-adapters)). No GPU is involved in training.
 
 ## Not done
 
@@ -1491,6 +1550,10 @@ too ([LoRA adapters](lora.md#adapters-on-a-loaded-model)), which is what the ser
   share. The multi-token matvecs of the rest (2.2 ms more for 4 tokens than for 1) could shrink
   with kernels of their own (the decode library's reload each token's input per row pair).
 - A CUDA drafter (the DSpark / MTP block runs on the CPU there: no gain over plain decoding).
+- On CUDA, LoRA updates of the routed experts (AtomicChat's adapter has them): a request with
+  such an adapter switched on runs on the CPU. The decode kernels read the chosen experts' rows
+  in place and the prefill groups rows by expert: both would need the per-expert factors beside
+  them, as the Metal engine has.
 - A checkpoint larger than the card's free memory on the GPU: it runs on the CPU alone
   ([above](#threadripper-9970x-and-rtx-5080-16-gb): Q8_0 on 16 GB). The looped layers 6-17 are 36
   of a step's 48 applications and half of the experts, so an engine that kept those layers on the
