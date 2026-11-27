@@ -4451,6 +4451,14 @@ impl Backend for MetalBackend {
         self.na3d_impl(q, k, v, qd, kd, off, ker, heads, hd, out)
     }
 
+    fn ltx_vae_session(&'static self) -> Option<Box<dyn crate::gpu::dit::LtxVaeSession>> {
+        self.ltx_vae_session_impl()
+    }
+
+    fn ltx_voc_session(&'static self) -> Option<Box<dyn crate::gpu::dit::LtxVocSession>> {
+        self.ltx_voc_session_impl()
+    }
+
     fn t5_session(&'static self) -> Option<Box<dyn crate::gpu::dit::T5Session>> {
         self.t5_session_impl()
     }

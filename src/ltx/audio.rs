@@ -288,6 +288,8 @@ struct Generator {
     act_post: Act,
     post: Conv1,
     clamp: bool,
+    /// The layers as the device sees them, made on the first device pass.
+    dev: std::sync::OnceLock<DevGen>,
 }
 
 impl Generator {
@@ -333,6 +335,7 @@ impl Generator {
             act_post: Act::load(f, &format!("{p}.act_post"))?,
             post: conv1(f, &format!("{p}.conv_post"), 1)?,
             clamp: c.get("apply_final_activation").and_then(|v| v.as_bool()).unwrap_or(true),
+            dev: std::sync::OnceLock::new(),
         })
     }
 
@@ -348,7 +351,42 @@ impl Generator {
                 }
             }
         }
-        let (mut x, mut t) = self.pre.forward(&x, t);
+        let (y, t) = match self.forward_device(&x, t) {
+            Some(r) => r,
+            None => self.forward_cpu(&x, t),
+        };
+        let mut out = vec![0f32; 2 * t];
+        for r in 0..t {
+            for s in 0..2 {
+                let v = y[r * 2 + s];
+                out[s * t + r] = if self.clamp { v.clamp(-1.0, 1.0) } else { v };
+            }
+        }
+        out
+    }
+
+    /// The whole generator on the accelerator's session ([`crate::gpu::dit::LtxVocSession`]):
+    /// `conv_post`'s rows `[t * hop, 2]` from `x` (`[t, 2 mels]`); None when there is none or it
+    /// declined (`OXINFER_LTX_VOC_GPU=0`: the CPU path).
+    fn forward_device(&self, x: &[f32], t: usize) -> Option<(Vec<f32>, usize)> {
+        if std::env::var("OXINFER_LTX_VOC_GPU").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        let mut s = crate::gpu::active()?.ltx_voc_session()?;
+        let dev = self.dev.get_or_init(|| DevGen::new(self));
+        let mut y = Vec::new();
+        if !s.generate(&dev.view(), x, t, &mut y) {
+            return None;
+        }
+        // conv_post's rows carry its channels padded to 32: the first two.
+        let cp = dev.post.cout;
+        let n = y.len() / cp;
+        Some((y.chunks(cp).flat_map(|r| [r[0], r[1]]).collect(), n))
+    }
+
+    /// `conv_post`'s rows `[t * hop, 2]` from `x` (`[t, 2 mels]`) on the CPU kernels.
+    fn forward_cpu(&self, x: &[f32], t: usize) -> (Vec<f32>, usize) {
+        let (mut x, mut t) = self.pre.forward(x, t);
         for (up, amps) in self.ups.iter().zip(&self.amps) {
             let (y, nt) = up.forward(&x, t);
             t = nt;
@@ -366,15 +404,7 @@ impl Generator {
             x = m;
         }
         let a = self.act_post.apply(&x, t);
-        let (y, t) = self.post.forward(&a, t);
-        let mut out = vec![0f32; 2 * t];
-        for r in 0..t {
-            for s in 0..2 {
-                let v = y[r * 2 + s];
-                out[s * t + r] = if self.clamp { v.clamp(-1.0, 1.0) } else { v };
-            }
-        }
-        out
+        self.post.forward(&a, t)
     }
 }
 
@@ -524,5 +554,176 @@ impl Vocoder {
                     .collect()
             })
             .collect()
+    }
+}
+
+/// A generator layer as the device sees it ([`crate::gpu::dit::LtxVocLin`]).
+struct DevLin {
+    w: Vec<u16>,
+    bias: Vec<f32>,
+    cin: usize,
+    cout: usize,
+    offs: Vec<i32>,
+}
+
+impl DevLin {
+    /// From f32 rows `[cout][taps cin]` (tap by tap): bf16, the channels padded with zeros to
+    /// multiples of 32 (the device's signals carry them: zeros throughout), the rows to 64.
+    fn new(w: &[f32], b: &[f32], cin: usize, cout: usize, offs: Vec<i32>) -> Self {
+        let (ci, co) = (cin.next_multiple_of(32), cout.next_multiple_of(32));
+        let rows = co.next_multiple_of(64);
+        let taps = offs.len();
+        let mut wb = vec![0u16; rows * taps * ci];
+        for o in 0..cout {
+            for j in 0..taps {
+                for c in 0..cin {
+                    wb[(o * taps + j) * ci + c] = half::bf16::from_f32(w[(o * taps + j) * cin + c]).to_bits();
+                }
+            }
+        }
+        let mut bias = b[..cout].to_vec();
+        bias.resize(rows, 0.0);
+        Self {
+            w: wb,
+            bias,
+            cin: ci,
+            cout: co,
+            offs,
+        }
+    }
+
+    fn conv(c: &Conv1) -> Self {
+        let (w, b, cin, offs) = c.taps();
+        Self::new(w, b, cin, c.c_out, offs)
+    }
+
+    fn view(&self) -> crate::gpu::dit::LtxVocLin<'_> {
+        crate::gpu::dit::LtxVocLin {
+            w: &self.w,
+            bias: &self.bias,
+            cin: self.cin,
+            cout: self.cout,
+            offs: &self.offs,
+        }
+    }
+}
+
+struct DevAct {
+    ab: Vec<f32>,
+    filt: Vec<f32>,
+    k: usize,
+}
+
+impl DevAct {
+    fn new(a: &Act) -> Self {
+        let (alpha, inv, up, down) = a.parts();
+        // Zero alpha and inverse beta for the padding channels: they stay zero.
+        let cp = alpha.len().next_multiple_of(32);
+        let pad = |v: &[f32]| {
+            v.iter()
+                .copied()
+                .chain(std::iter::repeat_n(0.0, cp - v.len()))
+                .collect::<Vec<f32>>()
+        };
+        Self {
+            ab: pad(alpha).into_iter().chain(pad(inv)).collect(),
+            filt: up.iter().chain(down).copied().collect(),
+            k: up.len(),
+        }
+    }
+
+    fn view(&self) -> crate::gpu::dit::LtxVocAct<'_> {
+        crate::gpu::dit::LtxVocAct {
+            ab: &self.ab,
+            filt: &self.filt,
+            k: self.k,
+        }
+    }
+}
+
+/// One dilation of an AMP block on the device: activation, convolution, activation, convolution.
+type DevRes = (DevAct, DevLin, DevAct, DevLin);
+
+/// A generator's layers as the device sees them (made on the first device pass).
+struct DevGen {
+    pre: DevLin,
+    stages: Vec<(Vec<DevLin>, Vec<Vec<DevRes>>)>,
+    act_post: DevAct,
+    post: DevLin,
+}
+
+impl DevGen {
+    fn new(g: &Generator) -> Self {
+        let stages = g
+            .ups
+            .iter()
+            .zip(&g.amps)
+            .map(|(up, amps)| {
+                // Output step i s + ph is the causal transposed convolution's step i s + ph + crop:
+                // phase (ph + crop) % s at input step i + (ph + crop) / s, whose taps read the
+                // inputs from `taps - 1` steps before it.
+                let (ct, crop) = up.parts();
+                let (w, b, cin, cout, s, taps) = ct.phases();
+                let ups = (0..s)
+                    .map(|ph| {
+                        let (pp, q) = ((ph + crop) % s, (ph + crop) / s);
+                        let n = taps * cin;
+                        let offs = (0..taps).map(|j| (q + j) as i32 - (taps - 1) as i32).collect();
+                        DevLin::new(&w[pp * cout * n..(pp + 1) * cout * n], b, cin, cout, offs)
+                    })
+                    .collect();
+                let amps = amps
+                    .iter()
+                    .map(|a| {
+                        (0..a.convs1.len())
+                            .map(|i| {
+                                (
+                                    DevAct::new(&a.acts1[i]),
+                                    DevLin::conv(&a.convs1[i]),
+                                    DevAct::new(&a.acts2[i]),
+                                    DevLin::conv(&a.convs2[i]),
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect();
+                (ups, amps)
+            })
+            .collect();
+        Self {
+            pre: DevLin::conv(&g.pre),
+            stages,
+            act_post: DevAct::new(&g.act_post),
+            post: DevLin::conv(&g.post),
+        }
+    }
+
+    fn view(&self) -> crate::gpu::dit::LtxVocGen<'_> {
+        use crate::gpu::dit::{LtxVocGen, LtxVocRes, LtxVocStage};
+        LtxVocGen {
+            pre: self.pre.view(),
+            stages: self
+                .stages
+                .iter()
+                .map(|(ups, amps)| LtxVocStage {
+                    up: ups.iter().map(DevLin::view).collect(),
+                    amps: amps
+                        .iter()
+                        .map(|a| {
+                            a.iter()
+                                .map(|(a1, l1, a2, l2)| LtxVocRes {
+                                    act1: a1.view(),
+                                    conv1: l1.view(),
+                                    act2: a2.view(),
+                                    conv2: l2.view(),
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                })
+                .collect(),
+            act_post: self.act_post.view(),
+            post: self.post.view(),
+        }
     }
 }

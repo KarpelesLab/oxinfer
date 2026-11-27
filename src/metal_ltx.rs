@@ -10,7 +10,7 @@
 use super::super::decode::{Fns, run_concurrent};
 use super::super::*;
 use super::{DBuf, Enc, U4, Xh, grow, release_all, runnable};
-use crate::gpu::dit::{Lin, LtxAttn, LtxIn, LtxModel, LtxPerturb, LtxSession};
+use crate::gpu::dit::{Lin, LtxAttn, LtxConnBlock, LtxIn, LtxModel, LtxPerturb, LtxSession};
 
 /// Blocks per command buffer.
 const BLOCKS_PER_CB: usize = 4;
@@ -34,6 +34,9 @@ pub(crate) struct MetalLtx {
     /// The static constants (biases, norm and gate weights) uploaded for this model: its key and
     /// the offsets of every layer's (see [`Consts`]).
     stat: Option<(usize, Vec<BlockConsts>)>,
+    /// The same for the text connector last run (its first query layer's address): per block its
+    /// attention's and its feed-forward's biases.
+    cstat: Option<(usize, Vec<ConnConsts>)>,
 }
 
 // SAFETY: as MetalDit.
@@ -88,8 +91,11 @@ enum B {
     U,
     Uh,
     Urs,
+    /// A text connector's static constants, and ones (its residuals' unit gates).
+    CStat,
+    One,
 }
-const NBUF: usize = 47;
+const NBUF: usize = 49;
 
 #[repr(C)]
 struct Lrm {
@@ -147,6 +153,14 @@ struct StreamConsts {
     down_b: Option<usize>,
 }
 
+/// A text connector block's attention constants and feed-forward biases.
+#[derive(Clone, Copy, Default)]
+struct ConnConsts {
+    attn: AttnConsts,
+    up_b: Option<usize>,
+    down_b: Option<usize>,
+}
+
 #[derive(Clone, Copy, Default)]
 struct BlockConsts {
     v: StreamConsts,
@@ -181,6 +195,7 @@ impl MetalBackend {
                 })
                 .collect(),
             stat: None,
+            cstat: None,
         }))
     }
 }
@@ -252,6 +267,20 @@ impl MetalLtx {
 }
 
 impl LtxSession for MetalLtx {
+    fn connector(
+        &mut self,
+        blocks: &[LtxConnBlock],
+        x: &[f32],
+        rows: usize,
+        cos: &[f32],
+        sin: &[f32],
+        eps: f32,
+        half_attention: bool,
+        out: &mut Vec<f32>,
+    ) -> bool {
+        self.connector_impl(blocks, x, rows, cos, sin, eps, half_attention, out)
+    }
+
     fn forward(&mut self, m: &LtxModel, v: &LtxIn, a: &LtxIn, ptb: &LtxPerturb, vout: &mut Vec<f32>, aout: &mut Vec<f32>) -> bool {
         let be = self.be;
         let (dv, da) = (m.dim, m.audio_dim);
@@ -726,6 +755,318 @@ impl LtxSession for MetalLtx {
             super::super::par_copy(vout.as_mut_ptr(), self.host(B::Hv), v.rows * dv);
             super::super::par_copy(aout.as_mut_ptr(), self.host(B::Ha), a.rows * da);
         }
+        true
+    }
+}
+
+/// The static constants of a text connector: (floats, per-block offsets).
+fn conn_statics(blocks: &[LtxConnBlock]) -> (Vec<f32>, Vec<ConnConsts>) {
+    let mut c: Vec<f32> = Vec::new();
+    let mut put = |v: &[f32]| -> usize {
+        let o = c.len();
+        c.extend_from_slice(v);
+        c.resize(c.len().next_multiple_of(64), 0.0);
+        o * 4
+    };
+    let mut out = Vec::with_capacity(blocks.len());
+    for b in blocks {
+        let a = &b.attn;
+        out.push(ConnConsts {
+            attn: AttnConsts {
+                bq: put(a.q.bias.unwrap_or(&[])),
+                bk: put(a.k.bias.unwrap_or(&[])),
+                bv: put(a.v.bias.unwrap_or(&[])),
+                bo: a.o.bias.map(&mut put),
+                qn: put(a.qn),
+                kn: put(a.kn),
+                gw: put(a.gate_w),
+                gb: put(a.gate_b),
+            },
+            up_b: b.ff.up.bias.map(&mut put),
+            down_b: b.ff.down.bias.map(&mut put),
+        });
+    }
+    (c, out)
+}
+
+impl MetalLtx {
+    /// [`LtxSession::connector`]: the blocks in one submission, the rows in `Hv`, the norms'
+    /// modulation a zero table and the residuals' gates a table of ones (the transformer
+    /// blocks' kernels with nothing to modulate).
+    #[allow(clippy::too_many_arguments)]
+    fn connector_impl(
+        &mut self,
+        blocks: &[LtxConnBlock],
+        x: &[f32],
+        rows: usize,
+        cos: &[f32],
+        sin: &[f32],
+        eps: f32,
+        half_att: bool,
+        out: &mut Vec<f32>,
+    ) -> bool {
+        let be = self.be;
+        let Some(b0) = blocks.first() else { return false };
+        let d = b0.attn.q.n_in;
+        let f = b0.ff.up.n_out;
+        if rows == 0 || x.len() != rows * d || cos.len() != rows * d / 2 || sin.len() != cos.len() {
+            return false;
+        }
+        for b in blocks {
+            let a = &b.attn;
+            if !attn_layers(a).iter().all(|l| runnable(be, l))
+                || a.k.rot != a.v.rot
+                || a.q.rot != a.k.rot
+                || !matches!(a.hd, 64 | 128)
+                || a.heads * a.hd != d
+                || a.q.n_in != d
+                || a.q.bias.is_none()
+                || a.k.bias.is_none()
+                || a.v.bias.is_none()
+                || a.gate_w.len() != a.heads * d
+                || !runnable(be, &b.ff.up)
+                || !runnable(be, &b.ff.down)
+                || b.ff.up.n_out != f
+            {
+                return false;
+            }
+        }
+        let rank = blocks
+            .iter()
+            .flat_map(|b| attn_layers(&b.attn).into_iter().chain([&b.ff.up, &b.ff.down]))
+            .filter_map(|l| l.side.as_ref().map(|(dn, _)| dn.n_out))
+            .max()
+            .unwrap_or(64);
+        let r = rows.next_multiple_of(MMA_TM);
+        let ok = self.ensure(B::Hv, r * d * 4)
+            && self.ensure(B::Xf, r * d * 4)
+            && self.ensure(B::Up, r * f * 4)
+            && self.ensure(B::Xh, r * f.max(d) * 2)
+            && self.ensure(B::Rs, r * 4)
+            && self.ensure(B::Xh2, r * d * 2)
+            && self.ensure(B::Rs2, r * 4)
+            && self.ensure(B::Q, r * d * 4)
+            && self.ensure(B::K, r * d * 4)
+            && self.ensure(B::V, r * d * 4)
+            && self.ensure(B::Qa, r * d * 4)
+            && self.ensure(B::Ka, r * d * 4)
+            && self.ensure(B::Va, r * d * 4)
+            && self.ensure(B::Att, r * d * 4)
+            && self.ensure(B::Tmp, r * d * 4)
+            && self.ensure(B::G, r * 64 * 4)
+            && self.ensure(B::Zero, f.max(d) * 4)
+            && self.ensure(B::U, r * rank * 4)
+            && self.ensure(B::Uh, r * rank * 2)
+            && self.ensure(B::Urs, r * 4);
+        if !ok {
+            return false;
+        }
+        let key = b0.attn.q.dev as *const _ as *const u8 as usize;
+        if self.cstat.as_ref().map(|s| s.0) != Some(key) {
+            let (c, offs) = conn_statics(blocks);
+            if !self.upload(B::CStat, &c) {
+                return false;
+            }
+            self.cstat = Some((key, offs));
+        }
+        let pad = |v: &[f32], n: usize| -> Vec<f32> {
+            let mut p = v.to_vec();
+            p.resize(r * n, 0.0);
+            p
+        };
+        let ok = self.upload(B::Hv, &pad(x, d))
+            && self.upload(B::Vcos, &pad(cos, d / 2))
+            && self.upload(B::Vsin, &pad(sin, d / 2))
+            && self.upload(B::One, &vec![1.0; d]);
+        if !ok {
+            return false;
+        }
+        // SAFETY: Zero holds f.max(d) floats; the device is idle.
+        unsafe { std::ptr::write_bytes(self.host(B::Zero), 0, f.max(d)) };
+        let ids: [Id; NBUF] = std::array::from_fn(|i| self.bufs[i].id);
+        let id = |b: B| ids[b as usize];
+        let at = |b: B, bytes: usize| (id(b), bytes);
+        let p = &self.p;
+        let mma = be.mma.as_ref().unwrap();
+        let stat = id(B::CStat);
+        let offs = &self.cstat.as_ref().unwrap().1;
+        let gemm = |en: &Enc, l: &Lin, x: Xh, r: usize, y: (Id, usize), ldy: usize| {
+            en.gemm(l, x, r, y, ldy, false);
+            if let Some((dn, up)) = &l.side {
+                let k = dn.n_out;
+                let u = Xh {
+                    xh: at(B::Uh, 0),
+                    rs: at(B::Urs, 0),
+                };
+                en.gemm(dn, x, r, at(B::U, 0), k, false);
+                en.to_half(at(B::U, 0), k, k, r, u);
+                en.gemm(up, u, r, y, ldy, true);
+            }
+        };
+        let input = |en: &Enc, l: &Lin, src: B, n: usize, r: usize, xh: B, rs: B| -> Xh {
+            let e = en.e;
+            let x = Xh {
+                xh: at(xh, 0),
+                rs: at(rs, 0),
+            };
+            if l.rot.is_some() {
+                e.pipe(p.rot);
+                e.buf(id(src), 0, 0);
+                e.buf(id(xh), 0, 1);
+                e.buf(id(rs), 0, 2);
+                e.bytes(&U4([n as u32, 0, 0, 0]), 3);
+                e.dispatch((r, 1), 256);
+                e.barrier();
+            } else {
+                en.to_half(at(src, 0), n, n, r, x);
+            }
+            x
+        };
+        // Rows of Hv RMS-normed (the zero table: no modulation) into Xf.
+        let norm = |en: &Enc| {
+            let e = en.e;
+            e.pipe(p.rms);
+            e.buf(id(B::Hv), 0, 0);
+            e.buf(id(B::Zero), 0, 1);
+            e.buf(id(B::Zero), 0, 2);
+            e.buf(id(B::Xf), 0, 3);
+            e.buf(id(B::Rs), 0, 4);
+            e.bytes(
+                &Lrm {
+                    n: d as u32,
+                    ld_x: d as u32,
+                    norm: 1,
+                    out_half: 0,
+                    eps,
+                    ld_tab: 0,
+                    sc_off: 0,
+                    sh_off: 0,
+                    uniform_cls: 1,
+                    _p: [0; 3],
+                },
+                5,
+            );
+            e.dispatch((r, 1), 256);
+            e.barrier();
+        };
+        // Hv[0..rows] += Tmp + bias (gates of one).
+        let residual = |en: &Enc, bias: Option<usize>| {
+            let e = en.e;
+            e.pipe(p.gadd);
+            e.buf(id(B::Hv), 0, 0);
+            e.buf(id(B::Tmp), 0, 1);
+            e.buf(stat, bias.unwrap_or(0), 2);
+            e.buf(id(B::One), 0, 3);
+            e.buf(id(B::One), 0, 4);
+            e.bytes(
+                &Lgd {
+                    n: d as u32,
+                    ld_y: d as u32,
+                    ld_tab: 0,
+                    off: 0,
+                    uniform_cls: 1,
+                    has_bias: bias.is_some() as u32,
+                    _p: [0; 2],
+                },
+                5,
+            );
+            e.dispatch(((d / 4).div_ceil(256), rows), 256);
+            e.barrier();
+        };
+        #[allow(clippy::too_many_arguments)]
+        let heads = |en: &Enc, src: B, dst: B, n: usize, hd: usize, bias: usize, nw: Option<usize>, rope: bool, half: bool| {
+            let e = en.e;
+            e.pipe(p.heads);
+            e.buf(id(src), 0, 0);
+            e.buf(id(dst), 0, 1);
+            e.buf(stat, bias, 2);
+            e.buf(stat, nw.unwrap_or(bias), 3);
+            e.buf(id(B::Vcos), 0, 4);
+            e.buf(id(B::Vsin), 0, 5);
+            e.bytes(
+                &Lhd {
+                    n: n as u32,
+                    ld_src: n as u32,
+                    hd: hd as u32,
+                    norm: nw.is_some() as u32,
+                    rope: rope as u32,
+                    out_half: half as u32,
+                    eps,
+                    n_valid: rows as u32,
+                },
+                6,
+            );
+            e.dispatch((r, 1), 256);
+        };
+        let (ok, _) = run_concurrent(be, &self.f, std::slice::from_ref(&(0..blocks.len())), |e, range| {
+            let en = Enc { e, be };
+            for i in range {
+                let b = &blocks[i];
+                let (a, c) = (&b.attn, &offs[i].attn);
+                // Self-attention.
+                norm(&en);
+                let inner = a.heads * a.hd;
+                e.pipe(p.glog);
+                e.buf(id(B::Xf), 0, 0);
+                e.buf(stat, c.gw, 1);
+                e.buf(stat, c.gb, 2);
+                e.buf(id(B::G), 0, 3);
+                e.bytes(&U4([d as u32, d as u32, a.heads as u32, 0]), 4);
+                e.dispatch((rows, 1), 256);
+                e.barrier();
+                let xq = input(&en, &a.q, B::Xf, d, r, B::Xh, B::Rs);
+                gemm(&en, &a.q, xq, r, at(B::Q, 0), inner);
+                gemm(&en, &a.k, xq, r, at(B::K, 0), inner);
+                gemm(&en, &a.v, xq, r, at(B::V, 0), inner);
+                let half = a.hd == 128 && half_att;
+                heads(&en, B::Q, B::Qa, inner, a.hd, c.bq, Some(c.qn), true, half);
+                heads(&en, B::K, B::Ka, inner, a.hd, c.bk, Some(c.kn), true, half);
+                heads(&en, B::V, B::Va, inner, a.hd, c.bv, None, false, half);
+                e.barrier();
+                let scale = (1.0 / (a.hd as f32).sqrt()).to_bits();
+                e.pipe(if a.hd == 128 {
+                    if half { mma.flash128 } else { mma.flash128_f32 }
+                } else {
+                    p.flash64
+                });
+                e.buf(id(B::Qa), 0, 0);
+                e.buf(id(B::Ka), 0, 1);
+                e.buf(id(B::Va), 0, 2);
+                e.buf(id(B::Att), 0, 3);
+                e.bytes(&U4([rows as u32, rows as u32, inner as u32, scale]), 4);
+                e.dispatch((rows.div_ceil(if a.hd == 128 { 64 } else { 32 }), a.heads), 128);
+                e.barrier();
+                e.pipe(p.gapp);
+                e.buf(id(B::Att), 0, 0);
+                e.buf(id(B::G), 0, 1);
+                e.bytes(&U4([inner as u32, a.hd as u32, a.heads as u32, 0]), 2);
+                e.dispatch((inner.div_ceil(256), rows), 256);
+                e.barrier();
+                let xo = input(&en, &a.o, B::Att, inner, r, B::Xh, B::Rs);
+                gemm(&en, &a.o, xo, r, at(B::Tmp, 0), d);
+                residual(&en, c.bo);
+                // Feed-forward.
+                norm(&en);
+                let xu = input(&en, &b.ff.up, B::Xf, d, r, B::Xh, B::Rs);
+                gemm(&en, &b.ff.up, xu, r, at(B::Up, 0), f);
+                let ub = offs[i].up_b;
+                e.pipe(p.gelu);
+                e.buf(id(B::Up), 0, 0);
+                e.buf(stat, ub.unwrap_or(0), 1);
+                e.bytes(&U4([f as u32, ub.is_some() as u32, 0, 0]), 2);
+                e.dispatch(((f / 4).div_ceil(256), r), 256);
+                e.barrier();
+                let xd = input(&en, &b.ff.down, B::Up, f, r, B::Xh, B::Rs);
+                gemm(&en, &b.ff.down, xd, r, at(B::Tmp, 0), d);
+                residual(&en, offs[i].down_b);
+            }
+        });
+        if !ok {
+            return false;
+        }
+        out.resize(rows * d, 0.0);
+        // SAFETY: Hv holds at least these rows.
+        unsafe { super::super::par_copy(out.as_mut_ptr(), self.host(B::Hv), rows * d) };
         true
     }
 }

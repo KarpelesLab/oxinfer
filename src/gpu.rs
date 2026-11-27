@@ -268,6 +268,16 @@ pub trait Backend: Send + Sync {
     ) -> bool {
         false
     }
+    /// A session running whole LTX-2.5 video VAE decodes on the device; None when the backend
+    /// has none.
+    fn ltx_vae_session(&'static self) -> Option<Box<dyn dit::LtxVaeSession>> {
+        None
+    }
+    /// A session running whole LTX-2.5 vocoder generator passes on the device; None when the
+    /// backend has none.
+    fn ltx_voc_session(&'static self) -> Option<Box<dyn dit::LtxVocSession>> {
+        None
+    }
     /// A session running whole CLIP text-encoder passes on the device; None when the backend
     /// has none.
     fn clip_session(&'static self) -> Option<Box<dyn dit::ClipSession>> {

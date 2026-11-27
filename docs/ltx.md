@@ -232,9 +232,29 @@ With Metal (M5's matrix units) every block of both streams runs as one submissio
 matrix-unit GEMMs (int8 ConvRot rows as Q8 blocks over the same mapped bytes, their inputs rotated
 on the GPU; bf16 as stored), video attention on `flash_attn128_mma` (half operands), audio and the
 cross-attention between the streams on `flash_attn64` (float32), the norms, modulations, gates
-and residuals on the `ltx_*` kernels of `metal_ltx.metal`. The output heads, the text encoder
-and its connectors, the VAEs and the vocoder run on the CPU kernels (their convolutions and
-matmuls on the GPU's per-op path). `OXINFER_LTX_GPU=0` keeps the transformer on the CPU; the
+and residuals on the `ltx_*` kernels of `metal_ltx.metal`. The rest, also as whole passes:
+
+- the text connectors: the same session (`LtxSession::connector`: both connectors' 8 blocks in
+  one submission, int8 ConvRot layers as Q8 twins, the norms and residuals on the blocks'
+  kernels with a zero modulation and unit gates); `OXINFER_LTX_GPU=0` keeps them on the CPU;
+- the video VAE decoder ([`metal_ltx_vae.rs`](../src/metal_ltx_vae.rs)): the activations in
+  `metal_unet.metal`'s padded layout with the frames as its images (plus images holding the
+  repeated first / last frames of the time padding), each 3x3x3 convolution three of
+  `un_gemm`'s shifted GEMMs (one per time tap, bf16 weights, half inputs: `PixelNorm` + SiLU'd by
+  `lv_prep`, or scaled into half's range), the depth-to-space steps and the final patches on
+  `lv_d2s` / `lv_out`; one command buffer per block (`OXINFER_LTX_VAE_GPU=0`: the CPU path);
+- the vocoder's two BigVGAN generators ([`metal_ltx_voc.rs`](../src/metal_ltx_voc.rs)): 1-D
+  convolutions as shifted GEMMs over their dilated taps, the transposed convolutions one GEMM
+  per output phase, the anti-aliased SnakeBeta `lb_act` writing the next GEMM's half input; the
+  STFT log-mel between them and the 3x sinc upsampling stay on the CPU
+  (`OXINFER_LTX_VOC_GPU=0`: the CPU path);
+- the text encoder (Gemma 4 12B) runs on the GPU prefill plan with every layer's output copied
+  out when the model has one (`OXINFER_LTX_TEXT_GPU=0`: the host path); the int8 ConvRot file's
+  rotated layers have no plan, so it stays on the host path (CPU kernels, per-op GPU matmuls).
+
+The image encoder (one frame per conditioning image, 0.7 s at 768x512), the latent upsamplers,
+the audio VAE decoder and the output heads stay on the CPU kernels with per-op GPU convolutions
+and matmuls. `OXINFER_LTX_GPU=0` keeps the transformer on the CPU; the
 `device=cpu` option of the server and the C API does the same per model. The NVFP4 transformer
 runs in the same session: its layers (repacked into ggml's NVFP4 blocks at load) go through
 `mma_NVFP4`, which dequantizes the E2M1 codes, the E4M3 scales of 16 values and the tensor-wide
@@ -257,6 +277,19 @@ wall time from start to the written `.mp4`, files mapped (resident set 17 to 22 
 | t2v 384x256 two stages, `--temporal-upscale`, 49 frames | 49 -> 97 (48 fps) | 63 s (machine shared) | no jump at the tile border (frame 48) |
 | t2v 384x256 one stage | 25 | 13.7 s | text 3.3 s, 8 forwards 4.4 s (0.55 s each), VAE 2.1 s, audio 1.3 s |
 | the same on the CPU (`--device cpu`, release build) | 25 | 79 s | 7.8 s a forward: the frames look the same as the GPU's |
+| t2v 384x256 one stage, `--transformer nvfp4` | 25 | 15.1 s | 0.54 s a forward on the Metal session (int8: 0.49 s); `--device cpu`: 7.5 s a forward |
+
+The whole GPU passes of the connectors, the VAE decoder and the vocoder, measured in one locked
+session against the build before them (same prompt and seed, `| time |` of the CLI):
+
+| run | before | after | parts before -> after |
+|---|---|---|---|
+| t2v 768x512x121, two stages | 80.4 s | 53.9 s | text + connectors 3.3 -> 1.4 s, VAE 23.1 -> 3.3 s, audio 4.4 -> 0.6 s (transformer stages unchanged: 35 s) |
+| t2v 384x256x25, one stage | 23.2 s | 10.3 s | text 5.8 -> 1.4 s, VAE 3.0 -> 0.4 s, audio 1.2 -> 0.4 s |
+
+Alone: the VAE decode of 768x512x121 takes 23.6 s per op and 3.2 s whole (`ltx_check vaebench`),
+both connectors 2.3 s and 0.39 s, the vocoder with its bandwidth extension (5 s of audio) 4.1 s
+and 0.29 s (`ltx_check audiobench`).
 
 ## Library, C API, server
 
@@ -291,6 +324,9 @@ are `ref_*.py` beside `examples/ltx_check.rs`'s checks):
 | `LTX2Scheduler(30)` | 6e-8 (one float32 ulp) | the dev schedule |
 | DiffVAE decoder, 2 x 4 x 6 latents (edge-padded to 3 x 7 x 7) / 4 x 8 x 12 (CPU) | 8.1e-7 / 8.1e-7 | `DiffusionVideoDecoder`, `CHUNKED` blocks, eager neighborhood attention, the reference's noise injected (`ref_diffvae.py`, `ltx_check diffvae`) |
 | the same on the Metal blocks | 1.8e-4 / 2.8e-4 | half GEMM inputs and half q / k / v |
+| video VAE decoder, whole Metal pass (3 x 4 x 6 latents) | 2.9e-4 | half GEMM inputs; 2.7e-4 from the CPU path at 768x512x121 |
+| text connectors on the Metal session (video / audio) | 1.6e-4 / 7.6e-5 | half GEMM inputs, int8 file |
+| vocoder with BWE, whole Metal passes | 1.6e-2 | half GEMM inputs through two 30-convolution generators (35 dB SNR against the CPU path on 5 s of audio; the soundtracks of a run have the same levels) |
 
 Positions (video and audio) are bit-identical to the reference's.
 
@@ -336,5 +372,5 @@ precision of the int8 and bf16 sessions; `ltx_check dit` with `LTX_SAVE` and `LT
 - The NVFP4 file is repacked into ggml's blocks at load (3 s, 18.7 GB of anonymous memory beside
   the mapped file: 34 GB resident at 384x256): the kernels do not read ComfyUI's packing (high
   nibble first, scales in cuBLAS's tiled order) in place.
-- The text encoder, connectors, VAEs and vocoder run on the CPU kernels with per-op GPU matmuls
-  and convolutions, not as whole GPU passes.
+- The int8 ConvRot text encoder has no whole GPU pass (the prefill plans have no input
+  rotation); the image encoder and the upsamplers run per op.

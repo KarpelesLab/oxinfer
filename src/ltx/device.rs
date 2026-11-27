@@ -198,6 +198,19 @@ impl<'a> Twins<'a> {
         })
     }
 
+    /// The device's view of a text connector's blocks.
+    pub(crate) fn connector<'s>(&'s self, c: &'s super::dit::Connector<'a>) -> Option<Vec<crate::gpu::dit::LtxConnBlock<'s>>> {
+        c.blocks()
+            .iter()
+            .map(|(a, f)| {
+                Some(crate::gpu::dit::LtxConnBlock {
+                    attn: self.attn(a)?,
+                    ff: self.ff(f)?,
+                })
+            })
+            .collect()
+    }
+
     /// The device's view of `dit`'s blocks.
     pub(crate) fn model<'s>(&'s self, dit: &'s Dit<'a>, half_attention: bool) -> Option<LtxModel<'s>> {
         let mut blocks = Vec::with_capacity(dit.n_blocks());

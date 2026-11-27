@@ -13,6 +13,8 @@
 //! ltx_check text FILE REF_DIR       # ref_text.py (FILE: the text encoder)
 //! ltx_check guider - REF_DIR        # ref_guider.py (guidance arithmetic, the dev schedule)
 //! ltx_check crf IMAGE QP OUT_DIR    # the H.264 round trip of a conditioning image
+//! ltx_check vaebench FILE T H W DIR # random latents decoded (timed); DIR/px_ref.f32: compared
+//! ltx_check audiobench FILE N DIR   # audio decoder and vocoder on N random rows (timed)
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -53,7 +55,7 @@ fn meta(dir: &Path) -> Result<serde_json::Value> {
 fn main() -> Result<()> {
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 4 {
-        bail!("usage: ltx_check dit|connector|vae|audio|upsample|text FILE [VAE] REF_DIR");
+        bail!("usage: ltx_check dit|connector|vae|vaebench|audio|audiobench|upsample|text FILE [ARGS] DIR");
     }
     let file = Path::new(&a[2]);
     let dir = Path::new(a.last().unwrap());
@@ -101,6 +103,18 @@ fn main() -> Result<()> {
             println!("forward {:.2}s", t0.elapsed().as_secs_f64());
             compare("video velocity", &vo, &r("vout")?);
             compare("audio velocity", &ao, &r("aout")?);
+            // LTX_SAVE=DIR: this run's velocities as DIR/vout.f32, DIR/aout.f32 (another run's
+            // reference: CPU against Metal on the same file).
+            if let Ok(out) = std::env::var("LTX_SAVE") {
+                let out = Path::new(&out);
+                std::fs::create_dir_all(out)?;
+                for (n, v) in [("vout", &vo), ("aout", &ao)] {
+                    std::fs::write(
+                        out.join(format!("{n}.f32")),
+                        v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
+                    )?;
+                }
+            }
             // The guidance passes (ref_dit_ptb.py): STG (video self-attention skipped in block 1,
             // audio in block 0) and the isolated-modality pass (no audio-video cross-attention).
             if dir.join("vout_ptb.f32").exists() {
@@ -187,9 +201,12 @@ fn main() -> Result<()> {
         "connector" => {
             let files = ModelFiles::open_file(file, false)?;
             let dit = ltx::dit::Dit::load(&files)?;
-            let v = dit.video_connector.forward(&r("vfeat")?, 1024);
+            // (On the device's session with LTX_DEVICE=metal.)
+            let t0 = std::time::Instant::now();
+            let v = dit.connect(true, &r("vfeat")?, 1024);
+            let a = dit.connect(false, &r("afeat")?, 1024);
+            println!("connectors {:.2}s", t0.elapsed().as_secs_f64());
             compare("video connector", &v, &r("vconn")?);
-            let a = dit.audio_connector.forward(&r("afeat")?, 1024);
             compare("audio connector", &a, &r("aconn")?);
         }
         "vae" => {
@@ -246,6 +263,68 @@ fn main() -> Result<()> {
                 ltx::vae::VideoDecoder::load(&files)?.decode(&lat, t, h, w, &mut |_, _| {})
             };
             println!("decode {:.2}s ({}x{}x{} frames)", t0.elapsed().as_secs_f64(), px.t, px.h, px.w);
+        }
+        "vaebench" => {
+            // ltx_check vaebench FILE T H W DIR: decode fixed random latents [128, T, H, W]
+            // (timed), the frames written to DIR/px.f32; compared with DIR/px_ref.f32 when
+            // present (another run's: CPU against GPU).
+            let (t, h, w) = (a[3].parse::<usize>()?, a[4].parse::<usize>()?, a[5].parse::<usize>()?);
+            let files = ModelFiles::open_file(file, false)?;
+            let dec = ltx::vae::VideoDecoder::load(&files)?;
+            let mut rng = oxinfer::sd::ops::Rng::new(7);
+            let lat = rng.normals(128 * t * h * w);
+            let t0 = std::time::Instant::now();
+            let px = dec.decode(&lat, t, h, w, &mut |_, _| {});
+            println!("decode {}x{}x{} frames {:.2}s", px.t, px.h, px.w, t0.elapsed().as_secs_f64());
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(
+                dir.join("px.f32"),
+                px.data.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
+            )?;
+            if dir.join("px_ref.f32").exists() {
+                compare("decoded frames", &px.data, &r("px_ref")?);
+            }
+            let enc = ltx::vae::VideoEncoder::load(&files)?;
+            let img = ltx::vae::Vid {
+                t: 1,
+                h: px.h,
+                w: px.w,
+                c: 3,
+                data: px.data[..px.h * px.w * 3].to_vec(),
+            };
+            let t0 = std::time::Instant::now();
+            let z = enc.encode(&img);
+            println!("encode one {}x{} frame {:.2}s", px.w, px.h, t0.elapsed().as_secs_f64());
+            std::fs::write(dir.join("z.f32"), z.data.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+            if dir.join("z_ref.f32").exists() {
+                compare("encoded frame", &z.data, &r("z_ref")?);
+            }
+        }
+        "audiobench" => {
+            // ltx_check audiobench FILE N DIR: N random audio latent rows through the audio
+            // decoder and the vocoder (timed), the waveform written to DIR/wave.f32 and compared
+            // with DIR/wave_ref.f32 when present.
+            let n = a[3].parse::<usize>()?;
+            let files = ModelFiles::open_file(file, false)?;
+            let dec = ltx::audio::AudioDecoder::load(&files)?;
+            let mut rng = oxinfer::sd::ops::Rng::new(9);
+            let rows = rng.normals(n * 128);
+            let t0 = std::time::Instant::now();
+            let mel = dec.decode(&rows)?;
+            println!("audio decoder {:.2}s", t0.elapsed().as_secs_f64());
+            let t_mel = mel.len() / (2 * dec.mel_bins);
+            let voc = ltx::audio::Vocoder::load(&files)?;
+            let t0 = std::time::Instant::now();
+            let w = voc.forward(&mel, t_mel);
+            println!("vocoder {:.2}s", t0.elapsed().as_secs_f64());
+            let flat: Vec<f32> = mel.iter().chain(w.concat().iter()).copied().collect();
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(dir.join("wave.f32"), flat.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+            if dir.join("wave_ref.f32").exists() {
+                let want = r("wave_ref")?;
+                compare("mel", &mel, &want[..mel.len().min(want.len())]);
+                compare("mel and waveform", &flat, &want);
+            }
         }
         "audio" => {
             let files = ModelFiles::open_file(file, false)?;

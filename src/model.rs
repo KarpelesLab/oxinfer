@@ -2243,6 +2243,15 @@ impl<'a> Model<'a> {
         self.forward_hidden_mm(sess, tokens, &[])
     }
 
+    /// A prompt through the GPU prefill plan with the residual after each layer of `cap`
+    /// (sorted) copied out: the final-normed hidden states `[t, hidden]` and the captured rows
+    /// `[t, cap.len(), hidden]`. None (nothing changed) when the plan cannot run.
+    pub fn forward_captures_gpu(&self, sess: &mut Session, tokens: &[u32], cap: &[usize]) -> Option<(Vec<f32>, Vec<f32>)> {
+        let mut rows = Vec::new();
+        let hs = self.gpu_prefill(sess, tokens, cap, &mut rows)?;
+        Some((hs, rows))
+    }
+
     /// Like `forward_hidden`, but positions listed in `mm` (relative to this call, sorted) take
     /// the given embedding (a multimodal soft token in text space) instead of the token
     /// embedding; their per-layer-embedding lookup uses the pad token, as in the reference.

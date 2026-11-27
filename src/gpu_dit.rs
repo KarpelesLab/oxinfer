@@ -320,6 +320,132 @@ pub trait LtxSession: Send {
     /// The rows of both streams after the last block (`[rows, dim]` each) into `vout` / `aout`;
     /// false when the device declined or failed (the caller runs the CPU path).
     fn forward(&mut self, m: &LtxModel, v: &LtxIn, a: &LtxIn, p: &LtxPerturb, vout: &mut Vec<f32>, aout: &mut Vec<f32>) -> bool;
+
+    /// A text connector's blocks (`x += attn1(rms(x))`, `x += ff(rms(x))`, the attention's
+    /// queries and keys rotated by `cos` / `sin`, `[rows, dim / 2]`) over `x` (`[rows, dim]`),
+    /// the rows after the last block into `out` (the final norm is the caller's). False when the
+    /// device declined or failed.
+    #[allow(clippy::too_many_arguments)]
+    fn connector(
+        &mut self,
+        _blocks: &[LtxConnBlock],
+        _x: &[f32],
+        _rows: usize,
+        _cos: &[f32],
+        _sin: &[f32],
+        _eps: f32,
+        _half_attention: bool,
+        _out: &mut Vec<f32>,
+    ) -> bool {
+        false
+    }
+}
+
+/// A block of LTX-2.5's text connectors (`Embeddings1DConnector`): gated self-attention and a
+/// GELU feed-forward.
+pub struct LtxConnBlock<'a> {
+    pub attn: LtxAttn<'a>,
+    pub ff: LtxFf<'a>,
+}
+
+/// A 3 x 3 x 3 convolution of LTX-2.5's video VAE (`crate::ltx::vae`): bfloat16 weights
+/// `[n_out][kt][ky][kx][cin]` (`n_out` the outputs rounded up to 64, the extra rows zero) and
+/// the bias (`n_out` values).
+pub struct LtxVaeConv<'a> {
+    pub w: &'a [u16],
+    pub bias: &'a [f32],
+    pub cin: usize,
+    pub cout: usize,
+}
+
+/// A step of the VAE decoder after its input convolution.
+pub enum LtxVaeOp<'a> {
+    /// A residual block: `x + conv2(silu(norm(conv1(silu(norm(x))))))`, `norm` the RMS over
+    /// the channels (`PixelNorm`, eps 1e-8).
+    Res(LtxVaeConv<'a>, LtxVaeConv<'a>),
+    /// A convolution, then depth-to-space by the strides (time, y, x), the first frame dropped
+    /// when time doubles.
+    D2s(LtxVaeConv<'a>, [usize; 3]),
+}
+
+/// LTX-2.5's convolutional video VAE decoder from its un-normalized latents to frames:
+/// `conv_in`, the ops, norm and SiLU, `conv_out`, the `patch x patch` depth-to-space.
+pub struct LtxVaeDecoder<'a> {
+    pub conv_in: LtxVaeConv<'a>,
+    pub ops: Vec<LtxVaeOp<'a>>,
+    pub conv_out: LtxVaeConv<'a>,
+    pub patch: usize,
+    /// Time padding: the first frame twice in front (causal) or the first and last frames
+    /// repeated (else).
+    pub causal: bool,
+}
+
+/// Whole LTX-2.5 video VAE decodes on the device.
+pub trait LtxVaeSession: Send {
+    /// Frames `[t', h 32, w 32, 3]` (in `[-1, 1]` before clamping, rows of 3) into `out` from
+    /// un-normalized latents `lat` (`[t, h, w, channels]` rows); `progress(done, total)` after
+    /// each op. False when the device declined or failed (the caller runs the CPU path).
+    #[allow(clippy::too_many_arguments)]
+    fn decode(
+        &mut self,
+        m: &LtxVaeDecoder,
+        lat: &[f32],
+        t: usize,
+        h: usize,
+        w: usize,
+        out: &mut Vec<f32>,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> bool;
+}
+
+/// A layer of a BigVGAN generator as shifted GEMMs (`crate::ltx::audio`): bfloat16 weights
+/// `[n_out][taps][cin]` (`n_out` the outputs rounded up to 64, the extra rows zero), the bias
+/// (`n_out` values) and the input row of each tap relative to the output's (a 1-D convolution:
+/// its dilated taps; a phase of a transposed convolution: its input steps).
+pub struct LtxVocLin<'a> {
+    pub w: &'a [u16],
+    pub bias: &'a [f32],
+    pub cin: usize,
+    pub cout: usize,
+    pub offs: &'a [i32],
+}
+
+/// An anti-aliased SnakeBeta activation: `alpha` then `1 / beta` per channel, the 2x upsampling
+/// filter (times 2) then the downsampling one, `k` taps each.
+pub struct LtxVocAct<'a> {
+    pub ab: &'a [f32],
+    pub filt: &'a [f32],
+    pub k: usize,
+}
+
+/// One dilation of an AMP block: `x += conv2(act2(conv1(act1(x))))`.
+pub struct LtxVocRes<'a> {
+    pub act1: LtxVocAct<'a>,
+    pub conv1: LtxVocLin<'a>,
+    pub act2: LtxVocAct<'a>,
+    pub conv2: LtxVocLin<'a>,
+}
+
+/// A generator stage: the transposed convolution (one layer per output phase: output step
+/// `i stride + phase` from the phase's GEMM at input step `i`), then the mean of its AMP blocks.
+pub struct LtxVocStage<'a> {
+    pub up: Vec<LtxVocLin<'a>>,
+    pub amps: Vec<Vec<LtxVocRes<'a>>>,
+}
+
+/// A BigVGAN v2 generator: `conv_pre`, the stages, the activation, `conv_post`.
+pub struct LtxVocGen<'a> {
+    pub pre: LtxVocLin<'a>,
+    pub stages: Vec<LtxVocStage<'a>>,
+    pub act_post: LtxVocAct<'a>,
+    pub post: LtxVocLin<'a>,
+}
+
+/// Whole vocoder generator passes on the device.
+pub trait LtxVocSession: Send {
+    /// `post.cout` channels of `t * prod(strides)` steps (`[steps, channels]` rows, before any
+    /// clamping) into `out` from `x` (`[t, pre.cin]` rows). False when the device declined.
+    fn generate(&mut self, g: &LtxVocGen, x: &[f32], t: usize, out: &mut Vec<f32>) -> bool;
 }
 
 /// One neighborhood-attention block of LTX-2.5's DiffVAE decoder (`crate::ltx::diffvae`):

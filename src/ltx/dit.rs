@@ -175,10 +175,8 @@ impl<'a> Connector<'a> {
         self.dim
     }
 
-    /// The context rows of `feats` (`[n, dim]`, the valid tokens in order) padded to `total`
-    /// rows (a multiple of the register count) with the learned registers: the connector's
-    /// blocks, then an RMS norm.
-    pub fn forward(&self, feats: &[f32], total: usize) -> Vec<f32> {
+    /// The blocks' input: `feats` then the registers, and the rotary tables of the rows.
+    fn input(&self, feats: &[f32], total: usize) -> (Vec<f32>, Rope) {
         let d = self.dim;
         let n = feats.len() / d;
         let nr = self.registers.len() / d;
@@ -189,7 +187,19 @@ impl<'a> Connector<'a> {
             x[r * d..(r + 1) * d].copy_from_slice(&self.registers[s..s + d]);
         }
         let frac: Vec<f32> = (0..total).map(|i| i as f32 / self.max_pos).collect();
-        let pe = Rope::new(&frac, 1, d, self.theta);
+        (x, Rope::new(&frac, 1, d, self.theta))
+    }
+
+    pub(crate) fn blocks(&self) -> &[(Attn<'a>, Ff<'a>)] {
+        &self.blocks
+    }
+
+    /// The context rows of `feats` (`[n, dim]`, the valid tokens in order) padded to `total`
+    /// rows (a multiple of the register count) with the learned registers: the connector's
+    /// blocks, then an RMS norm.
+    pub fn forward(&self, feats: &[f32], total: usize) -> Vec<f32> {
+        let d = self.dim;
+        let (mut x, pe) = self.input(feats, total);
         for (attn, ff) in &self.blocks {
             let h = rms_rows(&x, d, 1e-6);
             let a = attn.forward(&h, total, None, Some(&pe), None);
@@ -439,8 +449,17 @@ impl<'a> Dit<'a> {
         ((&b.v.attn1, &b.v.attn2, &b.v.ff), (&b.a.attn1, &b.a.attn2, &b.a.ff), &b.a2v, &b.v2a)
     }
 
-    /// Every linear layer of the blocks, with whether it is an attention gate.
+    /// Every linear layer of the blocks and of the connectors' blocks, with whether it is an
+    /// attention gate.
     pub(crate) fn for_each_block_layer(&self, f: &mut dyn FnMut(&DLin<'a>, bool)) {
+        for (at, ff) in self.video_connector.blocks().iter().chain(self.audio_connector.blocks()) {
+            for l in [&at.q, &at.k, &at.v, &at.o, &ff.up, &ff.down] {
+                f(l, false);
+            }
+            if let Some(g) = &at.gate {
+                f(g, true);
+            }
+        }
         for b in &self.blocks {
             for at in [&b.v.attn1, &b.v.attn2, &b.a.attn1, &b.a.attn2, &b.a2v, &b.v2a] {
                 for l in [&at.q, &at.k, &at.v, &at.o] {
@@ -457,9 +476,48 @@ impl<'a> Dit<'a> {
         }
     }
 
+    /// The device twins of the layers for the switched LoRA's state now.
+    fn device_twins(&self) -> &super::device::Twins<'a> {
+        let on = self
+            .lora_switch
+            .as_ref()
+            .is_none_or(|s| s.load(std::sync::atomic::Ordering::Relaxed));
+        self.twins[on as usize].get_or_init(|| super::device::Twins::build(self))
+    }
+
     /// Whether the transformer has the learned keyframe embedding (generated keyframe slots).
     pub fn has_keyframe_embedding(&self) -> bool {
         self.keyframe.is_some()
+    }
+
+    /// The context rows of a prompt's features through the video (or audio) connector
+    /// ([`Connector::forward`]): on the device's session when there is one, else the CPU.
+    pub fn connect(&self, video: bool, feats: &[f32], total: usize) -> Vec<f32> {
+        let c = if video { &self.video_connector } else { &self.audio_connector };
+        if let Some(y) = self.connect_device(c, feats, total) {
+            return y;
+        }
+        c.forward(feats, total)
+    }
+
+    fn connect_device(&self, c: &Connector<'a>, feats: &[f32], total: usize) -> Option<Vec<f32>> {
+        if !self.device || std::env::var("OXINFER_LTX_GPU").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        let be = crate::gpu::active()?;
+        let twins = self.device_twins();
+        let blocks = twins.connector(c)?;
+        let (x, pe) = c.input(feats, total);
+        let mut sess = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        if sess.is_none() {
+            *sess = be.ltx_session();
+        }
+        let s = sess.as_mut()?;
+        let mut y = Vec::new();
+        if !s.connector(&blocks, &x, total, &pe.cos, &pe.sin, 1e-6, !self.exact_attention, &mut y) {
+            return None;
+        }
+        Some(rms_rows(&y, c.dim, 1e-6))
     }
 
     /// Drops the device session's buffers (made again on the next device pass).
@@ -510,11 +568,7 @@ impl<'a> Dit<'a> {
             return false;
         }
         let Some(be) = crate::gpu::active() else { return false };
-        let on = self
-            .lora_switch
-            .as_ref()
-            .is_none_or(|s| s.load(std::sync::atomic::Ordering::Relaxed));
-        let twins = self.twins[on as usize].get_or_init(|| super::device::Twins::build(self));
+        let twins = self.device_twins();
         let Some(model) = twins.model(self, !self.exact_attention) else {
             return false;
         };

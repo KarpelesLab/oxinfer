@@ -772,8 +772,8 @@ impl Pipeline {
     /// The connectors over prompt features.
     pub fn context(&self, f: &text::Features) -> PromptContext {
         PromptContext {
-            video: self.dit.video_connector.forward(&f.video, text::MAX_TOKENS),
-            audio: self.dit.audio_connector.forward(&f.audio, text::MAX_TOKENS),
+            video: self.dit.connect(true, &f.video, text::MAX_TOKENS),
+            audio: self.dit.connect(false, &f.audio, text::MAX_TOKENS),
             tokens: f.tokens,
         }
     }

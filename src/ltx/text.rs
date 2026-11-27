@@ -105,7 +105,25 @@ impl<'a> TextEncoder<'a> {
         let mut states = Vec::with_capacity(nl + 1);
         states.push(ids.iter().flat_map(|&t| m.embed_scaled(t)).collect::<Vec<f32>>());
         let mut sess = m.new_session();
-        sess.capture = (0..nl - 1).collect();
+        let cap: Vec<usize> = (0..nl - 1).collect();
+        // On the GPU prefill plan (activations on the device for the whole pass, every layer's
+        // output copied out) when there is one; `OXINFER_LTX_TEXT_GPU=0`: the host path.
+        if crate::gpu::active().is_some()
+            && std::env::var("OXINFER_LTX_TEXT_GPU").map_or(true, |v| v != "0")
+            && let Some((last, rows)) = m.forward_captures_gpu(&mut sess, ids, &cap)
+        {
+            let (t, h, nc) = (ids.len(), m.cfg.hidden_size, cap.len());
+            for c in 0..nc {
+                let mut s = vec![0f32; t * h];
+                for (ti, r) in s.chunks_mut(h).enumerate() {
+                    r.copy_from_slice(&rows[(ti * nc + c) * h..(ti * nc + c + 1) * h]);
+                }
+                states.push(s);
+            }
+            states.push(last);
+            return states;
+        }
+        sess.capture = cap;
         let last = m.forward_hidden(&mut sess, ids);
         let mut caps = std::mem::take(&mut sess.captured);
         caps.sort_by_key(|c| c.0);

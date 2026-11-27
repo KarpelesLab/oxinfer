@@ -355,6 +355,13 @@ impl Conv {
 
     /// PyTorch's `Conv1d(stride, padding = pad)` with zero padding, for an input whose length is
     /// a multiple of `stride` and a kernel no longer than `2 * pad + stride`: `t / stride` steps.
+    /// A stride-1 convolution's `[c_out, k c_in]` weights (tap by tap), its bias, `c_in` and the
+    /// input step of each tap relative to the output's (whole-pass device plans).
+    pub(crate) fn taps(&self) -> (&[f32], &[f32], usize, Vec<i32>) {
+        let offs = (0..self.k).map(|j| (j * self.dilation) as i32 - self.pad as i32).collect();
+        (&self.w, &self.b, self.c_in, offs)
+    }
+
     pub(crate) fn padded(w: &[f32], shape: [usize; 3], b: Vec<f32>, stride: usize, pad: usize) -> Self {
         let mut c = Self::new(w, shape, b, stride, 1);
         c.pad = pad;
@@ -481,6 +488,13 @@ impl ConvT {
         }
     }
 
+    /// The phases' weights `[stride c_out, taps c_in]` (output step `t stride + r` reads inputs
+    /// `t - taps + 1 ..= t`, the oldest first), the bias per phase, `c_in`, `c_out`, the stride
+    /// and the taps.
+    pub(crate) fn phases(&self) -> (&[f32], &[f32], usize, usize, usize, usize) {
+        (&self.w, &self.b, self.c_in, self.c_out, self.stride, self.taps)
+    }
+
     /// `x` (`[t, c_in]`) to `[t * stride, c_out]`.
     pub(crate) fn forward(&self, x: &[f32], t: usize) -> (Vec<f32>, usize) {
         let (ci, n) = (self.c_in, self.stride * self.c_out);
@@ -539,6 +553,11 @@ impl Snake {
         let alpha = f.f32(name)?;
         let inv = alpha.iter().map(|&a| 1.0 / (a + 1e-9)).collect();
         Ok(Self { alpha, inv })
+    }
+
+    /// `alpha` and `inv` per channel.
+    pub(crate) fn params(&self) -> (&[f32], &[f32]) {
+        (&self.alpha, &self.inv)
     }
 
     pub(crate) fn apply(&self, x: &mut [f32]) {

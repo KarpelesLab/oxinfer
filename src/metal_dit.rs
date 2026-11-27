@@ -13,6 +13,10 @@ use crate::gpu::dit::{FluxInput, FluxModel, FluxSession, Lin, Model, Seq, Sessio
 mod diffvae;
 #[path = "metal_ltx.rs"]
 mod ltx;
+#[path = "metal_ltx_vae.rs"]
+mod ltx_vae;
+#[path = "metal_ltx_voc.rs"]
+mod ltx_voc;
 #[path = "metal_t5.rs"]
 mod t5;
 

@@ -216,6 +216,11 @@ impl Up {
         }
     }
 
+    /// The causal transposed convolution and the output steps cropped on its left.
+    pub(crate) fn parts(&self) -> (&ConvT, usize) {
+        (&self.conv, self.crop)
+    }
+
     /// `x` (`[t, c_in]`) to `[t * stride, c_out]`.
     pub(crate) fn forward(&self, x: &[f32], t: usize) -> (Vec<f32>, usize) {
         // The causal form gives the first `t * stride` steps of the full output; the centered one
@@ -257,6 +262,12 @@ impl Act {
             up,
             down,
         })
+    }
+
+    /// `alpha`, `1 / beta` per channel, the upsampling filter (times 2) and the downsampling one.
+    pub(crate) fn parts(&self) -> (&[f32], &[f32], &[f32], &[f32]) {
+        let (a, i) = self.snake.params();
+        (a, i, &self.up, &self.down)
     }
 
     /// `x` (`[t, c]`) to a new buffer of the same shape.

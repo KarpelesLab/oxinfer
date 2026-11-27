@@ -104,7 +104,12 @@ pub(crate) enum TPad {
 
 /// A 3 x 3 x 3 convolution (stride 1, zero padding in space).
 pub(crate) struct Conv3 {
-    conv: Conv,
+    /// The kernel as bfloat16 bits `[cout][kt][ky][kx][cin]` (the device passes' layout: per time
+    /// tap, nine spatial taps of `cin` inputs), the rows padded with zeros to a multiple of 64.
+    pub(crate) w: Vec<u16>,
+    pub(crate) bias: Vec<f32>,
+    /// The CPU path's 3 x 3 convolution over stacked frames, made on first use.
+    conv: std::sync::OnceLock<Conv>,
     pub(crate) cin: usize,
     pub(crate) cout: usize,
 }
@@ -121,23 +126,56 @@ impl Conv3 {
         Self::new(&w, cout, cin, b)
     }
 
-    /// From a `[cout, cin, 3, 3, 3]` kernel.
+    /// From a `[cout, cin, 3, 3, 3]` kernel (values bfloat16 holds: the files' are bf16).
     fn new(w: &[f32], cout: usize, cin: usize, b: Vec<f32>) -> Result<Self> {
-        // As a 3 x 3 kernel over `[frame t-2.., c]` stacked channels: `[cout, 3 cin, 3, 3]`.
-        let mut w2 = vec![0f32; w.len()];
-        for o in 0..cout {
-            for c in 0..cin {
+        if w.len() != cout * cin * 27 || b.len() != cout {
+            bail!("3x3x3 convolution: {} weights and {} biases for {cout}x{cin}", w.len(), b.len());
+        }
+        let rows = cout.next_multiple_of(64);
+        let mut wb = vec![0u16; rows * 27 * cin];
+        let per = cout.div_ceil(16).max(1);
+        std::thread::scope(|s| {
+            for (j, part) in wb[..cout * 27 * cin].chunks_mut(per * 27 * cin).enumerate() {
+                s.spawn(move || {
+                    for (i, row) in part.chunks_mut(27 * cin).enumerate() {
+                        let o = j * per + i;
+                        for c in 0..cin {
+                            for k in 0..27 {
+                                row[k * cin + c] = half::bf16::from_f32(w[(o * cin + c) * 27 + k]).to_bits();
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let mut bias = b;
+        bias.resize(rows, 0.0);
+        Ok(Self {
+            w: wb,
+            bias,
+            conv: std::sync::OnceLock::new(),
+            cin,
+            cout,
+        })
+    }
+
+    /// The CPU convolution: a 3 x 3 kernel over `[frame t-2.., c]` stacked channels
+    /// (`[cout, 3 cin, 3, 3]`).
+    fn cpu(&self) -> &Conv {
+        self.conv.get_or_init(|| {
+            let (cin, cout) = (self.cin, self.cout);
+            let mut w2 = vec![0f32; cout * 27 * cin];
+            for o in 0..cout {
                 for kt in 0..3 {
-                    for k in 0..9 {
-                        w2[((o * 3 * cin) + kt * cin + c) * 9 + k] = w[((o * cin + c) * 3 + kt) * 9 + k];
+                    for c in 0..cin {
+                        for k in 0..9 {
+                            let v = self.w[(o * 27 + kt * 9 + k) * cin + c];
+                            w2[((o * 3 * cin) + kt * cin + c) * 9 + k] = half::bf16::from_bits(v).to_f32();
+                        }
                     }
                 }
             }
-        }
-        Ok(Self {
-            conv: Conv::from_kernel(&w2, cout, 3 * cin, 3, Some(b))?,
-            cin,
-            cout,
+            Conv::from_kernel(&w2, cout, 3 * cin, 3, Some(self.bias[..cout].to_vec())).expect("a 3x3 kernel")
         })
     }
 
@@ -170,7 +208,7 @@ impl Conv3 {
                     }
                 }
             });
-            let (y, _, _) = self.conv.forward(&stacked, h, w, 1);
+            let (y, _, _) = self.cpu().forward(&stacked, h, w, 1);
             out.data[o * n..(o + 1) * n].copy_from_slice(&y);
         }
         out
@@ -411,6 +449,9 @@ impl VideoDecoder {
                 *v = *v * self.std[ch] + self.mean[ch];
             }
         }
+        if let Some(v) = self.decode_device(&x.data, t, h, w, progress) {
+            return v;
+        }
         let causal = self.cfg.causal_decoder;
         let mut x = self.conv_in.forward(&x, causal);
         let total = self.ups.len() + 1;
@@ -457,6 +498,58 @@ impl VideoDecoder {
             }
         }
         out
+    }
+}
+
+impl VideoDecoder {
+    /// The whole decode on the accelerator's session ([`crate::gpu::dit::LtxVaeSession`]) from
+    /// un-normalized latent rows `[t, h, w, c]`; None when there is none or it declined
+    /// (`OXINFER_LTX_VAE_GPU=0`: the CPU path).
+    fn decode_device(&self, lat: &[f32], t: usize, h: usize, w: usize, progress: &mut dyn FnMut(usize, usize)) -> Option<Vid> {
+        use crate::gpu::dit::{LtxVaeConv, LtxVaeDecoder, LtxVaeOp};
+        if std::env::var("OXINFER_LTX_VAE_GPU").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        let mut s = crate::gpu::active()?.ltx_vae_session()?;
+        fn conv(c: &Conv3) -> LtxVaeConv<'_> {
+            LtxVaeConv {
+                w: &c.w,
+                bias: &c.bias,
+                cin: c.cin,
+                cout: c.cout,
+            }
+        }
+        let (mut oh, mut ow) = (h * self.cfg.patch, w * self.cfg.patch);
+        let mut ops = Vec::new();
+        for u in &self.ups {
+            match u {
+                Up::Res(rs) => ops.extend(rs.iter().map(|r| LtxVaeOp::Res(conv(&r.c1), conv(&r.c2)))),
+                Up::D2s(c, st) => {
+                    oh *= st[1];
+                    ow *= st[2];
+                    ops.push(LtxVaeOp::D2s(conv(c), *st));
+                }
+            }
+        }
+        let m = LtxVaeDecoder {
+            conv_in: conv(&self.conv_in),
+            ops,
+            conv_out: conv(&self.conv_out),
+            patch: self.cfg.patch,
+            causal: self.cfg.causal_decoder,
+        };
+        let mut out = Vec::new();
+        if !s.decode(&m, lat, t, h, w, &mut out, progress) {
+            return None;
+        }
+        let oc = self.conv_out.cout / (self.cfg.patch * self.cfg.patch);
+        Some(Vid {
+            t: out.len() / (oh * ow * oc),
+            h: oh,
+            w: ow,
+            c: oc,
+            data: out,
+        })
     }
 }
 

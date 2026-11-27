@@ -386,3 +386,159 @@ DV_NA3D(3)
 DV_NA3D(5)
 DV_NA3D(7)
 DV_NA3D(11)
+
+// ---- LTX-2.5's video VAE decoder (metal_ltx_vae.rs, crate::gpu::dit::LtxVaeSession) ----
+// Activations are f32 rows in metal_unet.metal's padded layout, the frames as its images
+// ((h + 2) x (w + 2) grids of rows, zero borders, after a guard of G = w + 3 rows), with images
+// before and after the clip's frames (lo of them before): a 3x3x3 convolution's time taps are
+// then rows P apart, and lv_prep fills those images with the repeated first / last frame the
+// time padding takes. The convolutions are un_gemm's shifted GEMMs over lv_prep's half rows.
+struct LVG { uint h; uint w; uint G; uint P; };
+inline uint lv_row(LVG g, uint b, uint y, uint x) { return g.G + b * g.P + (y + 1) * (g.w + 2) + x + 1; }
+inline bool lv_interior(LVG g, uint nimg, uint r, thread uint& b, thread uint& y, thread uint& x) {
+    if (r < g.G) return false;
+    uint rr = r - g.G;
+    b = rr / g.P;
+    if (b >= nimg) return false;
+    uint q = rr - b * g.P, py = q / (g.w + 2), px = q - py * (g.w + 2);
+    if (py == 0 || px == 0 || py > g.h || px > g.w) return false;
+    y = py - 1; x = px - 1;
+    return true;
+}
+// metal_unet.metal's un_scale (the GEMM divides its products by the same factor).
+inline float lv_scale(uint bits) {
+    float m = as_type<float>(bits);
+    if (!(m > 16384.0f)) return 1.0f;
+    int e = 0;
+    frexp(min(m, 3.0e38f), e);
+    return ldexp(1.0f, 14 - e);
+}
+// The largest magnitude over the interior pixels of frames (images) lo .. hi of a padded f32
+// tensor, as float bits (an atomic max into a slot the host zeroed; only past 16384, where the
+// half rows need scaling).
+struct LVA { LVG g; uint c; uint lo; uint hi; uint rows; };
+kernel void lv_amax(device const float* x [[buffer(0)]], device atomic_uint* m [[buffer(1)]], constant LVA& p [[buffer(2)]],
+                    uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint c4 = p.c / 4, row = i / c4, j = i - row * c4;
+    float a = 0.f;
+    uint b, y, xx;
+    if (row < p.rows && lv_interior(p.g, p.hi, row, b, y, xx) && b >= p.lo) {
+        float4 v = abs(*((device const float4*)(x + (ulong)row * p.c) + j));
+        a = max(max(v.x, v.y), max(v.z, v.w));
+        if (isnan(a)) a = INFINITY;
+    }
+    a = simd_max(a);
+    if (lane == 0 && a > 16384.0f) atomic_fetch_max_explicit(m, as_type<uint>(a), memory_order_relaxed);
+}
+// The half input rows of a convolution: every row of the layout (`rows`; zeros on borders and
+// guards), image b reading frame clamp(b, lo, hi - 1) of x: as it is (mode 0), RMS-normed over
+// its c channels and SiLU'd (mode 1, `PixelNorm`), or scaled by lv_scale of the largest magnitude
+// (mode 2). A SIMD-group per row, 8 rows per threadgroup.
+struct LVP { LVG g; uint c; uint nimg; uint lo; uint hi; uint mode; uint rows; float eps; };
+kernel void lv_prep(device const float* x [[buffer(0)]], device half* out [[buffer(1)]], device const uint* amax [[buffer(2)]],
+                    constant LVP& p [[buffer(3)]], uint tg [[threadgroup_position_in_grid]],
+                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tg * 8 + sg;
+    if (row >= p.rows) return;
+    uint c4 = p.c / 4;
+    device half4* o = (device half4*)(out + (ulong)row * p.c);
+    uint b, y, xx;
+    if (!lv_interior(p.g, p.nimg, row, b, y, xx)) {
+        for (uint j = lane; j < c4; j += 32) o[j] = half4(0.h);
+        return;
+    }
+    uint sb = clamp(b, p.lo, p.hi - 1);
+    device const float4* s = (device const float4*)(x + (ulong)lv_row(p.g, sb, y, xx) * p.c);
+    float k = 1.0f;
+    if (p.mode == 1) {
+        float ss = 0.f;
+        for (uint j = lane; j < c4; j += 32) { float4 v = s[j]; ss += dot(v, v); }
+        ss = simd_sum(ss);
+        k = 1.0f / sqrt(ss / float(p.c) + p.eps);
+    } else if (p.mode == 2) {
+        k = lv_scale(amax[0]);
+    }
+    for (uint j = lane; j < c4; j += 32) {
+        float4 v = s[j] * k;
+        if (p.mode == 1) v = v / (1.0f + exp(-v));
+        o[j] = half4(v);
+    }
+}
+// Depth-to-space: output frame F (frames lo + F of the layout d, c channels) pixel (oy, ox)
+// channel ch from input frame f = (F + drop) / p1 (layout s, c p1 p2 p3 channels) pixel
+// (oy / p2, ox / p3), channel ((ch p1 + i1) p2 + i2) p3 + i3. A thread per output value.
+struct LVD { LVG s; LVG d; uint c; uint p1; uint p2; uint p3; uint drop; uint lo; uint t; uint _p; };
+kernel void lv_d2s(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], constant LVD& p [[buffer(2)]],
+                   uint i [[thread_position_in_grid]]) {
+    uint n = p.d.h * p.d.w * p.c, F = i / n;
+    if (F >= p.t) return;
+    uint q = i - F * n, pix = q / p.c, ch = q - pix * p.c, oy = pix / p.d.w, ox = pix - oy * p.d.w;
+    uint ff = F + p.drop, f = ff / p.p1, i1 = ff - f * p.p1;
+    uint sy = oy / p.p2, i2 = oy - sy * p.p2, sx = ox / p.p3, i3 = ox - sx * p.p3;
+    uint sc = p.c * p.p1 * p.p2 * p.p3;
+    y[(ulong)lv_row(p.d, p.lo + F, oy, ox) * p.c + ch] =
+        x[(ulong)lv_row(p.s, p.lo + f, sy, sx) * sc + ((ch * p.p1 + i1) * p.p2 + i2) * p.p3 + i3];
+}
+// The decoder's output: frames lo .. lo + t of conv_out's rows (c = oc pq pq channels ordered
+// (channel, x, y) per patch) as compact frames [t, h pq, w pq, oc]. A thread per output value.
+struct LVO { LVG s; uint c; uint pq; uint oc; uint lo; uint t; uint _p0; uint _p1; uint _p2; };
+kernel void lv_out(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], constant LVO& p [[buffer(2)]],
+                   uint i [[thread_position_in_grid]]) {
+    uint W = p.s.w * p.pq, n = p.s.h * p.pq * W * p.oc, F = i / n;
+    if (F >= p.t) return;
+    uint q = i - F * n, pix = q / p.oc, ch = q - pix * p.oc, oy = pix / W, ox = pix - oy * W;
+    uint yy = oy / p.pq, qq = oy - yy * p.pq, xx = ox / p.pq, r = ox - xx * p.pq;
+    y[i] = x[(ulong)lv_row(p.s, p.lo + F, yy, xx) * p.c + (ch * p.pq + r) * p.pq + qq];
+}
+
+// ---- LTX-2.5's vocoder (BigVGAN v2 generators: metal_ltx_voc.rs, crate::gpu::dit::LtxVocSession) ----
+// Signals are rows of channels, `t` steps after a guard of g rows (zeros in the half GEMM inputs:
+// a 1-D convolution's taps are rows dilation apart, un_gemm's shifted GEMMs; its zero padding).
+// The anti-aliased SnakeBeta (`Activation1d`) of f32 rows x (steps g .. g + t) into half rows of
+// the same layout (every row of `rows`, zeros outside the steps): per step i, the 2x upsampled
+// signal (filter `up` of k taps, already times 2, the input's ends repeated), x + inv sin(alpha
+// x)^2 of it, its 2x downsampling (filter `down`, the upsampled ends repeated). A thread per value.
+struct LBA { uint t; uint g; uint c; uint k; uint rows; uint _p0; uint _p1; uint _p2; };
+kernel void lb_act(device const float* x [[buffer(0)]], device half* out [[buffer(1)]], device const float* ab [[buffer(2)]],
+                   device const float* filt [[buffer(3)]], constant LBA& p [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    uint row = i / p.c, ch = i - row * p.c;
+    if (row >= p.rows) return;
+    if (row < p.g || row >= p.g + p.t) { out[i] = 0.0h; return; }
+    uint s = row - p.g;
+    int k = int(p.k), pad = k / 2 - 1, pad_left = pad * 2 + (k - 2) / 2, t = int(p.t);
+    float alpha = ab[ch], inv = ab[p.c + ch];
+    device const float* up = filt;
+    device const float* down = filt + p.k;
+    device const float* xc = x + (ulong)p.g * p.c + ch;
+    float acc = 0.f;
+    for (int j = 0; j < k; j++) {
+        int m = clamp(2 * int(s) + j - pad, 0, 2 * t - 1);
+        // Upsampled value m: taps of the parity of m + pad_left.
+        int n = m + pad_left;
+        float u = 0.f;
+        for (int q = n % 2; q < k; q += 2) {
+            int src = clamp((n - q) / 2 - pad, 0, t - 1);
+            u += up[q] * xc[(ulong)src * p.c];
+        }
+        float sv = sin(alpha * u);
+        acc += down[j] * (u + inv * sv * sv);
+    }
+    out[i] = half(acc);
+}
+// y[r] = (a[r] + b[r] + c[r]) * scale over rows g .. g + t of n channels (the mean of a stage's
+// AMP blocks).
+struct LBM { uint n; uint g; uint t; float scale; };
+kernel void lb_mean3(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device const float* c [[buffer(2)]],
+                     device float* y [[buffer(3)]], constant LBM& p [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.t * p.n) return;
+    ulong j = (ulong)p.g * p.n + i;
+    y[j] = (a[j] + b[j] + c[j]) * p.scale;
+}
+// f32 rows to half rows, every row of `rows` (zeros outside steps g .. g + t).
+struct LBH { uint n; uint g; uint t; uint rows; };
+kernel void lb_half(device const float* x [[buffer(0)]], device half* out [[buffer(1)]], constant LBH& p [[buffer(2)]],
+                    uint i [[thread_position_in_grid]]) {
+    uint row = i / p.n;
+    if (row >= p.rows) return;
+    out[i] = (row < p.g || row >= p.g + p.t) ? 0.0h : half(x[i]);
+}
