@@ -279,7 +279,7 @@ enum COp {
         /// The kernel over a batch of tokens (prefill plans; else null).
         ft: F,
         /// The tensor-core kernel over the whole step (`dfattn_D`: fast prefill plans, head
-        /// dimensions 64 and 128; else null).
+        /// dimensions 64, 128 and 256; else null).
         fa: F,
         /// Its variant with the group's heads in one block and streamed tiles (`dfattn2_D`;
         /// null with `fa`), taken for steps over at least `fa2_from` positions.
@@ -1760,10 +1760,25 @@ impl CudaPlan<'_> {
         let cu = &self.be.cu;
         // Room for pos + t positions in every mirror: one new arena for all of them.
         if slot.kv.iter().any(|m| m.cap < pos + t) {
-            let cap = (pos + t).next_power_of_two().max(256);
-            let sizes: Vec<usize> = self.kv.iter().map(|&(n, hd)| (cap * n * hd * 4).next_multiple_of(256)).collect();
-            let bytes: usize = 2 * sizes.iter().sum::<usize>();
-            let Some(arena) = self.be.alloc_zeroed(bytes) else {
+            // As many positions as the host caches have room for (a prompt reserves its whole
+            // length at the first chunk: no growth, each a new arena and a copy of the old one,
+            // every few chunks), when the device has the memory.
+            let least = (pos + t).next_power_of_two().max(256);
+            let room = kv.iter().map(|c| c.room()).min().unwrap_or(0).max(least);
+            let size_of = |cap: usize| -> (Vec<usize>, usize) {
+                let sizes: Vec<usize> = self.kv.iter().map(|&(n, hd)| (cap * n * hd * 4).next_multiple_of(256)).collect();
+                let bytes = 2 * sizes.iter().sum::<usize>();
+                (sizes, bytes)
+            };
+            let mut cap = room;
+            let (mut sizes, mut bytes) = size_of(cap);
+            let mut arena = self.be.alloc_zeroed(bytes);
+            if arena.is_none() && cap > least {
+                cap = least;
+                (sizes, bytes) = size_of(cap);
+                arena = self.be.alloc_zeroed(bytes);
+            }
+            let Some(arena) = arena else {
                 debug(&format!("no VRAM for the KV caches ({} MB)", bytes >> 20));
                 return false;
             };

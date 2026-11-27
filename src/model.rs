@@ -1645,6 +1645,14 @@ impl LayerCache {
             advise_huge(b);
         }
     }
+    /// Positions the cache has room for without moving (0 for an empty row).
+    #[cfg_attr(
+        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
+        allow(dead_code)
+    )]
+    pub(crate) fn room(&self) -> usize {
+        self.k.capacity().min(self.v.capacity()) / (self.n_kv * self.hd).max(1)
+    }
     /// [`Self::push`] of `t` rows into each of several caches (a device step's keys and values of
     /// every layer), copied in one parallel region over all of them. (CUDA only.)
     #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]

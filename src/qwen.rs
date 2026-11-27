@@ -2110,8 +2110,10 @@ impl<'a> QwenModel<'a> {
         let half = self.inv_freq.len();
         let mut hidden = crate::kernels::zeros(t * h);
         // The prompt's keys and values come down chunk by chunk: room for all of them at once.
+        // (and for the chunks `generate::prefill` feeds after this one).
+        let ahead = crate::generate::prompt_ahead();
         for c in sess.kv.iter_mut().flatten() {
-            c.reserve(t);
+            c.reserve(t + ahead);
         }
         captured.clear();
         captured.resize(t * nc * h, 0.0);

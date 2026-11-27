@@ -303,6 +303,18 @@ pub fn prefill<M: TextLm + ?Sized>(model: &M, sess: &mut M::Sess, ids: &[u32], c
     crate::kernels::lm_prefill(|| prefill_inner(model, sess, ids, chunk, overrides))
 }
 
+thread_local! {
+    /// Prompt tokens still to come after the chunk [`prefill`] is running on this thread.
+    static PROMPT_AHEAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Prompt tokens [`prefill`] will feed after the chunk it is running (0 outside it): a model
+/// whose chunks append to caches takes room for all of them at the first chunk, instead of
+/// growing (and moving) the caches every few chunks of a long prompt.
+pub(crate) fn prompt_ahead() -> usize {
+    PROMPT_AHEAD.with(|c| c.get())
+}
+
 fn prefill_inner<M: TextLm + ?Sized>(
     model: &M,
     sess: &mut M::Sess,
@@ -353,7 +365,9 @@ fn prefill_inner<M: TextLm + ?Sized>(
             .map(|(p, e)| (p - start, e.as_slice()))
             .collect();
         let tr = Instant::now();
+        PROMPT_AHEAD.with(|a| a.set(ids.len() - end));
         hs = model.prefill_hidden(sess, c, &local, end == ids.len());
+        PROMPT_AHEAD.with(|a| a.set(0));
         if crate::batch::trace() {
             eprintln!(
                 "[prompt chunk: {} tokens at {start} of {}, waited {:.2} ms, ran in {:.2} ms]",

@@ -616,8 +616,9 @@ impl<'a> Model<'a> {
         let nc = cap.len();
         let mut hidden = vec![0f32; t * h];
         // The prompt's keys and values come down chunk by chunk: room for all of them at once.
+        let ahead = crate::generate::prompt_ahead();
         for c in sess.caches.iter_mut().flatten() {
-            c.reserve(t);
+            c.reserve(t + ahead);
         }
         captured.clear();
         captured.resize(t * nc * h, 0.0);
@@ -743,8 +744,9 @@ impl<'a> Model<'a> {
         let (first, rest) = self.gpu_split_plans(split)?;
         let n = first.tokens();
         let pw = nl * cfg.hidden_size_per_layer_input;
+        let ahead = crate::generate::prompt_ahead();
         for c in sess.caches.iter_mut().flatten() {
-            c.reserve(t);
+            c.reserve(t + ahead);
         }
         // The residual after the first part, of each chunk's tokens.
         let mut res = vec![0f32; n.min(t) * h];
