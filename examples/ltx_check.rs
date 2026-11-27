@@ -86,6 +86,7 @@ fn main() -> Result<()> {
                     pos: &pos,
                     ctx: &vctx,
                     keyframe_rows: lh * lw,
+                    slot_rows: 0..0,
                 },
                 &ltx::dit::StreamIn {
                     x: &ax,
@@ -94,6 +95,7 @@ fn main() -> Result<()> {
                     pos: &apos,
                     ctx: &actx,
                     keyframe_rows: 0,
+                    slot_rows: 0..0,
                 },
             );
             println!("forward {:.2}s", t0.elapsed().as_secs_f64());
@@ -117,6 +119,7 @@ fn main() -> Result<()> {
                         pos,
                         ctx,
                         keyframe_rows,
+                        slot_rows: 0..0,
                     }
                 }
                 use ltx::dit::{Blocks, Perturb};
@@ -232,7 +235,7 @@ fn main() -> Result<()> {
             let n = |i: usize| -> Result<usize> { a.get(i).context("T H W")?.parse::<usize>().context("T H W") };
             let (t, h, w) = (n(3)?, n(4)?, n(5)?);
             let files = ModelFiles::open_file(file, false)?;
-            let mut g = ltx::NoiseGen::new(ltx::Noise::Oxinfer, 1);
+            let mut g = ltx::NoiseGen::new(&ltx::Noise::Oxinfer, 1);
             let lat = g.normals(128 * t * h * w);
             let t0 = std::time::Instant::now();
             // The convolutional VAE's decode for comparison when FILE is that one.

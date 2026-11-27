@@ -222,6 +222,8 @@ pub struct StreamIn<'a> {
     pub ctx: &'a [f32],
     /// Rows that get the keyframe embedding (the first latent frame of the video).
     pub keyframe_rows: usize,
+    /// More rows that get it: generated keyframe slots (`VideoGeneratedKeyframeSlots`).
+    pub slot_rows: std::ops::Range<usize>,
 }
 
 /// Blocks a perturbation applies to (`Perturbation.blocks`: none means all of them).
@@ -455,6 +457,11 @@ impl<'a> Dit<'a> {
         }
     }
 
+    /// Whether the transformer has the learned keyframe embedding (generated keyframe slots).
+    pub fn has_keyframe_embedding(&self) -> bool {
+        self.keyframe.is_some()
+    }
+
     /// Drops the device session's buffers (made again on the next device pass).
     pub fn release_device(&self) {
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -610,7 +617,7 @@ impl<'a> Dit<'a> {
 
         let mut vx = self.patchify.forward(v.x, nv);
         if let Some(k) = &self.keyframe {
-            for r in 0..v.keyframe_rows.min(nv) {
+            for r in (0..v.keyframe_rows.min(nv)).chain(v.slot_rows.start.min(nv)..v.slot_rows.end.min(nv)) {
                 vx[r * d..(r + 1) * d].iter_mut().zip(k).for_each(|(x, &e)| *x += e);
             }
         }

@@ -473,7 +473,8 @@ fn usage() -> ! {
          \x20 --init-image FILE    the first frame (--strength F, default 1); --last-image FILE the last;\n\
          \x20                      --image FILE@FRAME[:S] a guide image at FRAME (repeatable)\n\
          \x20 --one-stage          the distilled schedule at the full size (no spatial upsampler)\n\
-         \x20 --temporal-upscale   twice the frames and rate after the last stage\n\
+         \x20 --temporal-upscale   twice the frames and rate (DFR rounds: tiles between generated keyframes);\n\
+         \x20                      --temporal-rounds 2: four times\n\
          \x20 --transformer int8|bf16|nvfp4|dev|dev-bf16|FILE   the transformer (default int8)\n\
          \x20 --distilled-lora     the release's distilled LoRA on the dev transformer (its 2nd stage)\n\
          \x20 the dev transformer is guided (ti2vid: 30 Euler steps, CFG / STG / modality; one stage\n\

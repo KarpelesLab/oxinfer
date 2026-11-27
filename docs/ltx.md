@@ -50,7 +50,7 @@ files (the other parts from the folder above it).
 | `--last-image FILE` | the last frame (a guide image, below) |
 | `--image FILE@FRAME[:STRENGTH]` | an image for pixel frame `FRAME` (repeatable; 0 is the first frame) |
 | `--one-stage` | the distilled schedule at the full size, no upsampler |
-| `--temporal-upscale` | twice the frames and the rate after the last stage (fetches the temporal upsampler, 0.26 GB) |
+| `--temporal-upscale`, `--temporal-rounds N` | twice (N = 2: four times) the frames and the rate, the release's DFR temporal rounds (fetches the temporal upsampler, 0.26 GB) |
 | `--no-audio` | no soundtrack decoded (the audio stream is denoised anyway: the model is joint) |
 | `--transformer int8\|bf16\|nvfp4\|dev\|dev-bf16\|FILE` | the transformer file (default the distilled int8 one) |
 | `--distilled-lora` | the release's distilled LoRA (rank 450, 8.9 GB) on the dev transformer |
@@ -149,9 +149,33 @@ runs the distilled schedule instead (the LoRA makes it a distilled model). The d
 is switched per stage: on the GPU its side paths exist only in the second stage's view of the
 layers.
 
-`--temporal-upscale` doubles the latent frames with the temporal upsampler and refines the video
-with `[0.975, 0.909375, 0.725, 0.421875, 0]` (audio kept as it was): a simplified form of the
-release's DFR temporal rounds (`dfr_pipeline.py`), which tile the clip and carry keyframes.
+### Temporal upscaling: the DFR rounds
+
+`--temporal-upscale` (`--temporal-rounds 2`: twice) runs the release's temporal rounds
+(`dfr_pipeline.py`, `dfr_stages.run_one_temporal_round`; [`dfr.rs`](../src/ltx/dfr.rs)):
+
+1. The clip is made on a keyframe canvas: its length padded to whole segments of 24 or 32 frames
+   (`resolve_canvas`: the one padding least, ties to 32), with a generated keyframe slot at each
+   segment border (`VideoGeneratedKeyframeSlots`: a latent frame of rows per keyframe at one pixel
+   frame's time, with the learned keyframe embedding, denoised with the clip; in the second stage
+   started from the first stage's slots, upsampled).
+2. Each round doubles the latent frames with the temporal upsampler (and the rate; the transformer's
+   positions use 60 fps above 30, `conditioning_fps`) and splits the canvas at the keyframe borders
+   into `2^round` tiles (`TemporalTilePlan`), each denoised alone on `[0.975, 0.909375, 0.725,
+   0.421875, 0]` with the ancestral sampler at eta 0.5 (noise seed `seed + 1000 round + tile`):
+   the keyframes at its borders as guides at strength 0.95, a new slot in the middle of each
+   segment (started from the nearest latent frame), the first stage's soundtrack of its window
+   frozen (resampled to the tile's length). A tile after the first starts on the keyframe plane
+   before its border, followed by the previous tile's frames up to the border, all pinned
+   (`tile_prefix`, `lead_in_carryover`): the tiles meet on known frames, no blending.
+3. The tiles are stitched; every keyframe plane carries over to the next round. The canvas'
+   padding is cut at the end: `(frames - 1) 2^rounds + 1` frames.
+
+The release's DFR pipeline runs its second stage with a detailing IC-LoRA that is not among the
+release's files (its `detailing_lora` argument is required); here the second stage is the
+distilled pipeline's (with the slots), and the shipped soundtrack its refined one. Frame-to-frame
+change across a tile border is like anywhere else in the clip (384x256, 49 -> 97 frames: mean
+absolute difference 6.1 at the border, 4.3 to 6.3 elsewhere).
 
 ## The diffusion decoder (DiffVAE)
 
@@ -227,7 +251,8 @@ wall time from start to the written `.mp4`, files mapped (resident set 17 to 22 
 | t2v 768x512, no `--frames` (the duration head: 4.32 s) | 97 | 69.8 s | a woman in a kitchen saying the prompt's line; Whisper large-v3-turbo transcribes the soundtrack as "Good morning. Today we are going to bake fresh bread together." |
 | first + last frame 768x512 (`--init-image car.png --last-image` a 1.67x crop of it) | 49 | 47.7 s | the camera pushes in from the first frame to the last one |
 | dev transformer + `--distilled-lora` (1660 layers as side paths), 384x256 one stage | 25 | 56.8 s (19 s of it loading the LoRA; 40 GB resident) | the dog running, softer than the distilled file's |
-| t2v 384x256 one stage, `--temporal-upscale` | 25 -> 49 (48 fps) | 22.4 s | smooth doubled motion |
+| t2v 384x256 two stages, `--temporal-rounds 2` (DFR: 1 then 2 then 4 tiles) | 25 -> 97 (96 fps) | 45.6 s | the dog trotting, smooth, no visible tile borders |
+| t2v 384x256 two stages, `--temporal-upscale`, 49 frames | 49 -> 97 (48 fps) | 63 s (machine shared) | no jump at the tile border (frame 48) |
 | t2v 384x256 one stage | 25 | 13.7 s | text 3.3 s, 8 forwards 4.4 s (0.55 s each), VAE 2.1 s, audio 1.3 s |
 | the same on the CPU (`--device cpu`, release build) | 25 | 79 s | 7.8 s a forward: the frames look the same as the GPU's |
 
@@ -299,7 +324,8 @@ quantization) and the NVFP4 file 2.7e-2 / 1.6e-2 (its rows correlate 0.9956 with
 - The guided pipelines' `skip_step` with only one stream skipping a step runs both streams (the
   reference leaves the skipped stream out of that pass); off by default.
 - `ti2vid_two_stages_hq` (the res2s sampler) and the guidance factories by sigma.
-- The temporal upscaler's DFR rounds (tiled, with keyframes): a single refinement pass instead.
+- DFR's detailing IC-LoRA second stage and its spatial epilogue (`spatial_upscalings = 2`): the
+  LoRA is not part of the release's files.
 - NVFP4 on the GPU (CPU only), the DiffVAE's tiled decode (the reference's memory-driven tiles
   and its keyframe-anchored decode), the prompt enhancer, audio-to-video and
   video-to-video (IC-LoRA) pipelines.

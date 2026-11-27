@@ -21,13 +21,14 @@
 //! clip's length is predicted from the prompt ([`duration`]).
 //!
 //! Single-stage generation (`two_stage = false`) runs the distilled schedule at the full size and
-//! skips the upsampler. The temporal x2 upsampler doubles the frame count and rate after the
-//! last stage and refines the result with `DISTILLED_SIGMAS[4..]` (the audio kept as it was): a
-//! simplified form of the release's DFR temporal rounds.
+//! skips the upsampler. Temporal upscaling runs the release's DFR temporal rounds ([`dfr`]):
+//! the clip made on a keyframe canvas with generated keyframe slots, then per round the temporal
+//! x2 upsampler and a tiled refinement between the keyframes.
 
 pub mod api;
 pub mod audio;
 pub(crate) mod device;
+pub mod dfr;
 pub mod diffvae;
 pub mod dit;
 pub mod duration;
@@ -57,7 +58,6 @@ pub const STAGE_2_SIGMAS: [f32; 4] = [0.909375, 0.725, 0.421875, 0.0];
 /// Seed offsets of the ancestral sampler's noise per stage (`ANCESTRAL_*_NOISE_SEED_OFFSET`).
 const STAGE_1_NOISE_OFFSET: u64 = 10000;
 const STAGE_2_NOISE_OFFSET: u64 = 20000;
-const TEMPORAL_NOISE_OFFSET: u64 = 30000;
 /// Frames of video per latent frame, pixels per latent row and column.
 pub const TIME_SCALE: usize = 8;
 pub const SPACE_SCALE: usize = 32;
@@ -371,8 +371,9 @@ pub struct Params {
     /// Denoise the soundtrack again in the guided pipeline's second stage (`--refine-audio`;
     /// otherwise the first stage's is kept).
     pub refine_audio: bool,
-    /// Double the frame count and rate with the temporal upsampler after the last stage.
-    pub temporal_upscale: bool,
+    /// Temporal rounds after the last stage (0 to 2; [`dfr`]): each doubles the frame count and
+    /// rate with the temporal upsampler, refining the clip in tiles between generated keyframes.
+    pub temporal_upscale: usize,
     pub images: Vec<ImageCond>,
     /// Decode the soundtrack (the audio stream is denoised either way: the model is joint).
     pub audio: bool,
@@ -402,7 +403,7 @@ impl Params {
             guidance_mode: GuidanceMode::Auto,
             guidance: Guidance::default(),
             refine_audio: false,
-            temporal_upscale: false,
+            temporal_upscale: 0,
             images: Vec::new(),
             audio: true,
             eta: None,
@@ -635,6 +636,11 @@ struct Run<'a> {
     frozen_audio: bool,
     guidance: Option<&'a Guidance>,
     name: &'a str,
+    /// The video rows' positions (none: the clip's at the run's rate, then the images' guide
+    /// rows').
+    pos: Option<&'a [f32]>,
+    /// Generated keyframe slot rows (they get the keyframe embedding).
+    slots: std::ops::Range<usize>,
 }
 
 fn open_static(p: &Path) -> Result<&'static ModelFiles> {
@@ -817,10 +823,16 @@ impl Pipeline {
         run: &Run,
         progress: Progress,
     ) -> Result<()> {
-        let mut pos = video_positions(lt, lh, lw, p.fps);
-        for im in p.images.iter().filter(|im| im.frame != 0) {
-            pos.extend(guide_positions(im.frame, lh, lw, p.fps));
-        }
+        let pos = match run.pos {
+            Some(v) => v.to_vec(),
+            None => {
+                let mut pos = video_positions(lt, lh, lw, p.fps);
+                for im in p.images.iter().filter(|im| im.frame != 0) {
+                    pos.extend(guide_positions(im.frame, lh, lw, p.fps));
+                }
+                pos
+            }
+        };
         let apos = audio_positions(audio.rows());
         let mut g = NoiseGen::new(&p.noise, run.seed);
         let sigmas = run.sigmas;
@@ -844,6 +856,7 @@ impl Pipeline {
                         pos: &pos,
                         ctx: &c.video,
                         keyframe_rows: lh * lw,
+                        slot_rows: run.slots.clone(),
                     },
                     &StreamIn {
                         x: &audio.x,
@@ -852,6 +865,7 @@ impl Pipeline {
                         pos: &apos,
                         ctx: &c.audio,
                         keyframe_rows: 0,
+                        slot_rows: 0..0,
                     },
                     ptb,
                 );
@@ -982,12 +996,26 @@ impl Pipeline {
                 p.height
             );
         }
-        let frames = self.resolve_frames(p, ctx)?;
+        let requested = self.resolve_frames(p, ctx)?;
         for im in &p.images {
-            if im.frame >= frames {
-                bail!("LTX-2.5: an image conditions frame {} of a {frames}-frame clip", im.frame);
+            if im.frame >= requested {
+                bail!("LTX-2.5: an image conditions frame {} of a {requested}-frame clip", im.frame);
             }
         }
+        // Temporal rounds: the clip is made on the keyframe canvas (`resolve_canvas`) with a
+        // generated keyframe slot at each segment border.
+        let rounds = p.temporal_upscale.min(dfr::MAX_ROUNDS);
+        if rounds > 0 && !self.dit.has_keyframe_embedding() {
+            bail!("LTX-2.5: temporal upscaling needs a transformer with the keyframe embedding (generated keyframe slots)");
+        }
+        let (frames, keyframes_at) = if rounds > 0 {
+            let (n, _, at) = dfr::resolve_canvas(requested);
+            (n, at)
+        } else {
+            (requested, Vec::new())
+        };
+        // The transformer's rate (60 above 30 with the rounds' canvas; the soundtrack keeps `fps`).
+        let cfps = if rounds > 0 { dfr::conditioning_fps(p.fps) } else { p.fps };
         let c = self.dit.cfg.in_channels;
         let ac = self.dit.cfg.audio_in_channels;
         let lt = (frames - 1) / TIME_SCALE + 1;
@@ -1004,10 +1032,10 @@ impl Pipeline {
         // (`VideoConditionByLatentIndex`); one for any other frame is appended as guide rows
         // (`VideoConditionByKeyframeIndex`: clean latents at that frame's time), dropped after
         // each stage.
-        let condition = |st: &mut State, w: usize, h: usize| {
+        let condition_with = |st: &mut State, w: usize, h: usize, images: &[ImageCond]| {
             if let Some(enc) = &encoder {
                 let (lh, lw) = (h / SPACE_SCALE, w / SPACE_SCALE);
-                for im in &p.images {
+                for im in images {
                     let lat = self.encode_image(enc, &im.image, w, h);
                     let rows = patchify(&lat, c, 1, lh, lw);
                     if im.frame == 0 {
@@ -1021,6 +1049,32 @@ impl Pipeline {
                 }
             }
         };
+        let condition = |st: &mut State, w: usize, h: usize| condition_with(st, w, h, &p.images);
+        // Generated keyframe slots (`VideoGeneratedKeyframeSlots`): a latent frame of rows per
+        // keyframe at the end, denoised with the clip from `init` (or zeros).
+        let add_slots = |st: &mut State, n: usize, frame_rows: usize, init: Option<&[f32]>| -> std::ops::Range<usize> {
+            let start = st.rows();
+            let rows = n * frame_rows;
+            match init {
+                Some(v) => st.x.extend_from_slice(&v[..rows * c]),
+                None => st.x.extend(std::iter::repeat_n(0.0, rows * c)),
+            }
+            st.clean.extend(std::iter::repeat_n(0.0, rows * c));
+            st.mask.extend(std::iter::repeat_n(1.0, rows));
+            start..start + rows
+        };
+        // The video rows' positions with slots: the clip's, the images' guide rows', the slots'.
+        let positions = |lh: usize, lw: usize| -> Vec<f32> {
+            let mut pos = video_positions(lt, lh, lw, cfps);
+            for im in p.images.iter().filter(|im| im.frame != 0) {
+                pos.extend(guide_positions(im.frame, lh, lw, cfps));
+            }
+            for &k in &keyframes_at {
+                pos.extend(guide_positions(k, lh, lw, cfps));
+            }
+            pos
+        };
+        let slot_rows = |st: &State, r: &std::ops::Range<usize>| st.x[r.start * c..r.end * c].to_vec();
         // The rows of the clip itself (guide rows dropped).
         let clip = |st: &mut State, rows: usize| {
             st.x.truncate(rows * c);
@@ -1035,6 +1089,12 @@ impl Pipeline {
         let (lh, lw) = (h1 / SPACE_SCALE, w1 / SPACE_SCALE);
         let mut video = State::zeros(lt * lh * lw, c);
         condition(&mut video, w1, h1);
+        let slots1 = if rounds > 0 {
+            add_slots(&mut video, keyframes_at.len(), lh * lw, None)
+        } else {
+            0..0
+        };
+        let pos1 = (rounds > 0).then(|| positions(lh, lw));
         video.noise(&mut rng, 1.0);
         let mut audio = State::zeros(na, ac);
         audio.noise(&mut rng, 1.0);
@@ -1076,11 +1136,15 @@ impl Pipeline {
                 frozen_audio: false,
                 guidance: guidance.as_ref(),
                 name: "stage 1",
+                pos: pos1.as_deref(),
+                slots: slots1.clone(),
             },
             progress,
         );
         self.set_distilled_lora(true);
         r?;
+        let mut planes = slot_rows(&video, &slots1);
+        let stage1_audio = audio.x.clone();
         clip(&mut video, lt * lh * lw);
         dump("stage1_video", &video.x);
         dump("stage1_audio", &audio.x);
@@ -1098,6 +1162,8 @@ impl Pipeline {
             let uf = ModelFiles::open_file(up, false)?;
             let ups = upsample::LatentUpsampler::load(&uf)?;
             let x = upsample_rows(&ups, &vfiles_stats, &video.x, c, (lt, lh, lw));
+            // The slots' rows upsampled as a clip of their own (`upsampler(stacked_keyframes)`).
+            let up_planes = (rounds > 0).then(|| upsample_rows(&ups, &vfiles_stats, &planes, c, (keyframes_at.len(), lh, lw)));
             drop(ups);
             dump("upsampled_video", &x);
             lh *= 2;
@@ -1105,6 +1171,11 @@ impl Pipeline {
             let mut v2 = State::zeros(lt * lh * lw, c);
             v2.x = x;
             condition(&mut v2, p.width, p.height);
+            let slots2 = match &up_planes {
+                Some(u) => add_slots(&mut v2, keyframes_at.len(), lh * lw, Some(u)),
+                None => 0..0,
+            };
+            let pos2 = (rounds > 0).then(|| positions(lh, lw));
             let s0 = p.stage2_sigmas[0];
             v2.noise(&mut rng, s0);
             let mut a2 = State::zeros(na, ac);
@@ -1131,11 +1202,16 @@ impl Pipeline {
                     frozen_audio: frozen,
                     guidance: None,
                     name: "stage 2",
+                    pos: pos2.as_deref(),
+                    slots: slots2.clone(),
                 },
                 progress,
             )?;
             if frozen {
                 a2.x = audio.x.clone();
+            }
+            if rounds > 0 {
+                planes = slot_rows(&v2, &slots2);
             }
             clip(&mut v2, lt * lh * lw);
             dump("stage2_video", &v2.x);
@@ -1145,7 +1221,7 @@ impl Pipeline {
             t_s2 = t2.elapsed().as_secs_f64();
         }
         let (mut lt, mut fps, mut frames) = (lt, p.fps, frames);
-        if p.temporal_upscale {
+        if rounds > 0 {
             let up = self
                 .paths
                 .temporal_upsampler
@@ -1153,42 +1229,148 @@ impl Pipeline {
                 .context("temporal upscaling needs the temporal upsampler (latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors)")?;
             let uf = ModelFiles::open_file(up, false)?;
             let ups = upsample::LatentUpsampler::load(&uf)?;
-            let x = upsample_rows(&ups, &vfiles_stats, &video.x, c, (lt, lh, lw));
-            drop(ups);
-            lt = 2 * lt - 1;
-            fps *= 2.0;
-            frames = (lt - 1) * TIME_SCALE + 1;
-            let mut v3 = State::zeros(lt * lh * lw, c);
-            v3.x = x;
-            let sig: Vec<f32> = DISTILLED_SIGMAS[4..].to_vec();
-            v3.noise(&mut rng, sig[0]);
-            let mut a3 = State::zeros(na, ac);
-            a3.x = audio.x.clone();
-            a3.clean = audio.x.clone();
-            a3.mask.fill(0.0);
-            let pt = Params {
-                fps,
-                images: Vec::new(),
-                ..p.clone()
-            };
-            self.denoise(
-                ctx,
-                None,
-                &mut v3,
-                &mut a3,
-                (lt, lh, lw),
-                &pt,
-                &Run {
-                    sigmas: &sig,
-                    seed: p.seed + TEMPORAL_NOISE_OFFSET,
-                    eta: p.eta.unwrap_or(1.0),
-                    frozen_audio: true,
-                    guidance: None,
-                    name: "temporal",
-                },
-                progress,
-            )?;
-            video = v3;
+            let fr = lh * lw * c;
+            let mut keyframes: std::collections::BTreeMap<usize, Vec<f32>> =
+                keyframes_at.iter().zip(planes.chunks(fr)).map(|(&k, v)| (k, v.to_vec())).collect();
+            // The stage-1 soundtrack, frozen, for the tiles' cross-attention (`audio_latent_for_tile`).
+            let source_duration = frames as f32 / p.fps;
+            let full_t = stage1_audio.len() / ac;
+            for r in 1..=rounds {
+                let x = upsample_rows(&ups, &vfiles_stats, &video.x, c, (lt, lh, lw));
+                lt = 2 * lt - 1;
+                frames = 2 * (frames - 1) + 1;
+                fps *= 2.0;
+                let rfps = dfr::conditioning_fps(fps);
+                let scaled: std::collections::BTreeMap<usize, Vec<f32>> = keyframes.iter().map(|(k, v)| (2 * k, v.clone())).collect();
+                let seams: Vec<usize> = scaled.keys().copied().collect();
+                let tiles = dfr::tile_plan(&seams, frames, 1 << r);
+                let mut plane_at = scaled.clone();
+                let mut stitched: Vec<f32> = Vec::with_capacity(lt * fr);
+                let mut previous: Option<(usize, Vec<f32>)> = None;
+                for (ti, tile) in tiles.iter().enumerate() {
+                    let prefix = match ti {
+                        0 => None,
+                        _ => Some(dfr::tile_prefix((tile.start - 1) * TIME_SCALE, plane_at.keys().copied())?),
+                    };
+                    // The tile's frames: the canvas', or the plane before its border then the
+                    // canvas from there (`_temporal_tile_video_input`).
+                    let (tile_x, pixel_start, resume, pinned) = match prefix {
+                        None => (x[tile.start * fr..tile.end * fr].to_vec(), 0, 0, 0),
+                        Some(pf) => {
+                            let mut v = plane_at[&pf.keyframe].clone();
+                            v.extend_from_slice(&x[pf.video_start * fr..tile.end * fr]);
+                            (v, pf.keyframe, pf.resume, pf.cells)
+                        }
+                    };
+                    let tlt = tile_x.len() / fr;
+                    let local_frames = (tlt - 1) * TIME_SCALE + 1;
+                    let pixel_end = pixel_start + local_frames - 1;
+                    let mut st = State::zeros(tlt * lh * lw, c);
+                    st.x = tile_x.clone();
+                    let mut pos = video_positions(tlt, lh, lw, rfps);
+                    // The images that fall in the tile (`rebase_image_conditionings`).
+                    let imgs: Vec<ImageCond> = p
+                        .images
+                        .iter()
+                        .filter_map(|im| {
+                            let f = im.frame << r;
+                            (pixel_start <= f && f <= pixel_end).then(|| ImageCond {
+                                frame: f - pixel_start,
+                                ..im.clone()
+                            })
+                        })
+                        .collect();
+                    condition_with(&mut st, lw * SPACE_SCALE, lh * SPACE_SCALE, &imgs);
+                    for im in imgs.iter().filter(|im| im.frame != 0) {
+                        pos.extend(guide_positions(im.frame, lh, lw, rfps));
+                    }
+                    // The keyframes at its borders, as guides (strength 0.95).
+                    for &a in tile.anchors.iter().filter(|&&a| a >= resume) {
+                        st.x.extend(std::iter::repeat_n(0.0, fr));
+                        st.clean.extend_from_slice(&scaled[&a]);
+                        st.mask.extend(std::iter::repeat_n(1.0 - dfr::ANCHOR_STRENGTH, lh * lw));
+                        pos.extend(guide_positions(a - pixel_start, lh, lw, rfps));
+                    }
+                    // New slots mid-segment, started from the nearest latent frame
+                    // (`slot_initials_from_video`, Python's round half to even).
+                    let local: Vec<usize> = tile.slots.iter().map(|&s| s - pixel_start).collect();
+                    let slots = if local.is_empty() {
+                        0..0
+                    } else {
+                        let mut init = Vec::with_capacity(local.len() * fr);
+                        for &s in &local {
+                            let i = ((s as f64 / TIME_SCALE as f64).round_ties_even() as usize).min(tlt - 1);
+                            init.extend_from_slice(&tile_x[i * fr..(i + 1) * fr]);
+                            pos.extend(guide_positions(s, lh, lw, rfps));
+                        }
+                        add_slots(&mut st, local.len(), lh * lw, Some(&init))
+                    };
+                    // The pinned prefix: the plane, then the previous tile's frames up to the
+                    // border (`lead_in_carryover`, strength 1).
+                    if let (Some(pf), Some((base, prev))) = (prefix, &previous) {
+                        let offset = pf.video_start - base;
+                        let cells = pf.cells - 1;
+                        if offset + cells > prev.len() / fr {
+                            bail!("temporal round {r}: tile {ti}'s pinned frames fall outside the previous tile");
+                        }
+                        st.clean[..fr].copy_from_slice(&plane_at[&pf.keyframe]);
+                        st.clean[fr..pf.cells * fr].copy_from_slice(&prev[offset * fr..(offset + cells) * fr]);
+                        st.mask[..pf.cells * lh * lw].fill(0.0);
+                    }
+                    st.noise(&mut rng, dfr::TEMPORAL_SIGMAS[0]);
+                    // The soundtrack of the tile's window, frozen (noised at scale 0: drawn).
+                    let src0 = pixel_start as f32 / fps / source_duration * full_t as f32;
+                    let src1 = (pixel_start + local_frames) as f32 / fps / source_duration * full_t as f32;
+                    let mut at = State::zeros(audio_latents(local_frames, rfps), ac);
+                    at.x = dfr::resample_rows(&stage1_audio, ac, src0, src1, at.rows());
+                    at.noise(&mut rng, 0.0);
+                    at.clean = at.x.clone();
+                    at.mask.fill(0.0);
+                    let pt = Params {
+                        fps: rfps,
+                        images: imgs.clone(),
+                        ..p.clone()
+                    };
+                    self.denoise(
+                        ctx,
+                        None,
+                        &mut st,
+                        &mut at,
+                        (tlt, lh, lw),
+                        &pt,
+                        &Run {
+                            sigmas: &dfr::TEMPORAL_SIGMAS,
+                            seed: p.seed + 1000 * r as u64 + ti as u64,
+                            eta: p.eta.unwrap_or(dfr::TEMPORAL_ETA),
+                            frozen_audio: true,
+                            guidance: None,
+                            name: "temporal",
+                            pos: Some(&pos),
+                            slots: slots.clone(),
+                        },
+                        progress,
+                    )?;
+                    for (k, &s) in tile.slots.iter().enumerate() {
+                        let at_row = (slots.start + k * lh * lw) * c;
+                        plane_at.entry(s).or_insert_with(|| st.x[at_row..at_row + fr].to_vec());
+                    }
+                    let tile_lat = st.x[..tlt * fr].to_vec();
+                    stitched.extend_from_slice(&tile_lat[pinned * fr..]);
+                    previous = Some((prefix.map_or(tile.start, |pf| pf.video_start - 1), tile_lat));
+                }
+                if stitched.len() != lt * fr {
+                    bail!("temporal round {r}: stitched {} latent frames, expected {lt}", stitched.len() / fr);
+                }
+                video.x = stitched;
+                keyframes = plane_at;
+                dump(&format!("temporal{r}_video"), &video.x);
+            }
+            // The canvas' padding cut: `(frames - 1) 2^rounds + 1` frames.
+            let target = (requested - 1) * (1 << rounds) + 1;
+            let keep = (target - 1) / TIME_SCALE + 1;
+            video.x.truncate(keep * fr);
+            lt = keep;
+            frames = target;
         }
         // Decode.
         let t3 = Instant::now();

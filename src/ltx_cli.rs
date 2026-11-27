@@ -25,7 +25,7 @@ pub struct LtxArgs {
     /// `--one-stage`: the distilled schedule at the full size, no spatial upsampler.
     pub one_stage: bool,
     /// `--temporal-upscale`: twice the frames and rate after the last stage.
-    pub temporal_upscale: bool,
+    pub temporal_upscale: usize,
     /// `--no-audio`: no soundtrack decoded.
     pub no_audio: bool,
     /// `--image FILE[@FRAME[:STRENGTH]]` (repeatable).
@@ -68,7 +68,13 @@ impl LtxArgs {
         match flag {
             "--fps" => self.fps = Some(val()?.parse()?),
             "--one-stage" => self.one_stage = true,
-            "--temporal-upscale" => self.temporal_upscale = true,
+            "--temporal-upscale" => self.temporal_upscale = self.temporal_upscale.max(1),
+            "--temporal-rounds" => {
+                self.temporal_upscale = val()?.parse()?;
+                if self.temporal_upscale > ltx::dfr::MAX_ROUNDS {
+                    bail!("--temporal-rounds: at most {}", ltx::dfr::MAX_ROUNDS);
+                }
+            }
             "--no-audio" => self.no_audio = true,
             "--image" => self.images.push(val()?),
             "--eta" => self.eta = Some(val()?.parse()?),
@@ -146,7 +152,7 @@ pub fn run(args: &Args) -> Result<()> {
         let o = FetchOptions {
             variant: variant.unwrap_or_default(),
             text_bf16: a.text_bf16,
-            temporal_upsampler: a.temporal_upscale,
+            temporal_upsampler: a.temporal_upscale > 0,
             distilled_lora: a.distilled_lora,
             vae: vae_kind.unwrap_or_default(),
         };

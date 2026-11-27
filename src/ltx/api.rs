@@ -191,7 +191,8 @@ pub fn guidance_from(mode: Option<&str>, opts: &[(&str, String)]) -> Result<(Gui
 }
 
 /// [`Params`] from a JSON object: `prompt` (required), `size` (`"WxH"`) or `width` / `height`,
-/// `frames` or `seconds`, `fps`, `seed`, `one_stage`, `temporal_upscale`, `audio` (false: no
+/// `frames` or `seconds`, `fps`, `seed`, `one_stage`, `temporal_upscale` (true or the rounds,
+/// up to 2), `audio` (false: no
 /// soundtrack), `eta`, `sigmas` / `stage2_sigmas` (arrays or comma lists), `noise`
 /// (`oxinfer` / `torch`), `strength` (of the first frame), `guidance` (`auto`, `on`, `off`) and
 /// the guidance settings of [`guidance_option`] (`cfg`, `stg`, `steps`, `negative_prompt`, ...;
@@ -223,8 +224,20 @@ pub fn params_from_json(o: &serde_json::Value) -> Result<Params> {
     if let Some(x) = b("one_stage") {
         p.two_stage = !x;
     }
-    if let Some(x) = b("temporal_upscale") {
-        p.temporal_upscale = x;
+    // `temporal_upscale`: true (one round) or the rounds (0 to 2).
+    match &o["temporal_upscale"] {
+        serde_json::Value::Bool(x) => p.temporal_upscale = *x as usize,
+        serde_json::Value::Null => {}
+        _ => {
+            if let Some(n) = num("temporal_upscale") {
+                p.temporal_upscale = n.max(0.0) as usize;
+            } else if let Some(x) = b("temporal_upscale") {
+                p.temporal_upscale = x as usize;
+            }
+        }
+    }
+    if p.temporal_upscale > super::dfr::MAX_ROUNDS {
+        bail!("temporal_upscale: at most {} rounds", super::dfr::MAX_ROUNDS);
     }
     if let Some(x) = b("audio") {
         p.audio = x;
