@@ -787,12 +787,20 @@ impl Conv {
     }
 
     /// Zero padding before and after the input.
+    #[cfg_attr(
+        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
+        allow(dead_code)
+    )]
     pub(crate) fn pads(&self) -> (usize, usize) {
         self.pad
     }
 
     /// The kernel as float32 rows `[cout][ky][kx][cin]` and the bias, for an engine that keeps
     /// its own copy on a device (None for split float32 layers and rows that cannot be read).
+    #[cfg_attr(
+        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
+        allow(dead_code)
+    )]
     pub(crate) fn rows_f32(&self) -> Option<(Vec<f32>, Option<&[f32]>)> {
         let l = &self.lin;
         let mut w = vec![0f32; l.n_out * l.n_in];

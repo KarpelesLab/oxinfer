@@ -411,6 +411,11 @@ pub struct VideoVae {
     quant: Option<Conv>,
     dec: Stack,
     post_quant: Conv,
+    // (Read by the CUDA passes only.)
+    #[cfg_attr(
+        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
+        allow(dead_code)
+    )]
     device: Device,
 }
 
