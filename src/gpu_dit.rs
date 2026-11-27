@@ -396,6 +396,43 @@ pub trait LtxVaeSession: Send {
         out: &mut Vec<f32>,
         progress: &mut dyn FnMut(usize, usize),
     ) -> bool;
+
+    /// The encoder's latent means (`[t', h', w', m.latent]` rows, before the per-channel
+    /// normalization) into `out` from patchified frames `x` (`[t, h, w, m.conv_in.cin]` rows, the
+    /// channels zero-padded to the convolution's); false when declined.
+    #[allow(clippy::too_many_arguments)]
+    fn encode(
+        &mut self,
+        _m: &LtxVaeEncoder,
+        _x: &[f32],
+        _t: usize,
+        _h: usize,
+        _w: usize,
+        _out: &mut Vec<f32>,
+        _progress: &mut dyn FnMut(usize, usize),
+    ) -> bool {
+        false
+    }
+}
+
+/// A step of the VAE encoder after its input convolution.
+pub enum LtxVaeEncOp<'a> {
+    /// A residual block (as the decoder's).
+    Res(LtxVaeConv<'a>, LtxVaeConv<'a>),
+    /// Space-to-depth by the strides (time, y, x) of a convolution's output plus the mean of each
+    /// output channel's `group` channels of the input's space-to-depth; the first frame repeated
+    /// in front when time halves.
+    S2d(LtxVaeConv<'a>, [usize; 3], usize),
+}
+
+/// LTX-2.5's convolutional video VAE encoder (causal in time) after the input's patchifying:
+/// `conv_in`, the ops, norm and SiLU, `conv_out`, of whose outputs the first `latent` are the
+/// means.
+pub struct LtxVaeEncoder<'a> {
+    pub conv_in: LtxVaeConv<'a>,
+    pub ops: Vec<LtxVaeEncOp<'a>>,
+    pub conv_out: LtxVaeConv<'a>,
+    pub latent: usize,
 }
 
 /// A layer of a BigVGAN generator as shifted GEMMs (`crate::ltx::audio`): bfloat16 weights

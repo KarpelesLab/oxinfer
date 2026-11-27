@@ -434,7 +434,8 @@ kernel void lv_amax(device const float* x [[buffer(0)]], device atomic_uint* m [
 // guards), image b reading frame clamp(b, lo, hi - 1) of x: as it is (mode 0), RMS-normed over
 // its c channels and SiLU'd (mode 1, `PixelNorm`), or scaled by lv_scale of the largest magnitude
 // (mode 2). A SIMD-group per row, 8 rows per threadgroup.
-struct LVP { LVG g; uint c; uint nimg; uint lo; uint hi; uint mode; uint rows; float eps; };
+// Image b reads frame b - shift (the encoder's time-halving steps repeat the first frame).
+struct LVP { LVG g; uint c; uint nimg; uint lo; uint hi; uint mode; uint rows; float eps; uint shift; uint _p0; uint _p1; uint _p2; };
 kernel void lv_prep(device const float* x [[buffer(0)]], device half* out [[buffer(1)]], device const uint* amax [[buffer(2)]],
                     constant LVP& p [[buffer(3)]], uint tg [[threadgroup_position_in_grid]],
                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
@@ -447,7 +448,7 @@ kernel void lv_prep(device const float* x [[buffer(0)]], device half* out [[buff
         for (uint j = lane; j < c4; j += 32) o[j] = half4(0.h);
         return;
     }
-    uint sb = clamp(b, p.lo, p.hi - 1);
+    uint sb = uint(clamp(int(b) - int(p.shift), int(p.lo), int(p.hi) - 1));
     device const float4* s = (device const float4*)(x + (ulong)lv_row(p.g, sb, y, xx) * p.c);
     float k = 1.0f;
     if (p.mode == 1) {
@@ -478,6 +479,31 @@ kernel void lv_d2s(device const float* x [[buffer(0)]], device float* y [[buffer
     uint sc = p.c * p.p1 * p.p2 * p.p3;
     y[(ulong)lv_row(p.d, p.lo + F, oy, ox) * p.c + ch] =
         x[(ulong)lv_row(p.s, p.lo + f, sy, sx) * sc + ((ch * p.p1 + i1) * p.p2 + i2) * p.p3 + i3];
+}
+// The encoder's space-to-depth step: output frame F (frames lo + F of layout d, c = co p1 p2 p3
+// channels ordered (channel, i1, i2, i3)) pixel (oy, ox) from the convolution's output t (layout
+// s, co channels; its frames those of the input with the first one repeated dup times) at frame
+// F p1 + i1, pixel (oy p2 + i2, ox p3 + i3), plus the mean of channels o group .. (o + 1) group of
+// the input x's space-to-depth (layout s, xc channels; frame k of the repeated input is x's
+// frame max(k - dup, 0)). A thread per output value.
+struct LVS { LVG s; LVG d; uint co; uint xc; uint p1; uint p2; uint p3; uint group; uint dup; uint lo; uint t; uint _p; };
+kernel void lv_s2d(device const float* tt [[buffer(0)]], device const float* x [[buffer(1)]], device float* y [[buffer(2)]],
+                   constant LVS& p [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+    uint oc = p.co * p.p1 * p.p2 * p.p3, n = p.d.h * p.d.w * oc, F = i / n;
+    if (F >= p.t) return;
+    uint q = i - F * n, pix = q / oc, o = q - pix * oc, oy = pix / p.d.w, ox = pix - oy * p.d.w;
+    uint i3 = o % p.p3, r = o / p.p3, i2 = r % p.p2;
+    r /= p.p2;
+    uint i1 = r % p.p1, c = r / p.p1;
+    float v = tt[(ulong)lv_row(p.s, p.lo + F * p.p1 + i1, oy * p.p2 + i2, ox * p.p3 + i3) * p.co + c];
+    float acc = 0.f;
+    for (uint j = 0; j < p.group; j++) {
+        uint qq = o * p.group + j, j3 = qq % p.p3, rr = qq / p.p3, j2 = rr % p.p2;
+        rr /= p.p2;
+        uint j1 = rr % p.p1, cx = rr / p.p1, k = F * p.p1 + j1, xf = k >= p.dup ? k - p.dup : 0;
+        acc += x[(ulong)lv_row(p.s, p.lo + xf, oy * p.p2 + j2, ox * p.p3 + j3) * p.xc + cx];
+    }
+    y[(ulong)lv_row(p.d, p.lo + F, oy, ox) * oc + o] = v + acc / float(p.group);
 }
 // The decoder's output: frames lo .. lo + t of conv_out's rows (c = oc pq pq channels ordered
 // (channel, x, y) per patch) as compact frames [t, h pq, w pq, oc]. A thread per output value.

@@ -5,12 +5,13 @@
 //! spatial taps each, bf16 weights, half inputs: `PixelNorm` and SiLU'd by `lv_prep`, or scaled
 //! into half's range), accumulating in f32; the depth-to-space steps and the final patch layout
 //! are `lv_d2s` / `lv_out` (`metal_ltx.metal`). One command buffer per op; the frames come back
-//! once.
+//! once. The encoder runs the same way: its space-to-depth steps (the first frame repeated when
+//! time halves: `lv_prep`'s frame shift, the input's channel-group means added) are `lv_s2d`.
 
 use super::super::decode::{Fns, run_concurrent};
 use super::super::*;
 use super::{DBuf, grow, release_all};
-use crate::gpu::dit::{LtxVaeConv, LtxVaeDecoder, LtxVaeOp, LtxVaeSession};
+use crate::gpu::dit::{LtxVaeConv, LtxVaeDecoder, LtxVaeEncOp, LtxVaeEncoder, LtxVaeOp, LtxVaeSession};
 
 struct Pipes {
     gemm: Id,
@@ -18,6 +19,7 @@ struct Pipes {
     amax: Id,
     d2s: Id,
     out: Id,
+    s2d: Id,
 }
 
 #[derive(Clone, Copy)]
@@ -103,6 +105,24 @@ struct Lvp {
     mode: u32,
     rows: u32,
     eps: f32,
+    shift: u32,
+    _p: [u32; 3],
+}
+
+#[repr(C)]
+struct Lvs {
+    s: Geo,
+    d: Geo,
+    co: u32,
+    xc: u32,
+    p1: u32,
+    p2: u32,
+    p3: u32,
+    group: u32,
+    dup: u32,
+    lo: u32,
+    t: u32,
+    _p: u32,
 }
 
 #[repr(C)]
@@ -184,6 +204,7 @@ impl MetalBackend {
             amax: pipe("lv_amax")?,
             d2s: pipe("lv_d2s")?,
             out: pipe("lv_out")?,
+            s2d: pipe("lv_s2d")?,
         };
         Some(Box::new(MetalLtxVae {
             be: self,
@@ -397,6 +418,8 @@ impl LtxVaeSession for MetalLtxVae {
                     mode,
                     rows: l.rows() as u32,
                     eps: 1e-8,
+                    shift: 0,
+                    _p: [0; 3],
                 },
                 3,
             );
@@ -562,6 +585,335 @@ impl LtxVaeSession for MetalLtxVae {
         out.resize(frames, 0.0);
         // SAFETY: Out holds `frames` floats.
         unsafe { super::super::par_copy(out.as_mut_ptr(), self.host::<f32>(B::Out), frames) };
+        progress(total, total);
+        true
+    }
+
+    fn encode(
+        &mut self,
+        m: &LtxVaeEncoder,
+        xin: &[f32],
+        t: usize,
+        h: usize,
+        w: usize,
+        out: &mut Vec<f32>,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> bool {
+        let mut all = vec![&m.conv_in];
+        for op in &m.ops {
+            match op {
+                LtxVaeEncOp::Res(a, b) => {
+                    all.push(a);
+                    all.push(b);
+                }
+                LtxVaeEncOp::S2d(c, _, _) => all.push(c),
+            }
+        }
+        all.push(&m.conv_out);
+        let c0 = m.conv_in.cin;
+        if t == 0 || h == 0 || w == 0 || xin.len() != t * h * w * c0 || m.latent > m.conv_out.cout {
+            return false;
+        }
+        for c in &all {
+            let rows = c.cout.next_multiple_of(64);
+            if !c.cin.is_multiple_of(32) || c.w.len() != rows * 27 * c.cin || c.bias.len() != rows {
+                return false;
+            }
+        }
+        // The shapes through the encoder: the largest activation, convolution output and half
+        // input.
+        let (mut lay, mut ch) = (Lay { t, h, w }, m.conv_in.cout);
+        let (mut act, mut conv_out, mut half) = (lay.rows() * c0.max(ch) * 4, lay.rows() * ch * 4, lay.rows() * c0 * 2);
+        for op in &m.ops {
+            match op {
+                LtxVaeEncOp::Res(a, b) => {
+                    if a.cin != ch || b.cout != ch {
+                        return false;
+                    }
+                    half = half.max(lay.rows() * a.cin.max(b.cin) * 2);
+                    conv_out = conv_out.max(lay.rows() * a.cout * 4);
+                }
+                LtxVaeEncOp::S2d(c, st, group) => {
+                    let dup = (st[0] == 2) as usize;
+                    let n = st[0] * st[1] * st[2];
+                    let lc = Lay { t: lay.t + dup, ..lay };
+                    if c.cin != ch
+                        || !lc.t.is_multiple_of(st[0])
+                        || !lay.h.is_multiple_of(st[1])
+                        || !lay.w.is_multiple_of(st[2])
+                        || ch * n != c.cout * n * group
+                    {
+                        return false;
+                    }
+                    half = half.max(lc.rows() * c.cin * 2);
+                    conv_out = conv_out.max(lc.rows() * c.cout * 4);
+                    act = act.max(lc.rows() * ch * 4);
+                    lay = Lay {
+                        t: lc.t / st[0],
+                        h: lay.h / st[1],
+                        w: lay.w / st[2],
+                    };
+                    ch = c.cout * n;
+                    act = act.max(lay.rows() * ch * 4);
+                }
+            }
+        }
+        if ch != m.conv_out.cin {
+            return false;
+        }
+        half = half.max(lay.rows() * ch * 2);
+        conv_out = conv_out.max(lay.rows() * m.conv_out.cout * 4);
+        let ok = self.ensure(B::X, act)
+            && self.ensure(B::Y, act)
+            && self.ensure(B::T, conv_out)
+            && self.ensure(B::H, half)
+            && self.ensure(B::Amax, 256);
+        if !ok {
+            return false;
+        }
+        // Weights and biases, once per encoder.
+        let key = m.conv_in.w.as_ptr() as usize;
+        let mut at = Vec::with_capacity(all.len());
+        let (mut wb, mut bb) = (0usize, 0usize);
+        for c in &all {
+            at.push(ConvAt {
+                w: wb,
+                b: bb,
+                cin: c.cin,
+                cout: c.cout,
+            });
+            wb += (c.w.len() * 2).next_multiple_of(256);
+            bb += (c.bias.len() * 4).next_multiple_of(256);
+        }
+        if self.weights_of != key {
+            if !self.ensure(B::W, wb) || !self.ensure(B::Bias, bb) {
+                return false;
+            }
+            let (wp, bp) = (self.host::<u8>(B::W), self.host::<u8>(B::Bias));
+            for (c, a) in all.iter().zip(&at) {
+                // SAFETY: the buffers hold wb / bb bytes, every convolution inside them; the
+                // device is idle.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(c.w.as_ptr() as *const u8, wp.add(a.w), c.w.len() * 2);
+                    super::super::par_copy(bp.add(a.b) as *mut f32, c.bias.as_ptr(), c.bias.len());
+                }
+            }
+            self.weights_of = key;
+        }
+        // The frames into X (borders and guards are never read).
+        let lay0 = Lay { t, h, w };
+        let xp = self.host::<f32>(B::X);
+        for f in 0..t {
+            for y in 0..h {
+                let r = lay0.g() + (LO + f) * lay0.p() + (y + 1) * (w + 2) + 1;
+                // SAFETY: X holds lay0.rows() rows of c0 floats.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(xin.as_ptr().add((f * h + y) * w * c0), xp.add(r * c0), w * c0);
+                }
+            }
+        }
+        let ids: [Id; NBUF] = std::array::from_fn(|i| self.bufs[i].id);
+        let id = |b: B| ids[b as usize];
+        let p = &self.p;
+        // The half rows of `src` (c channels, layout sl) into H in layout dl (the same size, `shift`
+        // more frames in front, each a repeat of the first).
+        let prep = |e: &super::super::decode::FastEnc, src: B, sl: Lay, dl: Lay, c: usize, mode: u32, shift: usize| {
+            if mode == 2 {
+                e.pipe(p.amax);
+                e.buf(id(src), 0, 0);
+                e.buf(id(B::Amax), 0, 1);
+                e.bytes(
+                    &Lva {
+                        g: sl.geo(),
+                        c: c as u32,
+                        lo: LO as u32,
+                        hi: (LO + sl.t) as u32,
+                        rows: sl.rows() as u32,
+                    },
+                    2,
+                );
+                e.dispatch(((sl.rows() * c / 4).div_ceil(256), 1), 256);
+                e.barrier();
+            }
+            e.pipe(p.prep);
+            e.buf(id(src), 0, 0);
+            e.buf(id(B::H), 0, 1);
+            e.buf(id(B::Amax), 0, 2);
+            e.bytes(
+                &Lvp {
+                    g: dl.geo(),
+                    c: c as u32,
+                    nimg: dl.nimg() as u32,
+                    lo: LO as u32,
+                    hi: (LO + sl.t) as u32,
+                    mode,
+                    rows: dl.rows() as u32,
+                    eps: 1e-8,
+                    shift: shift as u32,
+                    _p: [0; 3],
+                },
+                3,
+            );
+            e.dispatch((dl.rows().div_ceil(8), 1), 256);
+            e.barrier();
+        };
+        // The causal convolution `a` of H (layout l) into `y`, plus `add` (same layout) when given.
+        let conv = |e: &super::super::decode::FastEnc, a: ConvAt, l: Lay, y: B, add: Option<B>, scaled: bool| {
+            let (r0, r_end) = l.span();
+            let nct = a.cout.div_ceil(64);
+            let tiles = (r_end - r0).div_ceil(TM) * nct;
+            let (p_, w2) = (l.p() as i32, l.w as i32 + 2);
+            for kt in 0..3 {
+                let mut off = [0i32; 9];
+                for (k, o) in off.iter_mut().enumerate() {
+                    let (ky, kx) = ((k / 3) as i32, (k % 3) as i32);
+                    *o = (kt as i32 - 2) * p_ + (ky - 1) * w2 + (kx - 1);
+                }
+                let addb = if kt == 0 { add } else { Some(y) };
+                e.pipe(p.gemm);
+                e.buf(id(B::W), a.w + kt * 9 * a.cin * 2, 0);
+                e.buf(id(B::H), 0, 1);
+                e.buf(id(y), 0, 2);
+                e.buf(id(B::Bias), a.b, 3);
+                e.bytes(
+                    &Ug {
+                        n_out: a.cout as u32,
+                        ldw: (27 * a.cin) as u32,
+                        cin: a.cin as u32,
+                        taps: 9,
+                        off,
+                        a_rows: l.rows() as u32,
+                        r0: r0 as u32,
+                        r_end: r_end as u32,
+                        omode: 2,
+                        ldy: a.cout as u32,
+                        has_bias: (kt == 0) as u32,
+                        bstride: 0,
+                        add: addb.is_some() as u32,
+                        nimg: l.nimg() as u32,
+                        g: l.geo(),
+                        scaled: scaled as u32,
+                        full: tiles as u32,
+                        rs: 1,
+                        kper: (9 * a.cin) as u32,
+                        nct: nct as u32,
+                        tm: TM as u32,
+                        nrem: 0,
+                        _p: 0,
+                    },
+                    4,
+                );
+                e.buf(id(addb.unwrap_or(y)), 0, 5);
+                e.buf(id(B::Amax), 0, 6);
+                e.buf(id(B::T), 0, 7);
+                e.dispatch((tiles, 1), 128);
+                e.barrier();
+            }
+        };
+        let zero_amax = |s: &Self| {
+            // SAFETY: Amax holds 256 bytes; the device is idle.
+            unsafe { std::ptr::write_bytes(s.host::<u8>(B::Amax), 0, 256) };
+        };
+        let total = m.ops.len() + 2;
+        let mut lay = lay0;
+        zero_amax(self);
+        let ok = self.run(|e| {
+            prep(e, B::X, lay, lay, c0, 2, 0);
+            conv(e, at[0], lay, B::Y, None, true);
+        });
+        if !ok {
+            return false;
+        }
+        let (mut x, mut yb) = (B::Y, B::X);
+        let mut ch = m.conv_in.cout;
+        progress(1, total);
+        let mut ci = 1;
+        for (oi, op) in m.ops.iter().enumerate() {
+            match op {
+                LtxVaeEncOp::Res(a, b) => {
+                    let (ca, cb) = (at[ci], at[ci + 1]);
+                    ci += 2;
+                    let ok = self.run(|e| {
+                        prep(e, x, lay, lay, a.cin, 1, 0);
+                        conv(e, ca, lay, B::T, None, false);
+                        prep(e, B::T, lay, lay, b.cin, 1, 0);
+                        conv(e, cb, lay, yb, Some(x), false);
+                    });
+                    if !ok {
+                        return false;
+                    }
+                    std::mem::swap(&mut x, &mut yb);
+                }
+                LtxVaeEncOp::S2d(c, st, group) => {
+                    let ca = at[ci];
+                    ci += 1;
+                    let dup = (st[0] == 2) as usize;
+                    let lc = Lay { t: lay.t + dup, ..lay };
+                    let nl = Lay {
+                        t: lc.t / st[0],
+                        h: lay.h / st[1],
+                        w: lay.w / st[2],
+                    };
+                    let oc = c.cout * st[0] * st[1] * st[2];
+                    zero_amax(self);
+                    let ok = self.run(|e| {
+                        prep(e, x, lay, lc, c.cin, 2, dup);
+                        conv(e, ca, lc, B::T, None, true);
+                        e.pipe(p.s2d);
+                        e.buf(id(B::T), 0, 0);
+                        e.buf(id(x), 0, 1);
+                        e.buf(id(yb), 0, 2);
+                        e.bytes(
+                            &Lvs {
+                                s: lay.geo(),
+                                d: nl.geo(),
+                                co: c.cout as u32,
+                                xc: ch as u32,
+                                p1: st[0] as u32,
+                                p2: st[1] as u32,
+                                p3: st[2] as u32,
+                                group: *group as u32,
+                                dup: dup as u32,
+                                lo: LO as u32,
+                                t: nl.t as u32,
+                                _p: 0,
+                            },
+                            3,
+                        );
+                        e.dispatch(((nl.t * nl.h * nl.w * oc).div_ceil(256), 1), 256);
+                    });
+                    if !ok {
+                        return false;
+                    }
+                    lay = nl;
+                    ch = oc;
+                    std::mem::swap(&mut x, &mut yb);
+                }
+            }
+            progress(oi + 2, total);
+        }
+        // Norm, SiLU, conv_out; the means read back.
+        let ca = at[ci];
+        let ok = self.run(|e| {
+            prep(e, x, lay, lay, ca.cin, 1, 0);
+            conv(e, ca, lay, B::T, None, false);
+        });
+        if !ok {
+            return false;
+        }
+        let (co, lc) = (m.conv_out.cout, m.latent);
+        out.clear();
+        out.reserve(lay.t * lay.h * lay.w * lc);
+        let tp = self.host::<f32>(B::T);
+        for f in 0..lay.t {
+            for y in 0..lay.h {
+                for xx in 0..lay.w {
+                    let r = lay.g() + (LO + f) * lay.p() + (y + 1) * (lay.w + 2) + xx + 1;
+                    // SAFETY: T holds lay.rows() rows of co floats.
+                    out.extend_from_slice(unsafe { std::slice::from_raw_parts(tp.add(r * co), lc) });
+                }
+            }
+        }
         progress(total, total);
         true
     }

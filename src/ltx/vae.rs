@@ -159,6 +159,24 @@ impl Conv3 {
         })
     }
 
+    /// This convolution with its inputs zero-padded to `cin` channels.
+    fn padded_cin(&self, cin: usize) -> Self {
+        let rows = self.cout.next_multiple_of(64);
+        let mut w = vec![0u16; rows * 27 * cin];
+        for (o, src) in w.chunks_mut(27 * cin).zip(self.w.chunks(27 * self.cin)) {
+            for k in 0..27 {
+                o[k * cin..k * cin + self.cin].copy_from_slice(&src[k * self.cin..(k + 1) * self.cin]);
+            }
+        }
+        Self {
+            w,
+            bias: self.bias.clone(),
+            conv: std::sync::OnceLock::new(),
+            cin,
+            cout: self.cout,
+        }
+    }
+
     /// The CPU convolution: a 3 x 3 kernel over `[frame t-2.., c]` stacked channels
     /// (`[cout, 3 cin, 3, 3]`).
     fn cpu(&self) -> &Conv {
@@ -560,6 +578,9 @@ pub struct VideoEncoder {
     conv_in: Conv3,
     downs: Vec<Down>,
     conv_out: Conv3,
+    /// `conv_in` with its inputs zero-padded to a multiple of 32 (the device's GEMMs), made on
+    /// the first device pass.
+    conv_in_dev: std::sync::OnceLock<Conv3>,
 }
 
 impl VideoEncoder {
@@ -591,7 +612,65 @@ impl VideoEncoder {
             std,
             downs,
             cfg,
+            conv_in_dev: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The whole encode on the accelerator's session ([`crate::gpu::dit::LtxVaeSession::encode`])
+    /// from the patchified frames; None when there is none or it declined
+    /// (`OXINFER_LTX_VAE_GPU=0`: the CPU path).
+    fn encode_device(&self, v: &Vid) -> Option<Vid> {
+        use crate::gpu::dit::{LtxVaeConv, LtxVaeEncOp, LtxVaeEncoder};
+        if std::env::var("OXINFER_LTX_VAE_GPU").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        let mut s = crate::gpu::active()?.ltx_vae_session()?;
+        fn conv(c: &Conv3) -> LtxVaeConv<'_> {
+            LtxVaeConv {
+                w: &c.w,
+                bias: &c.bias,
+                cin: c.cin,
+                cout: c.cout,
+            }
+        }
+        let cin = self.conv_in.cin.next_multiple_of(32);
+        let cin_dev = self.conv_in_dev.get_or_init(|| self.conv_in.padded_cin(cin));
+        let mut ops = Vec::new();
+        let (mut t, mut h, mut w) = (v.t, v.h, v.w);
+        for d in &self.downs {
+            match d {
+                Down::Res(rs) => ops.extend(rs.iter().map(|r| LtxVaeEncOp::Res(conv(&r.c1), conv(&r.c2)))),
+                Down::S2d(c, st, group) => {
+                    (t, h, w) = ((t + (st[0] == 2) as usize) / st[0], h / st[1], w / st[2]);
+                    ops.push(LtxVaeEncOp::S2d(conv(c), *st, *group));
+                }
+            }
+        }
+        let m = LtxVaeEncoder {
+            conv_in: conv(cin_dev),
+            ops,
+            conv_out: conv(&self.conv_out),
+            latent: self.cfg.latent_channels,
+        };
+        let mut x = vec![0f32; v.t * v.h * v.w * cin];
+        for (o, i) in x.chunks_mut(cin).zip(v.data.chunks(v.c)) {
+            o[..v.c].copy_from_slice(i);
+        }
+        let mut out = Vec::new();
+        if !s.encode(&m, &x, v.t, v.h, v.w, &mut out, &mut |_, _| {}) {
+            return None;
+        }
+        let c = self.cfg.latent_channels;
+        if out.len() != t * h * w * c {
+            return None;
+        }
+        let mut z = Vid::new(t, h, w, c);
+        for (o, s) in z.data.chunks_mut(c).zip(out.chunks(c)) {
+            for ch in 0..c {
+                o[ch] = (s[ch] - self.mean[ch]) / self.std[ch];
+            }
+        }
+        Some(z)
     }
 
     /// Normalized latent means `[c, t', h / 32, w / 32]` of frames `[t, h, w, 3]` in `[-1, 1]`
@@ -614,6 +693,9 @@ impl VideoEncoder {
                     }
                 }
             }
+        }
+        if let Some(z) = self.encode_device(&v) {
+            return z;
         }
         let mut x = self.conv_in.forward(&v, true);
         for d in &self.downs {

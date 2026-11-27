@@ -350,6 +350,11 @@ and residuals on the `ltx_*` kernels of `metal_ltx.metal`. The rest, also as who
   `un_gemm`'s shifted GEMMs (one per time tap, bf16 weights, half inputs: `PixelNorm` + SiLU'd by
   `lv_prep`, or scaled into half's range), the depth-to-space steps and the final patches on
   `lv_d2s` / `lv_out`; one command buffer per block (`OXINFER_LTX_VAE_GPU=0`: the CPU path);
+- the video VAE encoder (conditioning images, and a retake's whole clip, tile by tile) in the same
+  session: the residual blocks as the decoder's, the space-to-depth steps a convolution over the
+  input with its first frame repeated (`lv_prep` reading frame `b - 1`) and `lv_s2d` (its outputs
+  rearranged plus the input's channel-group means); `conv_in`'s 48 inputs zero-padded to 64;
+  25 frames at 384x256 in 0.25 s instead of 6 s on the CPU kernels;
 - the vocoder's two BigVGAN generators ([`metal_ltx_voc.rs`](../src/metal_ltx_voc.rs)): 1-D
   convolutions as shifted GEMMs over their dilated taps, the transposed convolutions one GEMM
   per output phase, the anti-aliased SnakeBeta `lb_act` writing the next GEMM's input as two half
@@ -362,9 +367,8 @@ and residuals on the `ltx_*` kernels of `metal_ltx.metal`. The rest, also as who
   plan rotates their inputs (`Op::Fold` with ConvRot's regular Hadamard transform, `dec_fold`'s
   radix-4 butterflies): a 12-token prompt in 0.33 s instead of 3.3 s.
 
-The image encoder (one frame per conditioning image, 0.7 s at 768x512), the latent upsamplers,
-the audio VAE decoder and the output heads stay on the CPU kernels with per-op GPU convolutions
-and matmuls. `OXINFER_LTX_GPU=0` keeps the transformer on the CPU; the
+The latent upsamplers, the audio VAE decoder and encoder and the output heads stay on the CPU
+kernels with per-op GPU convolutions and matmuls. `OXINFER_LTX_GPU=0` keeps the transformer on the CPU; the
 `device=cpu` option of the server and the C API does the same per model. The NVFP4 transformer
 runs in the same session: its layers (repacked into ggml's NVFP4 blocks at load) go through
 `mma_NVFP4`, which dequantizes the E2M1 codes, the E4M3 scales of 16 values and the tensor-wide
@@ -389,6 +393,14 @@ wall time from start to the written `.mp4`, files mapped (resident set 17 to 22 
 | t2v 384x256 one stage | 25 | 13.7 s | text 3.3 s, 8 forwards 4.4 s (0.55 s each), VAE 2.1 s, audio 1.3 s |
 | the same on the CPU (`--device cpu`, release build) | 25 | 79 s | 7.8 s a forward: the frames look the same as the GPU's |
 | t2v 384x256 one stage, `--transformer nvfp4` | 25 | 15.1 s | 0.54 s a forward on the Metal session (int8: 0.49 s); `--device cpu`: 7.5 s a forward |
+| t2v 768x512, two stages (the text encoder on the GPU plan, the vocoder's split inputs) | 121 | 51.2 s | text 1.1 s, stages 11.1 + 20.6 s, VAE 3.3 s, audio 0.7 s |
+| t2v 384x256 one stage | 25 | 8.6 s | text 0.9 s, stage 3.9 s, VAE 0.4 s, audio 0.3 s |
+| the same with `--enhance-prompt` (E2B-it on Metal, the 5-gram ban) | 25 | 11.3 s | text 4.0 s with the rewrite (a 150-word caption) |
+| i2v 768x512 (`--init-image`) | 121 | 54.0 s | the image encoder on the GPU |
+| audio to video 768x512 (`--audio`: the 4 s line of a generated news anchor) | 89 | 47.1 s | stages 10.9 + 17.6 s; a woman talking to the camera in a kitchen over the kept soundtrack |
+| retake 768x512 of seconds 1 to 2.5 of that clip | 97 | 66.9 s | one stage at the full size: 48.0 s with the whole clip's encoding; frames outside the window kept |
+| text to audio, dev transformer, 30 guided steps (`--audio-only`, rain on a tin roof) | 5 s | 107.6 s | the audio stream on the CPU kernels: 1.1 s a pass |
+| HQ: dev + `--distilled-lora --hq` 768x512 | 121 | 312.9 s | text 11.7 s, stage 1 187.1 s (15 res2s steps: 93 passes at 384x256x121), stage 2 76.0 s; 65 GB resident (the LoRA's side paths at two strengths) |
 
 The whole GPU passes of the connectors, the VAE decoder and the vocoder, measured in one locked
 session against the build before them (same prompt and seed, `| time |` of the CLI):
@@ -446,6 +458,7 @@ are `ref_*.py` beside `examples/ltx_check.rs`'s checks):
 | DiffVAE decoder, 2 x 4 x 6 latents (edge-padded to 3 x 7 x 7) / 4 x 8 x 12 (CPU) | 8.1e-7 / 8.1e-7 | `DiffusionVideoDecoder`, `CHUNKED` blocks, eager neighborhood attention, the reference's noise injected (`ref_diffvae.py`, `ltx_check diffvae`) |
 | the same on the Metal blocks | 1.8e-4 / 2.8e-4 | half GEMM inputs and half q / k / v |
 | video VAE decoder, whole Metal pass (3 x 4 x 6 latents) | 2.9e-4 | half GEMM inputs; 2.7e-4 from the CPU path at 768x512x121 |
+| video VAE encoder, whole Metal pass: an image / a 25-frame clip (tiled) | 4.9e-4 / 4.4e-4 | `VideoEncoder` / `tiled_encode` (half GEMM inputs) |
 | text connectors on the Metal session (video / audio) | 1.6e-4 / 7.6e-5 | half GEMM inputs, int8 file |
 | vocoder with BWE, whole Metal passes | 1.9e-3 | GEMM inputs as two halves (54.5 dB SNR against the CPU path on 5 s of audio; with single half inputs 1.8e-2, 34.8 dB: the rounding of each of the two 30-convolution generators' inputs; a precise `sin` in the SnakeBeta changes nothing). A news anchor's line generated at 768x512 (97 frames) is transcribed by Whisper large-v3-turbo word for word: "Good evening. Tonight we report on the new bridge across the river." |
 
@@ -512,4 +525,8 @@ precision of the int8 and bf16 sessions; `ltx_check dit` with `LTX_SAVE` and `LT
 - The NVFP4 file is repacked into ggml's blocks at load (3 s, 18.7 GB of anonymous memory beside
   the mapped file: 34 GB resident at 384x256): the kernels do not read ComfyUI's packing (high
   nibble first, scales in cuBLAS's tiled order) in place.
-- The image encoder and the upsamplers run per op.
+- The latent upsamplers run per op (their group norms reduce over every frame: no whole pass
+  yet); the spatial one of a 768x512x121 run's latents takes about 15 s with its loading
+  (`ltx_check upsample`), a good part of the second stage's 20.6 s.
+- oxinfer's MP4 muxer writes 24 fps clips with 41 ms frames (1000/41 fps): a retake of one of its
+  own videos runs at 24.39 fps.
