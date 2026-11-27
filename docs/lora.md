@@ -36,7 +36,7 @@ adapter.
 | Lower level | `oxinfer::lora::attach_specs(&mut model, &specs, model_path, merge)` on a `QwenModel`, Gemma `Model` or `Inkling2Model` (the `Adaptable` trait); `LoraAdapter::open` / `load` / `load_gguf` |
 | C API | `lora=FILE[:SCALE]` lines (repeatable) and `lora_merge=1` in the options of `oxi_engine_load`; `oxi_engine_loras_json`, `oxi_engine_set_lora_strength(engine, index, strength)` |
 | Server, per request | `MODEL@PROFILE` runs with the profile's adapter ([learning from outcomes](learning.md)) |
-| Training | `oxinfer lora-train --model M --profile DIR` writes a PEFT folder trained from a profile's episodes and outcomes (dense Qwen3 and Llama 3, CPU; [training a LoRA from episodes](learning.md#training-a-lora-from-episodes)) |
+| Training | `oxinfer lora-train --model M --profile DIR` writes a PEFT folder trained from a profile's episodes and outcomes (dense Qwen3 and Llama 3, and Inkling-2, on the CPU; [training a LoRA from episodes](learning.md#training-a-lora-from-episodes)) |
 | Server | the same model options: `qwen=Qwen/Qwen3-8B,lora=./adapter:0.5,lora=./other`; in a JSON config, `"options": {"lora": ["./a", "./b:0.5"]}` (an array) or one string |
 
 The prompt cache keys snapshots by the adapters and their strengths, so a cached conversation of
@@ -68,17 +68,22 @@ What it does, and what that costs:
   is unloaded. An adapter attached and switched off is still in the plans, where its side paths
   add zeros.
 
-Attaching is for Qwen-path and Gemma models decoded without MTP or a DSpark draft, not streamed
-from disk, without interventions or decision assets; the others return an error and stay as they
-were. Updates are runtime ones (no merge). An adapter that fails part of the way (a module of
+Attaching is for Qwen-path, Gemma and Inkling-2 models decoded without MTP or a DSpark draft, not
+streamed from disk, without interventions or decision assets; the others return an error and stay
+as they were. (Inkling-2 has no compiled plans: its GPU engine is built again for the new set of
+adapters at the next pass. On CUDA that engine leaves a model with attached adapters to the CPU,
+switched on or not, so from the first attached adapter every request of the model decodes on the
+CPU. Inkling-2-Mini's release drafts with its MTP head by default on a GPU: `mtp=0,draft=none`
+for a model that takes profiles.) Updates are runtime ones (no merge). An adapter that fails part of the way (a module of
 another shape) is retired as a whole. MTP-layer modules of such an adapter are not applied
 (these models decode without the MTP layer).
 
 Checked (`engine::pool_slots::tests`, tiny Qwen3.5, CPU): requests with the adapter give the
 tokens of a model loaded with it, requests without it the base model's, with two adapters
 attached, after a replacement, a failed load and a detach; requests with different adapters do
-not overlap. On the CUDA backend, see docs/learning.md, "What was checked". Gemma and Metal were
-not run.
+not overlap. The same on the tiny Inkling-2 loop checkpoint (CPU; two adapters, a replacement, a
+detach). On the CUDA backend, see docs/learning.md, "What was checked" and "Inkling-2". Gemma and
+Metal were not run.
 
 ## GPU plans
 

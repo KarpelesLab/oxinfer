@@ -1462,6 +1462,23 @@ Metal's mapping of the file counts against that limit, and jetsam's behaviour ne
 unmeasured; the Simulator's speed means nothing (its Metal is the host GPU behind a
 virtualization layer). [ios/README.md](../ios/README.md) has the steps to try it on a device.
 
+## Training adapters
+
+`oxinfer lora-train` trains a LoRA on the attention projections of an Inkling-2 model from
+logged episodes (`src/inkling_train.rs`; [learning.md](learning.md#inkling-2) has the method and
+the measurements). It has a backward pass through the whole text forward written out by hand,
+the loop included: a looped layer's projection is one weight used in three passes, and the
+messages, their gates and the stream each pass starts again from all carry gradient. The frozen
+weights stay as loaded: the experts are never dequantized whole (the backward decodes 16 rows of
+a routed expert at a time). The forward keeps 453 KB per token for Mini, the stream entering
+each of the 48 applications, and the backward runs each application again from it. On the DGX
+Spark's CPU a step over one 2,048-token episode of the release takes 157 s and 22.7 GB. The
+gradients are PyTorch autograd's on transformers' model to 1e-4, on a tiny checkpoint without
+the loop and on the release itself (a 45-token exchange), and the adapter it writes runs
+through `--lora` with the logits of the training forward (4.5e-5 to 6.7e-5 on real weights). A model served with `mtp=0,draft=none` takes adapters after its load
+too ([LoRA adapters](lora.md#adapters-on-a-loaded-model)), which is what the server's profiles
+(`MODEL@PROFILE`) use. No GPU is involved in training.
+
 ## Not done
 
 - 125 tok/s of decoding (the figure reported with EXO, see above): 66 at Q8_0, 82 at 4 bits

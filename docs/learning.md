@@ -115,9 +115,9 @@ files (`version` is those four numbers):
   base model answers (the episode's `adapters` is `[]`). It is tried again when its files change.
 
 No restart and no reload of the base weights is involved. What attaching costs and where it
-works is in [LoRA adapters](lora.md#adapters-on-a-loaded-model): Qwen-path and Gemma models
-decoded without MTP or a DSpark draft, not streamed from disk. On other models the profile's
-requests are logged and answered by the base model, with the stderr line above.
+works is in [LoRA adapters](lora.md#adapters-on-a-loaded-model): Qwen-path, Gemma and Inkling-2
+models decoded without MTP or a DSpark draft, not streamed from disk. On other models the
+profile's requests are logged and answered by the base model, with the stderr line above.
 
 `DELETE /v1/models/{id}/profiles/{profile}/adapter` removes the folder and keeps the logs: the
 way to drop an adapter that does not help.
@@ -217,8 +217,11 @@ and `qwen` gave the same text; with each adapter in place `qwen@p` gave the text
 loaded with it, and `qwen` the base text, also when both were requested at the same moment; after
 the delete, the base text again.
 
-Not checked: any other model family, Metal, profile requests with attachments, and many
-profiles or long logs (the index of episodes is held in memory, one small record per episode).
+Inkling-2: the pool test on the tiny looped checkpoint and a served Inkling-2-Mini with a
+trained adapter are under [Inkling-2](#inkling-2).
+
+Not checked: Gemma, Metal, profile requests with attachments, and many profiles or long logs
+(the index of episodes is held in memory, one small record per episode).
 
 ## Training a LoRA from episodes
 
@@ -243,9 +246,11 @@ standard error.
 The dense full-attention models of the Qwen path: **Qwen3** (per-head query / key norms) and
 **Llama 3** (none), from safetensors or GGUF, float or quantized. Every other model is refused
 with a message saying what is in the way: Qwen3.5 / 3.8 (Gated DeltaNet layers, gated
-attention), Qwen2 (attention biases), MoE models, Granite, LFM3, MiniMax; Gemma and Inkling-2
-are other model classes the trainer does not load. The server attaches adapters to more models
-than this trains.
+attention), Qwen2 (attention biases), MoE models, Granite, LFM3, MiniMax; Gemma is another model
+class the trainer does not load. The server attaches adapters to more models than this trains.
+**Inkling-2** (`inkling2`, `inkling2_loop`: Inkling-2-Mini) trains too, through a backward pass
+of its own behind the same command, objective, gate and adapter folder: see
+[Inkling-2](#inkling-2) for what differs (the targets, the memory, the speed).
 
 There is no autograd in oxinfer: `src/lora_train.rs` keeps what the backward needs of a forward
 pass and has the backward written out by hand (LM head, final norm, and per layer the SiLU MLP,
@@ -379,3 +384,180 @@ Not checked: whether an adapter trained this way makes a model better at anythin
 above are losses on synthetic episodes); Qwen3 real weights (none were at hand; only the tiny
 checkpoint); `--quant q8` / `q4` of a safetensors checkpoint; aarch64; episodes longer than
 1,023 tokens; training while the server reads the folder.
+
+## Inkling-2
+
+`oxinfer lora-train` also trains Inkling-2 (`inkling2`, and `inkling2_loop`: Inkling-2-Mini), from
+the release (NVFP4 / MXFP8 experts) or a GGUF file, with the same episodes, objective, optimizer,
+gate and adapter folder as above. What differs is the model's side, `src/inkling_train.rs`:
+
+```sh
+oxinfer lora-train --model thinkingmachines/Inkling-2-Mini --profile DIR
+oxinfer lora-train --model ggml-org/Inkling-2-Mini-GGUF:Q8_0 --profile DIR --rank 16 \
+  --targets wo_ud,wq_du --grad-window 512 --max-tokens 8192
+```
+
+**What trains.** `--targets` picks among the seven attention projections, by the release's
+names: `wq_du`, `wk_dv`, `wv_dv`, `wr_du` (the relative-position vectors), `gate_attn` (the
+output gate), `attn_sink_proj` and `wo_ud` (the output projection: the default, and where the
+published adapters of this model sit). Everything else is frozen: the experts and their router,
+the convolutions, the loop's gates, the embedding and the head. A looped layer has one pair,
+used in each of its three passes: its gradient is the sum over them. The folder holds
+`base_model.model.model.llm.layers.N.attn.NAME.lora_A / lora_B`, which `--lora` and the server's
+profiles read ([LoRA adapters](lora.md)).
+
+**The backward pass** goes through all of the text forward ([Inkling-2](inkling.md)): the final
+norm and soft-capped logits; per layer application the short convolutions, the routed experts
+with their soft-capped SwiGLU, the attention residual's mixes over the block states, attention
+with its sliding window, relative-position bias, sink, clips, log scaling, key / value
+convolutions (the per-token taps of the full layers included) and output gate; and through the
+loop: the messages read from the previous pass, their gates, and the stream each pass starts
+again from. The choice of experts is taken from the forward pass and has no gradient; the
+routing weights (the chosen experts' sigmoid scores, renormalized) do, into the router's input,
+which is what PyTorch's autograd does on transformers' model. Images are not handled.
+
+**Precision.** float32 on the CPU, and the gradient is that of the loss computed (not a
+straight-through estimate): the forward runs the frozen matmuls on the f32 GEMM, which decodes
+bf16, NVFP4, MXFP8 and GGUF blocks to their stored values and does not round activations (the
+trainer refuses to run with an int8 prefill GEMM selected, or with a GPU backend active), and
+the backward multiplies by the same values, 16 rows dequantized at a time: no transposed copy of
+any weight is made, and only the experts a sequence routes to are read. The served model
+differs from the trained one where its kernels round activations to int8 (decode steps on
+quantized weights, and prompts where the int8 prefill GEMM runs): [inkling.md](inkling.md) has
+the size of that (KL 2.8e-4 for decode steps on the release).
+
+**Memory.** The forward keeps the stream entering each of the 48 layer applications and the
+routing, 453 KB per token for Mini (`(48 + 1) x 2304` floats); the backward then runs each
+application again from its saved input to rebuild what its gradient reads (the projections'
+outputs, the experts' pre-activations and outputs: by the sizes of those arrays about 0.5 MB per
+token and application, so some 23 MB per token if all 48 were kept at once), one application at
+a time, and computes the attention scores again rather than keeping them.
+Measured on the release (19.5 GB): 19.7 GB peak resident for episodes of 30 tokens, 22.7 GB for
+one of 2,048, so about 1.5 MB per token in all. Longer episodes were not run: by these numbers
+8k tokens would take about 12 GB over the model and 32k about 48 GB (of which 15 GB kept), and
+`--max-tokens` (default 2048) has to be raised for them. The 8 full-attention applications cost
+time quadratic in the length.
+
+`--grad-window N` truncates the gradient: the whole episode runs forward, and the backward
+treats the positions more than `N` before the completion as constants (their adapter outputs get
+no gradient, and nothing is propagated into them). It saves backward time, not memory.
+
+### What was checked of the Inkling-2 trainer
+
+The reference is PyTorch autograd on transformers' `Inkling2ForConditionalGeneration` /
+`Inkling2LoopForConditionalGeneration` (5.24.0, torch 2.15.0, float64) with the pairs added as
+forward hooks on the seven `nn.Linear`s of each attention (`tools/ref_inkling2_lora_grad.py`,
+`examples/inkling2_train.rs check`): the same token ids, completion, adapter (random `A`, and a
+random `B` of standard deviation 0.05 so that both factors have gradient) and objective. Tiny
+random checkpoints of `tools/inkling2_tiny.py` (12 layers of 64, every text feature on: windows
+and relative extents shorter than the sequence, clips that bite, log scaling, sinks, soft caps),
+120 tokens of which the last 40 are the completion, rank 2 on all seven projections of every
+layer (84 pairs) unless said; the relative error is `|g - g_ref| / |g_ref|` over all gradients
+together, and for the worst of the 168 matrices:
+
+| Checkpoint | Episode | Loss, mine and the reference's | Together | Worst matrix |
+|---|---|---|---:|---:|
+| `inkling2` (no loop), float experts | rewarded | 7.610146 / 7.610143 | 1.4e-4 | 2.3e-4 |
+| | penalized | 0.002418 / 0.002418 | 4.8e-5 | 1.3e-4 |
+| | rewarded, rank 8 on `wo_ud` only | 7.416416 / 7.416418 | 3.8e-5 | 5.4e-5 |
+| `inkling2_loop`, NVFP4 / MXFP8 experts (`--packed`), `QSCALE=0.5 ROUTE=1 SPREAD=1` | rewarded | 7.600107 / 7.600132 | 1.2e-3 | 2.4e-3 |
+| | penalized | 0.002334 / 0.002334 | 1.0e-3 | 2.4e-3 |
+| | rewarded, rank 8 on `wo_ud` only | 7.212864 / 7.212912 | 1.0e-3 | 1.5e-3 |
+| the same with `QSCALE=0.3 ROUTE=0.5 SPREAD=2` | rewarded / penalized / `wo_ud` | within 3.4e-5 | 7.7e-4 / 9.2e-4 / 4.4e-4 | 1.5e-3 / 1.5e-3 / 5.0e-4 |
+| `inkling2_loop --packed` as [inkling.md](inkling.md) checks it (`QSCALE=1`) | rewarded / penalized / `wo_ud` | within 1.5e-4 | 3.3e-3 / 4.1e-3 / 5.9e-3 | 9.5e-3 / 8.1e-3 / 7.3e-3 |
+
+The looped rows are as far from the reference as the forward is: the float32 forward of a
+random looped model drifts from the float64 one ([inkling.md](inkling.md), "Tiny random
+checkpoints"; here the completion's log-probabilities differ by 5e-4 to 6e-3, against 8e-5 at
+most without the loop), and the gradients follow. Five more sequences of 80 tokens were run on
+the default looped checkpoint with float experts, with an earlier form of the loss (a weighted
+sum, every fourth target penalized): four within 2.6e-3 to 6.4e-3 together (one of them with a
+single matrix, the last layer's `wr_du`, 66% off), and one 12% off, whose float32 forward has a
+log-probability 0.12 from the float64 one. On the first of them transformers' own float32
+gradients are 108% from its float64 ones (its loss 122.2 against 116.7): at this size the
+reference in float32 is no reference. The penalized rows' tokens are all unlikely, so they do
+not reach the cap on the odds; the cap is the dense trainer's code, checked above.
+
+Unit tests (`cargo test --lib inkling::train`, the Rust-only tiny looped checkpoint, x86-64):
+
+- central differences of the loss along random directions, one projection kind and one factor at
+  a time (28 directions, for a rewarded and for a penalized sequence, the routing held as the
+  gradient holds it): within the 2e-2 that a float32 loss resolves;
+- a gradient window as long as the sequence gives the same gradients bit for bit, a shorter one
+  the same loss and other gradients;
+- the adapter written by the trainer, read back, and attached as `--lora` attaches it
+  (`lora::attach_specs`): the inference forward's logits are within 2.2e-5 of the training
+  forward's (the adapter moves them by 4.5), and the base model's within 2.8e-5;
+- the training loop on six episodes (one penalized): the loss goes down and the folder loads.
+
+On real weights, one DGX Spark (GB10; the training is on its 20 CPU cores, 10 Cortex-X925 and
+10 Cortex-A725, the machine shared with another job's runs in turn), rank 8 / alpha 16 on
+`wo_ud` of the 24 layers (1,032,192 parameters) unless said:
+
+- **A gradient against transformers.** `tools/ref_inkling2_lora_grad.py --real` runs
+  transformers in float32 on `thinkingmachines/Inkling-2-Mini` as stored (the loading of
+  `tools/ref_inkling2_mini.py`) on a 45-token chat exchange whose 20-token reply is the
+  completion, with a random adapter: loss 2.808228 against the reference's 2.808225, the
+  completion's log-probabilities within 1.6e-5, and the gradients of the 48 matrices within
+  9.6e-5 together, 1.3e-4 for the worst one. The reference peaked at 81 GB (sampled every 5 s)
+  and only fits the 121 GB machine with the experts' float32 weights kept out of autograd's graph
+  (`FrozenLinear` in the script recomputes them from the stored bfloat16 in the backward): as
+  first written it passed 118 GB and was stopped.
+- **Training.** A synthetic profile of 7 episodes (`examples/inkling2_train.rs episodes`: five
+  questions answered in a fixed pirate style with reward 1, two plain answers with reward -1;
+  19 to 32 tokens each, 109 completion tokens), `--steps 8 --batch 7 --holdout 0 --force --lr
+  1e-3`: the training loss went from 3.27 to 0.28 on the release (19.5 GB) and, in 6 steps, from
+  3.29 to 0.81 on ggml-org's Q8_0 GGUF (27.8 GB).
+- **The adapter through `--lora`.** The folder each run wrote, attached as `--lora` attaches it:
+  the inference forward's logits on a 26-token exchange are within 6.7e-5 (release) and 4.5e-5
+  (Q8_0) of the training forward's, which the adapter moves by up to 44 and 51; the base model's
+  two forwards are within 8.8e-5 and 5.2e-5 (`examples/inkling2_train.rs agree`, the CPU's exact
+  prefill GEMM on both sides).
+- **Served to a profile.** `oxinfer serve --model "ink=thinkingmachines/Inkling-2-Mini,
+  device=cuda,mtp=0,draft=none" --learn-dir DIR` (CUDA backend active), greedy replies to two
+  questions that are not in the profile: `ink` and `ink@p` without an adapter answered
+  "Tokyo." and "There are 7 days in a week."; with the trained folder copied to
+  `DIR/ink/p/adapter`, `ink@p` answered "Ahoy! The capital of Japan be Tokyo, matey." and
+  "Ahoy! A week be seven days, matey.", the texts of a server loaded with `lora=` that folder,
+  while `ink` kept its two answers; after `DELETE .../profiles/p/adapter`, `ink@p` answered
+  "Tokyo." again. The requests took 1.6 to 2.7 s before the attach (after the first), then 1.5
+  to 2.0 s for the profile and 4.6 to 5.1 s for the base model; which of them ran on the GPU was
+  not looked at (by its code, the CUDA engine leaves a model with attached adapters to the CPU).
+  `engine::pool_slots::tests::inkling_adapters_attach_to_a_loaded_model_and_switch_per_request`
+  checks the same on the tiny checkpoint, CPU: two adapters side by side, one replaced, one
+  detached, each reply equal to that of a model loaded with `lora=` or with none.
+
+Time and memory on that machine, the release, per optimizer step:
+
+| Episodes | Step | Of which | Peak resident |
+|---|---:|---|---:|
+| 7 of 19 to 32 tokens | 23 s | about 3.3 s an episode | 19.7 GB |
+| 1 of 2,048 tokens (248 of completion) | 157 s | forward 34 s; backward 123 s: the steps run again 31 s, the experts' gradient 38 s, the attention's 42 s, the rest 11 s | 22.7 GB |
+| the same with `--grad-window 256` (gradient over the last 505 positions) | 84 s | forward 34 s; backward 50 s: the steps run again 31 s, experts 8 s, attention 6 s | 22.2 GB |
+
+(`OXINFER_TRAIN_TIMES=1` prints these per episode. The loss before and after a run costs a
+forward per episode more: 34 s for 2,048 tokens, 60 tokens a second.) A short episode costs
+seconds whatever its length: every expert it routes to is decoded once per layer application.
+The attention's gradient computes every score twice more than the forward does (once from the
+queries' side, once from the keys', so that no two tasks write the same gradient), and the
+transposed products are plain loops over dequantized rows; neither was tuned.
+
+Not checked or not done:
+
+- **No GPU.** Training is CPU only. The CUDA engine ([inkling.md](inkling.md), "The CUDA
+  engine") has no LoRA side paths, so it cannot even run the adapted forward; a backward there
+  would need transposed GEMMs over bf16 and over the experts' NVFP4 / MXFP8 / GGUF blocks grouped
+  by expert, kernels for the gradients of attention (windowed, with the relative bias and the
+  sink), of the mixes, gates, convolutions and norms, and the routing kept from the forward. A
+  forward on the GB10 with the backward on the CPU would save the 34 s of the first forward and
+  no more, since the backward runs every application again on the CPU, and the device's
+  arithmetic is not the CPU's.
+- Episodes longer than 2,048 tokens; the memory figures for them above are extrapolations.
+- Targets other than `wo_ud` on real weights (all seven are checked on the tiny checkpoints),
+  Inkling-2-Small, GGUF files other than Q8_0, the held-out gate on real weights (the runs above
+  had no held-out episodes and `--force`), and whether an adapter trained this way makes the model
+  better at anything: the profile above is synthetic and its loss is a training loss.
+- Adapters of other shapes: the trainer reads and continues only folders whose modules are these
+  seven projections with one rank (the published adapters for this model were not tried as a
+  starting point).
+- Attaching to a loaded model on Metal, and with the MTP draft on.
