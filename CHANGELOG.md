@@ -7,6 +7,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.24](https://github.com/KarpelesLab/oxinfer/compare/v0.0.23...v0.0.24) - 2026-11-27
+
+### Added
+
+- *(engine)* adapters attach to Inkling-2 while its MTP head drafts
+- *(inkling)* LoRA side paths in the CUDA engine
+- *(opencode)* context cap, profile entries and an outcome plugin
+- *(minimax-h3)* float32 attention by default without a LoRA too (1344x768 18% faster than split and closer to the CPU); the turbo LoRA clip on Metal now 40.3 dB from the CPU's
+- *(ltx)* the latent upsamplers as whole Metal passes, text to audio on Metal, one copy of the LoRA side paths for every strength; fix(ltx): the distilled LoRA's small updates (gates x14) and its gates on Metal
+- *(sampling)* no_repeat_ngram everywhere: --no-repeat-ngram, the request field no_repeat_ngram_size, the C API setting, the web GUI
+- *(ocria)* LayoutNet with LiteParse's projection and table decoder: layout blocks, tables and Markdown of an image, as LiteParse gets them
+- *(minimax-h3)* FP8 and NVFP4 transformers on Metal; MiniMax-H3-Image from ComfyUI's single files, on Metal
+- *(ltx)* the video VAE encoder as whole Metal passes (25 frames at 384x256: 6 -> 0.25 s), measured runs
+- *(ltx)* audio to video, retake, text to audio and the HQ pipeline's res2s sampler
+- *(ltx)* the int8 ConvRot text encoder on the GPU prefill plan (a 12-token prompt 3.3 -> 0.33 s)
+- *(ltx)* the prompt enhancer bans repeated 5-token sequences (no_repeat_ngram_size), as the reference
+- *(ocria)* the detector, router and recognizers on the GPU (Metal operators for the ONNX interpreter); device=auto takes it for large pages (2000 x 2600 page 77.7 -> 50.4 ms)
+- *(ocria)* photos upright per their EXIF orientation (on by default, `exif` switch everywhere); docs: LiteParse's page orientation is all here
+- *(ocria)* rec_latin with onnxruntime's int8 arithmetic: the same characters at all 12,224 steps as its int8 kernels (was 5 off), confidences within 6e-8
+- *(depth)* Depth Pro 2 H verified against the reference; video in buffered and unbuffered modes (CLI, library, C API, server)
+- *(lora-train)* train Inkling-2 adapters with oxinfer lora-train
+- *(inkling)* attach and switch adapters on a loaded Inkling-2 model
+- *(inkling)* LoRA gradients for Inkling-2 on the CPU
+- *(cli)* oxinfer lora-train trains a profile's adapter
+- *(lora-train)* train a LoRA from logged episodes and outcomes
+- *(server)* profiles, MODEL@PROFILE logs episodes and takes outcomes
+- *(lora)* attach adapters to a loaded model, switched per request
+- *(nemotron-image)* source images as earlier turns with instruction guidance; why edits stay hazy
+- *(minimax-h3)* the transformer, the video VAE decoder and Sulphur-3's corrector as whole Metal passes
+- *(nemotron-h)* Metal prefill plans, batched rows and multi-token plans for Mamba-2 / sigmoid routing / squared-ReLU experts; experts read once; Nemotron-Labs-Image runs its N images in lockstep
+- *(ocr)* OCRia-nano-1 (llamaindex/OCRia-nano-1): LiteParse's OCR models on oxinfer's own ONNX interpreter, the line detector, script router and Latin / CJK / right-to-left / world recognizers, with LiteParse's page pipeline
+- *(depth)* Apple Depth Pro 2 (apple/DepthPro2-S / -B / -L / -H) with its focal length estimator: image in, metric depth map out
+- *(voice isolation)* Inworld Voice Isolator (inworld/voice-isolator), offline and realtime streaming, 48 kHz audio in, the voice out
+- *(ltx)* the release's prompt enhancer (--enhance-prompt / --prompt-enhancer MODEL, enhance_prompt in the server and C API)
+- *(ltx)* whole GPU passes for the text connectors, the video VAE decoder and the vocoder (768x512x121 two stages 80.4 -> 53.9 s: VAE 23.1 -> 3.3 s, audio 4.4 -> 0.6 s, connectors 2.3 -> 0.4 s)
+- *(ltx)* NVFP4 transformer on Metal (mma_NVFP4: E2M1 codes, E4M3 scales and the tensor-wide factor dequantized in the matrix-unit GEMMs; 5.9e-5 / 1.0e-4 from the CPU path, 0.54 s a forward at 384x256x25 like int8)
+- *(ltx)* the release's DFR temporal rounds for temporal upscaling (keyframe canvas with generated slots, tiled refinement between keyframes, up to two rounds)
+- *(ltx)* the DiffVAE diffusion video decoder (--vae diff), on Metal
+- *(ltx)* guidance for the dev transformer, H.264 re-compression of conditioning images, noise from files and a whole-pipeline comparison with the reference
+- *(nemotron-image)* nvidia/Nemotron-Labs-Image-30B-A3B text to image (Nemotron-H writes visual tokens, the L24SQ ViT tokenizer renders them), Nemotron-H whole-step Metal decoding
+- *(bonsai)* Ternary-Bonsai 2.5 27B on Metal and NEON: Hadamard-folded ternary weights in the decode / prefill plans, NEON PQ2_0 / PTQ1_0 dots, PrismML's mmproj names and Q8_0 towers
+- *(minimax-h3)* SulphurAI/Sulphur-3: asym_w4a8_int8 weights, header-only comfy_quant entries, kohya LoRAs, the H3 corrector, motion / structure guidance, GGUF text encoder vision tower from mmproj
+- *(ltx)* LTX-2.5 audio-video generation (distilled two-stage t2v / i2v, upsamplers, duration head, LoRAs; whole transformer passes on Metal)
+
+### Fixed
+
+- *(server)* say how Orpheus is served, and name a GGUF repo's files
+- *(hf)* cached models load when the hub does not answer
+- *(chat)* default system prompt without the time of day
+- *(video)* MP4s at their exact frame rate (24 fps was stored as 1000/41), NTSC rates as num / 1001
+- *(cuda)* Q8_0 int8 matvec read past its last block
+- *(minimax-h3)* LoRA'd transformers on Metal within 5e-5 of the CPU (hi + lo projection inputs, float32 attention, the text refined on the CPU, unit-scale int8 / FP8 twins)
+- *(clippy)* the device VAE fields and conv helpers only CUDA builds use are allowed as dead code elsewhere
+- *(vae)* allow the CUDA-only fields unused in builds without CUDA
+- *(tests)* keep the lib tests' backend on the CPU
+- *(ltx)* the Metal vocoder's GEMM inputs as two halves (34.8 -> 54.5 dB from the CPU path)
+- *(cli)* lora-train checks --neg-clip without a negated comparison
+- *(longcat-avatar)* round the VAE's biases and gains to bf16
+- *(update)* fall back to the newest release with a binary
+
+### Other
+
+- *(inkling)* LoRA adapters on the CUDA engine, and with the MTP head
+- *(weights)* offline loads and hubs that do not answer
+- *(metal)* give the checkpoint's experts back after a plan build, not layer by layer during it (one-shot first token 0.15-1.3 s sooner on MoE GGUFs)
+- *(metal)* Q2_0 / PQ2_0 GEMM codes two bytes per 32-bit op, PQ2_0 tiles read a block once (27B PQ2_0 prefill GEMMs -3.1%, logits identical)
+- *(cuda)* prompts on the GB10 on master's plans, beside llama.cpp
+- *(cuda)* delta rule recurrence on a block per head on unified memory
+- *(cuda)* 1024-token prefill steps for small graphs on unified memory
+- *(cuda)* 512 x 64 GEMM tiles for 8-bit and wider weights
+- *(cuda)* the LM head after a Q8 or Q4 prompt on the device
+- *(cuda)* prefill plans for Q8 and Q4 weights
+- *(voice-isolator)* crossfade lanes share their projections, 32 x 16 GEMM tiles, cache compaction on the GPU (two-lane steps 8.7 -> 4.6 ms p90, compacting pushes 126 ms -> under 20 ms)
+- *(metal)* PTQ1_0 GEMM digits two bytes per 32-bit op; prefill now level with PQ2_0 (pp2048 615-629 -> 666-682 tok/s, PQ2_0 661-671)
+- *(nemotron-h)* Mamba-2's scan chunked on the SIMD-group matrices in prefill plans (SSD form; Lightning Q4_0 pp2048 2,773 -> 3,748 tok/s, llama.cpp 2,378)
+- *(nemotron-image)* --num-images with guidance runs every image's sequences in one batched GPU step (2 edits of a 1184x880 image 90 -> 69 s, 4 edits 180 -> 135 s)
+- Revert "fix(clippy): the device VAE fields and conv helpers only CUDA builds use are allowed as dead code elsewhere"
+- *(longcat-avatar)* the speed work's numbers, profiles and checks
+- *(longcat-avatar)* keep the blocks on the device when the VAE has room
+- *(longcat-avatar)* norms write the next kernel's operands directly
+- *(longcat-avatar)* GEMMs in tiles of 128, fused outputs on shared memory
+- *(longcat-avatar)* attention in blocks of 128 queries, less per product
+- *(longcat-avatar)* the device VAE's convolutions on the tensor cores
+- *(qwen-image)* VAE encode and decode with the frames on the device
+- *(longcat-avatar)* VAE passes with the frames kept on the device
+- *(cuda)* allow clippy::type_complexity on the batched step's parts (linux gpu clippy)
+- *(voice-isolator)* realtime stream steps whole on Metal (20 ms pushes 0.9x -> 4.1x real time, same accuracy)
+- *(cuda)* RTX 5080 chat-model round, bf16 plans and batched rows
+- *(cuda)* rustfmt the new tests and plan code
+- *(cuda)* multi-token int8 matvecs read the weights once
+- *(cuda)* a batched step's small ops in one launch for all rows
+- *(cuda)* batched decode steps for concurrent requests
+- *(cuda)* recurrent states stay on the device between a prompt's chunks
+- *(cuda)* a prompt's Gated DeltaNet convolutions over every token at once
+- *(cuda)* the Gated DeltaNet rule of a prompt on a warp per state column
+- *(cuda)* tensor-core prefill attention at head dimension 256
+- *(cuda)* room for a whole prompt's keys and values at its first chunk
+- *(cuda)* a prompt's LM head over bf16 weights on the device
+- *(cuda)* prefill plans for bf16 safetensors weights
+- *(learning)* training Inkling-2 adapters, and profiles on Inkling-2
+- *(inkling)* train timings, column-blocked transposes, a real-weight reference
+- *(lora)* pin the system prompt of the pool adapter test
+- *(learning)* training a LoRA from episodes with oxinfer lora-train
+- *(longcat-avatar)* the clips against the reference, DGX Spark speed
+- *(nemotron-image)* edits' guidance sequences take each token in one batched GPU step (1184x880 edit 68 -> 46 s, 76 -> 101 tok/s, prefill 12 -> 3.7 s)
+- *(nemotron-h)* GPU-sized prefill chunks take the prefill plan's 2048 tokens (3,056-token prompt ~1,950 -> ~2,010 tok/s)
+- *(metal)* OXINFER_PF_PROFILE prints each prefill chunk's GPU time by op; docs: where Nemotron-H's prefill time goes (Mamba-2 scan a third, routed experts a third) and the scan variants that lost
+- *(metal)* PTQ1_0 GEMM loader reads runs of four trits (prefill ~270 -> 480-640 tok/s on Bonsai 2.5 27B)
+- *(ltx)* the guided dev transformer's timing (384x256x25, 30 steps of 4 passes: 73 s)
+- *(video)* Sulphur-3: its files, the corrector, the motion / structure guidance, the checks and six CPU runs (W4A8, bf16 + corrector, + guidance, base int8 + tuned LoRA, Ref2VA hybrid with a reference, first frame through the GGUF's mmproj tower); performance: video on the CPU; models: Sulphur-3 row; GGUF text encoders take keyframes
+- *(ltx)* measured runs on an M5 Max (768x512x121 two stages in 88 s, i2v, first + last frame, duration head with speech Whisper transcribes word for word, temporal x2, dev + distilled LoRA), bf16 / NVFP4 checks, not-done list; models.md / README rows; advisor timing
+
 ## [0.0.23](https://github.com/KarpelesLab/oxinfer/compare/v0.0.22...v0.0.23) - 2026-11-27
 
 ### Added
