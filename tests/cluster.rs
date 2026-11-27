@@ -348,7 +348,7 @@ fn balancing_and_cancel() {
     let dir = std::env::temp_dir().join(format!("oxinfer-cluster-sd3-{}", std::process::id()));
     oxinfer::sd3::tiny::write_tiny_release(&dir).unwrap();
     let m = dir.display();
-    let b = node(&format!("api_key=link; model=sd3={m}"));
+    let mut b = node(&format!("api_key=link; model=sd3={m}"));
     let a = node(&format!("model=sd3={m}; peer={},key=link", b.addr()));
     let addr = a.addr();
     let slow = |stream: bool| {
@@ -446,6 +446,20 @@ fn balancing_and_cancel() {
     assert_eq!(forwarded(), n + 2, "the conversation's machine");
     assert_eq!(request(addr, "POST", "/v1/images/generations", None, &quick).0, 200);
     assert_eq!(forwarded(), n + 2, "no conversation: this machine first");
+
+    // The peer goes away while this machine is busy: the next request, sent to the peer (the
+    // front has not found out yet), runs here instead once this machine is free.
+    let hold = spawn(slow(false));
+    wait_for("a request denoising here", || running(&a.api) == 1);
+    b.stop();
+    let fallback = spawn(quick.clone());
+    wait_for("the second request waiting here", || a.api.requests().len() == 2);
+    assert_eq!(a.api.status()["peers"][0]["up"], false);
+    assert!(a.api.requests().iter().all(|r| r.peer.is_none()));
+    let running_id = a.api.requests().into_iter().find(|r| r.step.is_some_and(|s| s.0 > 0)).unwrap().id;
+    assert!(a.api.cancel(&running_id));
+    assert_eq!(hold.join().unwrap().0, 499);
+    assert_eq!(fallback.join().unwrap().0, 200);
     std::fs::remove_dir_all(&dir).ok();
 }
 

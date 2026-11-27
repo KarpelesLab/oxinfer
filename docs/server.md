@@ -545,6 +545,15 @@ from this machine: a loopback listener, or a client connecting from a loopback a
 engine's context without a cap (set the engine's `max_context` to bound it): only the server
 knows whether `max_context` was the user's choice.
 
+### Peers
+
+`--peer HOST:PORT[,key=KEY]` (repeatable) names another `oxinfer serve` whose models are listed
+with this server's and take requests through it: a model only the peer has is forwarded there
+(streams passed through), a model both have goes to the machine that holds the conversation or
+has the free capacity. Peers need an API key. A chat model too large for one machine can run
+across two with the model option `split=HOST:PORT` and an `oxinfer split-worker` on the other
+one. Setup, what is routed how, the limits and the measurements: [Two machines](cluster.md).
+
 ### Models on request
 
 A request may name a model that is not listed: a repo id (`org/name`, or `org/name:QUANT` for a

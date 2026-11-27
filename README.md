@@ -103,6 +103,7 @@ optional.
 | [Supported models](docs/models.md) | every tested checkpoint with its size and measured agreement with the reference |
 | [Getting weights](docs/weights.md) | Hugging Face downloads, the mirror, GGUF files, MLX checkpoints |
 | [OpenAI-compatible server](docs/server.md) | chat, embeddings, images, audio; structured outputs, forced tool calls, log probabilities |
+| [Two machines](docs/cluster.md) | one server over two machines (`--peer`), one model across two (`split`), with the link's measurements |
 | [Web GUI on this machine](docs/web.md) | `oxinfer web`: the browser GUI with native models, the catalog, downloads, the model cache |
 | [Tool calling](docs/tool-calling.md) | built-in and caller-defined tools |
 | [Session snapshots and the prompt cache](docs/sessions.md) | saving and restoring a conversation's state |
