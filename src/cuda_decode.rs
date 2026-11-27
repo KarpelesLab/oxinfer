@@ -1301,7 +1301,7 @@ impl CudaBackend {
                             } else {
                                 std::ptr::null_mut()
                             },
-                            fa: if fast_attn && matches!(hd, 64 | 128) {
+                            fa: if fast_attn && matches!(hd, 64 | 128 | 256) {
                                 self.func(&format!("dfattn_{hd}"))?
                             } else {
                                 std::ptr::null_mut()
@@ -2306,7 +2306,7 @@ impl CudaPlan<'_> {
                 let m = &slot.kv[kv];
                 let (qa, oa, ga, sp, qs, os, gs) = (q.a, out.a, gate.a, self.sp, st(q), st(out), st(gate));
                 // During a step the device cache holds the positions before it (`synced`).
-                if m.synced + t >= fa2_from {
+                if !fa2.is_null() && m.synced + t >= fa2_from {
                     // The group's heads per block, 128 query rows: longer steps and head
                     // dimension 64 (measured: Qwen3-8B 512 tokens after 1536 110 -> 91 us).
                     let hb = crate::cuda::dfattn2_heads(p.nh as usize, p.nkv as usize);

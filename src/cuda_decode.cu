@@ -999,8 +999,8 @@ extern "C" __global__ void dguard_t(const float* x, unsigned int n, unsigned int
 // ---- Prefill attention on the tensor cores (`dfattn_D`, prefill plans' fast path): the step's
 // queries (tokens j at positions sp[4 j], consecutive) attend causally over a cache (rows of
 // nkv * D floats, keys at their positions; the last `window` only, if set). A 128-thread block
-// takes 64 queries of one head, a warp 16 of them; key tiles of 64 go to shared memory as f16
-// (keys and values), the scores Q K^T and the products P V are f16 MMAs with f32 sums, and the
+// takes 64 queries of one head, a warp 16 of them; key tiles of 64 (32 at head dimension 256:
+// the tiles' shared memory) go to shared memory as f16 (keys and values), the scores Q K^T and the products P V are f16 MMAs with f32 sums, and the
 // softmax runs online in f32 (scores scaled by p.scale before the queries are rounded to f16).
 // Out of the step's t tokens, query rows past t are skipped. `gate`: out *= sigmoid(gate[h
 // g_stride + i]) as in dattn. Rows of q / out / gate are qs / os / gs floats apart.
@@ -1024,12 +1024,12 @@ __device__ __forceinline__ void fa_ldsm4t(unsigned int* r, const void* p) {
 }
 #define FA_Q 64
 #define FA_K 64
-template <int D>
+template <int D, int KT>
 __device__ __forceinline__ void dfattn_body(const float* q, const float* kc, const float* vc, float* out, const float* gate,
                                             const unsigned int* sp, DAP p, unsigned int t, unsigned int qs, unsigned int os, unsigned int gs) {
     constexpr unsigned int LD = D + 8; // halves per shared row (ldmatrix rows on distinct banks)
-    __shared__ __align__(16) unsigned short Ks[FA_K * LD];
-    __shared__ __align__(16) unsigned short Vs[FA_K * LD];
+    __shared__ __align__(16) unsigned short Ks[KT * LD];
+    __shared__ __align__(16) unsigned short Vs[KT * LD];
     unsigned int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, c4 = lane & 3;
     unsigned int h = blockIdx.y, kvh = h / (p.nh / p.nkv);
     unsigned int j0 = blockIdx.x * FA_Q;
@@ -1058,16 +1058,16 @@ __device__ __forceinline__ void dfattn_body(const float* q, const float* kc, con
     // The block's key range.
     unsigned int plast = pos0 + min(j0 + FA_Q, t) - 1, pfirst = pos0 + j0;
     unsigned int klo = p.window != 0 && pfirst + 1 > p.window ? pfirst + 1 - p.window : 0;
-    klo = klo / FA_K * FA_K;
+    klo = klo / KT * KT;
     const float NEG = -__uint_as_float(0x7f800000u);
     float m0 = NEG, m1 = NEG, l0 = 0.f, l1 = 0.f;
     float o[D / 8][4];
 #pragma unroll
     for (int i = 0; i < D / 8; i++) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
-    for (unsigned int k0 = klo; k0 <= plast; k0 += FA_K) {
+    for (unsigned int k0 = klo; k0 <= plast; k0 += KT) {
         __syncthreads();
         // The tile's keys and values (rows past plast as zeros) as f16.
-        for (unsigned int i = tid; i < FA_K * D / 4; i += 128) {
+        for (unsigned int i = tid; i < KT * D / 4; i += 128) {
             unsigned int r = i / (D / 4), c = 4 * (i % (D / 4));
             float4 kv = make_float4(0.f, 0.f, 0.f, 0.f), vv = kv;
             if (k0 + r <= plast) {
@@ -1078,14 +1078,14 @@ __device__ __forceinline__ void dfattn_body(const float* q, const float* kc, con
             *(uint2*)&Vs[r * LD + c] = make_uint2(fa_pack(vv.x, vv.y), fa_pack(vv.z, vv.w));
         }
         __syncthreads();
-        // Scores of the warp's 16 queries against the 64 keys: 8 tiles of 8 keys.
-        float s[FA_K / 8][4];
+        // Scores of the warp's 16 queries against the tile's KT keys, 8 at a time.
+        float s[KT / 8][4];
 #pragma unroll
-        for (int nt = 0; nt < FA_K / 8; nt++) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.f;
+        for (int nt = 0; nt < KT / 8; nt++) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.f;
 #pragma unroll
         for (int kk = 0; kk < D / 16; kk++)
 #pragma unroll
-            for (int np = 0; np < FA_K / 16; np++) {
+            for (int np = 0; np < KT / 16; np++) {
                 unsigned int r = 16 * np + (lane & 7) + 8 * (lane >> 4), c = 16 * kk + 8 * ((lane >> 3) & 1);
                 unsigned int b4[4];
                 fa_ldsm4(b4, &Ks[r * LD + c]);
@@ -1095,7 +1095,7 @@ __device__ __forceinline__ void dfattn_body(const float* q, const float* kc, con
         // Masks, then the online softmax (rows g: s[..][0..1], g + 8: s[..][2..3]).
         float mx0 = m0, mx1 = m1;
 #pragma unroll
-        for (int nt = 0; nt < FA_K / 8; nt++)
+        for (int nt = 0; nt < KT / 8; nt++)
 #pragma unroll
             for (int e = 0; e < 2; e++) {
                 unsigned int kp = k0 + 8 * nt + 2 * c4 + e;
@@ -1111,9 +1111,9 @@ __device__ __forceinline__ void dfattn_body(const float* q, const float* kc, con
         // A row with no key yet (all masked) keeps m = -inf: its factors are taken as 0.
         float a0 = mx0 == NEG ? 1.f : expf(m0 - mx0), a1 = mx1 == NEG ? 1.f : expf(m1 - mx1);
         float rs0 = 0.f, rs1 = 0.f;
-        unsigned int pa[FA_K / 16][4];
+        unsigned int pa[KT / 16][4];
 #pragma unroll
-        for (int nt = 0; nt < FA_K / 8; nt++) {
+        for (int nt = 0; nt < KT / 8; nt++) {
             float e0 = mx0 == NEG ? 0.f : expf(s[nt][0] - mx0), e1 = mx0 == NEG ? 0.f : expf(s[nt][1] - mx0);
             float e2 = mx1 == NEG ? 0.f : expf(s[nt][2] - mx1), e3 = mx1 == NEG ? 0.f : expf(s[nt][3] - mx1);
             rs0 += e0 + e1;
@@ -1144,7 +1144,7 @@ __device__ __forceinline__ void dfattn_body(const float* q, const float* kc, con
         }
         // O += P V: V as the B operand by transposed ldmatrix (keys are its K, dimensions its N).
 #pragma unroll
-        for (int kk = 0; kk < FA_K / 16; kk++)
+        for (int kk = 0; kk < KT / 16; kk++)
 #pragma unroll
             for (int dp = 0; dp < D / 16; dp++) {
                 unsigned int r = 16 * kk + (lane & 7) + 8 * ((lane >> 3) & 1), c = 16 * dp + 8 * (lane >> 4);
@@ -1172,11 +1172,11 @@ __device__ __forceinline__ void dfattn_body(const float* q, const float* kc, con
             }
         }
 }
-#define DFATTN(D) \
+#define DFATTN(D, KT) \
 extern "C" __global__ void __launch_bounds__(128) dfattn_##D(const float* q, const float* kc, const float* vc, float* out, const float* gate, \
                                                              const unsigned int* sp, DAP p, unsigned int t, unsigned int qs, unsigned int os, \
-                                                             unsigned int gs) { dfattn_body<D>(q, kc, vc, out, gate, sp, p, t, qs, os, gs); }
-DFATTN(64) DFATTN(128)
+                                                             unsigned int gs) { dfattn_body<D, KT>(q, kc, vc, out, gate, sp, p, t, qs, os, gs); }
+DFATTN(64, 64) DFATTN(128, 64) DFATTN(256, 32)
 
 // ---- `dfattn2_D`: dfattn with the heads of a GQA group packed into one block and the key /
 // value tiles streamed. A 256-thread block (8 warps of 16 query rows) takes `hb` heads that

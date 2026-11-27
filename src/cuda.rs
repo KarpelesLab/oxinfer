@@ -3330,6 +3330,8 @@ mod tests {
         for (kn, d, nh, nkv) in [
             ("dfattn", 64usize, 4usize, 2usize),
             ("dfattn", 128, 4, 2),
+            ("dfattn", 256, 4, 2),
+            ("dfattn", 256, 8, 2),
             ("dfattn2", 64, 4, 2),
             ("dfattn2", 128, 4, 2),
             ("dfattn2", 128, 4, 1),
