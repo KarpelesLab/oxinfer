@@ -4332,12 +4332,14 @@ mod tests {
                 "fast prefill plan: {what} differ by {worst:.2e} (largest value {scale:.2e})"
             );
         }
-        // Batched rows (`step_rows`, the server's concurrent requests): three sequences at
+        // Batched rows (`step_rows`, the server's concurrent requests): eight sequences at
         // different positions, a token of each per step, give each sequence's one-token steps'
         // bits (hidden states, keys, values, recurrent states), with the f32 and int8 matvecs.
         for (what, one, multi) in [("f32", &one, &multi), ("int8", &one_q, &multi_q)] {
             use crate::gpu::decode::Row;
-            let (starts, steps) = ([0usize, 5, 11], 19usize);
+            // (Starts past 256 positions: attention split over chunks of keys.)
+            let (starts, steps) = ([0usize, 5, 11, 40, 130, 255, 300, 517], 19usize);
+            let nseq = starts.len();
             // Sequence j's token i: input row (3 i + j) % n at position i.
             let tok = |j: usize, i: usize| (3 * i + j) % n;
             struct Seq {
@@ -4364,7 +4366,7 @@ mod tests {
                     Step {
                         pos: i,
                         t: 1,
-                        rope_cs: &cs[i * hd..(i + 1) * hd],
+                        rope_cs: &cs[(i % n) * hd..(i % n + 1) * hd],
                         x: &xin[r * h..(r + 1) * h],
                         x2: &[],
                         kv: &mut kv,
@@ -4379,9 +4381,9 @@ mod tests {
                 ));
                 q.hs.extend_from_slice(&hid);
             };
-            let mut alone: Vec<Seq> = (0..3).map(|_| fresh()).collect();
-            let mut batch: Vec<Seq> = (0..3).map(|_| fresh()).collect();
-            for j in 0..3 {
+            let mut alone: Vec<Seq> = (0..nseq).map(|_| fresh()).collect();
+            let mut batch: Vec<Seq> = (0..nseq).map(|_| fresh()).collect();
+            for j in 0..nseq {
                 for i in 0..starts[j] + steps {
                     single(&mut alone[j], j, i, i > 0);
                 }
@@ -4397,7 +4399,7 @@ mod tests {
                     }
                     continue;
                 }
-                let mut hid = vec![0f32; 3 * h];
+                let mut hid = vec![0f32; nseq * h];
                 let mut parts: Vec<(&mut Slot, [&mut LayerCache; 1], [&mut [f32]; 2])> = batch
                     .iter_mut()
                     .map(|q| (&mut q.slot, [&mut q.cache], [&mut q.s0[..], &mut q.s1[..]]))
@@ -4410,7 +4412,7 @@ mod tests {
                         Row {
                             slot,
                             pos: i,
-                            rope_cs: &cs[i * hd..(i + 1) * hd],
+                            rope_cs: &cs[(i % n) * hd..(i % n + 1) * hd],
                             x: &xin[r * h..(r + 1) * h],
                             x2: &[],
                             kv: &mut kv[..],

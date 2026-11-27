@@ -278,6 +278,9 @@ enum COp {
         f: F,
         /// The kernel over a batch of tokens (prefill plans; else null).
         ft: F,
+        /// The kernel over batched rows, each on its own cache (`dattnr_*`: multi-token plans;
+        /// else null).
+        fr: F,
         /// The tensor-core kernel over the whole step (`dfattn_D`: fast prefill plans, head
         /// dimensions 64, 128 and 256; else null).
         fa: F,
@@ -488,6 +491,8 @@ pub(super) struct CudaPlan<'b> {
     _cached: Vec<super::CacheRefs>,
     /// A prefill plan: the kernels over every token of a step.
     pf: Option<PfFuncs>,
+    /// A multi-token plan: the kernels over batched rows ([`DecodePlan::step_rows`]).
+    rows: Option<RowFuncs>,
     /// Prefill plans: pinned host memory the step's new keys and values come down through (tens
     /// of megabytes per step, several times slower into pageable memory), or null.
     kv_pinned: *mut f32,
@@ -614,6 +619,17 @@ struct PfFuncs {
 }
 unsafe impl Send for CudaPlan<'_> {}
 unsafe impl Sync for CudaPlan<'_> {}
+
+/// The kernels a batched step ([`DecodePlan::step_rows`]) launches once for all its rows, each
+/// row's arithmetic the one-token kernel's, and the table of the rows' cache addresses (per
+/// cache, `tokens` pairs of keys and values).
+struct RowFuncs {
+    glu: F,
+    ew: F,
+    qk: F,
+    combine: F,
+    kvt: u64,
+}
 
 impl Drop for CudaPlan<'_> {
     fn drop(&mut self) {
@@ -1304,7 +1320,7 @@ impl CudaBackend {
                         if g.kv.get(kv) != Some(&(nkv, hd)) {
                             return None;
                         }
-                        part_floats = part_floats.max(nh * ATTN_SPLIT * (hd + 2) * if pf { PF_ATTN } else { 1 });
+                        part_floats = part_floats.max(nh * ATTN_SPLIT * (hd + 2) * if pf { PF_ATTN } else { tokens });
                         let rep = nh / nkv;
                         let grp = [8, 4, 2, 1]
                             .into_iter()
@@ -1318,6 +1334,11 @@ impl CudaBackend {
                             f: self.func(&format!("dattn_{d}_{grp}"))?,
                             ft: if pf {
                                 self.func(&format!("dattnt_{d}_{grp}"))?
+                            } else {
+                                std::ptr::null_mut()
+                            },
+                            fr: if mt && !pf {
+                                self.func(&format!("dattnr_{d}_{grp}"))?
                             } else {
                                 std::ptr::null_mut()
                             },
@@ -1599,6 +1620,8 @@ impl CudaBackend {
         let pair_off = region(pair_floats.max(1) * tokens * 4);
         let gdn_floats = gdn_floats.next_multiple_of(16);
         let gdn_off = region(gdn_floats.max(1) * tokens * 4);
+        // Batched rows: per cache and token, the addresses of the row's keys and values.
+        let kvt_off = region(g.kv.len().max(1) * tokens * 16);
         let save_off: Vec<usize> = saves.iter().map(|&n| region(n * 4)).collect();
         if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
             let (mut free, mut all) = (0usize, 0usize);
@@ -1756,6 +1779,17 @@ impl CudaBackend {
                     p = std::ptr::null_mut();
                 }
                 p as *mut f32
+            },
+            rows: if mt && !pf {
+                Some(RowFuncs {
+                    glu: self.func("dglu_t")?,
+                    ew: self.func("dew_t")?,
+                    qk: self.func("dqk_rope_r")?,
+                    combine: self.func("dattn_combine_t")?,
+                    kvt: arena + kvt_off as u64,
+                })
+            } else {
+                None
             },
             pf: if pf {
                 Some(PfFuncs {
@@ -2684,6 +2718,7 @@ impl CudaPlan<'_> {
             || b > self.tokens
             || self.tokens < 2
             || self.pf.is_some()
+            || self.rows.is_none()
             || hidden.len() < b * self.hidden.1
             || logits.as_ref().is_some_and(|l| self.logits.is_none_or(|(_, n, _)| l.len() < b * n))
             || rows.iter().any(|r| {
@@ -2764,6 +2799,22 @@ impl CudaPlan<'_> {
                 return false;
             }
         }
+        let Some(rf) = &self.rows else { return false };
+        // Per cache, the rows' keys and values (`tokens` pairs reserved for each).
+        let mut kvt = vec![0u64; self.kv.len() * self.tokens * 2];
+        for (j, &ms) in mss.iter().enumerate() {
+            // SAFETY: as above.
+            for (c, m) in unsafe { &*ms }.kv.iter().enumerate() {
+                (kvt[(c * self.tokens + j) * 2], kvt[(c * self.tokens + j) * 2 + 1]) = (m.k, m.v);
+            }
+        }
+        if !kvt.is_empty() && !be.htod(rf.kvt, &kvt) {
+            return false;
+        }
+        // (`OXINFER_CUDA_ROWS_FUSED=0`: a launch per row of every such op, as the rows' first form.)
+        let per_row = std::env::var("OXINFER_CUDA_ROWS_FUSED").is_ok_and(|v| v == "0");
+        let bb = b as u32;
+        let st = |p: P| (p.ts / 4) as u32;
         let want_logits = logits.is_some() && self.logits.is_some();
         let end = if want_logits { self.ops.len() } else { self.head_from };
         let tr = trace();
@@ -2772,7 +2823,76 @@ impl CudaPlan<'_> {
         self.xh_last.set(Default::default());
         for (i, op) in self.ops[..end].iter().enumerate() {
             self.before_op(i, end);
-            let ok = match op {
+            let ok = match *op {
+                // One launch for every row where a kernel takes a row per token (the one-token
+                // kernel's arithmetic on each).
+                COp::Norm {
+                    f,
+                    x,
+                    out,
+                    w,
+                    mut p,
+                    rows: 1,
+                    threads,
+                } if !per_row => {
+                    (p.x_stride, p.o_stride) = (st(x), st(out));
+                    let (x, out, w) = (x.a, out.a, w.a);
+                    be.launch(f, (bb, 1), threads, &mut args![x, out, w, p])
+                }
+                COp::Glu { g, u, out, n, gelu, .. } if !per_row => {
+                    let (ga, ua, oa, gs, us, os) = (g.a, u.a, out.a, st(g), st(u), st(out));
+                    be.launch(rf.glu, (n.div_ceil(256), bb), 256, &mut args![ga, ua, oa, n, gelu, gs, us, os])
+                }
+                COp::Ew { a, b: eb, out, n, kind, p, .. } if !per_row => {
+                    let (aa, ba, oa, sa, sb, so) = (a.a, eb.a, out.a, st(a), st(eb), st(out));
+                    be.launch(
+                        rf.ew,
+                        (n.div_ceil(256), bb),
+                        256,
+                        &mut args![aa, ba, oa, n, kind, p[0], p[1], p[2], sa, sb, so],
+                    )
+                }
+                COp::QkRope {
+                    qkv,
+                    qo,
+                    kv,
+                    kout,
+                    vout,
+                    qn,
+                    kn,
+                    cs,
+                    p,
+                    ..
+                } if !per_row && kv < self.kv.len() => {
+                    let kvt = rf.kvt + (kv * self.tokens * 16) as u64;
+                    let (qa, oa, ko, vo, qn, kn, cs, sp, qs, os) = (qkv.a, qo.a, kout.a, vout.a, qn.a, kn.a, cs.a, self.sp, st(qkv), st(qo));
+                    be.launch(
+                        rf.qk,
+                        (p.nh + 2 * p.nkv, bb),
+                        p.hd,
+                        &mut args![qa, oa, kvt, ko, vo, qn, kn, cs, sp, p, qs, os],
+                    )
+                }
+                COp::Attn {
+                    fr,
+                    q,
+                    out,
+                    kv,
+                    gate,
+                    p,
+                    grp,
+                    hd,
+                    ..
+                } if !per_row && !fr.is_null() => {
+                    let kvt = rf.kvt + (kv * self.tokens * 16) as u64;
+                    let (qa, oa, ga, sp, qs, os, gs, part) = (q.a, out.a, gate.a, self.sp, st(q), st(out), st(gate), self.part);
+                    be.launch3(
+                        fr,
+                        (p.nh / grp, ATTN_SPLIT as u32, bb),
+                        256,
+                        &mut args![qa, kvt, oa, ga, part, sp, p, qs, os, gs],
+                    ) && be.launch(rf.combine, (p.nh, bb), 256, &mut args![part, oa, ga, sp, p, hd, os, gs])
+                }
                 COp::QkRope { .. } | COp::Attn { .. } | COp::GdnConv { .. } | COp::GdnRule { .. } => {
                     // SAFETY: as above; the slots are only read here.
                     (0..b).all(|j| self.launch_op(op, unsafe { &*mss[j] }, j))

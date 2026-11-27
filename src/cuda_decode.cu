@@ -785,8 +785,9 @@ extern "C" __global__ void dew_t(const float* a, const float* b, float* out, uns
 
 // `dqk_rope` per token: grid (nh + 2 nkv, tokens). Token j is at position sp[4 j]; its RoPE row
 // is 2 half_rot floats after the previous one's, its kout / vout rows nkv hd.
-extern "C" __global__ void dqk_rope_t(const float* qkv, float* qo, float* kc, float* vc, float* kout, float* vout, const float* qn,
-                                      const float* kn, const float* cs, const unsigned int* sp, DQP p, unsigned int qs, unsigned int os) {
+__device__ __forceinline__ void dqk_rope_t_body(const float* qkv, float* qo, float* kc, float* vc, float* kout, float* vout,
+                                                const float* qn, const float* kn, const float* cs, const unsigned int* sp, DQP p,
+                                                unsigned int qs, unsigned int os) {
     __shared__ float buf[512];
     __shared__ float red[32];
     size_t tok = blockIdx.y;
@@ -835,6 +836,16 @@ extern "C" __global__ void dqk_rope_t(const float* qkv, float* qo, float* kc, fl
         kout[hh * hd + i] = v;
     }
 }
+extern "C" __global__ void dqk_rope_t(const float* qkv, float* qo, float* kc, float* vc, float* kout, float* vout, const float* qn,
+                                      const float* kn, const float* cs, const unsigned int* sp, DQP p, unsigned int qs, unsigned int os) {
+    dqk_rope_t_body(qkv, qo, kc, vc, kout, vout, qn, kn, cs, sp, p, qs, os);
+}
+// Batched rows (`step_rows`): token j is a sequence of its own, with its own cache (`kvt`: per
+// token, the device addresses of its keys and of its values).
+extern "C" __global__ void dqk_rope_r(const float* qkv, float* qo, const unsigned long long* kvt, float* kout, float* vout, const float* qn,
+                                      const float* kn, const float* cs, const unsigned int* sp, DQP p, unsigned int qs, unsigned int os) {
+    dqk_rope_t_body(qkv, qo, (float*)kvt[2 * blockIdx.y], (float*)kvt[2 * blockIdx.y + 1], kout, vout, qn, kn, cs, sp, p, qs, os);
+}
 
 // `dattn_*` for a batch of tokens: grid (head groups, 64 chunks, tokens of the batch); q, out,
 // gate and sp point at the batch's first token, `part` holds nh * 64 * (hd + 2) floats per token
@@ -845,6 +856,14 @@ extern "C" __global__ void dattnt_##D##_##G(const float* q, const float* kc, con
     size_t t = blockIdx.z; \
     dattn_body<D, G>(q + t * qs, kc, vc, out + t * os, gate + t * gs, part + t * p.nh * 64 * (D * 32 + 2), sp + 4 * t, p); }
 DATTNT(2, 1) DATTNT(2, 2) DATTNT(2, 4) DATTNT(2, 8) DATTNT(4, 1) DATTNT(4, 2) DATTNT(4, 4) DATTNT(8, 1) DATTNT(8, 2) DATTNT(16, 1)
+// The same over batched rows: token j attends over its own cache (`kvt` as dqk_rope_r's).
+#define DATTNR(D, G) \
+extern "C" __global__ void dattnr_##D##_##G(const float* q, const unsigned long long* kvt, float* out, const float* gate, float* part, \
+                                            const unsigned int* sp, DAP p, unsigned int qs, unsigned int os, unsigned int gs) { \
+    size_t t = blockIdx.z; \
+    dattn_body<D, G>(q + t * qs, (const float*)kvt[2 * t], (const float*)kvt[2 * t + 1], out + t * os, gate + t * gs, \
+                     part + t * p.nh * 64 * (D * 32 + 2), sp + 4 * t, p); }
+DATTNR(2, 1) DATTNR(2, 2) DATTNR(2, 4) DATTNR(2, 8) DATTNR(4, 1) DATTNR(4, 2) DATTNR(4, 4) DATTNR(8, 1) DATTNR(8, 2) DATTNR(16, 1)
 __device__ __forceinline__ void dattn_combine_body(const float* part, float* out, const float* gate, const unsigned int* sp, DAP p,
                                                    unsigned int hd) {
     unsigned int len, lo, chunk, nsplit;
