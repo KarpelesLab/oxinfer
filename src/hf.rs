@@ -6,13 +6,22 @@
 //!
 //! Files come from the ATOnline mirror when it carries the repo (`AI/Model:get`, which lists
 //! every file with a download URL), otherwise from huggingface.co; `OXINFER_HUB` overrides.
+//!
+//! Every load asks the hub for the repository's file list, within a few seconds when the cache
+//! already holds what the load needs: a hub that does not answer in that time is passed over with
+//! one note and the cached files are used. Offline ([`set_offline`], `HF_HUB_OFFLINE=1`) nothing
+//! is asked at all. No step of a request waits without a bound (the `net` submodule).
 
 use anyhow::{Context, Result, anyhow, bail};
-use rsurl::{DownloadOptions, Request};
+use rsurl::DownloadOptions;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+mod net;
+#[cfg(test)]
+mod offline_tests;
 
 /// `$OXINFER_CACHE`, else `~/.cache/oxinfer/hub` (on iOS, where `HOME` is the app's sandbox:
 /// `Library/Application Support/oxinfer/hub` in it, which the system does not purge).
@@ -109,11 +118,36 @@ pub fn resolve_with(spec: &str, cache_dir: Option<&Path>, mmproj: &crate::pixtra
     if parts.len() != 2 || parts.iter().any(|s| s.is_empty() || s.starts_with('.')) || spec.starts_with('/') {
         bail!("{spec}: not an existing directory and not a HuggingFace repo id of the form org/name");
     }
-    let root = cache_dir.map(Path::to_path_buf).unwrap_or_else(cache_root);
-    let dir = root.join(spec.replace('/', "--"));
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let dir = repo_dir(spec, cache_dir);
     fetch_repo(spec, &dir)?;
     Ok(dir)
+}
+
+/// Errors unless `spec` has the form of a repo id (`org/name`).
+fn check_repo_id(spec: &str) -> Result<()> {
+    let parts: Vec<&str> = spec.split('/').collect();
+    if parts.len() != 2 || parts.iter().any(|s| s.is_empty() || s.starts_with('.')) || spec.starts_with('/') {
+        bail!("{spec}: not an existing directory and not a HuggingFace repo id of the form org/name");
+    }
+    Ok(())
+}
+
+/// The folder of `repo` in the cache.
+fn repo_dir(repo: &str, cache_dir: Option<&Path>) -> PathBuf {
+    cache_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(cache_root)
+        .join(repo.replace('/', "--"))
+}
+
+/// Fetches the files of `names` that the listing has.
+fn fetch_present(repo: &str, dir: &Path, list: &Listing, names: &[&str]) -> Result<()> {
+    let present: Vec<&&str> = names.iter().filter(|n| list.contains_key(**n)).collect();
+    for (i, n) in present.iter().enumerate() {
+        let (size, src) = &list[**n];
+        fetch_file(repo, dir, n, *size, src, i + 1, present.len())?;
+    }
+    Ok(())
 }
 
 /// Some files of a repo: a local directory is used as is; otherwise the files of `names` that
@@ -124,32 +158,27 @@ pub fn resolve_files(spec: &str, names: &[&str], cache_dir: Option<&Path>) -> Re
     if p.is_dir() {
         return Ok(p.to_path_buf());
     }
-    let parts: Vec<&str> = spec.split('/').collect();
-    if parts.len() != 2 || parts.iter().any(|s| s.is_empty() || s.starts_with('.')) || spec.starts_with('/') {
-        bail!("{spec}: not an existing directory and not a HuggingFace repo id of the form org/name");
-    }
-    let root = cache_dir.map(Path::to_path_buf).unwrap_or_else(cache_root);
-    let dir = root.join(spec.replace('/', "--"));
-    let list = listing(spec)?;
-    let present: Vec<&&str> = names.iter().filter(|n| list.contains_key(**n)).collect();
-    for (i, n) in present.iter().enumerate() {
-        let (size, src) = &list[**n];
-        fetch_file(spec, &dir, n, *size, src, i + 1, present.len())?;
-    }
+    check_repo_id(spec)?;
+    let dir = repo_dir(spec, cache_dir);
+    with_listing(spec, &dir, &|list| fetch_present(spec, &dir, list, names))?;
     Ok(dir)
 }
 
 /// Every file of repo `spec` under the folder `prefix` (`audio_tokenizer/`), fetched into the
 /// repo's cache directory, which is returned: the parts of a model its main download leaves out.
 pub fn resolve_prefix(spec: &str, prefix: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
-    let list = listing(spec)?;
+    check_repo_id(spec)?;
+    let dir = repo_dir(spec, cache_dir);
     let prefix = format!("{}/", prefix.trim_end_matches('/'));
-    let mut names: Vec<&str> = list.keys().map(String::as_str).filter(|n| n.starts_with(&prefix)).collect();
-    if names.is_empty() {
-        bail!("{spec} has no {prefix} folder");
-    }
-    names.sort_unstable();
-    resolve_files(spec, &names, cache_dir)
+    with_listing(spec, &dir, &|list| {
+        let mut names: Vec<&str> = list.keys().map(String::as_str).filter(|n| n.starts_with(&prefix)).collect();
+        if names.is_empty() {
+            bail!("{spec} has no {prefix} folder");
+        }
+        names.sort_unstable();
+        fetch_present(spec, &dir, list, &names)
+    })?;
+    Ok(dir)
 }
 
 /// A single file: a local path is used as is; otherwise `spec` is `org/name/path/in/repo` (or
@@ -170,26 +199,26 @@ pub fn resolve_file(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
         bail!("{spec}: not an existing file and not a HuggingFace path of the form org/name/file");
     }
     let repo = format!("{}/{}", parts[0], parts[1]);
-    let list = listing(&repo)?;
-    let name = if parts.len() > 2 {
-        parts[2..].join("/")
-    } else {
-        let mut st: Vec<&String> = list.keys().filter(|k| k.ends_with(".safetensors")).collect();
-        st.sort();
-        match st.as_slice() {
-            [one] => one.to_string(),
-            [] => bail!("{repo}: no safetensors file in the repository"),
-            many => bail!(
-                "{repo} has several safetensors files; name one as {repo}/FILE: {}",
-                many.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-            ),
-        }
-    };
-    let (size, src) = list.get(&name).with_context(|| format!("{repo}: no file {name}"))?;
-    let root = cache_dir.map(Path::to_path_buf).unwrap_or_else(cache_root);
-    let dir = root.join(repo.replace('/', "--"));
-    fetch_file(&repo, &dir, &name, *size, src, 1, 1)?;
-    Ok(dir.join(name))
+    let dir = repo_dir(&repo, cache_dir);
+    with_listing(&repo, &dir, &|list| {
+        let name = if parts.len() > 2 {
+            parts[2..].join("/")
+        } else {
+            let mut st: Vec<&String> = list.keys().filter(|k| k.ends_with(".safetensors")).collect();
+            st.sort();
+            match st.as_slice() {
+                [one] => one.to_string(),
+                [] => bail!("{repo}: no safetensors file in the repository"),
+                many => bail!(
+                    "{repo} has several safetensors files; name one as {repo}/FILE: {}",
+                    many.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+            }
+        };
+        let (size, src) = list.get(&name).with_context(|| format!("{repo}: no file {name}"))?;
+        fetch_file(&repo, &dir, &name, *size, src, 1, 1)?;
+        Ok(dir.join(name))
+    })
 }
 
 /// The GGUF files of a listing that hold a model (not vision projectors), sorted.
@@ -215,18 +244,22 @@ pub fn resolve_gguf(repo: &str, quant: &str, cache_dir: Option<&Path>) -> Result
 /// [`crate::pixtral::mmproj_for`] finds it, unless one is there already; `none` or a given file
 /// fetch the model alone.
 pub fn resolve_gguf_with(repo: &str, quant: &str, cache_dir: Option<&Path>, mmproj: &crate::pixtral::Mmproj) -> Result<PathBuf> {
-    let list = listing(repo)?;
-    let (name, parts) = gguf_parts(repo, quant, &list)?;
-    let root = cache_dir.map(Path::to_path_buf).unwrap_or_else(cache_root);
-    let dir = root.join(repo.replace('/', "--"));
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let proj = gguf_mmproj(&list, &name, &mmprojs_present(&dir, &name), mmproj);
+    let dir = repo_dir(repo, cache_dir);
+    with_listing(repo, &dir, &|list| fetch_gguf(repo, quant, &dir, list, mmproj))
+}
+
+/// The fetch of [`resolve_gguf_with`] from one listing. The model's parts are needed; the vision
+/// projector is an extra, and a failure to fetch it is a note, not an error (the model then loads
+/// without image input, and a later load tries again).
+fn fetch_gguf(repo: &str, quant: &str, dir: &Path, list: &Listing, mmproj: &crate::pixtral::Mmproj) -> Result<PathBuf> {
+    let (name, parts) = gguf_parts(repo, quant, list)?;
+    let proj = gguf_mmproj(list, &name, &mmprojs_present(dir, &name), mmproj);
     let count = parts.len() + usize::from(proj.is_some());
     for (i, p) in parts.iter().enumerate() {
         let (size, src) = list
             .get(p)
             .with_context(|| format!("{repo}: split GGUF part {p} is not in the listing"))?;
-        fetch_file(repo, &dir, p, *size, src, i + 1, count)?;
+        fetch_file(repo, dir, p, *size, src, i + 1, count)?;
     }
     if let Some(p) = &proj {
         let (size, src) = &list[p];
@@ -237,7 +270,9 @@ pub fn resolve_gguf_with(repo: &str, quant: &str, cache_dir: Option<&Path>, mmpr
                 size.map_or(String::new(), |s| format!(" ({})", human_gb(s)))
             );
         }
-        fetch_file(repo, &dir, p, *size, src, count, count)?;
+        if let Err(e) = fetch_file(repo, dir, p, *size, src, count, count) {
+            eprintln!("note: {p} was not fetched ({e:#}); {name} loads without image input until a later load completes it");
+        }
     }
     // The shared part also under the name of the part it stands for, as llama.cpp opens the
     // parts by name (oxinfer finds it by its header either way).
@@ -446,31 +481,35 @@ pub fn plan(spec: &str, cache_dir: Option<&Path>) -> Result<Plan> {
     if parts.len() != 2 || parts.iter().any(|s| s.is_empty() || s.starts_with('.')) || repo.starts_with('/') {
         bail!("{spec}: not a HuggingFace repo id of the form org/name (or org/name:QUANT)");
     }
-    let root = cache_dir.map(Path::to_path_buf).unwrap_or_else(cache_root);
-    let dir = root.join(repo.replace('/', "--"));
-    let list = listing(repo)?;
-    let names = match quant {
-        Some(q) => {
-            let (name, mut parts) = gguf_parts(repo, q, &list)?;
-            parts.extend(gguf_mmproj(
-                &list,
-                &name,
-                &mmprojs_present(&dir, &name),
-                &crate::pixtral::Mmproj::Auto,
-            ));
-            parts
+    let dir = repo_dir(repo, cache_dir);
+    let files = with_listing(repo, &dir, &|list| {
+        let names = match quant {
+            Some(q) => {
+                let (name, mut parts) = gguf_parts(repo, q, list)?;
+                parts.extend(gguf_mmproj(
+                    list,
+                    &name,
+                    &mmprojs_present(&dir, &name),
+                    &crate::pixtral::Mmproj::Auto,
+                ));
+                parts
+            }
+            None => repo_files(repo, list, &mut |name| peek_meta(repo, &dir, list, name), Some(&dir))?,
+        };
+        // A file the cache's own listing lacks is one the cache cannot give.
+        if let Some(gone) = names.iter().find(|n| is_cached_listing(list) && !list.contains_key(*n)) {
+            bail!("{repo}: {gone} is not in the cache");
         }
-        None => repo_files(repo, &list, &mut |name| peek_meta(repo, &dir, &list, name), Some(&dir))?,
-    };
-    let files = names
-        .into_iter()
-        .map(|name| {
-            let size = list.get(&name).and_then(|(s, _)| *s);
-            let have = std::fs::metadata(dir.join(&name)).map(|m| m.len()).unwrap_or(0);
-            let have = size.map_or(have, |s| have.min(s));
-            PlanFile { name, size, have }
-        })
-        .collect();
+        Ok(names
+            .into_iter()
+            .map(|name| {
+                let size = list.get(&name).and_then(|(s, _)| *s);
+                let have = std::fs::metadata(dir.join(&name)).map(|m| m.len()).unwrap_or(0);
+                let have = size.map_or(have, |s| have.min(s));
+                PlanFile { name, size, have }
+            })
+            .collect())
+    })?;
     Ok(Plan {
         repo: repo.to_string(),
         dir,
@@ -498,28 +537,36 @@ fn token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// A GET request; `auth` adds the HuggingFace token (never sent to other hosts).
-fn request(url: &str, auth: bool) -> Result<Request> {
-    let mut r = Request::get(url)
-        .map_err(|e| anyhow!("{url}: {e}"))?
-        .follow_redirects(true)
-        .max_redirs(10)
-        .header("User-Agent", "oxinfer/0.1")
-        // The resumable downloader stores raw bytes; refuse compressed transfer encodings.
-        .header("Accept-Encoding", "identity");
-    if auth && let Some(t) = token() {
-        r = r.header("Authorization", &format!("Bearer {t}"));
-    }
-    Ok(r)
-}
-
-/// The body of a plain GET of `url` (no HuggingFace token), for image URLs in decision requests.
+/// The body of a plain GET of `url` (no HuggingFace token), for image URLs in decision requests
+/// and release archives: any size, so without a deadline for the whole of it, but with the
+/// client's bounds on the lookup, each connection attempt and each silence of the server.
 pub fn http_get(url: &str) -> Result<Vec<u8>> {
-    let resp = request(url, false)?.send().map_err(|e| anyhow!("{url}: {e}"))?;
+    let resp = net::request(&net::cfg(), url, false)?.send().map_err(|e| anyhow!("{url}: {e}"))?;
     if resp.status != 200 {
         bail!("{url}: HTTP {}", resp.status);
     }
     Ok(resp.body)
+}
+
+/// 0 = unset (the environment decides), 1 = offline, 2 = online.
+static OFFLINE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Offline mode for later loads, overriding the environment: a repo id is served from the cache
+/// without asking any hub, and a load the cache cannot serve fails at once.
+pub fn set_offline(offline: bool) {
+    OFFLINE.store(if offline { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the hub client is offline: what [`set_offline`] was given, else `HF_HUB_OFFLINE` or
+/// `OXINFER_OFFLINE` set to `1`, `true`, `yes` or `on`.
+pub fn offline() -> bool {
+    match OFFLINE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => ["HF_HUB_OFFLINE", "OXINFER_OFFLINE"]
+            .iter()
+            .any(|v| std::env::var(v).is_ok_and(|v| net::truthy(&v))),
+    }
 }
 
 #[derive(Deserialize)]
@@ -552,6 +599,9 @@ enum Source {
     Url(String),
     /// Small files the mirror inlines as `data:` URLs.
     Inline(Vec<u8>),
+    /// A file of the cache's own listing ([`cached_listing`]): on disk, with nowhere to fetch it
+    /// from.
+    Cached,
 }
 
 /// A repository's file listing: name -> (size, source).
@@ -581,16 +631,25 @@ struct MirrorReply {
     data: MirrorModel,
 }
 
-/// Lists `repo` on the mirror; Ok(None) when the mirror does not carry it.
-fn list_mirror(repo: &str) -> Result<Option<Listing>> {
-    let api = format!("{MIRROR_API}?key={repo}");
-    let resp = request(&api, false)?.send().map_err(|e| anyhow!("{api}: {e}"))?;
+/// A status that says the server could not answer now (as opposed to "no"): the hub counts as
+/// not reachable.
+fn try_later(status: u16) -> bool {
+    status == 408 || status == 429 || status >= 500
+}
+
+/// Lists `repo` on the mirror within `total`; Ok(None) when the mirror does not carry it.
+fn list_mirror(cfg: &net::Cfg, repo: &str, total: Duration) -> Result<Option<Listing>> {
+    let api = format!("{}?key={repo}", cfg.mirror_api);
+    let resp = net::send(net::request(cfg, &api, false)?, total).with_context(|| api.clone())?;
     match resp.status {
         200 => {}
         404 => return Ok(None),
+        s if try_later(s) => return Err(net::unreachable(format!("{api}: HTTP {s}"))),
         s => bail!("{api}: HTTP {s}"),
     }
-    let reply: MirrorReply = serde_json::from_slice(&resp.body).with_context(|| format!("parse {api}"))?;
+    // Not the mirror's JSON: something on the way answered in its place (a captive portal).
+    let reply: MirrorReply =
+        serde_json::from_slice(&resp.body).map_err(|e| net::unreachable(format!("{api}: not the mirror's answer ({e})")))?;
     let mut out = Listing::new();
     for f in reply.data.files {
         let src = match f.url.strip_prefix("data:") {
@@ -608,25 +667,27 @@ fn list_mirror(repo: &str) -> Result<Option<Listing>> {
     Ok(Some(out))
 }
 
-/// Lists `repo` on huggingface.co.
-fn list_hf(repo: &str) -> Result<Listing> {
-    let api = format!("https://huggingface.co/api/models/{repo}?blobs=true");
-    let resp = request(&api, true)?.send().map_err(|e| anyhow!("{api}: {e}"))?;
+/// Lists `repo` on huggingface.co (or the `HF_ENDPOINT` server) within `total`.
+fn list_hf(cfg: &net::Cfg, repo: &str, total: Duration) -> Result<Listing> {
+    let hf = &cfg.hf;
+    let api = format!("{hf}/api/models/{repo}?blobs=true");
+    let resp = net::send(net::request(cfg, &api, true)?, total).with_context(|| api.clone())?;
     match resp.status {
         200 => {}
         401 | 403 => bail!(
             "{repo}: access denied (HTTP {}). If the repo is gated, accept its license on huggingface.co and set HF_TOKEN.",
             resp.status
         ),
-        404 => bail!("{repo}: repository not found on huggingface.co"),
+        404 => bail!("{repo}: repository not found on {hf}"),
+        s if try_later(s) => return Err(net::unreachable(format!("{api}: HTTP {s}"))),
         s => bail!("{api}: HTTP {s}"),
     }
-    let info: RepoInfo = serde_json::from_slice(&resp.body).with_context(|| format!("parse {api}"))?;
+    let info: RepoInfo = serde_json::from_slice(&resp.body).map_err(|e| net::unreachable(format!("{api}: not the hub's answer ({e})")))?;
     Ok(info
         .siblings
         .into_iter()
         .map(|s| {
-            let url = format!("https://huggingface.co/{repo}/resolve/main/{}", url_path(&s.rfilename));
+            let url = format!("{hf}/{repo}/resolve/main/{}", url_path(&s.rfilename));
             (s.rfilename, (s.size, Source::Url(url)))
         })
         .collect())
@@ -665,18 +726,134 @@ pub fn hub() -> Result<Hub> {
     })
 }
 
-fn listing(repo: &str) -> Result<Listing> {
-    match hub()? {
-        Hub::HuggingFace => list_hf(repo),
-        Hub::Mirror => list_mirror(repo)?.with_context(|| format!("{repo}: not on the mirror ({MIRROR_API})")),
-        Hub::Auto => match list_mirror(repo) {
+/// The hub's listing of `repo`, the whole of it within `total`. An error that is
+/// [`net::is_unreachable`] says that no hub answered; any other is a hub's answer.
+fn listing(cfg: &net::Cfg, repo: &str, total: Duration) -> Result<Listing> {
+    let t0 = Instant::now();
+    let left = || total.saturating_sub(t0.elapsed());
+    let hub = match cfg.hub {
+        Some(h) => h,
+        None => hub()?,
+    };
+    match hub {
+        Hub::HuggingFace => list_hf(cfg, repo, total),
+        Hub::Mirror => list_mirror(cfg, repo, total)?.with_context(|| format!("{repo}: not on the mirror ({})", cfg.mirror_api)),
+        // The mirror gets half of the time, so that huggingface.co can still be asked.
+        Hub::Auto => match list_mirror(cfg, repo, total / 2) {
             Ok(Some(l)) => Ok(l),
-            Ok(None) => list_hf(repo),
-            Err(e) => {
-                eprintln!("[mirror unavailable ({e:#}); trying huggingface.co]");
-                list_hf(repo)
-            }
+            Ok(None) => list_hf(cfg, repo, left()),
+            Err(mirror) => match list_hf(cfg, repo, left()) {
+                Ok(l) => {
+                    eprintln!("[mirror unavailable ({mirror:#}); using {}]", cfg.hf);
+                    Ok(l)
+                }
+                // A mirror that did not answer may be the one place that carries the repo:
+                // whatever the other hub says, the listing is not known.
+                Err(hf) if net::is_unreachable(&mirror) => Err(net::unreachable(format!("{mirror:#}; {hf:#}"))),
+                Err(hf) => Err(hf),
+            },
         },
+    }
+}
+
+/// The cache's own listing of a repository: every file of its folder `dir` under the name the
+/// repository gives it, with its size on disk. A download in progress is kept in a
+/// `.rsurlpart` file beside the final name until it is whole, so a file under its final name is
+/// a complete one; empty files (never a download's result) and the part files are left out.
+fn cached_listing(dir: &Path) -> Listing {
+    fn walk(dir: &Path, prefix: &str, out: &mut Listing) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let name = format!("{prefix}{}", e.file_name().to_string_lossy());
+            // Through links: a shared GGUF part is also there under the name of the part it
+            // stands for.
+            let Ok(md) = std::fs::metadata(e.path()) else { continue };
+            if md.is_dir() {
+                walk(&e.path(), &format!("{name}/"), out);
+            } else if md.len() > 0 && !name.ends_with(".rsurlpart") {
+                out.insert(name, (Some(md.len()), Source::Cached));
+            }
+        }
+    }
+    let mut out = Listing::new();
+    walk(dir, "", &mut out);
+    out
+}
+
+/// Whether `list` is the cache's own ([`cached_listing`]) rather than a hub's.
+fn is_cached_listing(list: &Listing) -> bool {
+    list.values().any(|(_, s)| matches!(s, Source::Cached))
+}
+
+/// Until when each hub that did not answer is left alone (see [`with_listing`]), by endpoint.
+static HUB_DOWN: std::sync::Mutex<Vec<(String, Instant)>> = std::sync::Mutex::new(Vec::new());
+
+/// Runs `f`, the part of a load that reads a repository's listing and fetches from it, on the
+/// hub's listing of `repo` or, when no hub is to be asked or none answers, on the cache's own
+/// ([`cached_listing`] of `dir`).
+///
+/// A load asks the hub every time, as huggingface_hub does, so that a repository that changed is
+/// fetched again; what bounds the cost is the time given to the question. When the cache holds
+/// files of the repository the hub has `check` (5 s) for the whole listing, both hubs together,
+/// and a hub that does not answer is passed over: one note, then the cached files, and for the
+/// next minute loads the cache can serve do not ask again. Only when the cache cannot serve the
+/// load (nothing cached, or `f` fails on the cached files) does the listing get `meta` (30 s),
+/// and its failure is the load's. Offline, `f` runs on the cached files alone. `f` may run twice.
+fn with_listing<T>(repo: &str, dir: &Path, f: &dyn Fn(&Listing) -> Result<T>) -> Result<T> {
+    let cfg = net::cfg();
+    let cached = cached_listing(dir);
+    let at = dir.display();
+    if cfg.offline {
+        const WHY: &str = "offline (HF_HUB_OFFLINE, OXINFER_OFFLINE or --offline)";
+        if cached.is_empty() {
+            bail!("{repo}: {WHY}, and the repository is not in the cache ({at})");
+        }
+        return f(&cached).map_err(|e| anyhow!("{repo}: {WHY}, and the cache ({at}) cannot serve this load: {e:#}"));
+    }
+    let key = format!("{} {}", cfg.mirror_api, cfg.hf);
+    // Why the cached files do not do, when they were tried.
+    let mut lacking = None;
+    if !cached.is_empty() {
+        let down = {
+            let d = HUB_DOWN.lock().unwrap_or_else(|e| e.into_inner());
+            d.iter().any(|(k, until)| *k == key && Instant::now() < *until)
+        };
+        if down {
+            match f(&cached) {
+                Ok(v) => return Ok(v),
+                Err(e) => lacking = Some(e),
+            }
+        } else {
+            match listing(&cfg, repo, cfg.check) {
+                Ok(list) => return f(&list),
+                Err(e) if net::is_unreachable(&e) => match f(&cached) {
+                    Ok(v) => {
+                        let mut d = HUB_DOWN.lock().unwrap_or_else(|e| e.into_inner());
+                        d.retain(|(k, _)| *k != key);
+                        d.push((key, Instant::now() + cfg.down_for));
+                        eprintln!(
+                            "[the hub did not answer ({e:#}); using the cached files of {repo}, and not asking again for {} s]",
+                            cfg.down_for.as_secs()
+                        );
+                        return Ok(v);
+                    }
+                    Err(e) => lacking = Some(e),
+                },
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    // The cache cannot serve this load: the listing is needed, with the time that takes.
+    match (listing(&cfg, repo, cfg.meta), lacking) {
+        (Ok(list), _) => {
+            // It answers again.
+            HUB_DOWN.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, _)| *k != key);
+            f(&list)
+        }
+        (Err(e), Some(lacking)) if net::is_unreachable(&e) => {
+            bail!("{repo}: the hub did not answer ({e:#}), and the cache ({at}) cannot serve this load: {lacking:#}")
+        }
+        (Err(e), _) => Err(e),
     }
 }
 
@@ -696,9 +873,10 @@ fn anemll_wanted(name: &str) -> bool {
 }
 
 fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
-    let list = listing(repo)?;
-    let files = repo_files(repo, &list, &mut |name| fetch_meta(repo, dir, &list, name), Some(dir))?;
-    fetch_listed(repo, dir, &list, &files)
+    with_listing(repo, dir, &|list| {
+        let files = repo_files(repo, list, &mut |name| fetch_meta(repo, dir, list, name), Some(dir))?;
+        fetch_listed(repo, dir, list, &files)
+    })
 }
 
 /// Reads a small file of the listing that decides which files a fetch takes (`modules.json`,
@@ -721,10 +899,10 @@ fn peek_meta(repo: &str, dir: &Path, list: &Listing, name: &str) -> Result<Vec<u
     }
     match src {
         Source::Inline(b) => Ok(b.clone()),
+        Source::Cached => bail!("{repo}/{name}: not whole in the cache"),
         Source::Url(u) => {
-            let resp = request(u, u.starts_with("https://huggingface.co/"))?
-                .send()
-                .map_err(|e| anyhow!("{repo}/{name}: {e}"))?;
+            let cfg = net::cfg();
+            let resp = net::send(net::request(&cfg, u, cfg.is_hf(u))?, cfg.meta).with_context(|| format!("{repo}/{name}"))?;
             if resp.status != 200 {
                 bail!("{repo}/{name}: HTTP {}", resp.status);
             }
@@ -873,19 +1051,15 @@ pub fn resolve_diffusers(spec: &str, skip: &[&str], cache_dir: Option<&Path>) ->
     if p.is_dir() {
         return Ok(p.to_path_buf());
     }
-    let parts: Vec<&str> = spec.split('/').collect();
-    if parts.len() != 2 || parts.iter().any(|s| s.is_empty() || s.starts_with('.')) || spec.starts_with('/') {
-        bail!("{spec}: not an existing directory and not a HuggingFace repo id of the form org/name");
-    }
-    let root = cache_dir.map(Path::to_path_buf).unwrap_or_else(cache_root);
-    let dir = root.join(spec.replace('/', "--"));
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let list = listing(spec)?;
-    if !list.contains_key("model_index.json") {
-        bail!("{spec}: not a diffusers pipeline (no model_index.json)");
-    }
-    let files = diffusers_component_files(&list, skip, &mut |name| fetch_meta(spec, &dir, &list, name), Some(&dir))?;
-    fetch_listed(spec, &dir, &list, &files)?;
+    check_repo_id(spec)?;
+    let dir = repo_dir(spec, cache_dir);
+    with_listing(spec, &dir, &|list| {
+        if !list.contains_key("model_index.json") {
+            bail!("{spec}: not a diffusers pipeline (no model_index.json)");
+        }
+        let files = diffusers_component_files(list, skip, &mut |name| fetch_meta(spec, &dir, list, name), Some(&dir))?;
+        fetch_listed(spec, &dir, list, &files)
+    })?;
     Ok(dir)
 }
 
@@ -1037,8 +1211,10 @@ fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>, src: &S
             progress(b.len() as u64, Some(b.len() as u64));
             return Ok(());
         }
+        Source::Cached => bail!("{repo}/{name}: not whole in the cache"),
         Source::Url(u) => u.as_str(),
     };
+    let cfg = net::cfg();
     progress(0, expected);
     let (prepo, pname) = (repo.to_string(), name.to_string());
     let t0 = Instant::now();
@@ -1077,13 +1253,20 @@ fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>, src: &S
                 }
             }
         })),
+        // A connection that says nothing for `stall` is dropped (the request's read timeout)
+        // and the download resumes on a new one from the bytes it has, a few times over: the
+        // count starts again whenever an attempt adds bytes, so only a download that cannot
+        // advance at all gives up.
+        max_retries: cfg.retries,
+        initial_backoff: cfg.backoff,
+        max_backoff: cfg.backoff * 16,
         ..Default::default()
     };
     eprintln!(
         "[fetching {repo}/{name}{}]",
         expected.map(|s| format!(" ({})", human_gb(s))).unwrap_or_default()
     );
-    let out = request(url, url.starts_with("https://huggingface.co/"))?
+    let out = net::request(&cfg, url, cfg.is_hf(url))?
         .download_resumable(&path, opts)
         .map_err(|e| anyhow!("download {repo}/{name}: {e}"))?;
     let secs = t0.elapsed().as_secs_f64().max(1e-3);

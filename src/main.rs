@@ -422,6 +422,8 @@ fn usage() -> ! {
          \x20 --lora-merge         merge the LoRA updates into the weights at load (float weights: exact;\n\
          \x20                      quantized ones are re-quantized, GGUF blocks as Q8)\n\
          \x20 --cache-dir DIR      where fetched models are cached\n\
+         \x20 --offline            with any command: ask no hub, repo ids load from the cache or fail\n\
+         \x20                      (also HF_HUB_OFFLINE=1)\n\
          \x20 --download-only      fetch the model (and drafter) and exit\n\
          \x20 --save-quantized DIR write a checkpoint with the weights already quantized to --quant (loads\n\
          \x20                      zero-copy with no quantization pass; for browsers, mmap); Qwen keeps\n\
@@ -1083,7 +1085,7 @@ fn parse_args() -> Result<Args> {
             "--presets" => a.presets = true,
             "--check-update" => a.check_update = true,
             // Handled in `main`, before the arguments are read.
-            "--auto-update" => {}
+            "--auto-update" | "--offline" => {}
             "--update" => a.update = true,
             "--force" => a.force = true,
             "--all" => a.models_all = true,
@@ -1553,6 +1555,11 @@ fn auto_update() {
     eprintln!("[auto-update: this build has no self-update (the `update` feature)]");
 }
 
+/// The flags that go with any command and are handled in `main` before it runs.
+fn is_global_flag(arg: &str) -> bool {
+    arg == "--auto-update" || arg == "--offline"
+}
+
 fn main() -> Result<()> {
     // What an earlier update could not delete (Windows: the program was running).
     #[cfg(feature = "update")]
@@ -1561,37 +1568,42 @@ fn main() -> Result<()> {
         println!("oxinfer {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    // For repo ids; `--auto-update`, asked for by name, still asks GitHub.
+    if std::env::args().skip(1).any(|a| a == "--offline") {
+        #[cfg(feature = "hf")]
+        oxinfer::hf::set_offline(true);
+    }
     if std::env::args().skip(1).any(|a| a == "--auto-update") {
         auto_update();
     }
     #[cfg(feature = "server")]
     if std::env::args().nth(1).as_deref() == Some("serve") {
-        let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
+        let rest: Vec<String> = std::env::args().skip(2).filter(|a| !is_global_flag(a)).collect();
         return web_cli::run(&rest, "serve", false);
     }
     #[cfg(feature = "server")]
     if std::env::args().nth(1).as_deref() == Some("web") {
-        let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
+        let rest: Vec<String> = std::env::args().skip(2).filter(|a| !is_global_flag(a)).collect();
         return web_cli::run(&rest, "web", true);
     }
     if std::env::args().nth(1).as_deref() == Some("depth") {
-        let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
+        let rest: Vec<String> = std::env::args().skip(2).filter(|a| !is_global_flag(a)).collect();
         return depth_pro_cli::run(&rest);
     }
     if std::env::args().nth(1).as_deref() == Some("isolate") {
-        let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
+        let rest: Vec<String> = std::env::args().skip(2).filter(|a| !is_global_flag(a)).collect();
         return voice_isolator_cli::run(&rest);
     }
     if std::env::args().nth(1).as_deref() == Some("ocr") {
-        let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
+        let rest: Vec<String> = std::env::args().skip(2).filter(|a| !is_global_flag(a)).collect();
         return ocria_cli::run(&rest);
     }
     if std::env::args().nth(1).as_deref() == Some("lora-train") {
-        let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
+        let rest: Vec<String> = std::env::args().skip(2).filter(|a| !is_global_flag(a)).collect();
         return lora_train_cli::run(&rest);
     }
     if std::env::args().nth(1).as_deref() == Some("models") {
-        let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
+        let rest: Vec<String> = std::env::args().skip(2).filter(|a| !is_global_flag(a)).collect();
         return models_cli::run(&rest);
     }
     let mut args = parse_args()?;
