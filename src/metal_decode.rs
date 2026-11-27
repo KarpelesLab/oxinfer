@@ -3472,6 +3472,14 @@ impl MetalBackend {
     }
 
     fn build_plan_mode(&self, g: &Graph, tokens: usize, fast: bool, pf: bool) -> Option<MetalPlan<'_>> {
+        let plan = self.build_plan_inner(g, tokens, fast, pf);
+        // The checkpoint's experts the plan made tiled copies of (`expert_tables`), given back
+        // now that the build no longer wraps and releases buffers.
+        crate::safetensors::release_queued();
+        plan
+    }
+
+    fn build_plan_inner(&self, g: &Graph, tokens: usize, fast: bool, pf: bool) -> Option<MetalPlan<'_>> {
         let f = Fns::new(self);
         let mt = tokens > 1 || pf;
         let fast = fast && mt && !pf && fast_kernels();
@@ -6414,13 +6422,9 @@ impl MetalBackend {
                         unsafe { void(id, self.sels.release) };
                     }
                 }
-                // (Off the plan's path: giving back gigabytes of pages takes the system ~0.1 s
-                // a GB, and the bytes stay readable meanwhile.)
-                std::thread::spawn(move || {
-                    for (s, e) in spans {
-                        crate::safetensors::release_copied(s, e - s);
-                    }
-                });
+                // (Off the plan's path, once it is built: `release_copied_later`. The bytes stay
+                // readable meanwhile.)
+                crate::safetensors::release_copied_later(spans);
             }
         }
         if fused || ex.relu2 {

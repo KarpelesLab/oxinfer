@@ -84,14 +84,25 @@ ggml-org's Q4_0 GGUF of Lightning on the M5 Max (greedy, the machine shared with
 | decoding, 34-token prompt | 153 tok/s (before the prefill plan and the experts fix below: 93) | 104 tok/s (`llama-cli`), `llama-bench` tg128 115 |
 | decoding after a 3,056-token prompt | 136 tok/s (70) | |
 | prefill, warm (`pf_ab`: the plans built, best of 5) | 3,575 tok/s at 511 tokens, 3,748 at 2,047, 3,984 at 3,055 (token by token scan: 2,723 / 2,773 / 3,000) | `llama-bench` pp512 2,990, pp2048 2,378 (same session; 3,390 / 2,761 on a quieter machine) |
-| prefill, one-shot CLI (3,056 tokens, plan built in the run) | 1,690-1,810 tok/s: 1.1-1.5 s of it is building the plans; with `OXINFER_GPU_EXPERT_TILES=0` 0.08 s and 4,040-4,270 tok/s | |
+| prefill, one-shot CLI (3,056 tokens, plan built in the run) | 1,690-1,810 tok/s: 1.1-1.5 s of it is building the plans; with `OXINFER_GPU_EXPERT_TILES=0` 0.08 s and 4,040-4,270 tok/s; since the checkpoint's experts are given back after the build ([below](#on-metal)), 3,719 tokens in 1.15 s (base 1.28-2.4 s, tiles off 0.78 s) | |
 
 Decoding and prompts are ahead of llama.cpp (prompts 1.2x its pp512, 1.6x its pp2048). A
 one-shot run pays for the prefill plan once: almost all of it is the routed experts' tiled
 copies (`tiled_experts`, 46 matrices of 342 MB at 14 to 31 ms each, the time of filling fresh
 private GPU memory rather than of the copy kernel: one reading whole rows into threadgroup
 memory was no faster), which make warm prompts 5 to 8% faster and stay for the process's later
-prompts and its decoding.
+prompts and its decoding. Of the 1.1 to 1.5 s, the copies' GPU time was 0.58 s (the same copy into
+memory it had already filled took 2 to 3 ms a matrix instead of 8 to 20): the rest was each MoE
+layer giving the checkpoint's experts back (`release_copied`, a thread per layer, ~0.45 s of
+system time a layer) while the next layers wrapped and released their buffers under the same
+memory-map lock (a layer's tables 22 ms before the first releases started, 64 to 88 ms after).
+The pages are now given back once the plan is built (`release_copied_later`, up to an eighth of
+the machine's memory held meanwhile): the plan takes ~0.6 s, the prompt's first token comes
+0.15 to 0.25 s sooner on this model (more on the others, see
+[the performance notes](performance.md#metal-expert-tiles-round-10-one-copy-november-2026)), at
+the cost of a higher peak footprint while the build lasts (36.9 GB against 21.9). The copies'
+own 0.6 s stays: what was tried to make them cheaper (below the table in the performance notes)
+did not.
 
 **The scan.** Mamba-2's recurrence `S_t = exp(dt_t a) S_{t-1} + dt_t x_t B_t^T`, `y_t = S_t C_t`
 ran token after token, a SIMD-group per state row (`dec_mamba2_t`): of 266 ms of GPU time for

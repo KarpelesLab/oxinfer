@@ -1359,6 +1359,56 @@ first long one: the first prompt of a model (2116 tokens above) takes 1.02 s aga
 whose K-quant parts copy slower); once per load. Speculative verification (prompt lookup, 88%
 accepted) and Inkling-2-Mini (its own kernels: no tiles) give the same tokens as before.
 
+**The first prompt's cost (November 2026).** A one-shot CLI run (a ~3,700-token prompt, 16 greedy
+tokens) paid for the copies in its prefill: Nemotron-3.5 Lightning Q4_0 1.28-2.4 s against 0.78
+with `OXINFER_GPU_EXPERT_TILES=0` (the range depending on the machine's load). Two parts:
+
+- the copies themselves, 46 matrices of 342 MB at 8 to 20 ms each (GPU time 0.58 s): filling
+  fresh private memory, as the same copy into a buffer it had already filled took 2 to 3 ms;
+- each MoE layer giving the checkpoint's experts back (`release_copied` on a thread of its own,
+  ~0.45 s of system time for a layer's 0.68 GB of pages a GPU buffer had wrapped; 30 ms a GB for
+  pages no buffer had) while the plan's next layers wrapped, copied and released buffers under
+  the same memory-map lock: a layer's expert tables took 22 ms before the first releases
+  started, 64 to 88 ms after.
+
+The second is gone: `release_copied_later` holds the ranges until the plan is built (or until
+they pass an eighth of the machine's memory), then gives them back on a thread per layer while
+the prompt runs (which it does not slow: 1.38-1.42 s with the releases right after the build or
+5 s later). One-shot CLI runs, the same binary twice in a row (its shaders compiled; two rounds,
+seconds of the load plus the prefill, i.e. to the first token, and the peak footprint):
+
+| model (prompt) | before | now | tiles off |
+|---|---|---|---|
+| Nemotron-3.5 Lightning Q4_0 (3,719) | 2.24 / 2.84 s, 21.9-22.5 GB | 2.09 / 2.61, 36.9 GB | 1.74 / 1.75, 20.8 |
+| Gemma 4 26B-A4B Q4_0 (3,838) | 3.33 / 2.36, 19.2 | 2.59 / 2.32, 29.1-29.4 | 1.88 / 1.84, 19.2 |
+| Gemma 4 26B-A4B Q8_0 (3,838) | 4.47 / 3.60, 31.5 | 3.17 / 3.21, 47.3-48.1 | 2.60 / 2.49, 31.5 |
+| Qwen3.5-35B-A3B Q4_K_M (3,722) | 3.89 / 3.68, 24.9-25.1 | 3.93 / 3.70, 41.0 | 2.07 / 2.09, 24.1 |
+
+(Qwen's decode plan is built while the model loads, beside the prefill plan, so its copies were
+already made outside the prefill's path and the order of the two builds decides the rest.) The
+peak is the price: the checkpoint's experts and their copies are both in memory until the build
+ends, as before round 10 but only for the build (bounded by the eighth of memory: 4 GB on a
+32 GB machine, where it flushes after every few layers). The tokens are those of the previous
+build where it was deterministic itself (Nemotron, the 26B-A4B Q8_0; the 26B-A4B Q4_0 and
+Qwen3.5's 16 tokens differ between two runs of the same binary, before as now).
+
+Tried and dropped: mapping the routed experts from the file at load instead of reading them
+into memory (`MAP_PRIVATE`: Metal's wrap of the copy-on-write pages for the tile copy makes them
+private copies, prefill 3.7-5.0 s; `MAP_SHARED` read-only: 4.1-6.9 s, though a whole `--mmap`
+load did 1.47 s), one thread giving everything back (2.65 s of work after a prompt: a
+one-shot run then waited ~1.3 s at exit, and the peak grew to 34 GB as it lagged), the same in
+64 MB pieces (exit 13 s later: the pieces split the memory map). What is left is the fill of
+fresh memory; making it disappear for one-shot runs would take building the copies after the
+first prompt (its prefill on the checkpoint's layout, bit-identical; the decode plans, whose
+tiled kernels are not, would have to wait for them or be rebuilt between replies).
+
+Whether the copies should stay on for Q8_0 and the K-quants, whose decoding they slowed by ~1%
+(above): `dec_ab` (128 tokens, 12 rounds, best / median), off / on: 26B-A4B Q8_0 119.7 / 119.3
+against 119.0 / 118.8 tok/s (-0.5%), Qwen3.5-35B-A3B Q4_K_M 148.9 / 148.6 against 148.4 / 148.0
+(-0.4%), 26B-A4B Q4_0 165.1 / 164.3 against 168.3 / 159.4 (noise); the same tokens. Against
+their prompts' 6.3-6.7% (round 9) that is not a case for turning them off, so the default
+stays.
+
 #### Metal decode round (November 2026)
 
 One-token decode steps on Metal (the whole pass in one plan, see

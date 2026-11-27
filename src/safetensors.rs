@@ -229,6 +229,47 @@ pub fn release_copied(addr: usize, len: usize) -> bool {
         false
     }
 }
+
+/// [`release_copied`] of the `(start, end)` address ranges `spans`, held until
+/// [`release_queued`] (a plan build that makes tiled copies of the experts gives the
+/// checkpoint's experts back once it is done, not layer by layer while it builds) or until the
+/// held ranges pass an eighth of the machine's memory. Giving pages back takes the system CPU
+/// time (~0.2 s a GB of pages a GPU buffer wrapped) under its memory map's lock: while each MoE
+/// layer gave its experts back on a thread of its own as soon as it had its copies, the wraps,
+/// copies and releases of the next layers waited on that lock (Nemotron-3.5 Lightning Q4_0:
+/// 1.57 s to build its prefill plan, 0.6 s with the pages given back after it). Meanwhile the
+/// experts take their memory twice, hence the bound.
+pub fn release_copied_later(spans: Vec<(usize, usize)>) {
+    let cap = (crate::platform::total_memory().unwrap_or(0) / 8).max(1 << 30) as usize;
+    let mut q = RELEASES.lock().unwrap_or_else(|e| e.into_inner());
+    q.1 += spans.iter().map(|(s, e)| e - s).sum::<usize>();
+    q.0.push(spans);
+    let full = q.1 > cap;
+    drop(q);
+    if full {
+        release_queued();
+    }
+}
+
+/// Gives back the ranges [`release_copied_later`] holds, on background threads (one per call
+/// that queued them: together, they take a fraction of the time one thread takes for all).
+pub fn release_queued() {
+    let all = std::mem::take(&mut *RELEASES.lock().unwrap_or_else(|e| e.into_inner()));
+    for spans in all.0 {
+        std::thread::spawn(move || {
+            for (s, e) in spans {
+                release_copied(s, e - s);
+            }
+        });
+    }
+}
+
+/// Address ranges, `(start, end)`.
+type Spans = Vec<(usize, usize)>;
+
+/// The ranges [`release_copied_later`] holds, and their bytes.
+static RELEASES: Mutex<(Vec<Spans>, usize)> = Mutex::new((Vec::new(), 0));
+
 impl std::ops::Deref for Storage {
     type Target = [u8];
     fn deref(&self) -> &[u8] {

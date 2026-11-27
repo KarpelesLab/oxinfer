@@ -4129,11 +4129,8 @@ impl MetalBackend {
                 for b in dev.bufs.drain(..) {
                     unsafe { release.0(b.id, release.1) };
                 }
-                std::thread::spawn(move || {
-                    for (s, e) in spans {
-                        crate::safetensors::release_copied(s, e - s);
-                    }
-                });
+                crate::safetensors::release_copied_later(spans);
+                crate::safetensors::release_queued();
             }
         }
         if let Some(r) = self.residency.as_ref().filter(|_| resident) {
