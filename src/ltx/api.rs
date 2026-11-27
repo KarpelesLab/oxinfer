@@ -196,7 +196,8 @@ pub fn guidance_from(mode: Option<&str>, opts: &[(&str, String)]) -> Result<(Gui
 /// soundtrack), `eta`, `sigmas` / `stage2_sigmas` (arrays or comma lists), `noise`
 /// (`oxinfer` / `torch`), `strength` (of the first frame), `guidance` (`auto`, `on`, `off`) and
 /// the guidance settings of [`guidance_option`] (`cfg`, `stg`, `steps`, `negative_prompt`, ...;
-/// any of them but `steps` and `negative_prompt` turns guidance on), `refine_audio`, `image_crf`
+/// any of them but `steps` and `negative_prompt` turns guidance on), `refine_audio`,
+/// `enhance_prompt` (true: the reference's enhancer, or a Gemma 4 instruct model), `image_crf`
 /// (the H.264 CRF conditioning images are re-compressed at; 0: as they are). Images are the
 /// caller's to load ([`images_from_json`]).
 pub fn params_from_json(o: &serde_json::Value) -> Result<Params> {
@@ -272,6 +273,14 @@ pub fn params_from_json(o: &serde_json::Value) -> Result<Params> {
     if let Some(x) = b("refine_audio") {
         p.refine_audio = x;
     }
+    p.enhance_prompt = match &o["enhance_prompt"] {
+        serde_json::Value::Bool(true) => Some(super::enhance::DEFAULT_ENHANCER.to_string()),
+        serde_json::Value::String(s) if !s.is_empty() && !matches!(s.as_str(), "0" | "false" | "no") => Some(match s.as_str() {
+            "1" | "true" | "yes" => super::enhance::DEFAULT_ENHANCER.to_string(),
+            m => m.to_string(),
+        }),
+        _ => None,
+    };
     if let Some(c) = num("image_crf") {
         p.image_crf = Some(c.max(0.0) as u32);
     }

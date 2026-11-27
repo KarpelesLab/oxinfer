@@ -1163,7 +1163,7 @@ OxiVideo *oxi_video_load(const char *model, const char *options, oxi_progress_fn
  * guidance (the dev transformer's, by default): "guidance": "auto" | "on" | "off", "steps": 30,
  * "negative_prompt", "cfg" / "audio_cfg", "stg" / "audio_stg", "stg_blocks" / "audio_stg_blocks"
  * ([28], "all"), "rescale" / "audio_rescale", "modality" / "audio_modality", "skip_step" /
- * "audio_skip_step", "refine_audio": false. */
+ * "audio_skip_step", "refine_audio": false; "enhance_prompt": true (or a Gemma 4 instruct model). */
  * `progress` gets each denoising step (non-zero cancels). Writes the video (needs the `media`
  * feature) to `out_video` in the format of its extension: .mp4 (H.264 + AAC; also for other
  * names), .webm (VP9 + Opus), .avi (Motion JPEG + 16-bit PCM); and the soundtrack to `out_wav`,

@@ -32,6 +32,7 @@ pub mod dfr;
 pub mod diffvae;
 pub mod dit;
 pub mod duration;
+pub mod enhance;
 pub mod guidance;
 pub mod lora;
 pub(crate) mod nn;
@@ -368,6 +369,10 @@ pub struct Params {
     /// transformer), and how ([`Guidance`], the release's by default).
     pub guidance_mode: GuidanceMode,
     pub guidance: Guidance,
+    /// Rewrite the prompt first with this Gemma 4 instruct model (a repository id, folder or
+    /// file; [`enhance::DEFAULT_ENHANCER`] is the reference's), the release's prompt enhancer
+    /// ([`enhance`]); none: the prompt as it is.
+    pub enhance_prompt: Option<String>,
     /// Denoise the soundtrack again in the guided pipeline's second stage (`--refine-audio`;
     /// otherwise the first stage's is kept).
     pub refine_audio: bool,
@@ -403,6 +408,7 @@ impl Params {
             guidance_mode: GuidanceMode::Auto,
             guidance: Guidance::default(),
             refine_audio: false,
+            enhance_prompt: None,
             temporal_upscale: 0,
             images: Vec::new(),
             audio: true,
@@ -945,6 +951,17 @@ impl Pipeline {
     /// Text (and images) to video.
     pub fn generate(&self, p: &Params, progress: Progress) -> Result<Video> {
         let t0 = Instant::now();
+        let enhanced;
+        let p = match &p.enhance_prompt {
+            Some(model) => {
+                let first = p.images.iter().find(|im| im.frame == 0).map(|im| &im.image);
+                let text = enhance::enhance(model, &p.prompt, first, None)?;
+                eprintln!("[LTX-2.5 enhanced prompt: {text}]");
+                enhanced = Params { prompt: text, ..p.clone() };
+                &enhanced
+            }
+            None => p,
+        };
         let guidance = self.guidance_of(p);
         let neg = guidance.as_ref().filter(|g| g.uses_uncond()).map(|g| g.negative_prompt.as_str());
         let mut ctxs = self.encode_prompts(&[&p.prompt, neg.unwrap_or_default()][..1 + neg.is_some() as usize])?;

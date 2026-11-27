@@ -54,6 +54,8 @@ pub struct LtxArgs {
     pub refine_audio: bool,
     /// `--image-crf N`: the H.264 CRF conditioning images are re-compressed at (0: not).
     pub image_crf: Option<u32>,
+    /// `--enhance-prompt` (the reference's enhancer) / `--prompt-enhancer MODEL`.
+    pub enhance_prompt: Option<String>,
 }
 
 fn floats(v: &str) -> Result<Vec<f32>> {
@@ -90,6 +92,8 @@ impl LtxArgs {
             "--no-guidance" => self.guidance = Some("off".into()),
             "--refine-audio" => self.refine_audio = true,
             "--image-crf" => self.image_crf = Some(val()?.parse()?),
+            "--enhance-prompt" => self.enhance_prompt = Some(ltx::enhance::DEFAULT_ENHANCER.to_string()),
+            "--prompt-enhancer" => self.enhance_prompt = Some(val()?),
             "--audio-cfg"
             | "--stg"
             | "--audio-stg"
@@ -232,6 +236,7 @@ pub fn run(args: &Args) -> Result<()> {
     (p.guidance_mode, p.guidance) = ltx::api::guidance_from(a.guidance.as_deref(), &gopts)?;
     p.refine_audio = a.refine_audio;
     p.image_crf = a.image_crf;
+    p.enhance_prompt = a.enhance_prompt.clone();
     if let Some(s) = &a.stage2_sigmas {
         p.stage2_sigmas = s.clone();
     }

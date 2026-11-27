@@ -70,6 +70,7 @@ files (the other parts from the folder above it).
 | `--skip-step N`, `--audio-skip-step N` | guide one step in `N + 1` (default every step) |
 | `--guidance-mode auto\|on\|off`, `--no-guidance` | guidance on or off whatever the transformer (auto: the dev transformer's) |
 | `--refine-audio` | the guided pipeline's second stage denoises the soundtrack again (default: the first stage's kept, as the reference) |
+| `--enhance-prompt`, `--prompt-enhancer MODEL` | rewrite the prompt first with a Gemma 4 instruct model (default the reference's, `google/gemma-4-E2B-it`; [below](#the-prompt-enhancer)) |
 | `--image-crf N` | the H.264 CRF conditioning images are re-compressed at first (default the model's: 18 for LTX-2.5; 0: as they are) |
 | `--noise oxinfer\|torch\|files:DIR` | the noise source (`files:DIR`: the generator seeded `s` reads `DIR/noise_{s}.f32`, for comparisons with the reference) |
 | `--device cpu` | everything on the CPU |
@@ -124,6 +125,19 @@ PyAV encode) gives a lone intra picture at that CRF (measured: CRF 10 / 18 / 25 
 then moves single macroblocks' QP, which oxideav's encoder does not do. On three test images the
 result is as far from the original as x264's (PSNR 39.1 / 44.2 / 26.6 dB against x264's 38.4 /
 39.1 / 26.4) and 38.6 / 39.6 / 36.5 dB from x264's own output.
+
+### The prompt enhancer
+
+`--enhance-prompt` (`enhance_prompt: true` or a model name in the server and C API,
+`Params::enhance_prompt`) runs the release's prompt enhancer ([`enhance.rs`](../src/ltx/enhance.rs),
+`LTXGemmaTextEncoder.enhance_t2v` / `enhance_i2v`): LTX-2.5's own text encoder is not an instruct
+model, so as in the reference a separate Gemma 4 instruct model (default E2B-it, any Gemma 4 chat
+model oxinfer runs with `--prompt-enhancer`) rewrites the prompt with the release's system prompts
+(`gemma4_t2v_system_prompt.txt`, `gemma4_i2v_system_prompt.txt`, Apache-2.0, copied from the LTX-2
+repository), greedily, up to 600 tokens; with a first-frame image, the image goes first in the user
+turn; then `clean_response`. "a cat plays piano in a jazz bar" became a 160-word caption (shot
+sizes, camera push-in, the music's tone) in 2 s with E2B-it on Metal; the video follows it. The
+reference also bans repeated 5-grams (`no_repeat_ngram_size`); oxinfer's sampler has no such ban.
 
 ### The dev transformer: guidance
 
@@ -363,12 +377,16 @@ precision of the int8 and bf16 sessions; `ltx_check dit` with `LTX_SAVE` and `LT
   has constant QP only: the frame QP x264 picks is used).
 - The guided pipelines' `skip_step` with only one stream skipping a step runs both streams (the
   reference leaves the skipped stream out of that pass); off by default.
+- The prompt enhancer's `no_repeat_ngram_size = 5` (greedy decoding without the ban).
+- Audio-to-video (`a2vid_two_stage`: needs the audio VAE's encoder and mel front end), retake
+  (video-to-video regeneration of a time window: needs whole-clip VAE encoding of a decoded video),
+  the IC-LoRA pipelines (`ic_lora`, `hdr_ic_lora`, `dubit`: their LoRAs are not among the release's
+  files) and text-to-audio (`t2a_one_stage`).
 - `ti2vid_two_stages_hq` (the res2s sampler) and the guidance factories by sigma.
 - DFR's detailing IC-LoRA second stage and its spatial epilogue (`spatial_upscalings = 2`): the
   LoRA is not part of the release's files.
-- The DiffVAE's tiled decode (the reference's memory-driven tiles
-  and its keyframe-anchored decode), the prompt enhancer, audio-to-video and
-  video-to-video (IC-LoRA) pipelines.
+- The DiffVAE's tiled decode (the reference's memory-driven tiles and its keyframe-anchored
+  decode).
 - The NVFP4 file is repacked into ggml's blocks at load (3 s, 18.7 GB of anonymous memory beside
   the mapped file: 34 GB resident at 384x256): the kernels do not read ComfyUI's packing (high
   nibble first, scales in cuBLAS's tiled order) in place.
