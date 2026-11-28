@@ -345,9 +345,8 @@ pub struct ServerOptions {
     /// docs/learning.md.
     pub learn_dir: Option<PathBuf>,
     /// The most tokens of context written to opencode's configuration for a model that has no
-    /// `max_context` option (key `opencode_context`: tokens, default 131072; `none` writes the
-    /// model's trained context whatever its size). A model's own `max_context` always wins. See
-    /// [`crate::opencode::CONTEXT_CAP`].
+    /// `max_context` option (key `opencode_context`: tokens; `none`, the default, writes the
+    /// model's trained context whatever its size). A model's own `max_context` always wins.
     pub opencode_context: Option<u64>,
     /// Other oxinfer servers this one sends requests to (key `peer`, repeatable:
     /// `HOST:PORT[,key=KEY]`, see [`PeerSpec`]): their models are listed with this server's, a
@@ -393,7 +392,7 @@ impl Default for ServerOptions {
             auto_models: false,
             idle_unload: Some(std::time::Duration::from_secs(30 * 60)),
             learn_dir: Some(default_learn_dir()),
-            opencode_context: Some(crate::opencode::CONTEXT_CAP),
+            opencode_context: None,
             peers: Vec::new(),
         }
     }
@@ -521,8 +520,7 @@ impl ServerOptions {
             }
             "opencode_context" => {
                 self.opencode_context = match value {
-                    "none" | "off" | "0" => None,
-                    "" | "auto" => Some(crate::opencode::CONTEXT_CAP),
+                    "" | "auto" | "none" | "off" | "0" => None,
                     v => Some(
                         v.parse::<u64>()
                             .ok()

@@ -45,10 +45,10 @@ pub const NPM: &str = "@ai-sdk/openai-compatible";
 pub const SCHEMA: &str = "https://opencode.ai/config.json";
 /// The context written when the model's is not known.
 pub const DEFAULT_CONTEXT: u64 = 32768;
-/// The default cap on the context written for a model without a `max_context` option
-/// ([`Model::capped`]). opencode compacts a conversation as it nears `limit.context`: a model
-/// trained for a million tokens would otherwise be sent conversations of that size, which few
-/// machines can hold and no local model reads fast.
+/// A cap on the context written for a model without a `max_context` option ([`Model::capped`])
+/// that suits a machine which cannot hold a model's trained context (the server applies none
+/// unless asked: `opencode_context`). opencode compacts a conversation as it nears
+/// `limit.context`.
 pub const CONTEXT_CAP: u64 = 131072;
 /// The outcome plugin's file name in opencode's `plugins` directory.
 pub const PLUGIN_FILE: &str = "oxinfer-outcomes.js";
@@ -124,7 +124,7 @@ impl Model {
     }
 
     /// [`Model::new`] with the context limited to `cap` tokens: for a model whose context is its
-    /// trained one, not a `max_context` the user chose ([`CONTEXT_CAP`] is the server's default).
+    /// trained one, not a `max_context` the user chose (the server's `opencode_context`; none by default).
     pub fn capped(id: &str, caps: &Capabilities, cap: Option<u64>) -> Model {
         let context = caps.context.map_or(DEFAULT_CONTEXT, |c| c as u64).max(1);
         let context = cap.map_or(context, |c| context.min(c.max(1)));

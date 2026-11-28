@@ -488,14 +488,13 @@ Adding writes the model under an `oxinfer` provider, created when missing:
   a `vision_config`), or the catalog does for a vision model whose GGUF projector its load fetches.
 - `reasoning`: its chat format has a thinking block; `tool_call`: it has tool calls (before the
   first load: the catalog, or the chat template).
-- `limit.context`: the model's `max_context` option when it has one; else its trained context,
-  but at most 131072 tokens (32768 when the context is not known); `limit.output` a quarter of
-  it, from 1024 to 32768 tokens. `limit.context` is the size opencode takes the model's
-  context to be (what it compacts a conversation against; opencode's side of this was not
-  tested here), so the cap is for models trained for more than a machine holds: Inkling-2's
-  1,048,576 tokens, which the entry used to say. `--opencode-context N` (`opencode_context`)
-  sets another cap and `--opencode-context none` lifts it; a model's own `max_context` is
-  written as it is, whatever the cap. An entry written with another figure shows **Update**.
+- `limit.context`: the model's `max_context` option when it has one; else its trained context
+  (1,048,576 tokens for Inkling-2; 32768 when the context is not known);
+  `limit.output` a quarter of it, from 1024 to 32768 tokens. `limit.context` is the size
+  opencode takes the model's context to be (what it compacts a conversation against; opencode's
+  side of this was not tested here). `--opencode-context N` (`opencode_context`) caps what is
+  written for a model without `max_context`, for a machine that cannot hold the trained
+  context; the default is no cap. An entry written with another figure shows **Update**.
 - `options.baseURL` is this server as a program on this machine reaches it (`https` with TLS),
   and `options.apiKey` its API key when it has one. An existing provider keeps its name and
   other options; an existing entry keeps its `name` (rename it freely) and any other key.

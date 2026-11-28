@@ -217,19 +217,22 @@ fn context_cap_profiles_and_plugin(base: &std::path::Path, dir: &std::path::Path
     let entry =
         || oxinfer::opencode::parse_value(&std::fs::read_to_string(&file).unwrap()).unwrap()["provider"]["oxinfer"]["models"].clone();
 
-    // No cap: the trained context, as before.
+    // No cap, the default: the trained context.
     std::fs::write(&file, "{}\n").unwrap();
-    let a = api("; opencode_context=none");
-    let (l, state, v) = limit(&a);
-    assert_eq!(
-        (l, state.as_str(), &v["context_cap"]),
-        (json!({"context": 1048576, "output": 32768}), "absent", &Value::Null)
-    );
+    for extra in ["", "; opencode_context=none"] {
+        let (l, state, v) = limit(&api(extra));
+        assert_eq!(
+            (l, state.as_str(), &v["context_cap"]),
+            (json!({"context": 1048576, "output": 32768}), "absent", &Value::Null),
+            "{extra}"
+        );
+    }
+    let a = api("");
     let (st, v) = call(&a, "/api/web/opencode/add", Some(json!({"model": "big"})));
     assert_eq!(st, 200, "{v}");
     assert_eq!(entry()["big"]["limit"]["context"], 1048576);
-    // The default cap: that entry needs an update, which writes 131072.
-    let a = api("");
+    // A cap: that entry needs an update, which writes 131072.
+    let a = api("; opencode_context=131072");
     let (l, state, v) = limit(&a);
     assert_eq!(
         (l, state.as_str(), &v["context_cap"]),
