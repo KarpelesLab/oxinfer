@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.25](https://github.com/KarpelesLab/oxinfer/compare/v0.0.24...v0.0.25) - 2026-11-28
+
+### Added
+
+- *(web)* peers on the status page
+- *(split)* one Qwen-path model across two machines
+- *(server)* peers, one endpoint over several machines
+
+### Fixed
+
+- *(opencode)* write a model's trained context by default
+- *(server)* a conversation returns to a peer that just loaded its model
+- *(server)* peers under concurrent requests
+
+### Other
+
+- *(web)* rebuild the bundled GUI with the status page's peers table
+- *(cluster)* two machines, with the measurements
+- *(cuda)* the int8 prefill GEMM on the RTX 5080 and the GB10
+- *(cuda)* int8 prefill GEMM for Q3_K, IQ4_XS, IQ4_NL and IQ3
+- *(cuda)* gate / up pair of a prefill plan in one int8 GEMM launch
+- *(cuda)* int8 prefill GEMM for Q4_K, Q5_K, Q6_K and Q8_0
+
 ## [0.0.24](https://github.com/KarpelesLab/oxinfer/compare/v0.0.23...v0.0.24) - 2026-11-27
 
 ### Added
